@@ -1,0 +1,83 @@
+package: "@aws-sdk/client-sqs"
+semver: ">=3.0.0 <4.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-06"
+status: production
+evidence_quality: partial
+
+functions:
+  - name: send
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Sends any SQS command via the SQSClient. The single entry point for all SQS
+      operations in AWS SDK v3 — sends messages, receives messages, deletes messages,
+      and all queue management operations. Returns a Promise that rejects on any
+      network failure, AWS service error, or permission error.
+
+    postconditions:
+      # Evidence: scan-@aws-sdk-client-sqs-2026-04-01.json — 4 repos scanned, 0 violations
+      # Contract is documentation-confirmed from AWS SDK v3 official docs
+      - id: aws-service-error
+        condition: >
+          Any AWS service error or network failure: queue does not exist
+          (QueueDoesNotExist), insufficient permissions (AccessDeniedException),
+          request throttling (RequestThrottled / ThrottlingException), invalid
+          message content (InvalidMessageContents), receipt handle expired
+          (ReceiptHandleIsInvalid), KMS key errors, service unavailable, or
+          any network-level failure (DNS, timeout, connection refused)
+        throws: >
+          SQSServiceException subclass with error.name set to the specific error code
+          (e.g., "QueueDoesNotExist", "RequestThrottled", "AccessDeniedException",
+          "ReceiptHandleIsInvalid"). For network errors, throws a generic Error or
+          SdkClientError with a connection/timeout message.
+        required_handling: >
+          Caller MUST wrap client.send() in try-catch. All SQS operations can fail due
+          to network issues, permission problems, queue deletion, or AWS service outages.
+          Unhandled rejections cause silent message loss (for SendMessageCommand) or
+          crash consumer loops (for ReceiveMessageCommand).
+
+          Minimum handling:
+            try {
+              await sqsClient.send(new SendMessageCommand({ QueueUrl, MessageBody }));
+            } catch (error) {
+              if (error instanceof SQSServiceException) {
+                console.error(`SQS error [${error.name}]: ${error.message}`);
+              } else {
+                console.error('Network error:', error);
+              }
+              throw error;
+            }
+
+          For consumer loops using ReceiveMessageCommand, error handling is especially
+          critical — an unhandled rejection crashes the polling loop and stops all
+          message processing:
+            try {
+              const response = await sqsClient.send(new ReceiveMessageCommand({ QueueUrl }));
+              const messages = response.Messages ?? [];
+              // process messages...
+            } catch (error) {
+              logger.error('Failed to receive SQS messages', { queueUrl: QueueUrl, error });
+              // Continue polling — do not rethrow unless fatal
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/sqs/"
+          - "https://aws.amazon.com/blogs/developer/service-error-handling-modular-aws-sdk-js/"
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html"
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-best-practices.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
+  - "error.name contains the specific AWS error code (e.g., 'QueueDoesNotExist')"
+  - "error.$retryable.throttling is true for throttling errors — implement exponential backoff"
+  - "DeleteMessageBatchCommand returns HTTP 200 even for partial failures — check result.Failed array separately"
+  - "ReceiveMessageCommand response.Messages may be undefined (not empty array) when queue is empty"
+  - "ReceiptHandleIsInvalid is thrown when deleting a message after its visibility timeout expires"
+  - "SQSClient instance is reusable across multiple send() calls — no per-call instantiation needed"

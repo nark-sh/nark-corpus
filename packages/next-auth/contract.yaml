@@ -1,0 +1,336 @@
+# getToken() from next-auth/jwt already catches decode errors and returns null — no try/catch needed there.
+# encode()/decode() inside NextAuth jwt callbacks are protected by the framework.
+# Rotate NEXTAUTH_SECRET carefully — existing sessions will be invalidated.
+# CVE-2023-48309: Keep next-auth >= 4.24.5 for OAuth security fix.
+# signIn() with redirect:false returns {ok, error} object — check .error, not try/catch.
+package: next-auth
+semver: "^4.22.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-04"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.95
+
+detection:
+  import_names:
+    - "next-auth"
+    - "next-auth/jwt"
+    - "next-auth/react"
+    - "next-auth/middleware"
+  await_patterns:
+    - "encode("
+    - "decode("
+    - "getServerSession("
+    - "getToken("
+    - "signIn("
+    - "signOut("
+    - "withAuth("
+    - "getSession("
+
+functions:
+  - name: encode
+    import_path: "next-auth/jwt"
+    description: >
+      Encrypts a JWT payload using AES-256-GCM (via jose library). Requires NEXTAUTH_SECRET.
+      Used for custom JWT encoding in NextAuth options or standalone token generation.
+
+    postconditions:
+      # Evidence: seen in 2 primary firings across 2 repos in scan-next-auth-2026-04-03.json
+      # Top affected: ajnart/homarr (⭐ 7074 stars), boxyhq/saas-starter-kit (⭐ 4743 stars)
+      - id: encode-no-try-catch
+        condition: "secret parameter is undefined, null, or empty string; or EncryptJWT fails"
+        throws: "TypeError from @panva/hkdf when secret is missing; Error from jose during encryption failure"
+        required_handling: >
+          Caller MUST wrap encode() in try/catch when called outside of NextAuth's own
+          jwt.encode callback. Common error: NEXTAUTH_SECRET not set → TypeError from hkdf.
+          Handle gracefully: log the configuration error and fail the request with 500.
+          Note: encode() inside NextAuth's jwt.encode option is protected by the framework.
+        sources:
+          - "https://next-auth.js.org/configuration/options#secret"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: decode
+    import_path: "next-auth/jwt"
+    description: >
+      Decrypts a NextAuth JWT token (AES-256-GCM encrypted). Throws on malformed tokens
+      or wrong secret. Note: getToken() wraps decode() and catches errors internally —
+      this postcondition applies to direct decode() calls only.
+
+    postconditions:
+      # Evidence: seen in 2 primary firings across 2 repos in scan-next-auth-2026-04-03.json
+      # Top affected: ajnart/homarr (⭐ 7074 stars), boxyhq/saas-starter-kit (⭐ 4743 stars)
+      - id: decode-no-try-catch
+        condition: "Token encrypted with different secret (key rotation), malformed token, or missing secret"
+        throws: "JWEDecryptionFailed (wrong secret), JWEInvalid/JWTInvalid (malformed), TypeError (missing secret)"
+        required_handling: >
+          Caller MUST wrap decode() in try/catch when calling directly. Common scenarios:
+          1. Secret rotation: old tokens throw JWEDecryptionFailed → return null/401, force re-auth
+          2. Malformed/tampered token: JWEInvalid → return 401, do not expose error details
+          3. Missing NEXTAUTH_SECRET: TypeError → configuration error, fail fast with clear message
+          Note: getToken() from next-auth/jwt already wraps decode() in try/catch internally.
+          This postcondition applies only to direct decode() calls.
+        sources:
+          - "https://next-auth.js.org/configuration/options#secret"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getServerSession
+    import_path: "next-auth/next"
+    description: >
+      Retrieves the server-side session object. Returns Session | null.
+      Must be called with authOptions in App Router; in Pages Router can infer from [...nextauth].
+      Calls AuthHandler internally and throws Error(body.message) on non-200 responses.
+
+    postconditions:
+      - id: getserversession-null-not-checked
+        condition: "No active session (user not logged in, expired token, or invalid cookie)"
+        returns: "null"
+        required_handling: >
+          Caller MUST check the return value for null before accessing session properties.
+          getServerSession() returns null when: no session cookie present, session expired,
+          or token validation fails. Accessing .user or other properties on null causes TypeError.
+          Pattern: const session = await getServerSession(authOptions); if (!session) return redirect('/login');
+        sources:
+          - "https://next-auth.js.org/configuration/nextjs#getserversession"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getserversession-authoptions-mismatch
+        condition: "authOptions not passed or different from [...nextauth] route config"
+        returns: "null (silently returns null when options mismatch)"
+        required_handling: >
+          Caller MUST pass the same authOptions object used in the [...nextauth] route handler.
+          In App Router, getServerSession(authOptions) is required — omitting authOptions returns null silently.
+          Common mistake: importing authOptions from wrong file or passing partial config.
+          Always export authOptions from a single shared location.
+        sources:
+          - "https://next-auth.js.org/configuration/nextjs#getserversession"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: getToken
+    import_path: "next-auth/jwt"
+    description: >
+      Retrieves and decodes the JWT token from the request cookies.
+      Returns JWT | null. Wraps decode() in try/catch internally — never throws on
+      decode failure, returns null instead. Throws only if req parameter is missing.
+
+    postconditions:
+      - id: gettoken-null-not-checked
+        condition: "No valid JWT cookie present, token expired, or decode fails"
+        returns: "null"
+        required_handling: >
+          Caller MUST check the return value for null before accessing token properties.
+          getToken() returns null when: no session cookie, decode fails (wrong secret, malformed token),
+          or cookie name doesn't match. Accessing properties on null causes TypeError.
+          Pattern: const token = await getToken({ req }); if (!token) return res.status(401).json({ error: 'Unauthorized' });
+        sources:
+          - "https://next-auth.js.org/tutorials/securing-pages-and-api-routes#using-gettoken"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: gettoken-missing-req
+        condition: "req parameter is undefined or null"
+        throws: "TypeError: Cannot read properties of undefined (reading 'headers')"
+        required_handling: >
+          Caller MUST pass a valid request object to getToken(). In API routes, pass { req }.
+          In middleware, pass { req: request }. Missing req causes an immediate TypeError.
+          This is a coding error, not a runtime condition — ensure req is always provided.
+        sources:
+          - "https://next-auth.js.org/tutorials/securing-pages-and-api-routes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: gettoken-missing-secret
+        condition: "NEXTAUTH_SECRET environment variable not set and no secret option provided"
+        throws: "MissingSecret: Please define a `secret` in production by setting the NEXTAUTH_SECRET environment variable."
+        required_handling: >
+          Caller MUST ensure NEXTAUTH_SECRET is set in the environment or pass secret option
+          to getToken({ req, secret }). In development, NextAuth generates a random secret
+          with a warning. In production, missing secret throws MissingSecret error.
+          This is a deployment configuration issue — validate env vars at startup.
+        sources:
+          - "https://next-auth.js.org/configuration/options#secret"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: signIn
+    import_path: "next-auth/react"
+    description: >
+      Client-side function to initiate sign-in flow. With redirect:true (default),
+      redirects the browser. With redirect:false, returns SignInResponse object
+      { error, status, ok, url } instead of throwing — caller must check .error field.
+
+    postconditions:
+      - id: signin-error-not-checked
+        condition: "Authentication fails when called with redirect:false (wrong credentials, provider error)"
+        returns: "SignInResponse with error field set (e.g., { error: 'CredentialsSignin', status: 401, ok: false, url: null })"
+        required_handling: >
+          When using signIn('credentials', { redirect: false }), caller MUST check the .error
+          property of the returned object. signIn() does NOT throw on auth failure — it returns
+          { error: 'CredentialsSignin', ok: false }. Common mistake: using try/catch instead of
+          checking response.error. Pattern: const res = await signIn('credentials', { ...data, redirect: false });
+          if (res?.error) { showError(res.error); } else { router.push('/dashboard'); }
+        sources:
+          - "https://next-auth.js.org/getting-started/client#signin"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: signin-providers-fetch-failure
+        condition: "Network error when calling /api/auth/csrf or /api/auth/signin endpoint"
+        returns: "undefined (signIn returns undefined when the internal fetch fails)"
+        required_handling: >
+          Caller SHOULD handle the case where signIn() returns undefined, which happens when
+          the internal fetch to the auth API fails (network error, server down). The internal
+          fetchData utility catches fetch errors and returns null, which propagates as undefined
+          from signIn(). Pattern: const res = await signIn(...); if (!res) { showNetworkError(); }
+        sources:
+          - "https://next-auth.js.org/getting-started/client#signin"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: signOut
+    import_path: "next-auth/react"
+    description: >
+      Client-side function to sign out. With redirect:true (default), redirects browser.
+      With redirect:false, returns { url } object. Uses fetch internally without try/catch
+      in the signOut function body itself (fetchData wrapper catches).
+
+    postconditions:
+      - id: signout-network-error-not-handled
+        condition: "Network error when calling /api/auth/signout endpoint"
+        returns: "undefined (internal fetchData catches and returns null)"
+        required_handling: >
+          Caller SHOULD handle the case where signOut({ redirect: false }) returns undefined
+          or the redirect fails due to network error. The internal fetchData utility catches
+          fetch errors and returns null. If using redirect:false, check the return value
+          before using .url property. Pattern: const res = await signOut({ redirect: false });
+          if (res?.url) { window.location.href = res.url; } else { showError('Sign out failed'); }
+        sources:
+          - "https://next-auth.js.org/getting-started/client#signout"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: withAuth
+    import_path: "next-auth/middleware"
+    description: >
+      Next.js middleware wrapper that protects routes by checking JWT token.
+      Redirects unauthenticated users to sign-in page. Supports authorized callback
+      for custom authorization logic. Logs error and redirects to error page if secret missing.
+
+    postconditions:
+      - id: withauth-no-secret
+        condition: "NEXTAUTH_SECRET not set and secret option not provided"
+        returns: "Redirects to /api/auth/error page with console error logged"
+        required_handling: >
+          Caller MUST ensure NEXTAUTH_SECRET is set in the environment or pass secret option
+          in middleware config. Without a secret, withAuth cannot decode the JWT token and
+          redirects all users to the error page. This is a deployment configuration error.
+          The middleware logs 'NO_SECRET' error to console. Validate env vars in CI/CD pipeline.
+        sources:
+          - "https://next-auth.js.org/configuration/nextjs#middleware"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: withauth-authorized-callback-false
+        condition: "authorized callback returns false (user authenticated but not authorized)"
+        returns: "Redirects to sign-in page (not error page)"
+        required_handling: >
+          When using the authorized callback for role-based access, be aware that returning
+          false redirects to the sign-in page, NOT an 'access denied' page. This can confuse
+          authenticated users who lack permissions. To show a proper 403 page, handle
+          authorization in the page component instead of the middleware authorized callback.
+          Pattern: callbacks: { authorized: ({ token }) => token?.role === 'admin' }
+        sources:
+          - "https://next-auth.js.org/configuration/nextjs#middleware"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: getSession
+    import_path: "next-auth/react"
+    description: >
+      Client-side function to fetch the session from /api/auth/session endpoint.
+      Returns Session | null. Used in non-React contexts (vanilla JS, external scripts).
+      For React components, prefer useSession() hook instead.
+
+    postconditions:
+      - id: getsession-null-not-checked
+        condition: "No active session or network error fetching /api/auth/session"
+        returns: "null"
+        required_handling: >
+          Caller MUST check the return value for null before accessing session properties.
+          getSession() returns null when: user not authenticated, session expired, or
+          network error fetching the session endpoint. The internal fetchData utility
+          catches fetch errors and returns null. Accessing .user on null causes TypeError.
+          Pattern: const session = await getSession(); if (!session) { redirectToLogin(); }
+        sources:
+          - "https://next-auth.js.org/getting-started/client#getsession"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

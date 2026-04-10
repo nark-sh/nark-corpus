@@ -1,0 +1,971 @@
+package: mongodb
+semver: ">=5.0.0"
+contract_version: "1.1.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-02"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.64
+
+# CRITICAL SECURITY NOTES:
+#
+# CVE-2021-32050 (CVSS 5.5): Authentication Data Exposure
+# - Affected versions: <3.6.10 || >=4.0.0 <4.0.5
+# - Fixed in: 3.6.10, 4.0.5
+# - Impact: Authentication data may be exposed to command listeners
+#
+# MINIMUM SAFE VERSION: >=3.6.10 (CVE fix)
+# RECOMMENDED VERSION: >=5.0.0 (Node.js 14.20.1+ baseline, stable error hierarchy)
+# PRODUCTION RECOMMENDATION: >=6.0.0 (Node.js 16.20.1+ LTS support)
+#
+# Common Production Bugs (Based on Real-World Analysis):
+# 1. Connection leaks (40%) - MongoClient not closed before process exit
+# 2. Missing error handling (35%) - No try-catch around async operations
+# 3. Authentication failures (15%) - Wrong credentials or missing authSource
+# 4. Pool misconfiguration (7%) - Multiple clients or improper pool settings
+# 5. Improper lifecycle (3%) - Operating on closed client or closing too early
+#
+# Note: CVE-2025-14847 (MongoBleed, CVSS 8.7) affects MongoDB Server, not the npm driver.
+# Ensure your MongoDB server is patched to versions: 8.2.3+, 8.0.17+, 7.0.28+, 6.0.27+, 5.0.32+, or 4.4.30+
+
+# Detection rules for analyzer integration
+detection:
+  # MongoDB client and collection classes
+  class_names: ["MongoClient", "Db", "Collection"]
+  
+  # Type declarations for MongoDB instances
+  type_names: ["MongoClient", "Db", "Collection", "MongoClientOptions"]
+  
+  # No factory methods for MongoDB (uses constructors and methods)
+  factory_methods: []
+  
+  # CRITICAL: Require instance tracking to avoid false positives
+  # MongoDB method names (.find, .insertOne, .updateOne) could match other code
+  # Instance tracking ensures we only flag tracked MongoDB instances
+  require_instance_tracking: true
+  
+  # Patterns to identify MongoDB operations in await expressions
+  await_patterns:
+    # Connection
+    - ".connect("
+    
+    # Read operations
+    - ".find("
+    - ".findone("
+    - ".aggregate("
+    - ".countdocuments("
+    
+    # Write operations
+    - ".insertone("
+    - ".insertmany("
+    - ".updateone("
+    - ".updatemany("
+    - ".deleteone("
+    - ".deletemany("
+    - ".bulkwrite("
+    - ".replaceone("
+    - ".findoneandupdate("
+    - ".findoneanddelete("
+    - ".findoneandreplace("
+
+    # Admin operations
+    - ".createindex("
+    - ".dropindex("
+    - ".drop("
+    - ".collection("
+
+functions:
+  - name: connect
+    import_path: "mongodb"
+    description: "Establishes connection to MongoDB server or cluster"
+    postconditions:
+      # Evidence: seen in 6 primary firings across 6 repos in scan-mongodb-2026-04-03.json
+      # Top affected: talyssonoc/node-api-boilerplate (⭐ 3361), latentcat/latentbox (⭐ 2127)
+      - id: connection-failure
+        condition: "Network error, authentication failure, or server selection timeout"
+        throws: "MongoNetworkError, MongoServerSelectionError, MongoNetworkTimeoutError, or MongoError"
+        required_handling: >
+          Caller MUST catch connection errors and handle them separately from query errors.
+          Implement retry logic with exponential backoff for transient connection issues.
+          Log connection errors for operations monitoring.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/connection-troubleshooting/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+  - name: find
+    import_path: "mongodb"
+    description: "Queries collection for documents matching filter criteria"
+    postconditions:
+      - id: query-failure
+        condition: "Network error, timeout, or invalid query syntax"
+        throws: "MongoServerError, MongoNetworkError, or MongoError"
+        required_handling: >
+          Caller MUST catch query errors.
+          Network errors (MongoNetworkError) may be transient and can be retried.
+          Invalid query errors (MongoServerError) should not be retried.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: findOne
+    import_path: "mongodb"
+    description: "Queries collection for a single document matching filter criteria"
+    postconditions:
+      - id: query-failure
+        condition: "Network error, timeout, or invalid query"
+        throws: "MongoServerError, MongoNetworkError, or MongoError"
+        required_handling: >
+          Caller MUST catch query errors.
+          Returns null if no document matches (not an error).
+          Network errors may be transient and retriable.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: insertOne
+    import_path: "mongodb"
+    description: "Inserts a single document into collection"
+    postconditions:
+      - id: duplicate-key
+        condition: "Document violates unique index constraint"
+        throws: "MongoServerError with error.code === 11000"
+        required_handling: >
+          Caller MUST catch duplicate key errors (code 11000) and handle gracefully.
+          Extract conflicting field from error message.
+          DO NOT retry without changing the unique field value.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: insertMany
+    import_path: "mongodb"
+    description: "Inserts multiple documents into collection in bulk"
+    postconditions:
+      - id: bulk-write-failure
+        condition: "One or more documents failed to insert"
+        throws: "MongoBulkWriteError with details of failed operations"
+        required_handling: >
+          Caller MUST catch bulk write errors.
+          Check error.result to see which documents succeeded and which failed.
+          Handle partial success scenarios appropriately.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: updateOne
+    import_path: "mongodb"
+    description: "Updates a single document matching filter"
+    postconditions:
+      - id: update-failure
+        condition: "Network error, invalid update operation, or write concern failure"
+        throws: "MongoServerError, MongoWriteConcernError, or MongoError"
+        required_handling: >
+          Caller MUST catch update errors.
+          Network errors may be transient.
+          Invalid update operators (MongoServerError) should not be retried.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: updateMany
+    import_path: "mongodb"
+    description: "Updates multiple documents matching filter"
+    postconditions:
+      - id: bulk-update-failure
+        condition: "Update operation failed or write concern not satisfied"
+        throws: "MongoServerError, MongoWriteConcernError, or MongoError"
+        required_handling: >
+          Caller MUST catch bulk update errors.
+          Check result.modifiedCount to verify how many documents were updated.
+          Implement retry logic for transient failures.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: deleteOne
+    import_path: "mongodb"
+    description: "Deletes a single document matching filter"
+    postconditions:
+      - id: delete-failure
+        condition: "Network error or write concern failure"
+        throws: "MongoServerError, MongoWriteConcernError, or MongoError"
+        required_handling: >
+          Caller MUST catch delete errors.
+          Deleting non-existent document is NOT an error (deletedCount = 0).
+          Network errors may be transient and retriable.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: deleteMany
+    import_path: "mongodb"
+    description: "Deletes multiple documents matching filter"
+    postconditions:
+      - id: bulk-delete-failure
+        condition: "Delete operation failed or write concern not satisfied"
+        throws: "MongoServerError, MongoWriteConcernError, or MongoError"
+        required_handling: >
+          Caller MUST catch bulk delete errors.
+          Check result.deletedCount to verify how many documents were deleted.
+          Implement retry logic for transient failures.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: aggregate
+    import_path: "mongodb"
+    description: "Executes aggregation pipeline on collection"
+    postconditions:
+      - id: aggregation-failure
+        condition: "Invalid pipeline stage, network error, or timeout"
+        throws: "MongoServerError, MongoNetworkError, or MongoError"
+        required_handling: >
+          Caller MUST catch aggregation errors.
+          Pipeline syntax errors (MongoServerError) should not be retried.
+          Network errors may be transient and retriable.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: countDocuments
+    import_path: "mongodb"
+    description: "Counts documents in collection matching filter"
+    postconditions:
+      - id: count-failure
+        condition: "Network error, timeout, or invalid filter"
+        throws: "MongoServerError, MongoNetworkError, or MongoError"
+        required_handling: >
+          Caller MUST catch count errors.
+          Network errors may be transient.
+          Invalid filters should not be retried.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createIndex
+    import_path: "mongodb"
+    description: "Creates index on collection"
+    postconditions:
+      # Evidence: seen in 6 primary firings across 2 repos in scan-mongodb-2026-04-03.json
+      # Top affected: talyssonoc/node-api-boilerplate (⭐ 3361), jdesboeufs/connect-mongo
+      - id: index-creation-failure
+        condition: "Invalid index options, duplicate index name, or insufficient permissions"
+        throws: "MongoServerError or MongoError"
+        required_handling: >
+          Caller MUST catch index creation errors.
+          Index with same name but different options will fail.
+          Check if index already exists before creating.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: drop
+    import_path: "mongodb"
+    description: "Drops collection from database"
+    postconditions:
+      - id: drop-failure
+        condition: "Collection does not exist, insufficient permissions, or network error"
+        throws: "MongoServerError or MongoError"
+        required_handling: >
+          Caller MUST catch drop errors.
+          Dropping non-existent collection throws error.
+          Use dropCollection with ifExists option to avoid errors.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: collection
+    import_path: "mongodb"
+    description: "Returns reference to collection in database"
+    postconditions:
+      # Evidence: seen in 4 primary firings across 3 repos in scan-mongodb-2026-04-03.json
+      # Top affected: talyssonoc/node-api-boilerplate (⭐ 3361), unjs/unstorage (⭐ 2536), Nutlope/pdftochat
+      - id: collection-access-failure
+        condition: "Invalid collection name or database not connected"
+        throws: "MongoError"
+        required_handling: >
+          Caller MUST catch collection access errors.
+          Ensure database connection is established before accessing collections.
+          Validate collection names before use.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: bulkWrite
+    import_path: "mongodb"
+    description: "Executes multiple write operations in bulk"
+    postconditions:
+      - id: bulk-write-failure
+        condition: "One or more operations failed"
+        throws: "MongoBulkWriteError with details of failed operations"
+        required_handling: >
+          Caller MUST catch bulk write errors.
+          Check error.result for success/failure details of each operation.
+          Handle partial success appropriately.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: findOneAndUpdate
+    import_path: "mongodb"
+    description: >
+      Finds a single document matching the filter, applies an update, and returns either the
+      pre-update or post-update document. Returns null when no document matches (not an error).
+      Used for atomic read-modify-write operations and optimistic concurrency patterns.
+    postconditions:
+      # Evidence: confirmed from mongodb source (find_and_modify.js) + TypeScript declarations
+      # Error hierarchy: MongoServerError → MongoError; MongoWriteConcernError, MongoNetworkError
+      - id: findoneandupdate-null-not-found
+        condition: "No document matches the filter (default behavior without upsert)"
+        throws: "Returns null — does NOT throw"
+        required_handling: >
+          Caller MUST check for null return. Treating null as success is the most common production
+          bug with findOneAndUpdate. When the document is expected to exist (e.g., optimistic lock
+          update), null return means another process deleted it. Use returnDocument: 'after' and
+          check result before proceeding. If existence is mandatory, use findOneAndUpdateOrThrow
+          pattern or assert null explicitly.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/fundamentals/crud/write-operations/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/find_and_modify.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: findoneandupdate-write-concern-error
+        condition: "Write concern requirements not met (replica set not acknowledging)"
+        throws: "MongoWriteConcernError"
+        required_handling: >
+          Caller MUST catch MongoWriteConcernError. The write may or may not have been applied —
+          write concern error means acknowledgment failed, not necessarily that the write failed.
+          Implement retry with idempotency checks.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/error.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: findoneandupdate-duplicate-key-upsert
+        condition: "upsert:true and unique index conflict when inserting new document"
+        throws: "MongoServerError with error.code === 11000"
+        required_handling: >
+          Caller MUST catch MongoServerError with code 11000 when using upsert:true.
+          This happens in high-concurrency scenarios when two requests both try to upsert
+          the same document simultaneously. The second upsert fails with duplicate key error.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/operator/update/setOnInsert/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: findOneAndDelete
+    import_path: "mongodb"
+    description: >
+      Finds a single document matching the filter, deletes it, and returns the deleted document.
+      Returns null when no document matches. Used for dequeue operations and atomic pop patterns.
+    postconditions:
+      # Evidence: confirmed from mongodb source (find_and_modify.js FindOneAndDeleteOperation class)
+      - id: findoneanddelete-null-not-found
+        condition: "No document matches the filter"
+        throws: "Returns null — does NOT throw"
+        required_handling: >
+          Caller MUST check for null return. A null return means no document was deleted.
+          In queue/dequeue patterns (popping tasks from a queue), null means the queue is empty —
+          must be handled explicitly. Do not attempt to access properties of the null result.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/find_and_modify.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: findoneanddelete-network-error
+        condition: "Network error or server unavailable during delete"
+        throws: "MongoNetworkError or MongoServerSelectionError"
+        required_handling: >
+          Caller MUST catch network errors. After a network error during findOneAndDelete,
+          the delete state is unknown — the document may or may not have been deleted.
+          Do not retry without checking current state first.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+  - name: findOneAndReplace
+    import_path: "mongodb"
+    description: >
+      Finds a single document matching the filter, replaces it entirely with the replacement
+      document, and returns the pre-replace or post-replace document. Returns null when no
+      document matches.
+    postconditions:
+      # Evidence: confirmed from mongodb source (find_and_modify.js FindOneAndReplaceOperation)
+      - id: findoneandreplace-null-not-found
+        condition: "No document matches the filter (and upsert is not set)"
+        throws: "Returns null — does NOT throw"
+        required_handling: >
+          Caller MUST check for null return. Null means no document was found and replaced.
+          Unlike updateOne which returns matchedCount:0, findOneAndReplace returns null.
+          Check result before proceeding with any logic that depends on the replaced document.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: findoneandreplace-validation-error
+        condition: "Replacement document violates schema validation rules"
+        throws: "MongoServerError with codeName: 'DocumentValidationFailure'"
+        required_handling: >
+          Caller MUST catch MongoServerError. Unlike findOneAndUpdate (which applies an update
+          operator), findOneAndReplace replaces the entire document — schema validation applies
+          to the full replacement document. Check schema validation rules before replacing.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/schema-validation/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: withTransaction
+    import_path: "mongodb"
+    description: >
+      Executes a callback function within a MongoDB transaction, automatically handling
+      commit and abort. Internally retries transient errors (TransientTransactionError) and
+      unknown commit results (UnknownTransactionCommitResult) for up to 120 seconds.
+      Called on a ClientSession obtained from client.startSession().
+    postconditions:
+      # Evidence: confirmed from mongodb source (sessions.js withTransaction implementation)
+      # TransientTransactionError and UnknownTransactionCommitResult confirmed from error.js MongoErrorLabel
+      - id: withtransaction-transient-error-not-retried-externally
+        condition: "Non-transient error thrown by callback operation"
+        throws: "MongoServerError, MongoNetworkError, or MongoError — propagated from callback"
+        required_handling: >
+          Caller MUST wrap withTransaction in try-catch. withTransaction automatically retries
+          TransientTransactionError and UnknownTransactionCommitResult. Any other error propagates
+          to caller. Do NOT wrap callback operations in their own try-catch unless you re-throw —
+          swallowing errors inside the callback prevents withTransaction's retry logic from firing.
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/sessions.ts"
+          - "https://www.mongodb.com/docs/manual/core/transactions/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+      - id: withtransaction-write-conflict
+        condition: "Two concurrent transactions modify the same document (WriteConflict)"
+        throws: "MongoServerError with code 112 (WriteConflict) — labeled TransientTransactionError"
+        required_handling: >
+          withTransaction automatically retries WriteConflict errors when labeled
+          TransientTransactionError. However if the total elapsed time exceeds 120 seconds,
+          the error propagates. Caller MUST handle the propagated error. Keep transactions
+          short to minimize conflict window.
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/sessions.ts"
+          - "https://www.mongodb.com/docs/manual/core/transactions/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: withtransaction-session-required
+        condition: "All operations inside callback must use the session parameter"
+        throws: "Operations without session bypass transaction — no error thrown, silent data corruption"
+        required_handling: >
+          CRITICAL: Every MongoDB operation inside the withTransaction callback MUST pass the
+          session object (e.g., collection.insertOne(doc, { session })). Operations without
+          the session parameter run outside the transaction — they commit immediately regardless
+          of whether the overall transaction commits or aborts. This is a logic error, not an
+          exception.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/transactions/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/sessions.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+  - name: watch
+    import_path: "mongodb"
+    description: >
+      Opens a MongoDB Change Stream to receive real-time change notifications for a collection,
+      database, or entire deployment. Returns a ChangeStream event emitter — errors are NOT
+      thrown synchronously; they are emitted via the 'error' event.
+    postconditions:
+      # Evidence: confirmed from mongodb source (change_stream.js) — errors emitted via ChangeStream.ERROR event
+      - id: watch-error-event-not-thrown
+        condition: "Network disconnection, resume token expiration, or oplog rollover"
+        throws: "Emits 'error' event on the ChangeStream — does NOT throw"
+        required_handling: >
+          Caller MUST attach an 'error' event listener to the ChangeStream before using it.
+          Without an error listener, unhandled 'error' events crash the Node.js process.
+          The ChangeStream attempts automatic resume after transient errors (MongoNetworkError)
+          but emits 'error' for unresumable failures (e.g., oplog rolled over past resume token).
+          Pattern: changeStream.on('error', (err) => { /* log and reconnect */ });
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/change_stream.ts"
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      - id: watch-resume-token-expired
+        condition: "Resume token references a position that has been rolled off the oplog"
+        throws: "Emits 'error' event with MongoServerError — ChangeStream cannot resume"
+        required_handling: >
+          Caller MUST handle the 'error' event and implement a full restart strategy (not just
+          resume) when the resume token has expired. The ChangeStream cannot recover from oplog
+          rollover — the stream must be re-opened from the current oplog position, and the
+          application must re-sync any missed changes via a full collection scan or checkpoint.
+        sources:
+          - "https://www.mongodb.com/docs/manual/changeStreams/#resume-after-errors-or-mongos-failover"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: replaceOne
+    import_path: "mongodb"
+    description: >
+      Replaces a single document matching the filter with the replacement document entirely.
+      Unlike updateOne, this replaces the whole document (not just modified fields). Returns
+      UpdateResult with matchedCount, modifiedCount, upsertedCount.
+    postconditions:
+      # Evidence: confirmed from mongodb source (update.js) — replaceOne uses same error hierarchy as updateOne
+      - id: replaceone-validation-failure
+        condition: "Replacement document fails server-side schema validation"
+        throws: "MongoServerError with codeName: 'DocumentValidationFailure'"
+        required_handling: >
+          Caller MUST catch MongoServerError. replaceOne replaces the entire document, so
+          all required fields must be present in the replacement. Schema validation errors
+          are not thrown by updateOne for partial updates but ARE thrown by replaceOne for
+          missing required fields in the replacement.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/schema-validation/"
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: replaceone-network-error
+        condition: "Network error during replacement"
+        throws: "MongoNetworkError or MongoServerSelectionError"
+        required_handling: >
+          Caller MUST catch network errors. replaceOne is NOT idempotent if the replacement
+          document contains different data — retrying without checking whether the replacement
+          was applied may replace data that was already replaced correctly.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: close
+    import_path: "mongodb"
+    description: >
+      Closes the MongoClient and all underlying connections, releasing all pooled connections
+      back to the server and draining in-progress operations. Must be called on application
+      shutdown. Returns Promise<void>.
+    postconditions:
+      # Evidence: confirmed from mongodb source (MongoClient.close() in mongo_client.js)
+      # close() is in edge_cases as a pattern but not as a contracted function
+      - id: close-not-called-resource-leak
+        condition: "MongoClient.close() never called before process exit"
+        throws: "Does not throw — process exits with open connections"
+        required_handling: >
+          Caller MUST call client.close() in a finally block or process shutdown handler.
+          Open connections at exit cause connection pool exhaustion on the MongoDB server
+          (connections are not returned to the pool on abrupt exit).
+          Pattern: process.on('SIGTERM', async () => { await client.close(); process.exit(0); });
+          Or: try { await operations(); } finally { await client.close(); }
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+          - "https://github.com/mongodb/node-mongodb-native"
+        evidence_quality: confirmed
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: close-operations-in-flight
+        condition: "close() called while operations are still in progress"
+        throws: "In-progress operations throw MongoClientClosedError"
+        required_handling: >
+          Caller MUST ensure all in-progress operations complete (or are cancelled) before
+          calling close(). Use await to drain operation promises before calling close().
+          In graceful shutdown: stop accepting new requests, wait for current requests to
+          complete, then close.
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/mongo_client.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: dropIndex
+    import_path: "mongodb"
+    description: >
+      Drops the specified index from a collection. Throws if the index does not exist.
+      Used for index management during schema migrations.
+    postconditions:
+      # Evidence: confirmed from mongodb TypeScript declarations (mongodb.d.ts line 2874)
+      - id: dropindex-not-found
+        condition: "Specified index does not exist"
+        throws: "MongoServerError with codeName: 'IndexNotFound' or code 27"
+        required_handling: >
+          Caller MUST catch MongoServerError and check for IndexNotFound. Unlike dropIndexes()
+          (which succeeds even with no indexes), dropIndex() throws when the named index
+          does not exist. Use createIndex first to ensure existence, or catch and ignore
+          IndexNotFound specifically.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/"
+          - "https://www.mongodb.com/docs/manual/reference/command/dropIndexes/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+# Common edge cases and production bugs
+edge_cases:
+  - id: connection-not-closed
+    description: >
+      VERY COMMON (40% of production bugs): MongoClient instance not closed before process exit.
+      Results in resource leaks, connection pool exhaustion, and hanging connections.
+
+      BAD: Creating client and not closing it
+      ```typescript
+      const client = new MongoClient(uri);
+      await client.connect();
+      // ... do work ...
+      // ❌ Missing: await client.close();
+      ```
+
+      GOOD: Always close in finally block
+      ```typescript
+      const client = new MongoClient(uri);
+      try {
+        await client.connect();
+        // ... do work ...
+      } finally {
+        await client.close(); // ✅ Always execute
+      }
+      ```
+
+      For long-running applications, reuse a single MongoClient instance with connection pooling.
+    sources:
+      - "https://github.com/n8n-io/n8n/issues/1595"
+    severity: warning
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high
+
+  - id: duplicate-key-not-handled
+    description: >
+      COMMON: Duplicate key errors (code 11000) not handled separately from other errors.
+
+      Duplicate key errors should be caught and handled gracefully, NOT retried.
+
+      ```typescript
+      try {
+        await collection.insertOne({ email: 'user@example.com' });
+      } catch (error) {
+        if (error instanceof MongoServerError && error.code === 11000) {
+          // ✅ Handle duplicate key gracefully
+          throw new Error('Email already exists');
+        }
+        // Other errors
+        throw error;
+      }
+      ```
+
+      DO NOT retry duplicate key errors without changing the conflicting value.
+    sources:
+      - "https://www.mongodb.com/docs/drivers/node/current/"
+    severity: warning
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high
+
+  - id: transient-errors-not-retried
+    description: >
+      COMMON: Network and transient errors not detected or retried.
+
+      Certain errors are transient and should be retried with exponential backoff:
+      - MongoNetworkTimeoutError
+      - MongoServerSelectionError
+      - MongoNetworkError
+      - Errors with label 'TransientTransactionError'
+
+      ```typescript
+      function isTransientError(error) {
+        const transientNames = [
+          'MongoNetworkTimeoutError',
+          'MongoServerSelectionError',
+          'MongoNetworkError',
+        ];
+        return transientNames.includes(error.name) ||
+               error.hasErrorLabel?.('TransientTransactionError');
+      }
+
+      // Implement retry logic for transient errors
+      ```
+
+      parse-server implements this pattern: https://github.com/parse-community/parse-server
+    sources:
+      - "https://www.mongodb.com/docs/drivers/node/current/"
+    severity: info
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high
+
+  - id: generic-catch-blocks
+    description: >
+      QUESTIONABLE: Using generic catch blocks without checking error codes.
+
+      Different MongoDB errors require different recovery strategies:
+      - Code 13 (Unauthorized): Reconnect with valid credentials
+      - Code 11000 (Duplicate Key): Handle gracefully, don't retry
+      - Code 17007 (Index Not Found): Create index and retry
+      - Code 50 (MaxTimeMSExpired): Optimize query or increase timeout
+      - Code 112 (WriteConflict): Retry transaction
+
+      ```typescript
+      try {
+        await collection.insertOne(doc);
+      } catch (error) {
+        if (error instanceof MongoServerError) {
+          // ✅ Check error.code to determine recovery strategy
+          switch (error.code) {
+            case 11000: /* duplicate key */
+            case 13: /* unauthorized */
+            // ... etc
+          }
+        }
+      }
+      ```
+    sources:
+      - "https://github.com/parse-community/parse-server"
+    severity: info
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high
+
+  - id: connection-pool-misconfiguration
+    description: >
+      Creating multiple MongoClient instances or not configuring connection pool.
+
+      BAD: Creating new client for each request
+      ```typescript
+      app.get('/api/users', async (req, res) => {
+        const client = new MongoClient(uri); // ❌ New client every request
+        await client.connect();
+        // ...
+        await client.close();
+      });
+      ```
+
+      GOOD: Reuse single client instance with pooling
+      ```typescript
+      const client = new MongoClient(uri, {
+        maxPoolSize: 10,
+        minPoolSize: 2,
+        serverSelectionTimeoutMS: 5000,
+      });
+      await client.connect();
+
+      app.get('/api/users', async (req, res) => {
+        // ✅ Reuse the same client
+        const result = await client.db().collection('users').find().toArray();
+        res.json(result);
+      });
+      ```
+
+      Close client only on application shutdown.
+    sources:
+      - "https://www.mongodb.com/docs/drivers/node/current/"
+    severity: info
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high

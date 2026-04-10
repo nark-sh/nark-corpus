@@ -1,0 +1,269 @@
+# @notionhq/client throws APIResponseError on all API failures (401, 403, 404, 409, 429, 500, 503).
+# Also throws RequestTimeoutError (client timeout) and UnknownHTTPResponseError.
+# SDK auto-retries: rate_limited (429) for all methods; 500/503 for idempotent (GET/DELETE) only.
+# After retries exhausted, the error is thrown to the caller — try-catch is always required.
+# Type guard: isNotionClientError(error) from '@notionhq/client'.
+package: "@notionhq/client"
+semver: ">=1.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-01"
+status: production
+evidence_quality: confirmed
+
+detection:
+  class_names:
+    - "Client"
+  await_patterns:
+    - ".databases.query("
+    - ".databases.retrieve("
+    - ".databases.create("
+    - ".databases.update("
+    - ".pages.create("
+    - ".pages.retrieve("
+    - ".pages.update("
+    - ".blocks.children.append("
+    - ".blocks.children.list("
+    - ".blocks.retrieve("
+    - ".blocks.update("
+    - ".users.list("
+    - ".users.retrieve("
+    - ".search("
+    - ".comments.create("
+    - ".comments.list("
+
+functions:
+  - name: query
+    import_path: "@notionhq/client"
+    namespace: "databases"
+    description: >
+      Queries a Notion database, returning matching page objects. The most commonly used
+      Notion SDK method — used in virtually every Notion integration for reading data.
+      Makes an outbound HTTPS POST request to the Notion API. All network and API
+      errors are thrown — the SDK does NOT swallow them.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: authentication error (401 unauthorized), permission
+          error (403 restricted_resource), database not found (404 object_not_found),
+          rate limit (429 rate_limited), server error (500 internal_server_error),
+          service unavailable (503), client timeout (RequestTimeoutError), or
+          connection failure.
+        throws: >
+          APIResponseError with error.code (APIErrorCode enum) for API failures;
+          RequestTimeoutError for client-side timeouts (default 60s);
+          UnknownHTTPResponseError for unexpected HTTP responses.
+          Common: ObjectNotFound when database_id is deleted/unshared,
+          Unauthorized when NOTION_TOKEN is invalid/expired.
+          SDK auto-retries rate_limited (429) but throws after maxRetries exhausted.
+        required_handling: >
+          Caller MUST wrap notion.databases.query() in try-catch. API and network errors
+          are thrown after retry exhaustion. Unhandled rejections crash Next.js API routes,
+          Express handlers, and serverless functions.
+
+          Minimum handling:
+            try {
+              const response = await notion.databases.query({ database_id: '...' });
+            } catch (error) {
+              if (isNotionClientError(error)) {
+                console.error('Notion API error:', error.code, error.message);
+              }
+              throw error;
+            }
+
+          For integrations that must handle "not found" gracefully:
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return null; // Database deleted or not shared
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://github.com/makenotion/notion-sdk-js"
+          - "https://developers.notion.com/reference/post-database-query"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: create
+    import_path: "@notionhq/client"
+    namespace: "pages"
+    description: >
+      Creates a new page or database entry in Notion. The primary write operation for
+      Notion integrations — used to add CRM entries, project tasks, or content pages.
+      Makes an outbound HTTPS POST request. All errors are thrown.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: permission error (403), parent not found (404),
+          validation error (400 — missing required properties or invalid property values),
+          rate limit (429), server error (500/503), or connection failure.
+        throws: >
+          APIResponseError with error.code for API failures;
+          RequestTimeoutError for timeouts;
+          ValidationError (400) is common when required database properties are missing
+          or property values don't match database schema.
+        required_handling: >
+          Caller MUST wrap notion.pages.create() in try-catch. Silent failure means
+          the entry is never created with no visible error in the application.
+
+          Minimum handling:
+            try {
+              const page = await notion.pages.create({ parent: { ... }, properties: { ... } });
+            } catch (error) {
+              if (isNotionClientError(error)) {
+                console.error('Failed to create Notion page:', error.code);
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://developers.notion.com/reference/post-page"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: update
+    import_path: "@notionhq/client"
+    namespace: "pages"
+    description: >
+      Updates a Notion page's properties or archived state. Used to sync status,
+      update metadata, or mark items complete in Notion-backed workflows.
+      Makes an outbound HTTPS PATCH request. All errors are thrown.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: page not found (404 — deleted or unshared),
+          permission error (403), validation error (400 — invalid property values),
+          rate limit (429), server error (500/503 — not auto-retried for PATCH),
+          or connection failure.
+        throws: >
+          APIResponseError with error.code for API failures;
+          RequestTimeoutError for timeouts.
+          Note: PATCH is not idempotent — 500/503 errors are NOT auto-retried by the SDK.
+          The caller receives the error after the first failure.
+        required_handling: >
+          Caller MUST wrap notion.pages.update() in try-catch. PATCH failures are not
+          auto-retried — the SDK only auto-retries GET/DELETE on 500/503.
+
+          Minimum handling:
+            try {
+              await notion.pages.update({ page_id: '...', properties: { ... } });
+            } catch (error) {
+              console.error('Failed to update Notion page:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://developers.notion.com/reference/patch-page"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: append
+    import_path: "@notionhq/client"
+    namespace: "blocks.children"
+    description: >
+      Appends new content blocks to a page or existing block. Used to add paragraphs,
+      headings, code blocks, and other content to Notion pages. Makes an outbound
+      HTTPS PATCH request. All errors are thrown.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: block/page not found (404), permission error (403),
+          validation error (400 — invalid block structure), rate limit (429),
+          server error (500/503), or connection failure.
+        throws: >
+          APIResponseError with error.code for API failures;
+          RequestTimeoutError for timeouts.
+          ValidationError (400) is common when block objects have invalid structure.
+          PATCH is not auto-retried on 500/503.
+        required_handling: >
+          Caller MUST wrap notion.blocks.children.append() in try-catch.
+
+          Minimum handling:
+            try {
+              await notion.blocks.children.append({ block_id: '...', children: [...] });
+            } catch (error) {
+              console.error('Failed to append Notion blocks:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://developers.notion.com/reference/patch-block-children"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: search
+    import_path: "@notionhq/client"
+    description: >
+      Searches across all pages and databases in the Notion workspace that are accessible
+      to the integration. Top-level method (not namespaced). Makes an outbound HTTPS POST
+      request. All errors are thrown.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: permission error (403), rate limit (429),
+          server error (500/503), or connection failure.
+        throws: >
+          APIResponseError with error.code for API failures;
+          RequestTimeoutError for timeouts.
+        required_handling: >
+          Caller MUST wrap notion.search() in try-catch.
+
+          Minimum handling:
+            try {
+              const results = await notion.search({ query: '...' });
+            } catch (error) {
+              console.error('Notion search failed:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://developers.notion.com/reference/post-search"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "All Client methods make HTTPS calls to the Notion API — all require try-catch"
+  - "SDK auto-retries: rate_limited (429) for all methods; 500/503 for GET/DELETE only"
+  - "After maxRetries (default 2) exhausted, error is thrown to caller"
+  - "Use isNotionClientError(error) for type-safe error handling"
+  - "Use APIResponseError.isAPIResponseError(error) to narrow to API-specific errors"
+  - "error.code is typed as APIErrorCode enum — use switch for exhaustive handling"
+  - "object_not_found (404) is extremely common — databases/pages get deleted or unshared"
+  - "pages.create / pages.update / blocks.children.append are PATCH/POST — NOT auto-retried on 500/503"
+  - "iteratePaginatedAPI() and collectPaginatedAPI() helpers still throw on API errors"

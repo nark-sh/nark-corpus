@@ -1,0 +1,1330 @@
+package: firebase-admin
+semver: ">=11.0.0 <14.0.0"
+contract_version: "1.1.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-06"
+status: production
+evidence_quality: confirmed
+# Depth pass 2026-04-06 (deepen-stream-2):
+# Added 9 new function entries covering session cookies, custom tokens,
+# token revocation, password reset, Firestore transactions/batches, and
+# modern messaging APIs (sendEach, subscribeToTopic).
+# API surface total: ~38 async-callable; contracted: 28; omitted: 10
+# Omitted: getUserByPhoneNumber, getUsers, listUsers, deleteUsers,
+#   sendEachForMulticast (same surface as sendEach), generateEmailVerificationLink
+#   (same surface as generatePasswordResetLink), unsubscribeFromTopic (same surface),
+#   AppCheck.createToken, AppCheck.verifyToken (rarely called directly in SaaS backends)
+# coverage_score: 0.74 (28 contracted / 38 total)
+coverage_score: 0.74
+
+detection:
+  class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck"]
+  type_names: ["Auth", "BaseAuth", "UserRecord", "DecodedIdToken", "Messaging", "Firestore"]
+  factory_methods:
+    - "getAuth"
+    - "getMessaging"
+    - "getFirestore"
+    - "getDatabase"
+    - "getAppCheck"
+    - "initializeApp"
+  require_instance_tracking: true
+  import_source: "firebase-admin"
+
+  await_patterns:
+    # Auth
+    - ".verifyIdToken("
+    - ".verifySessionCookie("
+    - ".createSessionCookie("
+    - ".createCustomToken("
+    - ".getUser("
+    - ".getUserByEmail("
+    - ".getUserByPhoneNumber("
+    - ".createUser("
+    - ".updateUser("
+    - ".deleteUser("
+    - ".setCustomUserClaims("
+    - ".revokeRefreshTokens("
+    - ".generatePasswordResetLink("
+    - ".generateEmailVerificationLink("
+    # Firestore
+    - ".runTransaction("
+    - ".commit("
+    - ".get("
+    - ".set("
+    - ".update("
+    - ".delete("
+    - ".add("
+    # Messaging
+    - ".send("
+    - ".sendEach("
+    - ".sendMulticast("
+    - ".sendEachForMulticast("
+    - ".sendToTopic("
+    - ".subscribeToTopic("
+    - ".unsubscribeFromTopic("
+    # Realtime Database
+    - ".once("
+    - ".remove("
+
+functions:
+  # Authentication Service
+  - name: verifyIdToken
+    import_path: "firebase-admin"
+    description: "Verifies a Firebase ID token (JWT)"
+
+    postconditions:
+      - id: token-expired
+        condition: "ID token has expired"
+        throws: "FirebaseAuthError with code 'auth/id-token-expired'"
+        required_handling: >
+          Caller MUST catch and handle expired token errors.
+          Return 401 Unauthorized to client and require re-authentication.
+          DO NOT retry with same token - it's permanently expired.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: token-invalid
+        condition: "ID token is invalid (malformed, wrong project, revoked)"
+        throws: "FirebaseAuthError with code 'auth/argument-error' or 'auth/id-token-revoked'"
+        required_handling: >
+          Caller MUST validate token format and handle invalid tokens.
+          Check error.code to distinguish between format errors and revoked tokens.
+          Return 401 Unauthorized to client.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/verify-id-tokens"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: network-error
+        condition: "Network request to Firebase Auth service failed"
+        throws: "FirebaseAuthError or generic Error"
+        required_handling: >
+          Caller SHOULD implement retry with exponential backoff for transient failures.
+          Check if Firebase Auth service is available.
+        sources:
+          - "https://firebase.google.com/docs/reference/admin/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+    edge_cases:
+      - id: custom-token-vs-id-token
+        description: "verifyIdToken() only works with ID tokens, not custom tokens"
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/verify-id-tokens"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: createUser
+    import_path: "firebase-admin"
+    description: "Creates a new Firebase user account"
+
+    postconditions:
+      - id: email-already-exists
+        condition: "Email address is already in use"
+        throws: "FirebaseAuthError with code 'auth/email-already-exists'"
+        required_handling: >
+          Caller MUST check if error.code === 'auth/email-already-exists'.
+          Return user-friendly error message.
+          Consider suggesting password reset if user forgot they have an account.
+          DO NOT retry with same email.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-email
+        condition: "Email format is invalid"
+        throws: "FirebaseAuthError with code 'auth/invalid-email'"
+        required_handling: >
+          Caller SHOULD validate email format before calling createUser.
+          Use email validation library to prevent this error.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: uid-already-exists
+        condition: "Provided UID is already in use (when specifying custom UID)"
+        throws: "FirebaseAuthError with code 'auth/uid-already-exists'"
+        required_handling: >
+          If using custom UIDs, generate unique values.
+          Catch this error and either generate new UID or handle collision.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-password
+        condition: "Password is too weak or doesn't meet requirements"
+        throws: "FirebaseAuthError with code 'auth/invalid-password'"
+        required_handling: >
+          Validate password strength on client side.
+          Firebase requires minimum 6 characters.
+          Return helpful error to user about password requirements.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/manage-users"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: getUser
+    import_path: "firebase-admin"
+    description: "Fetches user data by UID"
+
+    postconditions:
+      - id: user-not-found
+        condition: "No user record found for the given UID"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Caller MUST handle user-not-found errors.
+          DO NOT assume user exists - always catch this error.
+          Consider if this indicates deleted account or invalid UID.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-uid
+        condition: "UID format is invalid"
+        throws: "FirebaseAuthError with code 'auth/invalid-uid'"
+        required_handling: >
+          Validate UID format before calling getUser.
+          Firebase UIDs are typically 28-character strings.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: updateUser
+    import_path: "firebase-admin"
+    description: "Updates an existing user's data"
+
+    postconditions:
+      - id: user-not-found
+        condition: "No user record found for the given UID"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Caller MUST handle user-not-found errors.
+          Decide whether to create user or return error.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: email-already-exists
+        condition: "New email address is already in use by another user"
+        throws: "FirebaseAuthError with code 'auth/email-already-exists'"
+        required_handling: >
+          Check if new email is available before updating.
+          Return user-friendly error if email is taken.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: deleteUser
+    import_path: "firebase-admin"
+    description: "Deletes a user account"
+
+    postconditions:
+      - id: user-not-found
+        condition: "No user record found for the given UID"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Caller SHOULD handle user-not-found errors gracefully.
+          Consider if idempotent delete is acceptable (user already deleted).
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: getUserByEmail
+    import_path: "firebase-admin"
+    description: "Fetches user data by email address"
+
+    postconditions:
+      - id: user-not-found
+        condition: "No user record with the given email"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Caller MUST handle user-not-found errors.
+          This is common when checking if email is registered.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: setCustomUserClaims
+    import_path: "firebase-admin"
+    description: "Sets custom claims for user tokens"
+
+    postconditions:
+      - id: user-not-found
+        condition: "No user record found"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Verify user exists before setting claims.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-claims
+        condition: "Claims object exceeds 1000 bytes or uses reserved keys"
+        throws: "FirebaseAuthError with code 'auth/invalid-claims'"
+        required_handling: >
+          Validate claims size and avoid reserved keys.
+          Reserved keys: iss, sub, aud, exp, iat, auth_time, nonce, etc.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/custom-claims"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  # Firestore Service
+  - name: get
+    import_path: "firebase-admin"
+    description: "Reads Firestore document or collection data"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Security rules deny read access"
+        throws: "Error with code 'PERMISSION_DENIED' (gRPC code 7)"
+        required_handling: >
+          Caller MUST handle permission errors.
+          Check Firestore security rules.
+          Admin SDK bypasses rules by default - if seeing this, check service account permissions.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: not-found
+        condition: "Document does not exist"
+        returns: "DocumentSnapshot with exists: false"
+        required_handling: >
+          Caller MUST check snapshot.exists before accessing data.
+          Use snapshot.exists or check if snapshot.data() is undefined.
+        sources:
+          - "https://firebase.google.com/docs/firestore/query-data/get-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: deadline-exceeded
+        condition: "Operation timed out"
+        throws: "Error with code 'DEADLINE_EXCEEDED' (gRPC code 4)"
+        required_handling: >
+          Caller SHOULD implement retry with exponential backoff.
+          Check network connectivity and Firestore status.
+          Consider if query is too complex (missing indexes).
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: add
+    import_path: "firebase-admin"
+    description: "Adds a new document to Firestore collection with auto-generated ID"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Security rules deny write access"
+        throws: "Error with code 'PERMISSION_DENIED' (gRPC code 7)"
+        required_handling: >
+          Check Firestore security rules and service account permissions.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: resource-exhausted
+        condition: "Write quota exceeded or rate limit hit"
+        throws: "Error with code 'RESOURCE_EXHAUSTED' (gRPC code 8)"
+        required_handling: >
+          Caller MUST handle quota errors.
+          Check if billing is enabled (free tier limits).
+          Implement backoff and reduce write rate.
+          Avoid writing to lexicographically close documents (hot spots).
+        sources:
+          - "https://firebase.google.com/docs/firestore/best-practices"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: set
+    import_path: "firebase-admin"
+    description: "Writes or overwrites a Firestore document"
+
+    postconditions:
+      - id: aborted
+        condition: "Transaction aborted due to contention"
+        throws: "Error with code 'ABORTED' (gRPC code 10)"
+        required_handling: >
+          Caller SHOULD retry with exponential backoff and jitter.
+          Occurs when multiple transactions access same data.
+          Consider redesigning to reduce contention.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: resource-exhausted
+        condition: "Write quota exceeded"
+        throws: "Error with code 'RESOURCE_EXHAUSTED'"
+        required_handling: >
+          Implement rate limiting and backoff.
+          Check daily write quota and billing status.
+        sources:
+          - "https://firebase.google.com/docs/firestore/best-practices"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: update
+    import_path: "firebase-admin"
+    description: "Updates fields in existing Firestore document"
+
+    postconditions:
+      - id: not-found
+        condition: "Document to update does not exist"
+        throws: "Error with code 'NOT_FOUND' (gRPC code 5)"
+        required_handling: >
+          Caller MUST handle not-found errors.
+          Use set() with merge: true if you want to create-or-update.
+          update() requires document to exist.
+        sources:
+          - "https://firebase.google.com/docs/firestore/manage-data/add-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: aborted
+        condition: "Transaction contention"
+        throws: "Error with code 'ABORTED'"
+        required_handling: "Retry with exponential backoff."
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: delete
+    import_path: "firebase-admin"
+    description: "Deletes a Firestore document"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Security rules deny delete access"
+        throws: "Error with code 'PERMISSION_DENIED'"
+        required_handling: "Check security rules and permissions."
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  # Cloud Messaging Service
+  - name: send
+    import_path: "firebase-admin"
+    description: "Sends a message to a device via Firebase Cloud Messaging"
+
+    postconditions:
+      - id: invalid-recipient
+        condition: "Device token is invalid, expired, or unregistered"
+        throws: "FirebaseMessagingError with code 'messaging/invalid-recipient'"
+        required_handling: >
+          Caller MUST remove invalid tokens from database.
+          Check error code and error.code === 'messaging/invalid-recipient'.
+          Tokens can expire if user uninstalls app or revokes permissions.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-argument
+        condition: "Message payload is malformed or exceeds size limits"
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Validate message structure before sending.
+          Check payload size limits (4KB for data messages).
+          Verify required fields are present.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: quota-exceeded
+        condition: "FCM rate limit exceeded"
+        throws: "FirebaseMessagingError with code 'messaging/quota-exceeded'"
+        required_handling: >
+          Implement exponential backoff retry.
+          Reduce message send rate.
+          Check if quota limit is reasonable for use case.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: sendMulticast
+    import_path: "firebase-admin"
+    description: "Sends a message to multiple devices (up to 500)"
+
+    postconditions:
+      - id: partial-failure
+        condition: "Some tokens succeeded, some failed"
+        returns: "BatchResponse with failureCount > 0"
+        required_handling: >
+          Caller MUST check response.failureCount and response.responses array.
+          Each response contains success boolean and optional error.
+          Remove invalid tokens from database based on specific error codes.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/send-message"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: invalid-argument
+        condition: "Invalid tokens or payload"
+        throws: "FirebaseMessagingError"
+        required_handling: "Validate all tokens and payload before sending."
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: sendToTopic
+    import_path: "firebase-admin"
+    description: "Sends a message to all devices subscribed to a topic"
+
+    postconditions:
+      - id: invalid-topic
+        condition: "Topic name is invalid or doesn't exist"
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Validate topic name format.
+          Topic names must match /topics/[a-zA-Z0-9-_.~%]+
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/send-message#send-messages-to-topics"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  # Realtime Database Service
+  - name: once
+    import_path: "firebase-admin"
+    description: "Reads Realtime Database data once (non-listening)"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Database rules deny read access"
+        throws: "Error with code 'PERMISSION_DENIED'"
+        required_handling: >
+          Check Realtime Database rules.
+          Admin SDK bypasses rules by default - if seeing this, check databaseAuthVariableOverride.
+        sources:
+          - "https://firebase.google.com/docs/database/admin/start"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: network-error
+        condition: "Network connection failed"
+        throws: "Error"
+        required_handling: >
+          Implement retry with exponential backoff for transient failures.
+        sources:
+          - "https://firebase.google.com/docs/reference/admin/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: set
+    import_path: "firebase-admin"
+    description: "Writes data to Realtime Database path (overwrites)"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Database rules deny write access"
+        throws: "Error with code 'PERMISSION_DENIED'"
+        required_handling: "Check database rules and authentication."
+        sources:
+          - "https://firebase.google.com/docs/database/admin/save-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: update
+    import_path: "firebase-admin"
+    description: "Updates specific fields in Realtime Database"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Database rules deny write access"
+        throws: "Error with code 'PERMISSION_DENIED'"
+        required_handling: "Check database rules."
+        sources:
+          - "https://firebase.google.com/docs/database/admin/save-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: remove
+    import_path: "firebase-admin"
+    description: "Deletes data from Realtime Database path"
+
+    postconditions:
+      - id: permission-denied
+        condition: "Database rules deny delete access"
+        throws: "Error with code 'PERMISSION_DENIED'"
+        required_handling: "Check database rules."
+        sources:
+          - "https://firebase.google.com/docs/database/admin/save-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  # --- Added by deepen-stream-2 depth pass 2026-04-06 ---
+  # Evidence: firebase-admin v13.7.0 source (lib/auth/base-auth.js, lib/utils/error.js)
+  # Evidence: https://firebase.google.com/docs/auth/admin/manage-cookies (session cookies)
+  # Evidence: https://firebase.google.com/docs/auth/admin/custom-tokens (createCustomToken)
+  # Evidence: @google-cloud/firestore source (transaction.js — DEFAULT_MAX_TRANSACTION_ATTEMPTS=5)
+  # Evidence: https://cloud.google.com/firestore/docs/understand-error-codes (ABORTED, RESOURCE_EXHAUSTED)
+  # Evidence: https://firebase.google.com/docs/cloud-messaging/error-codes (messaging errors)
+
+  # Auth Service — Session Cookie Management
+
+  - name: createSessionCookie
+    import_path: "firebase-admin"
+    description: >
+      Creates a Firebase session cookie from a valid ID token. Used to implement
+      server-side session management with httpOnly cookies. The cookie is a signed
+      JWT with configurable expiry (5 minutes to 2 weeks). Called in login endpoints
+      to exchange an ID token for a long-lived session cookie.
+
+    postconditions:
+      # Evidence: lib/auth/base-auth.js createSessionCookie() validates duration before calling authRequestHandler
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.INVALID_SESSION_COOKIE_DURATION
+      - id: session-cookie-invalid-duration
+        severity: error
+        condition: "expiresIn is not provided, not a number, or outside the allowed range (5 minutes to 2 weeks)"
+        throws: "FirebaseAuthError with code 'auth/invalid-session-cookie-duration'"
+        required_handling: >
+          Validate expiresIn is a number between 300000ms (5 min) and 1209600000ms (2 weeks)
+          before calling. Catch this error and return 400 Bad Request with a clear message.
+          This error rejects synchronously — no network call is made.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: lib/auth/auth-api-request.js — sends idToken to Firebase Auth REST API
+      # Evidence: base-auth.d.ts JSDoc — "idToken must be a recently issued ID token"
+      - id: session-cookie-invalid-id-token
+        severity: error
+        condition: "ID token is malformed, expired, or belongs to a different Firebase project"
+        throws: "FirebaseAuthError with code 'auth/invalid-id-token'"
+        required_handling: >
+          Catch this error at the login endpoint and return 401 Unauthorized.
+          The ID token must be recently issued (within 5 minutes). Require the
+          front-end to obtain a fresh ID token and retry.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.INVALID_CREDENTIAL
+      - id: session-cookie-network-error
+        severity: error
+        condition: "Firebase Auth service is unreachable"
+        throws: "FirebaseAuthError or network Error"
+        required_handling: >
+          Catch network errors at the login endpoint and return 503 Service Unavailable.
+          Implement exponential backoff retry for transient failures.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: verifySessionCookie
+    import_path: "firebase-admin"
+    description: >
+      Verifies a Firebase session cookie and returns its decoded claims. Used in
+      middleware to authenticate requests. With checkRevoked=true, makes an extra
+      network call to check if the session was explicitly revoked via revokeRefreshTokens().
+      Must be called on every authenticated request in session-cookie-based auth flows.
+
+    postconditions:
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.SESSION_COOKIE_EXPIRED
+      # Evidence: base-auth.d.ts JSDoc — "auth/session-cookie-revoked error is thrown"
+      - id: session-cookie-expired
+        severity: error
+        condition: "Session cookie's expiry time has passed"
+        throws: "FirebaseAuthError with code 'auth/session-cookie-expired'"
+        required_handling: >
+          Catch in authentication middleware. Clear the session cookie and redirect
+          to login. DO NOT retry — the cookie is permanently expired.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.SESSION_COOKIE_REVOKED
+      - id: session-cookie-revoked
+        severity: error
+        condition: "checkRevoked=true and the user's session was revoked via revokeRefreshTokens()"
+        throws: "FirebaseAuthError with code 'auth/session-cookie-revoked'"
+        required_handling: >
+          Catch in authentication middleware alongside cookie-expired. Clear the session
+          cookie and redirect to login. Distinguish from expired for proper UX messaging.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: lib/utils/error.js — general auth errors thrown by token verifier
+      - id: session-cookie-invalid
+        severity: error
+        condition: "Session cookie is malformed, has invalid signature, or belongs to different Firebase project"
+        throws: "FirebaseAuthError with code 'auth/argument-error' or similar"
+        required_handling: >
+          Catch in authentication middleware. Return 401 Unauthorized and clear the
+          invalid cookie. Never swallow this error — tampered cookies must be rejected.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: base-auth.d.ts JSDoc — checkRevoked requires network call to Firebase
+      - id: session-cookie-user-disabled
+        severity: error
+        condition: "checkRevoked=true and the user account has been disabled"
+        throws: "FirebaseAuthError with code 'auth/user-disabled'"
+        required_handling: >
+          Catch separately from cookie-expired and cookie-revoked. Return a
+          disabled-account response, not a generic 401. Requires network call to Firebase Auth.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  # Auth Service — Custom Tokens
+
+  - name: createCustomToken
+    import_path: "firebase-admin"
+    description: >
+      Creates a signed JWT that client-side SDKs can use with signInWithCustomToken()
+      to authenticate users. Used to implement custom authentication systems (e.g.,
+      linking a legacy auth system to Firebase). The token is signed with the service
+      account's private key.
+
+    postconditions:
+      # Evidence: lib/auth/token-generator.js — validates uid length <= 128 chars
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.INVALID_ARGUMENT
+      - id: custom-token-invalid-uid
+        severity: error
+        condition: "uid is empty, not a string, or exceeds 128 characters"
+        throws: "FirebaseAuthError with code 'auth/argument-error'"
+        required_handling: >
+          Validate uid is a non-empty string of 128 chars or fewer before calling.
+          Catch and return 400 Bad Request. This rejects synchronously before signing.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/create-custom-tokens"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      # Evidence: lib/auth/token-generator.js — developerClaims must be a non-null object
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.CLAIMS_TOO_LARGE
+      - id: custom-token-invalid-claims
+        severity: error
+        condition: "developerClaims contains reserved JWT keys (iss, sub, aud, exp, iat, firebase, etc.)"
+        throws: "FirebaseAuthError with code 'auth/argument-error'"
+        required_handling: >
+          Avoid reserved JWT claim keys in developerClaims. Validate claims object
+          does not contain reserved names before calling. Catch and return 400.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/create-custom-tokens"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      # Evidence: lib/auth/token-generator.js — signs with service account key
+      # Common production issue: service account misconfiguration
+      - id: custom-token-signing-error
+        severity: error
+        condition: "Service account private key is invalid, revoked, or corrupt"
+        throws: "FirebaseAuthError with code 'auth/invalid-credential'"
+        required_handling: >
+          Catch and alert on this error — it indicates service account misconfiguration.
+          Return 500 Internal Server Error. Do not retry. Requires manual key rotation fix.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/create-custom-tokens"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  # Auth Service — Session Revocation
+
+  - name: revokeRefreshTokens
+    import_path: "firebase-admin"
+    description: >
+      Revokes all refresh tokens for a user, invalidating all existing sessions.
+      Used after password changes, security events, or account compromise detection.
+      After calling this, verifyIdToken(token, true) and verifySessionCookie(cookie, true)
+      will throw revoked errors for that user. Takes effect within 1 hour for ID tokens
+      without checkRevoked.
+
+    postconditions:
+      # Evidence: base-auth.d.ts and auth API — requires valid UID
+      - id: revoke-tokens-user-not-found
+        severity: error
+        condition: "UID does not correspond to an existing Firebase user"
+        throws: "FirebaseAuthError with code 'auth/user-not-found'"
+        required_handling: >
+          Catch and treat as success — user is already gone so revocation is moot.
+          Log the discrepancy but do not crash the security incident handler.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: revokeRefreshTokens makes network call to Firebase Auth service
+      - id: revoke-tokens-network-error
+        severity: error
+        condition: "Firebase Auth service is unreachable during revocation"
+        throws: "FirebaseAuthError or network Error"
+        required_handling: >
+          MUST catch and retry on network failure. Failed revocation during a security
+          incident leaves compromised sessions active. Implement exponential backoff.
+          Alert if retries are exhausted.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  # Auth Service — Password & Email Link Generation
+
+  - name: generatePasswordResetLink
+    import_path: "firebase-admin"
+    description: >
+      Generates a password reset link for the given email address. Used in custom
+      email templates or programmatic password reset flows. The link is a Firebase
+      Auth action URL that, when visited, allows the user to set a new password.
+
+    postconditions:
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.EMAIL_NOT_FOUND
+      - id: password-reset-user-not-found
+        severity: error
+        condition: "No user exists with the specified email address"
+        throws: "FirebaseAuthError with code 'auth/email-not-found' or 'auth/user-not-found'"
+        required_handling: >
+          Catch and return success regardless to prevent email enumeration attacks.
+          Do not reveal whether the email is registered. Log the error internally.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/utils/error.js — AuthClientErrorCode.INVALID_EMAIL
+      - id: password-reset-invalid-email
+        severity: error
+        condition: "Email format is invalid"
+        throws: "FirebaseAuthError with code 'auth/invalid-email'"
+        required_handling: >
+          Validate email format with a regex or Zod schema before calling.
+          Catch and return 400 Bad Request with a user-friendly message.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Firestore — Transaction and Batch Operations
+
+  - name: runTransaction
+    import_path: "firebase-admin"
+    description: >
+      Executes a transaction against Firestore with automatic retry on contention.
+      The transaction function receives a Transaction object and must return a Promise.
+      Firestore retries up to DEFAULT_MAX_TRANSACTION_ATTEMPTS (5) times on ABORTED
+      errors. After 5 failed attempts, the promise rejects with the last ABORTED error.
+      All reads must happen before any writes within the transaction function.
+
+    postconditions:
+      # Evidence: @google-cloud/firestore/build/src/transaction.js — _maxAttempts=5, retries on ABORTED
+      # Evidence: @google-cloud/firestore/build/src/index.js — DEFAULT_MAX_TRANSACTION_ATTEMPTS = 5
+      # Evidence: https://cloud.google.com/firestore/docs/understand-error-codes (ABORTED code 10)
+      - id: transaction-aborted-max-retries
+        severity: error
+        condition: "Transaction contention persists across all 5 automatic retry attempts"
+        throws: "Error with gRPC code ABORTED (code 10) — message: 'Too much contention on these datastore entities. Please try again.'"
+        required_handling: >
+          Catch the final rejection after retries are exhausted and return a 409 Conflict
+          or retry the full operation at the application level with backoff. Do not swallow
+          this error — silent swallowing causes lost writes that appear as stale data.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      # Evidence: https://cloud.google.com/firestore/docs/understand-error-codes (DEADLINE_EXCEEDED code 4)
+      - id: transaction-deadline-exceeded
+        severity: error
+        condition: "Transaction execution exceeds Firestore's 60-second server deadline"
+        throws: "Error with gRPC code DEADLINE_EXCEEDED (code 4)"
+        required_handling: >
+          Catch and treat as a non-retryable failure — the transaction was rolled back.
+          For background jobs, return a failure result. For API routes, return 503.
+          Break large transactions into smaller units to avoid hitting the deadline.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: @google-cloud/firestore/build/src/transaction.js — offline triggers immediate failure
+      - id: transaction-failed-offline
+        severity: error
+        condition: "Firestore service is unreachable or the network connection is unavailable"
+        throws: "Error with gRPC code UNAVAILABLE (code 14)"
+        required_handling: >
+          Catch and implement external retry with exponential backoff. The Admin SDK
+          does NOT queue offline — it fails immediately. Background jobs MUST retry
+          externally when UNAVAILABLE errors occur during network partitions.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: Firestore docs — updateFunction must not have side effects; retried up to 5 times
+      - id: transaction-function-side-effects
+        severity: warning
+        condition: "The transaction update function contains side effects that execute on every retry attempt"
+        throws: "No throw — side effects execute silently N times (up to 5)"
+        required_handling: >
+          Keep the updateFunction free of observable side effects beyond Firestore writes.
+          Move external API calls, payments, and email sends to AFTER the transaction resolves.
+        sources:
+          - "https://firebase.google.com/docs/firestore/manage-data/transactions"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: commit
+    import_path: "firebase-admin"
+    description: >
+      Commits a Firestore WriteBatch atomically. All operations in the batch succeed
+      or all fail — no partial commits. Batches can contain up to 500 operations.
+      Unlike transactions, batched writes do NOT read before writing and do NOT
+      retry on contention — the caller is responsible for retry logic.
+
+    postconditions:
+      # Evidence: https://cloud.google.com/firestore/docs/understand-error-codes (RESOURCE_EXHAUSTED code 8)
+      # Evidence: @google-cloud/firestore write-batch.d.ts — commit() returns Promise<WriteResult[]>
+      - id: batch-resource-exhausted
+        severity: error
+        condition: "Write quota is exceeded or batch causes a hot-spot on a document"
+        throws: "Error with gRPC code RESOURCE_EXHAUSTED (code 8)"
+        required_handling: >
+          Catch and implement exponential backoff retry. Batch commits that hit
+          RESOURCE_EXHAUSTED have NOT been applied — retry the full batch. Add
+          jitter to backoff to prevent thundering herd in serverless deployments.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: https://cloud.google.com/firestore/docs/understand-error-codes (ABORTED code 10)
+      - id: batch-aborted
+        severity: error
+        condition: "Batch write fails due to document contention"
+        throws: "Error with gRPC code ABORTED (code 10)"
+        required_handling: >
+          Catch ABORTED and retry the full batch from scratch. WriteBatch does NOT
+          automatically retry unlike runTransaction(). No writes are applied on
+          ABORTED — the batch is atomic and all-or-nothing.
+        sources:
+          - "https://cloud.google.com/firestore/docs/understand-error-codes"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: @google-cloud/firestore source — INVALID_ARGUMENT thrown for >500 ops
+      - id: batch-too-many-operations
+        severity: error
+        condition: "Batch contains more than 500 write operations"
+        throws: "Error with gRPC INVALID_ARGUMENT — Firestore's hard 500-operation limit per batch"
+        required_handling: >
+          Split large datasets into chunks of 500 or fewer before committing.
+          Validate batch size before calling commit(). The SDK throws before
+          sending to the server — no partial writes occur.
+        sources:
+          - "https://firebase.google.com/docs/firestore/manage-data/transactions"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Messaging Service — Modern Batch Send API
+
+  - name: sendEach
+    import_path: "firebase-admin"
+    description: >
+      Sends a list of messages via Firebase Cloud Messaging, one per HTTP/2 connection.
+      This is the modern replacement for the deprecated sendAll(). Returns a BatchResponse
+      where each individual send result must be inspected — partial failure is possible.
+      Maximum 500 messages per call. Unlike send(), does NOT throw on per-message failure;
+      instead, the failure is captured in the individual SendResponse.
+
+    postconditions:
+      # Evidence: messaging.d.ts — sendEach returns Promise<BatchResponse>
+      # Evidence: lib/messaging/messaging.js — parses per-message responses
+      - id: send-each-partial-failure
+        severity: error
+        condition: "One or more messages fail to send while others succeed (partial failure)"
+        throws: "Promise resolves with BatchResponse where failureCount > 0; does NOT reject on partial failure"
+        required_handling: >
+          After every sendEach() call, check response.failureCount. If > 0, iterate
+          response.responses to find per-message errors. Remove tokens with
+          'messaging/registration-token-not-registered' from the database.
+          failureCount === messages.length means total failure with no deliveries.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/send-message"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: lib/utils/error.js — MessagingClientErrorCode.MESSAGE_RATE_EXCEEDED
+      - id: send-each-rate-exceeded
+        severity: error
+        condition: "Global FCM send rate limit is exceeded during batch send"
+        throws: "FirebaseMessagingError with code 'messaging/message-rate-exceeded'"
+        required_handling: >
+          Catch and implement exponential backoff before retrying. This is a global
+          rate limit (not per-device). Reduce send frequency or fan out over time.
+          Distinguish from per-device 'messaging/device-message-rate-exceeded' errors
+          that appear in per-message response.responses[i].error.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: lib/utils/error.js — MessagingClientErrorCode.TOPICS_MESSAGE_RATE_EXCEEDED
+      - id: send-each-invalid-argument
+        severity: error
+        condition: "Message payloads are malformed, tokens are empty strings, or required fields are missing"
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Validate all message objects before calling sendEach(). Ensure tokens are
+          non-empty strings. Catch and return 400 Bad Request. Input validation
+          before the call prevents the entire batch from being rejected.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/error-codes"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: subscribeToTopic
+    import_path: "firebase-admin"
+    description: >
+      Subscribes one or more device registration tokens to a Firebase Cloud Messaging
+      topic. Returns MessagingTopicManagementResponse where errors array contains
+      per-token failures. Partial failure is possible — some tokens may be subscribed
+      while others fail.
+
+    postconditions:
+      # Evidence: messaging.d.ts — returns Promise<MessagingTopicManagementResponse>
+      # Evidence: lib/messaging/messaging.js — topic management API
+      - id: subscribe-partial-failure
+        severity: error
+        condition: "One or more tokens fail to subscribe while others succeed"
+        throws: "Promise resolves with MessagingTopicManagementResponse where errors array is non-empty; does NOT reject"
+        required_handling: >
+          After every subscribeToTopic() call, check response.errors array.
+          Remove tokens with 'messaging/registration-token-not-registered'
+          from the database. Partial success means some tokens were subscribed;
+          do not assume all succeeded when Promise resolves.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/manage-topics"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: lib/utils/error.js — MessagingClientErrorCode general errors
+      - id: subscribe-invalid-topic
+        severity: error
+        condition: "Topic name is invalid — does not match /topics/[a-zA-Z0-9-_.~%]+ pattern"
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Validate topic names before calling. Topic names must match
+          [a-zA-Z0-9-_.~%]+ (the /topics/ prefix is added automatically if omitted).
+          Catch and return 400 Bad Request for invalid topic name inputs.
+        sources:
+          - "https://firebase.google.com/docs/cloud-messaging/manage-topics"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low

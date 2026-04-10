@@ -1,0 +1,330 @@
+# Resend SDK v2+ returns { data, error } — does NOT throw exceptions for API failures.
+# Unlike Stripe/Twilio, try-catch alone is insufficient — must check result.error.
+# Network errors are caught by SDK and returned as error.name = 'application_error'.
+# Rate limit: 5 req/sec per team across all API keys. Returns error.name='rate_limit_exceeded', statusCode=429.
+# Domain verification required: unverified from address returns error.name = 'invalid_from_address'.
+# Idempotency: re-sending same email creates a new email_id — no built-in deduplication.
+# EXCEPTION: webhooks.verify() is the ONLY method that THROWS (WebhookVerificationError from standardwebhooks).
+# All other Resend methods return { data, error } — webhooks.verify() is categorically different.
+package: resend
+semver: ">=3.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.60
+
+functions:
+  - name: send
+    import_path: "resend"
+    description: >
+      Sends a single transactional email via the Resend API. Returns { data, error } — does NOT
+      throw exceptions. Resend SDK v2+ catches all network/API errors and returns them in the
+      error field. Callers must check result.error to detect failures.
+
+    postconditions:
+      # Evidence: seen in 2 primary firings across 1 repo in scan-resend-2026-04-03.json
+      # Top affected: vas3k/TaxHacker (⭐ 2308) — both sendOTPCodeEmail and sendNewsletterWelcomeEmail
+      - id: send-no-error-check
+        condition: >
+          emails.send() called without checking result.error — API failure, rate limit, invalid
+          address, or network error returns { data: null, error: ErrorResponse } silently
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Unchecked: email silently not sent with no visible error in application.
+        required_handling: >
+          Caller MUST check result.error after every emails.send() call. Two acceptable patterns:
+
+          Pattern 1 — destructure and check:
+            const { data, error } = await resend.emails.send({...});
+            if (error) { handle error; }
+
+          Pattern 2 — assign and check:
+            const result = await resend.emails.send({...});
+            if (result.error) { handle error; }
+
+          Pattern 3 — try-catch (also acceptable, defensive):
+            try {
+              const result = await resend.emails.send({...});
+              if (result.error) { handle error; }
+            } catch (err) { handle unexpected error; }
+
+          DO NOT return result to caller without checking result.error first.
+          DO NOT access result.data without checking result.error first.
+        sources:
+          - "https://resend.com/docs/api-reference/introduction#errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: batch.send
+    import_path: "resend"
+    description: >
+      Sends multiple emails in a single API request. Returns { data, error } — same result
+      pattern as emails.send(). All emails in the batch fail atomically if the request fails.
+
+    postconditions:
+      - id: batch-send-no-error-check
+        condition: >
+          batch.send() called without checking result.error — entire batch silently fails
+          if API call returns an error
+        throws: >
+          Does not throw. Returns { data: null, error: ErrorResponse } on failure.
+          All emails in batch are unsent if error is unchecked.
+        required_handling: >
+          Caller MUST check result.error after every batch.send() call.
+          Batch failures affect all emails — no partial success.
+          Log error with batch size and recipient count for debugging.
+        sources:
+          - "https://resend.com/docs/api-reference/emails/send-batch-emails"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: webhooks.verify
+    import_path: "resend"
+    description: >
+      Verifies the cryptographic signature of an incoming Resend webhook request.
+      This is the ONLY Resend SDK method that THROWS an exception rather than returning
+      { data, error }. Uses svix/standardwebhooks under the hood. Throws
+      WebhookVerificationError for invalid signatures, expired timestamps (>5 min old),
+      or missing headers. CRITICAL: an uncaught exception here crashes the webhook handler
+      and silently accepts or rejects all further webhooks depending on framework error handling.
+
+    postconditions:
+      # Evidence: source code inspection of standardwebhooks@1.x in resend@6.10.0 node_modules
+      # standardwebhooks/dist/index.js: WEBHOOK_TOLERANCE_IN_SECONDS = 5 * 60
+      # Throws WebhookVerificationError("Missing required headers") — when svix-id/timestamp/signature absent
+      # Throws WebhookVerificationError("Invalid Signature Headers") — when timestamp is NaN
+      # Throws WebhookVerificationError("Message timestamp too old") — when > 5 minutes old
+      # Throws WebhookVerificationError("No matching signature found") — when signature doesn't match
+      # Also throws Error("Secret can't be empty.") if webhookSecret is empty string
+      - id: webhooks-verify-no-try-catch
+        condition: >
+          webhooks.verify() called without try-catch — WebhookVerificationError thrown
+          on invalid signature, expired timestamp, or missing headers is not caught
+        throws: >
+          Throws WebhookVerificationError (from standardwebhooks package, extends Error) on:
+          - "Missing required headers" — svix-id, svix-timestamp, or svix-signature missing
+          - "Invalid Signature Headers" — svix-timestamp is not a valid integer
+          - "Message timestamp too old" — webhook timestamp > 300 seconds in the past
+          - "Message timestamp too new" — webhook timestamp > 300 seconds in the future
+          - "No matching signature found" — HMAC signature does not match payload
+
+          Also throws plain Error("Secret can't be empty.") if webhookSecret is empty string.
+
+          UNLIKE all other resend methods, webhooks.verify() does NOT return { data, error }.
+          It either returns the parsed WebhookEventPayload or throws.
+        required_handling: >
+          Caller MUST wrap webhooks.verify() in try-catch:
+
+            try {
+              const payload = resend.webhooks.verify({
+                payload: rawBody,
+                headers: { id, timestamp, signature },
+                webhookSecret: process.env.RESEND_WEBHOOK_SECRET!,
+              });
+              // process payload
+            } catch (err) {
+              if (err instanceof WebhookVerificationError) {
+                return res.status(401).json({ error: 'Invalid webhook signature' });
+              }
+              throw err;
+            }
+
+          DO NOT call webhooks.verify() without try-catch.
+          DO NOT trust the payload or process the event if verify() throws.
+          Return HTTP 401 on WebhookVerificationError — do not process the webhook.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+
+      - id: webhooks-verify-missing-secret
+        condition: >
+          webhooks.verify() called with empty or undefined webhookSecret — throws
+          Error("Secret can't be empty.") before any signature check occurs
+        throws: >
+          Throws plain Error("Secret can't be empty.") when webhookSecret is an empty string.
+          Throws TypeError when webhookSecret is undefined (cannot read property of undefined).
+        required_handling: >
+          MUST validate that process.env.RESEND_WEBHOOK_SECRET is set before calling verify().
+          Crash at startup (not at request time) if the secret is missing:
+
+            if (!process.env.RESEND_WEBHOOK_SECRET) {
+              throw new Error('RESEND_WEBHOOK_SECRET environment variable is required');
+            }
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+        sources:
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+
+  - name: emails.cancel
+    import_path: "resend"
+    description: >
+      Cancels a scheduled email before it is sent. Only works on emails with status='scheduled'.
+      Returns { data, error } — does NOT throw. Returns error if the email ID is not found,
+      the email was already sent, or the API key lacks permission.
+
+    postconditions:
+      # Evidence: https://resend.com/docs/api-reference/emails/cancel-email
+      # Error codes from: https://resend.com/docs/api-reference/errors
+      # cancel() uses POST /emails/{id}/cancel — not_found (404) if email_id invalid
+      # restricted_api_key (401) if API key only has sending_access permission
+      - id: emails-cancel-no-error-check
+        condition: >
+          emails.cancel() called without checking result.error — silent failure if email
+          not found, already sent, or API key lacks permission
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors: name='not_found' (404) — email_id does not exist or was already sent.
+          name='restricted_api_key' (401) — API key only has sending_access, not full_access.
+        required_handling: >
+          Caller MUST check result.error after emails.cancel():
+
+            const { data, error } = await resend.emails.cancel(emailId);
+            if (error) {
+              if (error.name === 'not_found') {
+                // Email already sent or never existed — log and continue
+              } else {
+                throw new Error(`Failed to cancel email: ${error.message}`);
+              }
+            }
+
+          DO NOT assume cancel succeeded without checking result.error.
+          Handle not_found gracefully (email may have already been sent).
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        sources:
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: warning
+
+  - name: contacts.create
+    import_path: "resend"
+    description: >
+      Creates or updates a contact in a Resend segment/audience for marketing emails.
+      Returns { data, error } — does NOT throw. Commonly used to sync user signups into
+      marketing contact lists. The segment must exist and the domain must be verified.
+
+    postconditions:
+      # Evidence: https://resend.com/docs/api-reference/errors
+      # contacts.create() returns validation_error (400) for missing required fields
+      # invalid_api_key (403) or restricted_api_key (401) for auth failures
+      # RESEND_ERROR_CODE_KEY from index.d.mts: 'validation_error' | 'missing_required_field' | 'invalid_api_key' | ...
+      - id: contacts-create-no-error-check
+        condition: >
+          contacts.create() called without checking result.error — contact not added to
+          segment silently if validation fails, API key is restricted, or segment not found
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='validation_error' (400) — email format invalid, required fields missing
+          - name='missing_required_field' (422) — email field not provided
+          - name='restricted_api_key' (401) — API key only allows sending_access, not contact management
+          - name='not_found' (404) — segment/audience ID does not exist
+        required_handling: >
+          Caller MUST check result.error after contacts.create():
+
+            const { data, error } = await resend.contacts.create({
+              email: user.email,
+              firstName: user.name,
+              segments: [{ id: process.env.RESEND_SEGMENT_ID }],
+            });
+            if (error) {
+              logger.error('Failed to add contact to Resend', { error, email: user.email });
+              // Do NOT throw — contact sync failure should not block user registration
+            }
+
+          Contact sync failures should be logged but should NOT block user-facing operations.
+          Missing result.error check causes silent contact sync failures that corrupt marketing lists.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: warning
+
+  - name: broadcasts.send
+    import_path: "resend"
+    description: >
+      Sends a previously created broadcast to its segment. Returns { data, error } — does NOT
+      throw. The broadcast must be in 'draft' status. The sender domain must be verified.
+      Rate limited. This is a HIGH-IMPACT operation: one call sends email to potentially
+      thousands of subscribers. Errors here mean mass email delivery failure.
+
+    postconditions:
+      # Evidence: https://resend.com/docs/api-reference/errors
+      # broadcasts.send() is distinct from broadcasts.create() — two-step process
+      # Confirmed: invalid_from_address (422) if domain unverified at send time
+      # monthly_quota_exceeded (429) / rate_limit_exceeded (429) for quota
+      - id: broadcasts-send-no-error-check
+        condition: >
+          broadcasts.send() called without checking result.error — entire mass email
+          silently fails if domain unverified, quota exceeded, or broadcast already sent
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Critical errors:
+          - name='invalid_from_address' (422) — sender domain not verified in Resend
+          - name='monthly_quota_exceeded' (429) — monthly sending quota hit (common for large lists)
+          - name='rate_limit_exceeded' (429) — too many API calls (5 req/sec limit per team)
+          - name='not_found' (404) — broadcast ID does not exist
+          - name='validation_error' (400/403) — broadcast in wrong status (already sent/queued)
+        required_handling: >
+          Caller MUST check result.error after broadcasts.send():
+
+            const { data, error } = await resend.broadcasts.send(broadcastId);
+            if (error) {
+              logger.error('Broadcast send failed', {
+                broadcastId,
+                errorName: error.name,
+                errorMessage: error.message,
+                statusCode: error.statusCode,
+              });
+              if (error.name === 'monthly_quota_exceeded') {
+                await notifyTeam('Monthly email quota exceeded — broadcast not sent');
+              }
+              throw new Error(`Broadcast send failed: ${error.message}`);
+            }
+
+          ALWAYS log broadcast send results with broadcastId for audit trail.
+          monthly_quota_exceeded requires immediate team notification — quota resets monthly.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        sources:
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error

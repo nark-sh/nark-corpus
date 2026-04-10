@@ -1,0 +1,149 @@
+package: "@neondatabase/serverless"
+semver: ">=0.7.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-01"
+status: production
+evidence_quality: confirmed
+
+# Official Neon serverless driver for JavaScript/TypeScript.
+# Carries SQL over HTTP (neon() tagged template) and WebSockets (Pool/Client).
+# Designed for serverless environments: Cloudflare Workers, Vercel Edge, Deno, Bun.
+# v1.0.0 reached GA on March 25, 2025.
+
+detection:
+  class_names:
+    - "Pool"
+    - "Client"
+  type_names:
+    - "Pool"
+    - "Client"
+    - "PoolClient"
+  factory_methods:
+    - "neon"
+  require_instance_tracking: true
+
+  await_patterns:
+    - ".connect("
+    - ".query("
+    - ".end("
+
+functions:
+  - name: query
+    import_path: "@neondatabase/serverless"
+    description: >
+      Executes a SQL query. Used as Pool.query(text, values?) for stateless queries
+      or client.query(text, values?) on a checked-out PoolClient. Returns a QueryResult
+      with rows, rowCount, fields. Throws NeonDbError on any PostgreSQL or network error.
+
+    postconditions:
+      - id: neon-db-error
+        condition: >
+          PostgreSQL error (syntax error, constraint violation, undefined table, permission denied,
+          etc.) OR network error (connection refused, timeout, scale-to-zero activation failure)
+        throws: >
+          NeonDbError extends Error with fields: code (PostgreSQL SQLSTATE 5-char code),
+          severity, detail, hint, constraint, table, column, sourceError.
+          Common codes: 42601 (syntax), 23505 (unique), 23503 (foreign key), 42P01 (undefined table).
+          Network errors include Neon scale-to-zero activation timeouts on first query after idle period.
+        required_handling: >
+          Caller MUST wrap in try-catch. NeonDbError carries a PostgreSQL SQLSTATE code
+          in error.code. Distinguish constraint violations (23505/23503) from network errors
+          (sourceError set) from query errors. All uncaught errors crash the request handler.
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: connect
+    import_path: "@neondatabase/serverless"
+    description: >
+      Checks out a client from the Pool (Pool.connect()) or establishes a WebSocket
+      connection (Client.connect()). Pool.connect() returns a PoolClient that MUST be
+      released via client.release() in a finally block to prevent pool exhaustion.
+      Throws NeonDbError on connection failure.
+
+    postconditions:
+      - id: connection-error
+        condition: >
+          Cannot establish WebSocket connection to Neon — database suspended, network error,
+          invalid connection string, or pool exhausted (connectionTimeoutMillis exceeded)
+        throws: >
+          NeonDbError with sourceError set to the underlying network error.
+          Pool exhaustion: Error with message containing "timeout" when all pool clients
+          are checked out and connectionTimeoutMillis elapses.
+        required_handling: >
+          Caller MUST wrap in try-catch. For Pool.connect(), use try/finally to ALWAYS
+          release the client even if the query throws:
+            const client = await pool.connect();
+            try { await client.query(...); }
+            finally { client.release(); }
+          Failure to release causes pool exhaustion and eventual application hang.
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver#pool-and-client"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: end
+    import_path: "@neondatabase/serverless"
+    description: >
+      Closes the Pool (Pool.end()) or Client (Client.end()), draining WebSocket connections.
+      Should be called during graceful shutdown to avoid connection leaks.
+
+    postconditions:
+      - id: close-error
+        condition: "in-flight queries are abandoned or WebSocket close handshake fails"
+        throws: "Error wrapping the underlying WebSocket error"
+        required_handling: >
+          Caller SHOULD wrap in try-catch, especially in shutdown handlers.
+          Uncaught errors from pool.end() during SIGTERM handling will crash the process.
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver#pool-and-client"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: neon
+    import_path: "@neondatabase/serverless"
+    description: >
+      HTTP-transport SQL execution function. Call neon(connectionString) to get a tagged-template
+      SQL function. Every call to sql`...` is an async HTTP request that can throw NeonDbError on
+      query error or network failure. This is the primary transport for serverless environments
+      (Vercel Edge, Cloudflare Workers) where WebSocket Pool/Client is not available.
+
+    postconditions:
+      - id: neon-db-error
+        condition: >
+          PostgreSQL error (syntax error, constraint violation, undefined table, permission denied,
+          etc.) OR network error (connection refused, timeout, scale-to-zero activation failure)
+        throws: >
+          NeonDbError extends Error with fields: code (PostgreSQL SQLSTATE 5-char code),
+          severity, detail, hint, constraint, table, column, sourceError.
+          Common codes: 42601 (syntax), 23505 (unique), 23503 (foreign key), 42P01 (undefined table).
+          Network errors include Neon scale-to-zero activation timeouts on first query after idle period.
+        required_handling: >
+          Caller MUST wrap in try-catch. Every sql`...` tagged template call is a live HTTP
+          request that can fail. Uncaught errors crash the request handler (Next.js route, etc.).
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

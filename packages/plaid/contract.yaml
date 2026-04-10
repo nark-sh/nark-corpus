@@ -1,0 +1,212 @@
+package: plaid
+semver: ">=9.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-01"
+status: production
+evidence_quality: confirmed
+
+# Official Plaid Node.js/TypeScript SDK — OpenAPI-generated (v9+/v14+).
+# All methods are called on a PlaidApi instance and return AxiosResponse<T>.
+# Errors are Axios errors: the PlaidError payload is in error.response.data,
+# NOT thrown as a PlaidError class instance (use error.response.data.error_type).
+# WARNING: Never log the full error object — it contains API keys in the request headers.
+
+functions:
+  - name: linkTokenCreate
+    import_path: "plaid"
+    description: >
+      Creates a Link token that initializes Plaid Link in the client. Required as the
+      first step for all Plaid integrations. Returns a short-lived link_token (expiry
+      ~30 minutes). Throws an Axios error with PlaidError payload on API or network failure.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Plaid API error (INVALID_REQUEST, INVALID_INPUT, RATE_LIMIT_EXCEEDED, API_ERROR)
+          or network failure connecting to Plaid.
+        throws: >
+          Axios error. Access PlaidError via error.response.data. Fields include:
+          error_type (e.g. 'RATE_LIMIT_EXCEEDED', 'API_ERROR'), error_code,
+          error_message, request_id.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed linkTokenCreate means the user
+          cannot open Plaid Link at all. Handle RATE_LIMIT_EXCEEDED with backoff;
+          return a 5xx to the client for API_ERROR. Never surface raw Plaid errors
+          to end users.
+        sources:
+          - "https://plaid.com/docs/api/tokens/#linktokencreate"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: itemPublicTokenExchange
+    import_path: "plaid"
+    description: >
+      Exchanges a Link public_token for a permanent access_token. Called in the
+      onSuccess callback of Plaid Link after the user completes the Link flow.
+      Public tokens are single-use and expire after 30 minutes. Throws on invalid
+      or already-used tokens.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          INVALID_INPUT / INVALID_PUBLIC_TOKEN (token already exchanged, expired, or
+          malformed) or API_ERROR (internal Plaid error) or network failure.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          INVALID_PUBLIC_TOKEN is the most common: token was already exchanged
+          (double-submit) or expired after 30 minutes.
+        required_handling: >
+          Caller MUST wrap in try-catch. Failure means the user's bank connection
+          is lost — they must restart the Link flow. Store the access_token only
+          after successful exchange. INVALID_PUBLIC_TOKEN should prompt the user
+          to re-link, not be shown as a generic error.
+        sources:
+          - "https://plaid.com/docs/api/tokens/#itempublictokenexchange"
+          - "https://plaid.com/docs/errors/invalid-input/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transactionsSync
+    import_path: "plaid"
+    description: >
+      Incrementally syncs transactions for an Item using a cursor. The modern
+      replacement for transactionsGet. Returns added, modified, removed arrays
+      and a next_cursor. Called repeatedly in webhook handlers when TRANSACTIONS
+      webhook fires.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          ITEM_ERROR / PRODUCT_NOT_READY (initial transaction pull still pending),
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED (user must re-authenticate),
+          INSTITUTION_ERROR (bank connectivity failure), RATE_LIMIT_EXCEEDED,
+          or network failure.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          PRODUCT_NOT_READY is common on first call before the initial pull completes.
+          ITEM_LOGIN_REQUIRED requires re-linking via Link update mode.
+        required_handling: >
+          Caller MUST wrap in try-catch. This is typically called inside a webhook
+          handler — an unhandled error silently breaks transaction sync. Handle
+          PRODUCT_NOT_READY by retrying later; handle ITEM_LOGIN_REQUIRED by
+          notifying the user to re-link their account.
+        sources:
+          - "https://plaid.com/docs/api/products/transactions/#transactionssync"
+          - "https://plaid.com/docs/errors/item/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: accountsGet
+    import_path: "plaid"
+    description: >
+      Returns all accounts associated with an Item (access token). Includes
+      account names, types (checking, savings), balances, and account IDs.
+      Commonly called after token exchange to display account selection.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED (credentials expired or revoked),
+          INSTITUTION_ERROR (bank unavailable), INVALID_INPUT / INVALID_ACCESS_TOKEN,
+          or network failure.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          ITEM_LOGIN_REQUIRED is the most common production error — the user's
+          bank session expired and they must re-link.
+        required_handling: >
+          Caller MUST wrap in try-catch. Surface ITEM_LOGIN_REQUIRED to the user
+          as a prompt to update their bank connection. Other errors should return
+          a 5xx to avoid exposing Plaid internals.
+        sources:
+          - "https://plaid.com/docs/api/accounts/#accountsget"
+          - "https://plaid.com/docs/errors/item/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: authGet
+    import_path: "plaid"
+    description: >
+      Returns bank account and routing numbers for ACH transfers. Used to verify
+      account ownership before initiating ACH payments or direct deposits.
+      Not all institutions support the Auth product.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          ITEM_ERROR / PRODUCT_NOT_READY (Auth product not yet initialized),
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED, INVALID_INPUT (institution does not
+          support Auth), or network failure.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          PRODUCT_NOT_READY means Auth hasn't been initialized yet for this Item.
+          Some institutions require micro-deposit verification.
+        required_handling: >
+          Caller MUST wrap in try-catch. Auth data is used for financial operations;
+          unhandled errors can cause incorrect routing. Handle PRODUCT_NOT_READY
+          with polling or retry logic. Handle ITEM_LOGIN_REQUIRED by prompting re-link.
+        sources:
+          - "https://plaid.com/docs/api/products/auth/#authget"
+          - "https://plaid.com/docs/errors/item/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transferCreate
+    import_path: "plaid"
+    description: >
+      Creates an ACH transfer (debit or credit). Must be preceded by a successful
+      transferAuthorizationCreate call. The transfer is submitted to the ACH network;
+      errors here mean the transfer was NOT submitted. Highest risk if left unhandled.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          TRANSFER_ERROR (authorization expired, duplicate transfer, account closed),
+          INVALID_INPUT (invalid account_id or amount), API_ERROR, or network failure.
+          Authorization IDs expire after a short window; using an expired ID returns
+          TRANSFER_ERROR / AUTHORIZATION_EXPIRED.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          AUTHORIZATION_EXPIRED is common if too much time passes between authorization
+          and creation. DUPLICATE_TRANSFER prevents double-charging.
+        required_handling: >
+          Caller MUST wrap in try-catch. This is a financial operation — an unhandled
+          error can result in a silent failure where money was not moved but the app
+          treats it as success. Log error.response.data.request_id for reconciliation.
+          NEVER retry without checking transfer status first.
+        sources:
+          - "https://plaid.com/docs/api/products/transfer/#transfercreate"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

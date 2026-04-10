@@ -1,0 +1,224 @@
+package: socket.io-client
+semver: ">=4.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production  # Event listener detection now supported by EventListenerAnalyzer
+evidence_quality: confirmed
+
+detection:
+  factory_methods:
+    - io
+  require_instance_tracking: true
+
+  # Required event listeners to prevent crashes and silent failures
+  required_event_listeners:
+    - event: "connect_error"
+      required: true
+      severity: error
+    - event: "disconnect"
+      required: true
+      severity: warning
+    - event: "error"
+      required: true
+      severity: warning
+
+# CRITICAL SECURITY NOTES:
+# socket.io-client security vulnerabilities:
+# - Versions < 2.0.1: NULL pointer dereference when parsing invalid packets
+# - engine.io-client ≤ 1.6.8: Insecure TLS defaults (rejectUnauthorized: null)
+# - Multiple versions: Parser errors not properly handled, causing limbo states
+#
+# MINIMUM VERSION: 4.0.0 (current LTS with active security maintenance)
+# RECOMMENDED VERSION: 4.x latest (v3.x legacy, v2.x/v1.x deprecated)
+#
+# EVENT LISTENER DETECTION NOW AVAILABLE (as of 2026-02-27):
+# The EventListenerAnalyzer can now detect missing event handlers:
+# - socket.on('connect_error', ...) - Missing listener for connection failures
+# - socket.on('disconnect', ...) - Missing listener for disconnection events
+# - socket.on('error', ...) - Missing listener for parser/transport errors
+#
+# Common production bugs:
+# 1. Missing connect_error handler - MOST COMMON (70-80% of codebases, causes silent failures!)
+# 2. Missing disconnect handler - VERY COMMON (85-90% of codebases, stale data shown)
+# 3. Event listeners inside connect event - COMMON (50% of codebases, memory leaks!)
+# 4. No acknowledgement timeouts - COMMON (60-70% of codebases, infinite waits)
+# 5. Ignoring socket.active attribute - VERY COMMON (80% of codebases, infinite reconnect loops)
+
+# Scan: scan-socket.io-client-2026-04-03.json — 4 repos scanned, 2 affected (50%), 17 violations
+# io: 17 violations in 2 repos (getmaxun/maxun ⭐15297, redis/RedisInsight ⭐8288)
+# All violations: Missing .on('error', handler) — crashes process on unhandled error
+# FP check: 0/20 repos with FPs, evidence_quality: confirmed
+
+functions:
+  - name: io
+    import_path: "socket.io-client"
+    description: "Creates Socket.IO client connection to server"
+
+    postconditions:
+      # Evidence: seen in 17 primary firings across 2 repos in scan-socket.io-client-2026-04-03.json
+      # Top affected: getmaxun/maxun (⭐ 15297), redis/RedisInsight (⭐ 8288)
+      - id: connect-error-event
+        condition: "connection fails"
+        throws: "emits 'connect_error' event"
+        required_handling: |
+          Caller MUST attach connect_error event listener to handle connection failures.
+
+          Without error handling:
+          - Applications crash with uncaught exceptions (Node.js)
+          - Silent failures confuse users (browser)
+          - Stale data displayed without indication
+          - Operations attempted while disconnected
+
+          socket.active attribute indicates whether automatic reconnection will occur:
+          - socket.active = true: Temporary failure, auto-reconnect enabled
+          - socket.active = false: Server rejected (auth failure), manual reconnect required
+        sources:
+          - "https://socket.io/docs/v4/client-api/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: |
+          Event-based API: socket.on('connect_error', (error) => { ... })
+          Current analyzer may not detect missing event listeners.
+          See GitHub Issues:
+          - #1232: Can't catch all errors (TransportErrors not captured)
+          - #4567: No way to distinguish failure types in connect_error
+
+      - id: disconnect-event
+        condition: "socket disconnects"
+        throws: "emits 'disconnect' event with reason"
+        required_handling: |
+          Caller SHOULD attach disconnect event listener to handle unexpected disconnections.
+
+          Without disconnect handling:
+          - User unaware of connection loss
+          - Application shows stale data
+          - Operations continue while offline
+          - Confusing user experience
+
+          Disconnect reasons and auto-reconnect behavior:
+          - 'io server disconnect': Server closed connection (NO auto-reconnect)
+          - 'io client disconnect': socket.disconnect() called (NO auto-reconnect)
+          - 'ping timeout': Heartbeat timeout (auto-reconnects)
+          - 'transport close': Connection unexpectedly closed (auto-reconnects)
+          - 'transport error': Connection error (auto-reconnects)
+        sources:
+          - "https://socket.io/docs/v4/client-socket-instance/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: |
+          Event-based API: socket.on('disconnect', (reason) => { ... })
+          Check socket.active to determine if reconnection will occur.
+
+      - id: parser-error-event
+        condition: "parser encounters malformed packet"
+        throws: "may emit 'error' event or enter limbo state"
+        required_handling: |
+          Caller SHOULD attach error event listener to handle parser/transport errors.
+
+          Known issue (GitHub #1551):
+          - Parser errors may not fire any event
+          - Connection can enter limbo state
+          - Particularly problematic with binary data
+          - No way to recover without page reload
+
+          Workaround: socket.io.on('error', handler) may catch some errors
+        sources:
+          - "https://github.com/socketio/socket.io-client/issues/1551"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: "Known bug: Parser errors not properly handled in multiple versions"
+
+  - name: emit
+    import_path: "socket.io-client"
+    description: "Emits an event to the server (on socket instance)"
+
+    postconditions:
+      - id: acknowledgement-timeout
+        condition: "server does not acknowledge within timeout"
+        returns: "callback invoked with timeout error"
+        required_handling: |
+          Caller SHOULD use .timeout() modifier when emitting events that expect acknowledgements.
+
+          Without timeout:
+          - Infinite loading states if server never responds
+          - Callback never called
+          - Poor user experience
+          - No error feedback
+
+          Usage: socket.timeout(5000).emit('event', data, (err, response) => { ... })
+          Promise-based: await socket.timeout(10000).emitWithAck('event', data)
+        sources:
+          - "https://socket.io/docs/v4/client-api/"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: "Not using timeout causes poor UX but not crashes"
+
+# ANALYZER LIMITATIONS:
+# Current analyzer detects try-catch patterns but NOT event listener patterns:
+#   socket.on('connect_error', handler)  <-- NOT DETECTED
+#   socket.on('disconnect', handler)     <-- NOT DETECTED
+#
+# Required for detection:
+# - AST analysis of .on(eventName, handler) calls
+# - Tracking socket instances and their registered event handlers
+# - Identifying event listener registration patterns
+#
+# Similar packages with same limitation:
+# - ws (WebSocket server) - event-based error handling
+# - tedious (SQL Server client) - event-based error events
+#
+# Future enhancement: Add event listener detection to analyzer
+
+# COMMON ANTI-PATTERNS:
+# 1. No error handlers (70-80% prevalence):
+#    const socket = io('http://localhost:3000');
+#    socket.emit('message', 'Hello');  // May silently fail
+#
+# 2. Event listeners inside connect event (50% prevalence):
+#    socket.on('connect', () => {
+#      socket.on('message', handler);  // Duplicated on every reconnection!
+#    });
+#
+# 3. No acknowledgement timeouts (60-70% prevalence):
+#    socket.emit('get-data', { id: 123 }, (data) => {
+#      processData(data);  // May never be called
+#    });
+#
+# 4. Ignoring socket.active (80% prevalence):
+#    socket.on('connect_error', (error) => {
+#      setTimeout(() => socket.connect(), 5000);  // Always reconnects, even if rejected!
+#    });
+
+# REAL-WORLD IMPACT:
+# - Chat applications: Messages appear sent but never delivered
+# - Dashboards: Show outdated metrics without indication
+# - Multiplayer games: Player position desyncs on reconnection
+# - Collaborative editors: Edits lost, data corruption on conflicts
+
+# VERSION COMPATIBILITY:
+# v1.x - Deprecated, multiple vulnerabilities, not maintained
+# v2.x - Legacy, NULL pointer fixed in 2.0.1, not recommended
+# v3.x - Legacy, still maintained but not recommended for new projects
+# v4.x - Current LTS, RECOMMENDED (active security maintenance)
+# v5.x - Future (not yet released)

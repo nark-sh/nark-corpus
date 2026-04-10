@@ -1,0 +1,157 @@
+/**
+ * Ground-truth fixture for @aws-sdk/client-sns
+ *
+ * Annotations placed DIRECTLY before the violating call site.
+ * The line number stored is the line of the awaited send() call.
+ *
+ * Postcondition IDs:
+ *   aws-sns-service-error   (SNSClient.send — all commands)
+ */
+import {
+  SNSClient,
+  PublishCommand,
+  PublishBatchCommand,
+  CreateTopicCommand,
+  DeleteTopicCommand,
+  SubscribeCommand,
+  SNSServiceException,
+} from '@aws-sdk/client-sns';
+
+const snsClient = new SNSClient({ region: 'us-east-1' });
+const TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789:my-topic';
+
+// ──────────────────────────────────────────────────
+// 1. PublishCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_publish_missing() {
+  // SHOULD_FIRE: aws-sns-service-error — PublishCommand without try-catch
+  const response = await snsClient.send(new PublishCommand({
+    TopicArn: TOPIC_ARN,
+    Message: 'hello world',
+  }));
+  return response.MessageId;
+}
+
+// 1. PublishCommand — with try/catch (SHOULD_NOT_FIRE)
+async function gt_publish_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const response = await snsClient.send(new PublishCommand({
+      TopicArn: TOPIC_ARN,
+      Message: 'hello world',
+    }));
+    return response.MessageId;
+  } catch (error) {
+    if (error instanceof SNSServiceException) {
+      console.error(`SNS error [${error.name}]:`, error.message);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 2. PublishBatchCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_publishBatch_missing() {
+  // SHOULD_FIRE: aws-sns-service-error — PublishBatchCommand without try-catch
+  const response = await snsClient.send(new PublishBatchCommand({
+    TopicArn: TOPIC_ARN,
+    PublishBatchRequestEntries: [
+      { Id: '1', Message: 'msg1' },
+      { Id: '2', Message: 'msg2' },
+    ],
+  }));
+  return response.Successful;
+}
+
+// 2. PublishBatchCommand — with try/catch (SHOULD_NOT_FIRE)
+async function gt_publishBatch_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const response = await snsClient.send(new PublishBatchCommand({
+      TopicArn: TOPIC_ARN,
+      PublishBatchRequestEntries: [
+        { Id: '1', Message: 'msg1' },
+        { Id: '2', Message: 'msg2' },
+      ],
+    }));
+    return response.Successful;
+  } catch (error) {
+    console.error('Batch publish failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 3. CreateTopicCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createTopic_missing() {
+  // SHOULD_FIRE: aws-sns-service-error — CreateTopicCommand without try-catch
+  const response = await snsClient.send(new CreateTopicCommand({ Name: 'my-topic' }));
+  return response.TopicArn;
+}
+
+// 3. CreateTopicCommand — with try/catch (SHOULD_NOT_FIRE)
+async function gt_createTopic_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const response = await snsClient.send(new CreateTopicCommand({ Name: 'my-topic' }));
+    return response.TopicArn;
+  } catch (error) {
+    console.error('Failed to create topic:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 4. DeleteTopicCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_deleteTopic_missing() {
+  // SHOULD_FIRE: aws-sns-service-error — DeleteTopicCommand without try-catch
+  await snsClient.send(new DeleteTopicCommand({ TopicArn: TOPIC_ARN }));
+}
+
+// 4. DeleteTopicCommand — with try/catch (SHOULD_NOT_FIRE)
+async function gt_deleteTopic_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    await snsClient.send(new DeleteTopicCommand({ TopicArn: TOPIC_ARN }));
+  } catch (error) {
+    if (error instanceof SNSServiceException && error.name === 'NotFound') return;
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 5. SubscribeCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_subscribe_missing() {
+  // SHOULD_FIRE: aws-sns-service-error — SubscribeCommand without try-catch
+  const response = await snsClient.send(new SubscribeCommand({
+    TopicArn: TOPIC_ARN,
+    Protocol: 'https',
+    Endpoint: 'https://example.com/webhook',
+  }));
+  return response.SubscriptionArn;
+}
+
+// 5. SubscribeCommand — with try/catch (SHOULD_NOT_FIRE)
+async function gt_subscribe_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const response = await snsClient.send(new SubscribeCommand({
+      TopicArn: TOPIC_ARN,
+      Protocol: 'https',
+      Endpoint: 'https://example.com/webhook',
+    }));
+    return response.SubscriptionArn;
+  } catch (error) {
+    console.error('Subscribe failed:', error);
+    throw error;
+  }
+}

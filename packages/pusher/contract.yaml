@@ -1,0 +1,141 @@
+package: pusher
+semver: "^5.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-03-12"
+status: production
+evidence_quality: partial
+
+functions:
+  - name: trigger
+    import_path: "pusher"
+    description: >
+      Triggers one or more real-time events on specified Pusher channel(s).
+      The most common server-side Pusher call — used after DB writes to push
+      live updates to connected clients. Returns a Promise that rejects on
+      API failures, network errors, or rate limits.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: authentication error (401/403), rate limit (429),
+          invalid app configuration (400), server error (5xx), network timeout, or
+          connection failure
+        throws: >
+          Pusher.RequestError with properties: status (HTTP code or undefined for network),
+          error (underlying Error for network failures), body (API response text), url (request URL).
+          Common cases: 403 for bad credentials, 429 for rate limit, 5xx for Pusher outage.
+        required_handling: >
+          Caller MUST wrap in try-catch. pusher.trigger() rejects on all API and network
+          failures — there is no auto-retry. Unhandled rejections crash Node.js workers or
+          produce silent data loss in async route handlers.
+
+          Minimum handling:
+            try {
+              await pusher.trigger(channel, event, data);
+            } catch (err) {
+              if (err instanceof Pusher.RequestError) {
+                console.error('Pusher trigger failed:', err.status, err.body);
+              }
+              throw err;
+            }
+
+          For fire-and-forget patterns (where trigger is a side effect), at minimum log the
+          error rather than silently dropping it:
+            pusher.trigger(channel, event, data).catch(err => console.error('Pusher failed:', err));
+        sources:
+          - "https://github.com/pusher/pusher-http-node#error-handling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: triggerBatch
+    import_path: "pusher"
+    description: >
+      Triggers up to 10 events in a single Pusher API request. Used for efficiency
+      when multiple channels or events need updating simultaneously. Rejects with
+      RequestError on any failure — all events in the batch fail together.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure, including rate limit (429), auth error, server
+          error, or network failure. Batch max of 10 events — exceeding it throws
+          before any network call.
+        throws: >
+          Pusher.RequestError (same as trigger) for API/network failures.
+          Plain Error for exceeding batch size limit or invalid event structure.
+        required_handling: >
+          Caller MUST wrap in try-catch. A batch failure means ALL events in the
+          batch were not delivered — callers should handle this atomically.
+
+          try {
+            await pusher.triggerBatch(events);
+          } catch (err) {
+            if (err instanceof Pusher.RequestError) {
+              // All events failed — consider retry or fallback
+            }
+            throw err;
+          }
+        sources:
+          - "https://github.com/pusher/pusher-http-node#triggering-events"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: sendToUser
+    import_path: "pusher"
+    description: >
+      Sends a real-time event to a specific authenticated user by their user ID.
+      Used with Pusher's user authentication feature (requires authenticateUser
+      on the client). Rejects with RequestError on failure.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any API or network failure: invalid user ID format, auth error, server error,
+          network failure, or rate limit
+        throws: >
+          Pusher.RequestError for API/network failures.
+          Plain Error for invalid userId (empty string, non-string value).
+        required_handling: >
+          Caller MUST wrap in try-catch. User notification failures should be handled
+          gracefully — the primary action (DB write) may have succeeded even if the
+          real-time notification fails.
+
+          try {
+            await pusher.sendToUser(userId, event, data);
+          } catch (err) {
+            if (err instanceof Pusher.RequestError) {
+              console.error('Failed to notify user:', userId, err.status);
+            }
+            // Don't re-throw if notification failure should not abort the operation
+          }
+        sources:
+          - "https://github.com/pusher/pusher-http-node#sending-events-to-users"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "pusher uses its own RequestError class (not a standard Error subclass) — check instanceof Pusher.RequestError"
+  - "err.status is the HTTP status code (403=auth, 429=rate limit) or undefined for network errors"
+  - "err.body contains the raw Pusher API response body — useful for debugging"
+  - "No auto-retry — every failure immediately rejects the Promise"
+  - "trigger() accepts string or string[] for channel — up to 100 channels per call"
+  - "triggerBatch() max 10 events per request — exceeding throws synchronously"
+  - "Default: no timeout configured — network hangs can block workers indefinitely"
+  - "sendToUser() requires client-side user authentication (pusher-js authenticateUser)"
+  - "RequestError and WebHookError properly exported as TypeScript types since v5.3.2"

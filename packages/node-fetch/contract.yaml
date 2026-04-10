@@ -1,0 +1,271 @@
+package: node-fetch
+semver: ">=2.0.0"
+contract_version: "1.2.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.83  # 5/6 async-callable functions contracted (response.buffer() deprecated, intentionally omitted)
+
+# Note: no factory_methods — fetch() is a Promise-returning function, not an EventEmitter factory.
+# Removed factory_methods: [fetch] which was incorrectly routing detection to event-listener-absence
+# plugin (looking for .on('error')) instead of the standard try-catch throwing-function check.
+# Evidence: concern-2026-04-02-node-fetch-16 (2 FPs in files with try-catch present).
+
+# Depth pass 2026-04-02:
+# Evidence sources:
+#   - Source: https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md
+#   - Source: https://github.com/node-fetch/node-fetch/blob/main/README.md
+#   - Source: node_modules/node-fetch/src/index.js (AbortError, FetchError throw sites)
+#   - Source: node_modules/node-fetch/src/body.js (consumeBody — json/text/blob/arrayBuffer throw sites)
+#   - Source: node_modules/node-fetch/src/errors/fetch-error.js (FetchError class definition)
+#   - Source: node_modules/node-fetch/src/errors/abort-error.js (AbortError class definition)
+
+functions:
+  - name: fetch
+    import_path: "node-fetch"
+    description: >
+      Makes an HTTP request and returns a Promise that resolves to a Response object.
+      Network-level failures reject the Promise. HTTP 4xx/5xx status codes do NOT reject —
+      they resolve to a Response that must be checked with response.ok.
+    postconditions:
+      # Evidence: seen in 65 primary firings across 21 repos in scan-node-fetch-2026-04-03.json
+      # Top affected: YouMind-OpenLab/awesome-nano-banana-pro-prompts, chrismaltby/gb-studio, telegraf/telegraf
+      # Evidence: node_modules/node-fetch/src/index.js line 108 — FetchError type='system'
+      # Evidence: https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md
+      - id: fetch-rejects-on-network-error
+        condition: "network failure (DNS resolution failure, connection refused, timeout, etc.)"
+        throws: "Promise rejection with FetchError (error.type='system', error.code like ENOTFOUND, ECONNREFUSED, ETIMEDOUT)"
+        required_handling: >
+          Caller MUST use try-catch to handle Promise rejections from fetch().
+          Network-level failures (DNS errors, connection refused, timeouts) reject the Promise.
+          CRITICAL: fetch() does NOT reject on HTTP 4xx/5xx status codes - those are successful
+          responses that must be checked with response.ok. Recommended pattern:
+          try { const res = await fetch(url); if (!res.ok) throw new Error(`HTTP ${res.status}`); }
+          catch (error) { /* handle network errors */ }
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/node-fetch/src/index.js lines 69-89 — AbortError thrown on signal.aborted
+      # Evidence: node_modules/node-fetch/src/errors/abort-error.js — AbortError class
+      - id: fetch-rejects-on-abort
+        condition: "request is cancelled via AbortSignal before or during the request"
+        throws: "Promise rejection with AbortError (error.name='AbortError', error.type='aborted')"
+        required_handling: >
+          When using AbortController to cancel requests, the caller MUST handle AbortError
+          separately from FetchError. AbortError is thrown when signal.abort() is called.
+          Pattern: try { const res = await fetch(url, { signal }); }
+          catch (err) { if (err.name === 'AbortError') { /* handle cancellation */ } else throw err; }
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: error
+        business_impact:
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+          incident_label: SILENT_FAILURE
+
+      # Evidence: node_modules/node-fetch/src/index.js line 165 — FetchError type='no-redirect'
+      # Evidence: node_modules/node-fetch/src/index.js line 179 — FetchError type='max-redirect'
+      - id: fetch-rejects-on-redirect-error
+        condition: "redirect:error option set and server responds with redirect, OR redirect limit (default 20) exceeded"
+        throws: "Promise rejection with FetchError (error.type='no-redirect' or error.type='max-redirect')"
+        required_handling: >
+          When fetch() is called with redirect:'error', any redirect response causes
+          rejection with FetchError (error.type='no-redirect'). When redirect limit (default 20)
+          is exhausted, rejects with FetchError (error.type='max-redirect'). Both must be caught.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: README.md — "3xx-5xx responses are NOT exceptions"
+      # Evidence: response.ok property in @types/node-fetch/index.d.ts
+      - id: fetch-http-error-not-thrown
+        condition: "server responds with HTTP 4xx or 5xx status code"
+        throws: "DOES NOT throw — resolves with Response object where response.ok === false"
+        required_handling: >
+          CRITICAL FOOTGUN: Unlike axios, node-fetch does NOT reject on HTTP error status codes.
+          HTTP 4xx/5xx resolve successfully to a Response with response.ok === false.
+          Callers MUST explicitly check response.ok or response.status before processing body.
+          Failure silently processes error responses (HTML error pages, error JSON) as valid data.
+          Pattern: if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: error
+        business_impact:
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+          incident_label: SILENT_FAILURE
+
+  - name: response.json
+    import_path: "node-fetch"
+    description: >
+      Reads the response body stream and parses it as JSON. Returns a Promise.
+      The body stream can only be consumed once — calling json() twice throws TypeError.
+    postconditions:
+      # Evidence: node_modules/node-fetch/src/body.js — json() calls text() then JSON.parse(text)
+      - id: response-json-throws-on-invalid-json
+        condition: "response body is not valid JSON (HTML error pages, plain text, empty body from 204 responses)"
+        throws: "SyntaxError from JSON.parse() — 'Unexpected token < in JSON at position 0' or similar"
+        required_handling: >
+          response.json() calls JSON.parse() internally. If the server returns HTML
+          (e.g., error page, WAF block, load balancer error), SyntaxError is thrown.
+          Caller MUST wrap in try-catch. Combine with response.ok check to handle HTTP errors
+          before attempting to parse body.
+          Pattern: if (!response.ok) throw new Error(...); const data = await response.json();
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: error
+        business_impact:
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+          incident_label: SILENT_FAILURE
+
+      # Evidence: node_modules/node-fetch/src/body.js consumeBody() line 225 — max-size FetchError
+      - id: response-json-throws-on-max-size
+        condition: "response body size exceeds the size limit set in RequestInit.size option"
+        throws: "FetchError (error.type='max-size') — 'content size at <url> over limit: <size>'"
+        required_handling: >
+          If fetch() was called with a size limit option and the response body exceeds it,
+          response.json() throws FetchError with error.type='max-size'. Must be caught with
+          try-catch around response.json().
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/node-fetch/src/body.js line 196 — TypeError body already used
+      - id: response-json-throws-on-body-used
+        condition: "response.json() called after body stream has already been consumed by any body-reading method"
+        throws: "TypeError — 'body used already for: <url>'"
+        required_handling: >
+          Response bodies can only be consumed once. Calling response.json() after any other
+          body-consuming method (json, text, blob, arrayBuffer, formData) throws TypeError.
+          Use response.clone() to read the body multiple times.
+          Pattern: const cloned = response.clone(); const data = await cloned.json();
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/README.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: response.text
+    import_path: "node-fetch"
+    description: >
+      Reads the response body stream and returns it as a UTF-8 decoded string.
+      Returns a Promise. Body stream can only be consumed once.
+    postconditions:
+      # Evidence: node_modules/node-fetch/src/body.js consumeBody() — FetchError type='system' on stream error
+      - id: response-text-throws-on-stream-error
+        condition: "response body stream encounters a system-level error during reading (premature close, network drop after headers received)"
+        throws: "FetchError (error.type='system') — 'Invalid response body while trying to fetch <url>'"
+        required_handling: >
+          Even after a successful fetch() (headers received, Promise resolved), the body
+          stream can fail during reading. response.text() MUST be wrapped in try-catch.
+          FetchError with type='system' indicates a stream-level I/O error.
+          Common mistake: wrapping only fetch() in try-catch, leaving response.text() unguarded.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+        severity: error
+        business_impact:
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+          incident_label: SILENT_FAILURE
+
+      # Evidence: node_modules/node-fetch/src/body.js consumeBody() lines 248-249 — premature close
+      - id: response-text-throws-on-premature-close
+        condition: "server closes the connection before the full body is received"
+        throws: "FetchError — 'Premature close of server response while trying to fetch <url>'"
+        required_handling: >
+          If the server closes the TCP connection before sending the full response body,
+          response.text() throws FetchError. This occurs after headers are received but
+          before body completes — distinct from initial fetch() network failure.
+          Must be caught with try-catch around response.text().
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: response.blob
+    import_path: "node-fetch"
+    description: >
+      Reads the response body stream and returns it as a Blob object.
+      Calls arrayBuffer() internally. Returns a Promise.
+    postconditions:
+      # Evidence: node_modules/node-fetch/src/body.js blob() line 133-136 — delegates to arrayBuffer() → consumeBody()
+      - id: response-blob-throws-on-stream-error
+        condition: "response body stream fails during reading (system error, premature close, max-size exceeded)"
+        throws: "FetchError (error.type='system' or 'max-size') — same errors as response.text()"
+        required_handling: >
+          response.blob() delegates to arrayBuffer() which uses the same consumeBody() stream path.
+          Must be wrapped in try-catch to handle FetchError on stream errors.
+          Same error types apply as response.text() and response.arrayBuffer().
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: response.arrayBuffer
+    import_path: "node-fetch"
+    description: >
+      Reads the response body stream and returns it as an ArrayBuffer.
+      Returns a Promise. Used for binary data (images, files, audio).
+    postconditions:
+      # Evidence: node_modules/node-fetch/src/body.js consumeBody() — same stream-reading path as text()
+      - id: response-arraybuffer-throws-on-stream-error
+        condition: "response body stream fails during reading (system error, premature close, or size limit exceeded)"
+        throws: "FetchError (error.type='system') or FetchError (error.type='max-size') if size limit exceeded"
+        required_handling: >
+          response.arrayBuffer() uses the same consumeBody() stream-reading path.
+          IMPORTANT for file downloads: max-size option on the original fetch() call
+          will cause FetchError here if the file is larger than the limit.
+          Must be wrapped in try-catch.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

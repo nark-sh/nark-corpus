@@ -1,0 +1,466 @@
+package: "@anthropic-ai/sdk"
+semver: ">=0.18.0 <1.0.0"
+contract_version: 1.0.0
+maintainer: corpus-team
+last_verified: 2026-04-04
+status: production
+evidence_quality: confirmed
+coverage_score: 0.57
+functions:
+  - name: create
+    import_path: "@anthropic-ai/sdk"
+    description: Creates a message completion using Claude models
+    postconditions:
+      # Evidence: seen in 4 primary firings across 2 repos in scan-anthropic-ai-sdk-2026-04-01.json
+      # Top affected: cline/cline (59274 stars), btahir/open-deep-research (2132 stars)
+      - id: messages-create-no-try-catch
+        condition: messages.create() called without try-catch or .catch() handler
+        throws: APIError with error.status and error.message
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          messages.create() is called without try-catch block. This function makes HTTP requests to Anthropic's API and can fail with various errors (401 auth, 429 rate limit, 500 server, 529 overload, 413 request too large). Unhandled promise rejections will crash the application.
+        detector: |
+          If client.messages.create() or anthropic.messages.create() is called in an async context without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.create() in try-catch block. Catch block should check error instanceof Anthropic.APIError and handle specific error types (RateLimitError, AuthenticationError, etc.) appropriately.
+        source: https://platform.claude.com/docs/en/api/errors
+        sources:
+          - https://platform.claude.com/docs/en/api/errors
+      - id: messages-create-generic-catch
+        condition: messages.create() in try-catch but doesn't check error types
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          Catch block uses generic error handling without checking error.status or error types. Anthropic SDK provides specific error classes (RateLimitError, AuthenticationError) that should be differentiated for proper error recovery. Rate limit errors need retry logic, auth errors need API key fixes, and server errors need different handling.
+        detector: |
+          If try-catch block wraps messages.create() but catch block does not check 'error instanceof Anthropic.APIError' or 'error instanceof Anthropic.RateLimitError'
+        required_handling: |
+          SHOULD check error type using instanceof or error.status code. Handle RateLimitError with retry logic (using retry-after header), AuthenticationError by validating API key, and server errors (500/529) with appropriate backoff.
+        source: https://github.com/anthropics/anthropic-sdk-typescript
+        sources:
+          - https://github.com/anthropics/anthropic-sdk-typescript
+  - name: stream
+    import_path: "@anthropic-ai/sdk"
+    description: Creates a streaming message completion using Claude models
+    postconditions:
+      # Evidence: seen in 3 primary firings across 1 repo in scan-anthropic-ai-sdk-2026-04-01.json
+      # Top affected: BuilderIO/micro-agent (4284 stars)
+      - id: messages-stream-no-try-catch
+        condition: messages.stream() called without try-catch or .catch() handler
+        throws: APIError, can occur mid-stream after initial 200 response
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          messages.stream() is called without try-catch block. Streaming responses can fail mid-response even after receiving initial 200 status. Errors can occur during stream parsing, network issues, or API errors. Unhandled errors will crash the application.
+        detector: |
+          If client.messages.stream() is called in an async context without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.stream() in try-catch block. Should also wrap stream iteration in try-catch to handle mid-stream errors. Check error types for proper recovery.
+        source: https://platform.claude.com/docs/en/api/errors
+        sources:
+          - https://platform.claude.com/docs/en/api/errors
+      - id: stream-abort-not-handled
+        condition: Stream created but no abort/cleanup handling
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          Stream is created but code doesn't handle cancellation or cleanup. Long-running streams should support cancellation via stream.controller.abort() and proper cleanup in finally blocks to avoid resource leaks.
+        detector: |
+          If messages.stream() is called but no stream.controller.abort() or break statement exists for cancellation handling
+        required_handling: |
+          SHOULD implement cancellation handling with stream.controller.abort() or break from stream iteration. Use finally blocks for cleanup.
+        source: https://github.com/anthropics/anthropic-sdk-typescript
+        sources:
+          - https://github.com/anthropics/anthropic-sdk-typescript
+  - name: Anthropic
+    import_path: "@anthropic-ai/sdk"
+    description: Initializes Anthropic API client
+    postconditions:
+      - id: api-key-not-validated
+        condition: Anthropic client created without validating API key exists
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          Anthropic client is instantiated without validating that API key exists. Missing or invalid API keys cause AuthenticationError (401) at request time rather than initialization time. Early validation provides better error messages.
+        detector: |
+          If 'new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })' is called without checking if ANTHROPIC_API_KEY exists or has value
+        required_handling: |
+          SHOULD validate API key exists before client creation: if (!process.env.ANTHROPIC_API_KEY) throw new Error('Missing ANTHROPIC_API_KEY'). Consider using default apiKey validation from SDK.
+        source: https://platform.claude.com/docs/en/api/errors
+        sources:
+          - https://platform.claude.com/docs/en/api/errors
+      - id: rate-limit-no-retry-logic
+        condition: API calls made without retry logic for 429 errors
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          Code makes API calls without implementing retry logic for rate limit errors (429). Anthropic API includes retry-after header indicating when to retry. Proper retry logic with exponential backoff prevents cascading failures and improves reliability.
+        detector: |
+          If messages.create() or messages.stream() is called with try-catch, but catch block doesn't check for error.status === 429 or RateLimitError for retry logic
+        required_handling: |
+          SHOULD implement retry logic for 429 errors. Check retry-after header value and implement exponential backoff. Example: if (error instanceof RateLimitError) wait for error.headers['retry-after'] seconds before retry.
+        source: https://platform.claude.com/docs/en/api/errors
+        sources:
+          - https://platform.claude.com/docs/en/api/errors
+
+  # Evidence: https://platform.claude.com/docs/en/api/errors (fetched 2026-04-02)
+  # Evidence: https://platform.claude.com/docs/en/build-with-claude/token-counting (fetched 2026-04-02)
+  # Error types confirmed from @anthropic-ai/sdk source: APIError, BadRequestError, AuthenticationError,
+  #   RateLimitError, InternalServerError, APIConnectionError, APIConnectionTimeoutError
+  - name: countTokens
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Counts the number of tokens in a message without creating it. Used for
+      proactive rate limit management and cost estimation before expensive API calls.
+      Returns an estimate — actual tokens may differ slightly due to system optimizations.
+    postconditions:
+      - id: count-tokens-no-try-catch
+        condition: messages.countTokens() called without try-catch or .catch() handler
+        throws: APIError (BadRequestError 400, AuthenticationError 401, RateLimitError 429, InternalServerError 500)
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: |
+          messages.countTokens() is called without try-catch block. Like messages.create(),
+          it makes HTTP requests to Anthropic's API and can throw the full range of APIError
+          subclasses: BadRequestError (400) for invalid inputs, AuthenticationError (401)
+          for bad API keys, RateLimitError (429) when quota exceeded, InternalServerError
+          (500/529) for server failures. The 32 MB request size limit applies identically
+          to the Token Counting API. Unhandled promise rejections crash the application.
+        detector: |
+          If client.messages.countTokens() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.countTokens() in try-catch. Despite being a
+          read-only operation, it can fail with auth errors (bad API key) or rate limit
+          errors when count token RPM quota is exceeded. Token counting has its own
+          independent rate limit separate from message creation.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/token-counting
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/token-counting
+          - https://platform.claude.com/docs/en/api/errors
+
+      - id: count-tokens-estimate-used-as-exact
+        condition: Token count result used as exact limit without accounting for estimate variance
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          The Anthropic docs explicitly state: "The token count should be considered an
+          estimate. In some cases, the actual number of input tokens used when creating a
+          message may differ by a small amount." Token counts may also include tokens added
+          automatically by Anthropic for system optimizations that are not billed. Using
+          the count as an exact gate to decide whether to send a message can result in
+          messages being incorrectly rejected or context window overflows if slightly off.
+        detector: |
+          If messages.countTokens() result is used in a strict equality check (=== or ==)
+          or compared exactly against a context window limit without a safety margin
+        required_handling: |
+          SHOULD add a safety margin (e.g., 5-10%) when using token counts as gates.
+          Example: if (tokenCount.input_tokens * 1.05 > maxContextTokens) { ... }
+          Do not use strict equality to gate on token counts.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/token-counting
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/token-counting
+
+  # Evidence: https://platform.claude.com/docs/en/build-with-claude/batch-processing (fetched 2026-04-02)
+  # Evidence: https://platform.claude.com/docs/en/api/errors (fetched 2026-04-02)
+  # Error types confirmed from @anthropic-ai/sdk source: APIError hierarchy
+  - name: batches.create
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Sends a batch of Message creation requests for asynchronous processing.
+      Batches take up to 24 hours to complete and reduce costs by 50%. Results
+      are accessed by polling batches.retrieve() or streaming via batches.results().
+      The Batch API has a larger request size limit (256 MB vs 32 MB for Messages).
+    postconditions:
+      - id: batches-create-no-try-catch
+        condition: messages.batches.create() called without try-catch or .catch() handler
+        throws: APIError (BadRequestError 400, AuthenticationError 401, RateLimitError 429, InternalServerError 500)
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: |
+          messages.batches.create() is called without try-catch block. This submits
+          potentially hundreds or thousands of requests. Any APIError (auth failure,
+          rate limit, malformed batch request, or server error) rejects the entire
+          submission. Unhandled promise rejection crashes the application, losing
+          the entire batch submission with no retry. In batch processing pipelines
+          this can mean losing hours of work preparation.
+        detector: |
+          If client.messages.batches.create() is called in an async context without
+          try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.batches.create() in try-catch. Batch
+          creation can fail with BadRequestError (400) if any individual request
+          params are invalid, AuthenticationError (401) if API key invalid, or
+          RateLimitError (429) for quota exceeded. Check error.status and implement
+          retry with exponential backoff for 429/500/529 errors.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/batch-processing
+          - https://platform.claude.com/docs/en/api/errors
+
+      - id: batches-result-not-polled
+        condition: Batch created but results never retrieved or polling logic absent
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        description: |
+          A batch is created via messages.batches.create() but the code does not
+          poll messages.batches.retrieve() to check completion status, nor retrieve
+          results via messages.batches.results(). Batches run asynchronously and
+          can take up to 24 hours. Without polling, results are never consumed.
+          The application pays for the batch but discards all output — a silent,
+          expensive failure pattern common in fire-and-forget batch submissions.
+        detector: |
+          If messages.batches.create() is called but no subsequent call to
+          messages.batches.retrieve() or messages.batches.results() exists in the
+          same code path or in any registered callback/job
+        required_handling: |
+          MUST implement result retrieval after batch creation. Either poll
+          messages.batches.retrieve() until processing_status === 'ended', then
+          stream results with messages.batches.results(); or use a background job
+          (e.g. Inngest, BullMQ) triggered by webhook or periodic cron to poll
+          and process results. Never create a batch without a retrieval plan.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/batch-processing
+
+      - id: batches-individual-errors-not-handled
+        condition: Batch results retrieved but individual request error statuses not checked
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: |
+          When streaming batch results via messages.batches.results(), each
+          MessageBatchIndividualResponse has a result.type field that can be
+          'succeeded', 'errored', 'canceled', or 'expired'. Code that only reads
+          result.message (for succeeded) without checking result.type first will
+          silently skip errored/canceled/expired requests. In large batches,
+          10-20% of requests may fail silently if the model refuses, rate limits
+          hit individual requests, or the batch partially expires.
+        detector: |
+          If messages.batches.results() output is consumed but result.type is not
+          checked before accessing result.message, or if errored/canceled/expired
+          cases have no error handling branch
+        required_handling: |
+          MUST check result.type before accessing result.message:
+          if (result.type === 'succeeded') { process(result.message) }
+          else if (result.type === 'errored') { handleError(result.error) }
+          else if (result.type === 'expired') { requeue(result.custom_id) }
+          Track errored count and alert when error rate exceeds threshold.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/batch-processing
+
+  # Evidence: https://platform.claude.com/docs/en/build-with-claude/files (fetched 2026-04-02)
+  # Evidence: https://platform.claude.com/docs/en/api/errors (fetched 2026-04-02)
+  # Error types confirmed from @anthropic-ai/sdk source: APIError hierarchy
+  # Files API limits confirmed: 500 MB per file, 500 GB per org, 100 req/min during beta
+  - name: beta.files.upload
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Uploads a file to Anthropic's secure storage and returns a file_id for
+      reuse across multiple API calls. Supports PDF, plain text, images (jpeg/png/gif/webp),
+      and container formats for code execution. Beta feature requiring
+      anthropic-beta: files-api-2025-04-14 header. Max 500 MB per file.
+    postconditions:
+      - id: files-upload-no-try-catch
+        condition: beta.files.upload() called without try-catch or .catch() handler
+        throws: APIError (BadRequestError 400, AuthenticationError 401, RateLimitError 429, InternalServerError 500, 413 file too large, 403 storage limit exceeded)
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          beta.files.upload() is called without try-catch block. The Files API
+          has documented error cases beyond standard API errors: 413 when file
+          exceeds 500 MB limit, 403 when organization reaches 500 GB storage limit,
+          400 for invalid filename (1-255 chars, forbidden characters: < > : " | ? * \ / and unicode 0-31),
+          400 for unsupported file type, AuthenticationError (401) for invalid API key,
+          RateLimitError (429) for exceeding ~100 req/min during beta, InternalServerError
+          (500) for server failures. Unhandled promise rejection crashes the application.
+        detector: |
+          If client.beta.files.upload() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.beta.files.upload() in try-catch. Check error.status:
+          413 = file too large (enforce 500 MB limit before upload);
+          403 = organization storage limit reached (implement storage quota checks);
+          400 = invalid filename or file type (validate before upload);
+          429 = rate limit (implement backoff, beta limit is ~100 req/min).
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/files
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/files
+          - https://platform.claude.com/docs/en/api/errors
+
+      - id: files-upload-id-not-validated
+        condition: File ID from upload used in messages without checking upload succeeded
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: |
+          The file_id from beta.files.upload() is used in subsequent messages.create()
+          calls without verifying the upload response contains a valid id field.
+          The upload response is FileMetadata containing id, filename, mime_type,
+          size_bytes, and created_at. If error handling swallows upload errors and
+          code proceeds with an undefined or stale file_id, the subsequent messages
+          call will throw NotFoundError (404) with 'File not found: file_xyz'. This
+          propagates the original upload failure as a confusing downstream error.
+        detector: |
+          If beta.files.upload() result is assigned but result.id is not checked
+          before being passed as file_id to a messages.create() content block
+        required_handling: |
+          SHOULD verify upload result contains a valid id before using in messages:
+          const file = await client.beta.files.upload({ file: ... });
+          if (!file.id) throw new Error('File upload returned no ID');
+          Then use file.id in the content block.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/build-with-claude/files
+        sources:
+          - https://platform.claude.com/docs/en/build-with-claude/files
+
+  # Evidence: https://platform.claude.com/docs/en/api/errors (fetched 2026-04-02)
+  # Evidence: messages.d.ts - parse() method returns ParsedMessage<T> with parsed_output: T | null
+  # Evidence: lib/parser.d.ts - parse() calls zodOutputFormat.parse() which can throw ZodError
+  - name: messages.parse
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Convenience wrapper around messages.create() that parses the response
+      according to an output_config.format (e.g. zodOutputFormat). Returns a
+      ParsedMessage<T> with a parsed_output field. If the model refuses or output
+      does not match the schema, parsed_output is null rather than throwing.
+      Requires structured outputs (output_config.format) to be specified.
+    postconditions:
+      - id: messages-parse-no-try-catch
+        condition: messages.parse() called without try-catch or .catch() handler
+        throws: APIError (identical error set to messages.create()), plus ZodError if schema parse fails
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          messages.parse() is called without try-catch block. As a wrapper around
+          messages.create(), it inherits the full APIError hierarchy: BadRequestError
+          (400) for invalid_request including prefill-not-supported for Claude Opus 4.6,
+          AuthenticationError (401) for invalid API key, RateLimitError (429) for quota
+          exceeded, InternalServerError (500/529) for server failures,
+          APIConnectionError for network failures. Additionally, if the zodOutputFormat
+          schema's parse() function throws (ZodError), that exception propagates uncaught.
+          Unhandled promise rejections crash the application.
+        detector: |
+          If client.messages.parse() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.parse() in try-catch. Catch block should
+          handle both APIError subclasses (instanceof Anthropic.APIError) and ZodError
+          from schema validation failures. Note: a successful API call that produces
+          output not matching the schema sets parsed_output to null rather than throwing —
+          always check parsed_output !== null before using it.
+        evidence_quality: confirmed
+        source: https://platform.claude.com/docs/en/api/errors
+        sources:
+          - https://platform.claude.com/docs/en/api/errors
+          - https://github.com/anthropics/anthropic-sdk-typescript
+
+      - id: messages-parse-null-output-unchecked
+        condition: parsed_output used without null check after messages.parse()
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+        description: |
+          The ParsedMessage<T> type declares parsed_output as T | null. This is null
+          when the model's stop_reason is 'refusal' (streaming classifiers block the
+          response), when max_tokens is hit mid-generation (incomplete JSON cannot be
+          parsed), or when the model produces output that does not match the expected
+          schema structure. Accessing parsed_output.someField without a null guard
+          throws TypeError at runtime — an unchecked null dereference that crashes
+          the response handler.
+        detector: |
+          If messages.parse() result.parsed_output is accessed (e.g. result.parsed_output.field)
+          without a prior null check (if (result.parsed_output !== null) or optional chaining)
+        required_handling: |
+          MUST check parsed_output before using:
+          const result = await client.messages.parse({ ... });
+          if (result.parsed_output === null) {
+            // Handle refusal or incomplete output
+            // Check result.stop_reason for diagnosis
+          } else {
+            use(result.parsed_output);
+          }
+        evidence_quality: confirmed
+        source: https://github.com/anthropics/anthropic-sdk-typescript
+        sources:
+          - https://github.com/anthropics/anthropic-sdk-typescript

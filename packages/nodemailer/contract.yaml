@@ -1,0 +1,387 @@
+package: nodemailer
+semver: ">=7.0.11"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production
+evidence_quality: confirmed
+coverage_score: 1.0
+
+# CRITICAL SECURITY NOTE:
+# nodemailer has 4 CVEs in versions < 7.0.11:
+# - CVE-2020-7769 (CVSS 9.8): Command injection in sendmail transport
+# - CVE-2021-23400 (CVSS 8.8): HTTP header injection via newlines in addresses
+# - CVE-2025-14874 (CVSS 7.5): DoS via infinite recursion in email parser
+# - CVE-2025-13033 (Medium): Email parsing misrouting
+#
+# MINIMUM VERSION: 7.0.11 (includes all security fixes)
+# RECOMMENDED VERSION: 7.0.11+ (latest stable)
+#
+# Common production bugs:
+# 1. Missing await in serverless functions - MOST COMMON (30-40% of issues)
+# 2. No error handling on sendMail() - VERY COMMON
+# 3. Not validating email addresses - SECURITY RISK (enables CVE-2021-23400)
+# 4. Creating new transporter each time - PERFORMANCE
+
+detection:
+  class_names: ["Transport", "Transporter"]
+  type_names: ["Transport", "Transporter", "SentMessageInfo"]
+  factory_methods: ["createTransport"]
+  require_instance_tracking: true
+
+  await_patterns:
+    # Email sending
+    - ".sendmail("
+
+    # Connection verification
+    - ".verify("
+
+    # Connection management
+    - ".close("
+
+functions:
+  - name: sendMail
+    import_path: "nodemailer"
+    description: "Sends email via configured transport"
+    postconditions:
+      - id: connection-error
+        condition: "Network connectivity issues (TCP connection failed, timeout, DNS failure)"
+        throws: "Error with code: ECONNECTION, ETIMEDOUT, EDNS, ESOCKET"
+        required_handling: >
+          Caller MUST catch connection errors.
+          ECONNECTION: TCP connection failed or closed unexpectedly.
+          ETIMEDOUT: Connection/greeting/socket timeout (defaults: 2min/30s/10min).
+          EDNS: Hostname DNS resolution failed.
+          ESOCKET: Low-level socket error from net/tls modules.
+          These errors are TRANSIENT and RETRIABLE with exponential backoff.
+        sources:
+          - "https://nodemailer.com/errors/#econnection"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: authentication-failure
+        condition: "SMTP authentication fails (wrong credentials, locked account, unsupported auth)"
+        throws: "Error with code: EAUTH, ENOAUTH, EOAUTH2"
+        required_handling: >
+          Caller MUST catch authentication errors.
+          EAUTH: Invalid username/password, account locked, unsupported auth method.
+          ENOAUTH: Authentication required but not configured.
+          EOAUTH2: OAuth2 token refresh failed or invalid credentials.
+          DO NOT RETRY - indicates configuration issue.
+          Check SMTP credentials and account status.
+        sources:
+          - "https://nodemailer.com/errors/#eauth"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: tls-ssl-error
+        condition: "TLS/SSL certificate validation fails or STARTTLS fails"
+        throws: "Error with code: ETLS, EREQUIRETLS"
+        required_handling: >
+          Caller MUST catch TLS errors.
+          ETLS: Certificate validation failed, hostname mismatch, STARTTLS failed.
+          EREQUIRETLS: RFC 8689 REQUIRETLS extension unsupported by server.
+          DO NOT RETRY - indicates certificate or TLS configuration issue.
+          Verify SSL certificate validity and STARTTLS support.
+        sources:
+          - "https://nodemailer.com/smtp/#tls-options"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: invalid-recipient
+        condition: "Recipient email address is malformed or rejected"
+        throws: "Error with code: EENVELOPE"
+        required_handling: >
+          Caller MUST validate email addresses before sending.
+          EENVELOPE: Invalid recipient format, missing from/to address, SMTP rejected.
+          Validate against RFC 5321/5322 before calling sendMail().
+          Check info.rejected array for partial failures.
+          SECURITY: Sanitize addresses to prevent CVE-2021-23400 (header injection).
+        sources:
+          - "https://nodemailer.com/errors/#eenvelope"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: message-content-error
+        condition: "Message content is invalid or attachments fail to load"
+        throws: "Error with code: EMESSAGE, EFILEACCESS, EURLACCESS, EFETCH, ESTREAM"
+        required_handling: >
+          Caller MUST validate message content and attachments.
+          EMESSAGE: Invalid message structure, encoding issues.
+          EFILEACCESS: Attachment file not found or unreadable.
+          EURLACCESS: Cannot fetch URL attachment.
+          EFETCH: HTTP error fetching remote content.
+          ESTREAM: Attachment stream failed.
+          Verify attachment paths exist and are readable before sending.
+        sources:
+          - "https://nodemailer.com/message/attachments/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      - id: protocol-error
+        condition: "SMTP protocol violation or configuration error"
+        throws: "Error with code: EPROTOCOL, ECONFIG, EMAXLIMIT"
+        required_handling: >
+          Caller MUST handle protocol errors.
+          EPROTOCOL: SMTP protocol error from server.
+          ECONFIG: Invalid transport configuration.
+          EMAXLIMIT: Message size exceeds server limit.
+          Check SMTP server logs and message size limits.
+        sources:
+          - "https://nodemailer.com/errors/#eprotocol"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: missing-await-serverless
+        description: >
+          MOST COMMON PRODUCTION BUG (30-40% of issues): Missing await in serverless.
+          In AWS Lambda, Google Cloud Functions, or Vercel Functions, forgetting to await
+          sendMail() causes function to terminate before email is sent. No error is logged
+          because promise rejection happens after termination.
+          ALWAYS use: await transporter.sendMail(mailOptions)
+          NEVER use: transporter.sendMail(mailOptions) // Missing await!
+          This is the #1 cause of "emails not sending" support tickets.
+        sources:
+          - "https://github.com/nodemailer/nodemailer/issues/1174"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: no-input-validation
+        description: >
+          SECURITY CRITICAL: Not sanitizing email addresses enables CVE-2021-23400.
+          Attackers can inject HTTP headers via newlines/carriage returns in addresses.
+          ALWAYS sanitize: email.replace(/[\r\n]/g, '')
+          REQUIRED: Validate against RFC 5321/5322 format.
+          Affects ALL user-supplied email addresses (to, from, cc, bcc, replyTo).
+        sources:
+          - "https://nvd.nist.gov/vuln/detail/CVE-2021-23400"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: ignored-rejected-recipients
+        description: >
+          COMMON: Not checking info.rejected array causes silent partial failures.
+          sendMail() succeeds even if some recipients were rejected.
+          ALWAYS check: if (info.rejected.length > 0) { handle_partial_failure(); }
+          Also check: info.rejectedErrors for detailed error per rejected recipient.
+        sources:
+          - "https://github.com/nodemailer/nodemailer/issues/414"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: new-transporter-each-time
+        description: >
+          PERFORMANCE: Creating new transporter for each email causes overhead.
+          Creates new connection pool every time, wastes resources, may exceed limits.
+          CORRECT: Create once during initialization, reuse for all emails.
+          Use pool: true for high-volume sending (default: 5 connections).
+        sources:
+          - "https://nodemailer.com/smtp/pooled/"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: no-retry-transient-errors
+        description: >
+          RELIABILITY: Not retrying transient network errors causes permanent failures.
+          RETRIABLE: ECONNECTION, ETIMEDOUT, EDNS, ESOCKET
+          NON-RETRIABLE: EAUTH, ENOAUTH, EENVELOPE, ETLS
+          Implement exponential backoff: 1s, 2s, 4s, 8s delays.
+          Use job queue (Bull, BullMQ) for production retry logic.
+        sources:
+          - "https://github.com/nodemailer/nodemailer/issues/1340"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: verify
+    import_path: "nodemailer"
+    description: "Verifies SMTP connection and configuration"
+    postconditions:
+      - id: verification-failure
+        condition: "SMTP connection or authentication fails during verification"
+        throws: "Error with code: ECONNECTION, EAUTH, ETLS, EDNS, ETIMEDOUT"
+        required_handling: >
+          Caller MUST catch verification errors.
+          Call verify() during application initialization to catch config issues early.
+          Same error codes as sendMail() connection/auth errors.
+          Verification failure indicates configuration problem - fix before deployment.
+        sources:
+          - "https://nodemailer.com/usage/#verify-smtp-connection-configuration"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+    edge_cases:
+      - id: no-verify-before-production
+        description: >
+          BEST PRACTICE: Not calling verify() during initialization means config
+          errors are discovered only when first email is sent (possibly in production).
+          ALWAYS call verify() during app startup to fail fast on misconfiguration.
+          Example: await transporter.verify(); // Before serving requests
+        sources:
+          - "https://github.com/nodemailer/nodemailer/issues/206"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: createTransport
+    import_path: "nodemailer"
+    description: "Creates reusable email transport instance"
+    postconditions:
+      # Evidence: seen in 2 primary firings across 2 repos in scan-nodemailer-2026-04-03.json
+      # Top affected: amruthpillai/reactive-resume (⭐ 35930), seerr-team/seerr (⭐ 10423)
+      - id: configuration-error
+        condition: "Invalid transport configuration"
+        throws: "Error with code: ECONFIG"
+        required_handling: >
+          Caller MUST validate transport configuration.
+          Common issues: missing host/port, invalid auth structure, unsupported options.
+          Use environment variables for credentials, never hardcode.
+          Call verify() after createTransport() to test configuration.
+        sources:
+          - "https://nodemailer.com/smtp/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: createTestAccount
+    import_path: "nodemailer"
+    description: >
+      Creates a temporary Ethereal email test account by calling the Ethereal API
+      (https://api.nodemailer.com/user). Returns SMTP credentials for a disposable
+      inbox where sent messages can be previewed at ethereal.email. Used in
+      development/testing environments. NOTE: Makes a real HTTP call to external
+      service — must be awaited and errors must be caught.
+    postconditions:
+      # Evidence: source code inspection of nodemailer@8.0.4 lib/nodemailer.js lines 64-132
+      # req.once('error', err => callback(err)) — propagates raw network errors
+      # catch (E) { return callback(E); } — propagates JSON.SyntaxError on bad response
+      # callback(new Error(data.error || 'Request failed')) — API-level errors
+
+      - id: create-test-account-network-error
+        condition: "Ethereal API (api.nodemailer.com) is unreachable or connection fails"
+        throws: "Error (no code) — raw ECONNREFUSED, ETIMEDOUT, ENOTFOUND from HTTP layer"
+        required_handling: >
+          Caller MUST catch network errors from createTestAccount().
+          Unlike sendMail(), this error has no structured code field — it is the raw
+          network error from Node.js HTTP (ECONNREFUSED, ETIMEDOUT, ENOTFOUND).
+          DO NOT use createTestAccount() in production app startup — if Ethereal API
+          is down, it will crash your app initialization.
+          BEST PRACTICE: Call createTestAccount() only in test setup scripts with
+          full try/catch. Cache the result (it is already module-scoped by nodemailer).
+        sources:
+          - "https://github.com/nodemailer/nodemailer/blob/master/lib/nodemailer.js#L113"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: create-test-account-api-error
+        condition: "Ethereal API returns non-success status or error field in response"
+        throws: "Error with message from data.error or 'Request failed'"
+        required_handling: >
+          Caller MUST catch API-level errors.
+          Ethereal API returns { status: 'error', error: 'message' } for failures
+          including rate limits, server errors, and account creation failures.
+          This error has no .code property — check err.message for details.
+          RETRY: These errors are generally transient — retry after delay.
+          FALLBACK: Use static test credentials (saved from a previous successful call)
+          or configure a real test SMTP server (Mailhog, Mailtrap) instead of Ethereal.
+        sources:
+          - "https://github.com/nodemailer/nodemailer/blob/master/lib/nodemailer.js#L123-L125"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: create-test-account-parse-error
+        condition: "Ethereal API returns invalid JSON (service outage, CDN error page)"
+        throws: "SyntaxError (JSON parse failure)"
+        required_handling: >
+          Caller MUST catch SyntaxError from createTestAccount().
+          During Ethereal API outages, the response may be an HTML error page (Cloudflare
+          5xx, maintenance page) instead of JSON. JSON.parse() throws SyntaxError.
+          Check err instanceof SyntaxError to distinguish from network/API errors.
+          FALLBACK: Use hardcoded test SMTP credentials or local mail catcher.
+        sources:
+          - "https://github.com/nodemailer/nodemailer/blob/master/lib/nodemailer.js#L118-L121"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low

@@ -1,0 +1,160 @@
+# @upstash/qstash — all Client publish methods make HTTPS requests to the QStash API.
+# Error hierarchy: QstashError (base) → QstashRatelimitError (429 burst),
+# QstashDailyRatelimitError (429 daily), QstashChatRatelimitError (429 chat),
+# QstashEmptyArrayError (empty params).
+# Receiver.verify() throws SignatureError on invalid webhook signatures.
+# No auto-retry by default (retries: 0 unless configured).
+package: "@upstash/qstash"
+semver: ">=2.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-02"
+status: production
+evidence_quality: confirmed
+
+detection:
+  class_names:
+    - "Client"
+    - "Receiver"
+
+functions:
+  - name: publishJSON
+    import_path: "@upstash/qstash"
+    description: >
+      Publishes a JSON-serialized message to a URL, URL group, or API endpoint via
+      the QStash API. The most commonly used method in SaaS apps — called in API routes
+      to queue background jobs, send webhooks, trigger workflows. Makes an outbound
+      HTTPS POST to the QStash API. All HTTP errors are thrown — QStash's retry logic
+      applies on the DELIVERY side, not at publish time.
+
+    postconditions:
+      - id: api-error
+        # Evidence: seen in 2 primary firings across 1 repo in scan-upstash-qstash-2026-04-02.json
+        # Top affected: mfts/papermark (⭐ 8147 stars)
+        condition: >
+          Any HTTP or network failure at publish time: invalid QStash token (401),
+          bad destination URL (422), rate limit exceeded (429), invalid request (400),
+          QStash API unavailable (5xx), or network/DNS failure. QStash's retry
+          configuration only applies to message DELIVERY — the publish call itself
+          does not retry on failure.
+        throws: >
+          QstashError (non-2xx HTTP responses — invalid token, bad URL, server errors).
+          QstashRatelimitError extends QstashError (429 burst rate limit).
+          QstashDailyRatelimitError extends QstashError (429 daily limit).
+          Network errors: ECONNREFUSED, ETIMEDOUT when QStash API unreachable.
+        required_handling: >
+          Caller MUST wrap client.publishJSON() in try/catch (or .catch()).
+          Failure to catch means background jobs silently fail — the work is never queued,
+          never delivered, and never retried. Users don't know their task didn't run.
+
+          Minimum handling:
+            try {
+              await qstash.publishJSON({
+                url: `${process.env.NEXTAUTH_URL}/api/process-order`,
+                body: { orderId: order.id },
+              });
+            } catch (error) {
+              console.error('Failed to queue job:', error);
+              throw error; // Propagate to caller
+            }
+        sources:
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/publish"
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/http.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: publish
+    import_path: "@upstash/qstash"
+    description: >
+      Publishes a raw message (string, Buffer, etc.) to a URL via the QStash API.
+      Identical to publishJSON but without JSON serialization. Same network behavior
+      and error characteristics as publishJSON.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any HTTP or network failure: invalid token (401), bad destination (422),
+          rate limit (429), server error (5xx), or network failure.
+        throws: >
+          QstashError, QstashRatelimitError, QstashDailyRatelimitError.
+          Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.publish() in try/catch.
+
+          try {
+            await qstash.publish({
+              url: 'https://myapp.com/api/webhook',
+              body: 'raw payload',
+            });
+          } catch (error) {
+            console.error('Failed to publish message:', error);
+            throw error;
+          }
+        sources:
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/publish"
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: enqueueJSON
+    import_path: "@upstash/qstash"
+    description: >
+      Adds a JSON-serialized message to a named queue for ordered, rate-limited delivery.
+      Called on a Queue instance obtained via client.queue({ queueName }). Used when
+      message ordering matters or to control parallelism. Makes an outbound HTTPS request
+      to the QStash API — same error characteristics as publishJSON.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Any HTTP or network failure: invalid token (401), queue not found or error (400/404),
+          rate limit (429), server error (5xx), or network failure. Also throws if no
+          queue name was provided to the Queue constructor.
+        throws: >
+          QstashError (non-2xx HTTP responses).
+          QstashRatelimitError (429 burst), QstashDailyRatelimitError (429 daily).
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+          Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap queue.enqueueJSON() in try/catch.
+
+          const queue = qstash.queue({ queueName: 'email-queue' });
+          try {
+            await queue.enqueueJSON({
+              url: 'https://myapp.com/api/send-email',
+              body: { to: user.email, template: 'welcome' },
+            });
+          } catch (error) {
+            console.error('Failed to enqueue email job:', error);
+            throw error;
+          }
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts"
+          - "https://upstash.com/docs/qstash/features/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "publishJSON/publish make HTTPS calls to QStash API at publish time — always need try-catch"
+  - "QStash's retry config (retries: N) applies to MESSAGE DELIVERY, not the publish call itself"
+  - "QstashRatelimitError and QstashDailyRatelimitError extend QstashError — catch QstashError to catch all"
+  - "receiver.verify() throws SignatureError — should be caught and result in 401 Unauthorized response"
+  - "batch() and batchJSON() have the same error characteristics as publish/publishJSON"
+  - "Default retries: 0 (no auto-retry at publish time). Configure RetryConfig in Client constructor for retries."
+  - "enqueue() is the non-JSON version of enqueueJSON() — same error behavior"
+  - "QSTASH_TOKEN env var is the standard name; missing token causes immediate auth error on first call"

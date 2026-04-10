@@ -1,0 +1,498 @@
+package: "@google-cloud/storage"
+semver: ">=5.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-01"
+status: production
+evidence_quality: confirmed
+
+functions:
+  # Bucket Operations
+  - name: upload
+    import_path: "@google-cloud/storage"
+    description: "Uploads a file to Google Cloud Storage bucket; commonly called as bucket.upload(filePath, options)"
+
+    postconditions:
+      # Evidence: upload called without try-catch in electron/forge (7015★) PublisherGCS.ts:72
+      # bucket.upload() inside Promise.all with no error handling — confirmed violation pattern
+      # Top affected: electron/forge (⭐ 7015), erxes/erxes (⭐ 3918)
+      - id: upload-network-error
+        condition: "Network connection fails or times out"
+        throws: "ApiError with code ECONNRESET, ETIMEDOUT, or HTTP 408/504"
+        required_handling: >
+          Caller MUST wrap bucket.upload() in try-catch block. Network errors can occur
+          due to internet connectivity issues, DNS failures, or Cloud Storage service downtime.
+          The library automatically retries (default: 3 attempts with exponential backoff),
+          but will throw after max retries exhausted.
+        sources:
+          - "https://github.com/googleapis/nodejs-storage/issues/833"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-permission-error
+        condition: "IAM permissions insufficient for bucket write"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.create permission on the target bucket. This error is NOT
+          automatically retried.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#upload"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-bucket-not-found
+        condition: "Bucket does not exist"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle bucket not found errors. Create bucket first using
+          storage.createBucket() or verify bucket name is correct.
+        sources:
+          - "https://github.com/googleapis/nodejs-storage/issues/813"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-file-not-found
+        condition: "Local file path does not exist"
+        throws: "Error: ENOENT: no such file or directory"
+        required_handling: >
+          Caller MUST validate local file exists before calling upload(). Check with
+          fs.existsSync() or handle file not found errors gracefully.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#upload"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: download
+    import_path: "@google-cloud/storage"
+    description: "Downloads a file from Google Cloud Storage; called as file.download(options)"
+
+    postconditions:
+      # Evidence: file.download() called without try-catch in erxes/erxes (3918★) read.ts:163
+      # const [contents] = await file.download({}) — no error handling for 404/403/network
+      # Top affected: erxes/erxes (⭐ 3918)
+      - id: download-file-not-found
+        condition: "File does not exist in bucket"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle file not found errors. Check if file exists using
+          file.exists() before downloading, or handle 404 gracefully.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#download"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: download-permission-error
+        condition: "IAM permissions insufficient for file read"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.get permission. This error is NOT automatically retried.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#download"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: download-network-error
+        condition: "Network connection fails during download"
+        throws: "ApiError with code ECONNRESET, ETIMEDOUT"
+        required_handling: >
+          Caller MUST handle network errors. Large file downloads are more susceptible
+          to connection timeouts. The library automatically retries, but will throw after
+          max retries exhausted.
+        sources:
+          - "https://github.com/googleapis/nodejs-storage/issues/2482"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: download-corruption-error
+        condition: "Downloaded file hash does not match expected checksum"
+        throws: "Error with code CONTENT_DOWNLOAD_MISMATCH"
+        required_handling: >
+          Caller MUST retry download when corruption detected. This error indicates
+          the downloaded content differs from what was stored. Retry the download operation.
+        sources:
+          - "https://github.com/googleapis/nodejs-storage/issues/709"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: delete
+    import_path: "@google-cloud/storage"
+    description: "Deletes a file or bucket from Google Cloud Storage; called as file.delete(options)"
+
+    postconditions:
+      # Evidence: blob.delete() called without try-catch in Oneirocom/Magick (835★) gcs-storage-manager.ts:47
+      # await blob.delete() with no error handling — confirmed violation pattern
+      # Top affected: Oneirocom/Magick (⭐ 835)
+      - id: delete-not-found
+        condition: "File or bucket does not exist"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller SHOULD handle 404 errors gracefully. If idempotent delete is desired,
+          catch 404 and treat as success. Otherwise, throw error to caller.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#delete"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: delete-permission-error
+        condition: "IAM permissions insufficient for delete"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.delete or storage.buckets.delete permission.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#delete"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: delete-bucket-not-empty
+        condition: "Attempting to delete bucket that contains files"
+        throws: "ApiError with HTTP 409 Conflict"
+        required_handling: >
+          Caller MUST delete all files first using bucket.deleteFiles() before deleting
+          bucket, or handle conflict error.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#delete"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: save
+    import_path: "@google-cloud/storage"
+    description: "Writes data to a file in Google Cloud Storage; called as file.save(data, options)"
+
+    postconditions:
+      # Evidence: blob.save() called without try-catch in Oneirocom/Magick (835★) gcs-storage-manager.ts:27
+      # await blob.save(file, { contentType }) — no error handling in uploadFile method
+      # Top affected: Oneirocom/Magick (⭐ 835)
+      - id: save-permission-error
+        condition: "IAM permissions insufficient for file write"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.create permission on the target bucket.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#save"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: save-network-error
+        condition: "Network connection fails during write"
+        throws: "ApiError with code ECONNRESET, ETIMEDOUT"
+        required_handling: >
+          Caller MUST handle network errors. The library automatically retries with
+          exponential backoff, but will throw after max retries exhausted.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#save"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getMetadata
+    import_path: "@google-cloud/storage"
+    description: "Retrieves metadata for a file or bucket; called as file.getMetadata()"
+
+    postconditions:
+      # Evidence: file.getMetadata() called inside try-catch in Oneirocom/Magick (835★) embedder-queue.ts:40
+      # Correct usage observed — error handling present in deleteFileFromStorage function
+      - id: getmetadata-not-found
+        condition: "File or bucket does not exist"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle not found errors. Check if resource exists using
+          exists() method before calling getMetadata(), or handle 404 gracefully.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#getMetadata"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getmetadata-permission-error
+        condition: "IAM permissions insufficient for metadata read"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has appropriate
+          read permissions for the resource.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#getMetadata"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: setMetadata
+    import_path: "@google-cloud/storage"
+    description: "Updates metadata for a file or bucket; called as file.setMetadata(metadata)"
+
+    postconditions:
+      - id: setmetadata-not-found
+        condition: "File or bucket does not exist"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle not found errors. Verify resource exists before
+          attempting to update metadata.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#setMetadata"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: setmetadata-permission-error
+        condition: "IAM permissions insufficient for metadata write"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.update or storage.buckets.update permission.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#setMetadata"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getFiles
+    import_path: "@google-cloud/storage"
+    description: "Lists files in a bucket; called as bucket.getFiles(options)"
+
+    postconditions:
+      - id: getfiles-permission-error
+        condition: "IAM permissions insufficient for listing"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.list permission on the bucket.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#getFiles"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getfiles-network-error
+        condition: "Network connection fails"
+        throws: "ApiError with network error codes"
+        required_handling: >
+          Caller MUST handle network errors. The library automatically retries,
+          but will throw after max retries exhausted.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#getFiles"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: createBucket
+    import_path: "@google-cloud/storage"
+    description: "Creates a new Google Cloud Storage bucket; called as storage.createBucket(name, options)"
+
+    postconditions:
+      - id: createbucket-already-exists
+        condition: "Bucket with same name already exists"
+        throws: "ApiError with HTTP 409 Conflict"
+        required_handling: >
+          Caller SHOULD handle bucket already exists errors. If idempotent create
+          is desired, catch 409 and retrieve existing bucket.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Storage.html#createBucket"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: createbucket-invalid-name
+        condition: "Bucket name violates naming requirements"
+        throws: "ApiError with HTTP 400 Bad Request"
+        required_handling: >
+          Caller MUST validate bucket names before creation. Names must be globally
+          unique, lowercase, 3-63 characters, and follow DNS naming conventions.
+        sources:
+          - "https://cloud.google.com/storage/docs/naming-buckets"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: createbucket-permission-error
+        condition: "IAM permissions insufficient for bucket creation"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.buckets.create permission in the project.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Storage.html#createBucket"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: deleteFiles
+    import_path: "@google-cloud/storage"
+    description: "Deletes multiple files from a bucket (batch operation); called as bucket.deleteFiles(options)"
+
+    postconditions:
+      - id: deletefiles-partial-failure
+        condition: "Some files fail to delete while others succeed"
+        throws: "PartialFailureError containing array of failed operations"
+        required_handling: >
+          Caller MUST handle PartialFailureError separately from ApiError. Inspect
+          error.errors array to determine which files failed and why. Consider retry
+          logic for failed operations.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#deleteFiles"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: deletefiles-permission-error
+        condition: "IAM permissions insufficient for batch delete"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.delete permission on all matching files.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#deleteFiles"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getSignedUrl
+    import_path: "@google-cloud/storage"
+    description: "Generates a signed URL for temporary file access; called as file.getSignedUrl(options)"
+
+    postconditions:
+      # Evidence: blob.getSignedUrl() called without try-catch in Oneirocom/Magick (835★) gcs-storage-manager.ts:35
+      # const [url] = await blob.getSignedUrl({...}) — no error handling in getFileUrl method
+      # Correct usage also observed in upload-presigner.ts (wrapped in try-catch) — confirms mixed pattern
+      # Top affected: Oneirocom/Magick (⭐ 835)
+      - id: getsignedurl-invalid-credentials
+        condition: "Service account credentials are invalid or missing"
+        throws: "ApiError with authentication failure"
+        required_handling: >
+          Caller MUST handle credential errors. Signed URLs require service account
+          with private key. Verify GOOGLE_APPLICATION_CREDENTIALS is set correctly.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#getSignedUrl"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getsignedurl-file-not-found
+        condition: "File does not exist (for read operations)"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller SHOULD handle file not found errors. For read URLs, file must exist.
+          For write URLs, file will be created on upload.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#getSignedUrl"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

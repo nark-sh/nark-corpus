@@ -1,0 +1,575 @@
+package: pg
+semver: ">=8.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.83  # contracted_functions / total_async_api_functions (5/6: query, connect, end, release, transaction; omitted: copyFrom/copyTo)
+
+# CRITICAL SECURITY NOTE:
+# pg has 1 CVE in versions < 7.2.0:
+# - CVE-2017-16082 (HIGH): Arbitrary code execution via malicious column names
+#
+# MINIMUM VERSION: 8.0.0 (includes all security fixes, latest stable 8.18.0)
+#
+# Common production bugs:
+# 1. Connection pool exhaustion from missing client.release() - MOST COMMON (30% of projects!)
+# 2. SQL injection via string concatenation - CRITICAL SECURITY
+# 3. Transaction not rolled back on error - DATA CORRUPTION
+# 4. Missing error handling on queries - CRASHES
+
+detection:
+  class_names: ["Client", "Pool"]
+  type_names: ["Client", "Pool", "PoolClient", "QueryResult"]
+  factory_methods: []
+  require_instance_tracking: true
+
+  await_patterns:
+    # Client operations
+    - ".connect("
+    - ".query("
+    - ".end("
+
+  # Required event listeners to prevent background errors
+  required_event_listeners:
+    - event: "error"
+      required: true
+      severity: error
+
+functions:
+  - name: query
+    import_path: "pg"
+    description: "Executes a SQL query (Client.query or Pool.query)"
+
+    postconditions:
+      - id: syntax-error
+        condition: "SQL syntax error (42601)"
+        throws: "Error with code '42601'"
+        required_handling: >
+          Caller MUST validate SQL syntax before execution.
+          This indicates a SQL syntax error - DO NOT retry.
+          Check error.position for location of syntax error in query.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: unique-violation
+        condition: "Unique constraint violation (23505)"
+        throws: "Error with code '23505'"
+        required_handling: >
+          Caller MUST handle duplicate key violations gracefully.
+          Extract constraint name from error.constraint.
+          DO NOT retry without changing the unique field value.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: foreign-key-violation
+        condition: "Foreign key constraint violation (23503)"
+        throws: "Error with code '23503'"
+        required_handling: >
+          Caller MUST verify referenced record exists before insertion.
+          Extract constraint and table from error.constraint and error.table.
+          This indicates data integrity issue - DO NOT retry.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: not-null-violation
+        condition: "NOT NULL constraint violation (23502)"
+        throws: "Error with code '23502'"
+        required_handling: >
+          Caller MUST provide all required fields.
+          Extract column name from error.column.
+          Validate data completeness before query execution.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: connection-error
+        condition: "Connection to database failed"
+        throws: "Error with code 'ECONNREFUSED' or similar network errors"
+        required_handling: >
+          Caller MUST handle connection failures separately from query errors.
+          Common causes: database down, wrong host/port, network issues.
+          Implement retry with exponential backoff for transient connection issues.
+          Alert operations if connection errors persist.
+        sources:
+          - "https://node-postgres.com/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: undefined-table
+        condition: "Table or view does not exist (42P01)"
+        throws: "Error with code '42P01'"
+        required_handling: >
+          Caller MUST verify table exists before querying.
+          Check error.message for table name.
+          DO NOT retry - this indicates schema mismatch or missing migration.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: sql-injection-string-concatenation
+        description: >
+          CRITICAL SECURITY: Using string concatenation or template literals with user input.
+          WRONG: pool.query(`SELECT * FROM users WHERE username = '${username}'`);
+          CORRECT: pool.query('SELECT * FROM users WHERE username = $1', [username]);
+          NEVER concatenate user input into SQL - use parameterized queries ($1, $2, etc).
+          This is the #1 security vulnerability in database applications.
+        sources:
+          - "https://dev.to/ofri-peretz/sql-injection-in-node-postgres-the-pattern-everyone-gets-wrong-54mn"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: transaction-not-rolled-back
+        description: >
+          COMMON: BEGIN transaction without ROLLBACK in catch block.
+          Results in data corruption and held locks.
+          ALWAYS wrap transactions: try { BEGIN -> COMMIT } catch { ROLLBACK } finally { release() }
+          Missing ROLLBACK leaves database in inconsistent state.
+        sources:
+          - "https://node-postgres.com/features/transactions"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: query-timeout
+        description: "Long-running queries may timeout. Configure statement_timeout or query_timeout."
+        sources:
+          - "https://node-postgres.com/apis/client"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: connect
+    import_path: "pg"
+    description: "Establishes connection (Client.connect or Pool.connect)"
+
+    postconditions:
+      - id: pool-exhausted
+        condition: "All clients in pool are busy and connectionTimeoutMillis exceeded"
+        throws: "Error with message 'timeout exceeded when trying to connect'"
+        required_handling: >
+          Caller MUST handle pool exhaustion errors.
+          Root causes:
+          1. Clients not released (forgot client.release())
+          2. Pool size too small for load
+          3. Queries taking too long
+          Implement proper client.release() in finally blocks.
+          Monitor pool metrics to identify leaks.
+        sources:
+          - "https://node-postgres.com/apis/pool"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: connection-error
+        condition: "Cannot establish database connection"
+        throws: "Error with code 'ECONNREFUSED', 'ETIMEDOUT', etc."
+        required_handling: >
+          Caller MUST handle connection failures.
+          Implement retry with exponential backoff.
+          Check database server status.
+          Verify connection string credentials.
+        sources:
+          - "https://node-postgres.com/features/pooling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: client-not-released
+        condition: "Caller forgets to release client back to pool"
+        throws: "No error thrown, but pool becomes exhausted over time"
+        required_handling: >
+          Caller MUST ALWAYS release clients in a finally block:
+          ```
+          const client = await pool.connect();
+          try {
+            await client.query(...);
+          } finally {
+            client.release();
+          }
+          ```
+          CRITICAL: This is the #1 production bug (affects 30% of mid-sized projects).
+          Failure to release causes pool exhaustion and application hangs.
+          Silent failure until complete outage.
+        sources:
+          - "https://github.com/brianc/node-postgres/issues/1882"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+    edge_cases:
+      - id: pool-query-for-transactions
+        description: >
+          COMMON: Using pool.query() for BEGIN/COMMIT/ROLLBACK.
+          Each pool.query() might use a different client, breaking transactions.
+          WRONG: await pool.query('BEGIN'); await pool.query(...); await pool.query('COMMIT');
+          CORRECT: const client = await pool.connect(); try { await client.query('BEGIN'); ... } ...
+          Transactions MUST use a dedicated client from pool.connect().
+        sources:
+          - "https://node-postgres.com/features/transactions"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: pool-error-events
+        description: "Pool emits 'error' events for background errors. MUST add error listener to prevent crash."
+        sources:
+          - "https://node-postgres.com/apis/pool"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: pool-not-closed-on-shutdown
+        description: >
+          COMMON: Not calling pool.end() during graceful shutdown.
+          Results in hung connections and prevents clean application exit.
+          MUST call pool.end() in shutdown handlers (SIGTERM, SIGINT).
+        sources:
+          - "https://node-postgres.com/apis/pool"
+        severity: info
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: end
+    import_path: "pg"
+    description: >
+      Drains the pool of all active clients, disconnects them, and shuts down
+      internal timers (Pool.end). Or disconnects a client from PostgreSQL server
+      (Client.end). Called during graceful shutdown or when a standalone client
+      is no longer needed.
+
+    postconditions:
+      # Evidence: pg-pool/index.js source — 'Called end on pool more than once'
+      # https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js
+      - id: pool-end-called-twice
+        condition: "Pool.end() called more than once on the same pool instance"
+        throws: "Error with message 'Called end on pool more than once'"
+        required_handling: >
+          Caller MUST guard against double-end by checking a boolean flag before
+          calling pool.end(). Common in serverless functions with multiple shutdown
+          signal handlers. Pattern: if (!isShuttingDown) { isShuttingDown = true; await pool.end(); }
+          Failure to guard causes an unhandled rejection on the second call.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+          - "https://node-postgres.com/apis/pool"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg-pool/index.js source — 'Cannot use a pool after calling end on the pool'
+      - id: pool-query-after-end
+        condition: "Pool.connect() or Pool.query() called after Pool.end() has completed"
+        throws: "Error with message 'Cannot use a pool after calling end on the pool'"
+        required_handling: >
+          Caller MUST stop routing new requests before initiating pool shutdown.
+          Implement graceful drain: stop accepting requests → wait for in-flight to
+          complete → then call pool.end(). Never call pool.end() in the middle of
+          active request handling without draining first.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+          - "https://node-postgres.com/apis/pool"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg/lib/client.js source — 'Connection terminated unexpectedly'
+      - id: client-end-connection-terminated
+        condition: "Queries in-flight when Client.end() is called"
+        throws: "Error with message 'Client was closed and is not queryable'"
+        required_handling: >
+          Caller MUST ensure no queries are in-flight before calling client.end().
+          For standalone client usage, always await all queries to completion before
+          calling end(). Use try/finally to ensure end() is called after query completion.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/lib/client.js"
+          - "https://node-postgres.com/apis/client"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+    edge_cases:
+      - id: end-without-release
+        description: >
+          Pool clients must be released back to the pool before pool.end() is
+          called. Unreleased clients prevent pool.end() from fully draining.
+          Always ensure all clients obtained from pool.connect() have been
+          released before calling pool.end().
+        sources:
+          - "https://node-postgres.com/apis/pool"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: release
+    import_path: "pg"
+    description: >
+      Returns a PoolClient back to the connection pool. Must be called after
+      every pool.connect() in a finally block to prevent pool exhaustion.
+      Optionally accepts an Error argument (or true) to destroy the client
+      instead of returning it to the pool.
+
+    postconditions:
+      # Evidence: pg-pool/index.js — throwOnDoubleRelease() throws
+      # 'Release called on client which has already been released to the pool.'
+      - id: double-release-throws
+        condition: "client.release() called more than once on the same PoolClient"
+        throws: "Error with message 'Release called on client which has already been released to the pool.'"
+        required_handling: >
+          Caller MUST call release() exactly once. ALWAYS use finally block exclusively:
+          const client = await pool.connect();
+          try { ... } finally { client.release(); }
+          NEVER call release() in both catch and finally — the catch error path
+          goes through the finally block, causing a double-release.
+          If a transaction error occurred, call client.release(err) once in finally.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+          - "https://node-postgres.com/features/pooling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: release-with-error-destroys-client
+        condition: "client.release(err) called with an error after a failed transaction"
+        throws: "No error thrown — client is destroyed instead of returned to pool"
+        required_handling: >
+          Caller SHOULD pass the error to release() when the client was used in a
+          failed transaction: client.release(err). This destroys the connection
+          rather than returning a tainted connection (with an open transaction or
+          held locks) to the pool. Forgetting to pass the error can cause the next
+          user of that pooled connection to inherit transaction state.
+        sources:
+          - "https://node-postgres.com/apis/pool"
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+    edge_cases:
+      - id: release-in-finally-not-catch
+        description: >
+          MOST COMMON BUG: Calling release() in the catch block but not in a
+          finally block — the client leaks if no error occurs but the catch is
+          skipped. ALWAYS use finally:
+          const client = await pool.connect();
+          try { ... } finally { client.release(); }
+          Never put release() only in catch or only in try.
+        sources:
+          - "https://node-postgres.com/features/pooling"
+          - "https://github.com/brianc/node-postgres/issues/1882"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: transaction
+    import_path: "pg"
+    description: >
+      Manual transaction lifecycle using BEGIN, COMMIT, and ROLLBACK SQL commands
+      on a dedicated client. pg has no built-in transaction() method — callers
+      issue BEGIN/COMMIT/ROLLBACK directly via client.query(). All transaction
+      statements MUST use the same client instance.
+
+    postconditions:
+      # Evidence: https://node-postgres.com/features/transactions
+      - id: transaction-not-rolled-back-on-error
+        condition: "Query inside BEGIN/COMMIT transaction block throws and ROLLBACK is not issued"
+        throws: "No error from pg — but PostgreSQL holds row locks until session disconnects"
+        required_handling: >
+          Caller MUST issue ROLLBACK in the catch block whenever a transaction is in progress.
+          REQUIRED pattern:
+            try { await client.query('BEGIN'); ... await client.query('COMMIT'); }
+            catch (e) { await client.query('ROLLBACK'); throw e; }
+            finally { client.release(); }
+          Failure to ROLLBACK leaves open locks, causing other queries to block
+          waiting for those rows. Can cascade into application-wide deadlock.
+        sources:
+          - "https://node-postgres.com/features/transactions"
+          - "https://www.postgresql.org/docs/current/sql-rollback.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      - id: transaction-on-pool-query
+        condition: "pool.query() used for BEGIN/COMMIT/ROLLBACK instead of a dedicated client"
+        throws: "No error thrown — but transaction silently spans different connections"
+        required_handling: >
+          Caller MUST obtain a dedicated client via pool.connect() for all transaction work.
+          NEVER use pool.query() for BEGIN/COMMIT/ROLLBACK — each call may hit a
+          different connection, making the transaction a no-op.
+          CORRECT: const client = await pool.connect(); await client.query('BEGIN'); ...
+          WRONG: await pool.query('BEGIN'); await pool.query(...); await pool.query('COMMIT');
+        sources:
+          - "https://node-postgres.com/features/transactions"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+      - id: transaction-deadlock
+        condition: "Two concurrent transactions deadlock — PostgreSQL code 40P01"
+        throws: "DatabaseError with error.code === '40P01' (deadlock_detected)"
+        required_handling: >
+          Caller MUST catch DatabaseError with code '40P01' and retry the entire
+          transaction from BEGIN. DO NOT retry individual queries — the whole
+          transaction context is invalidated. Implement exponential backoff with
+          jitter between retries. Check error.code to distinguish deadlock from
+          other errors.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+          - "https://www.postgresql.org/docs/current/explicit-locking.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: transaction-serialization-failure
+        condition: "SERIALIZABLE transaction conflicts — PostgreSQL code 40001"
+        throws: "DatabaseError with error.code === '40001' (serialization_failure)"
+        required_handling: >
+          Caller MUST catch DatabaseError with code '40001' and retry the entire
+          transaction from BEGIN. Serialization failures are expected in SERIALIZABLE
+          isolation — they are not bugs but rather PostgreSQL enforcing correctness.
+          Implement retry with backoff. Only applies when using SERIALIZABLE isolation.
+        sources:
+          - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+          - "https://www.postgresql.org/docs/current/transaction-iso.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+    edge_cases:
+      - id: rollback-itself-can-fail
+        description: >
+          ROLLBACK can fail if the connection was lost (network partition or
+          server restart) during the transaction. The ROLLBACK query itself will
+          throw with 'Connection terminated unexpectedly'. Always wrap ROLLBACK
+          in its own try/catch. The finally block should handle release()
+          regardless of whether ROLLBACK succeeded.
+        sources:
+          - "https://node-postgres.com/features/transactions"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+

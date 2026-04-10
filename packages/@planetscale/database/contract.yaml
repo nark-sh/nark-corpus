@@ -1,0 +1,126 @@
+# @planetscale/database — PlanetScale serverless database driver using HTTP transport.
+# DatabaseError extends Error with status (HTTP status code) and body (VitessError) properties.
+# All execute() and transaction() calls make HTTPS requests to PlanetScale's API.
+# Errors: network failures (TypeError: fetch failed), DatabaseError (non-ok HTTP responses).
+package: "@planetscale/database"
+semver: ">=1.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-02"
+status: production
+evidence_quality: confirmed
+
+detection:
+  class_names:
+    - "Client"
+    - "Connection"
+  function_names:
+    - "connect"
+
+functions:
+  - name: execute
+    import_path: "@planetscale/database"
+    description: >
+      Executes a SQL query against the PlanetScale database using HTTP transport.
+      Available on Connection (returned by connect() or client.connection()) and
+      directly on Client. Makes an outbound HTTPS POST to PlanetScale's API.
+      Used for SELECT, INSERT, UPDATE, DELETE operations — all can fail if the
+      database is unavailable, credentials are wrong, or the query is invalid.
+
+    postconditions:
+      - id: database-error
+        # Evidence: 0 primary firings across 2 repos in scan-planetscale-database-2026-04-02.json
+        # FP check: 0/100 false positives (0% FP rate) — confirmed clean
+        # Top affected: unjs/unstorage (⭐ 2536), jln13x/ui.jln.dev (⭐ 1288)
+        condition: >
+          Any failure during query execution: network/DNS failure (TypeError: fetch failed),
+          authentication failure (401/403), invalid query (400), PlanetScale server error (500),
+          or database unavailable. PlanetScale uses HTTP transport — all the failure modes
+          of network calls apply.
+        throws: >
+          DatabaseError (extends Error) — thrown on all non-ok HTTP responses.
+            Properties: message (string), status (HTTP status code), body (VitessError with code and message).
+          TypeError — thrown on network/fetch failures ("TypeError: fetch failed" on connection issues).
+        required_handling: >
+          Caller MUST wrap execute() in try/catch. Database failures in production cause
+          silent data loss or unhandled exceptions that crash the request handler.
+
+          Minimum handling:
+            try {
+              const { rows } = await conn.execute(
+                'SELECT * FROM users WHERE id = ?',
+                [userId]
+              );
+              return rows;
+            } catch (error) {
+              if (error instanceof DatabaseError) {
+                console.error('Query failed:', error.message, 'status:', error.status);
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/planetscale/database-js"
+          - "https://planetscale.com/docs/vitess/tutorials/planetscale-serverless-driver"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transaction
+    import_path: "@planetscale/database"
+    description: >
+      Executes a series of SQL statements within a database transaction. Available on
+      Connection and Client. Automatically rolls back on unhandled errors inside the
+      callback — but the error still propagates to the caller. Makes multiple HTTPS
+      requests to PlanetScale's API (begin, execute statements, commit).
+
+    postconditions:
+      - id: database-error
+        # Evidence: 0 primary firings across 2 repos in scan-planetscale-database-2026-04-02.json
+        # FP check: 0/100 false positives (0% FP rate) — confirmed clean
+        # Top affected: unjs/unstorage (⭐ 2536), jln13x/ui.jln.dev (⭐ 1288)
+        condition: >
+          Any failure during the transaction: network failure at any step,
+          authentication failure, constraint violation, PlanetScale server error,
+          or unhandled error thrown inside the transaction callback.
+          The transaction is rolled back automatically, but the error still propagates.
+        throws: >
+          DatabaseError — on network or API failures at any point in the transaction.
+          TypeError — on network/fetch failures.
+          Any error thrown inside the transaction callback propagates to the caller.
+        required_handling: >
+          Caller MUST wrap transaction() in try/catch. Transaction failures leave the
+          database in a rolled-back state — callers need to handle the error to retry
+          or inform the user.
+
+          try {
+            await conn.transaction(async (tx) => {
+              await tx.execute('INSERT INTO orders (id, user_id) VALUES (?, ?)', [orderId, userId]);
+              await tx.execute('UPDATE inventory SET count = count - 1 WHERE id = ?', [itemId]);
+            });
+          } catch (error) {
+            console.error('Transaction failed, rolled back:', error);
+            throw error;
+          }
+        sources:
+          - "https://github.com/planetscale/database-js"
+          - "https://planetscale.com/docs/vitess/tutorials/planetscale-serverless-driver"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "execute() uses HTTPS transport — all network failure modes apply"
+  - "DatabaseError has .status (HTTP code) and .body.code (Vitess error code) for specific handling"
+  - "When used via Prisma/Drizzle adapter, errors are wrapped by the ORM — this contract targets direct usage"
+  - "connect() is a factory function — the execute() on the returned Connection is what needs try-catch"
+  - "TypeError 'fetch failed' is the common error when database host is unreachable"
+  - "PlanetScale changed pricing in 2024; some users migrated, but the package is still widely used"
+  - "Scan 2026-04-02: only 2 repos found using this package — low adoption in scanned corpus"

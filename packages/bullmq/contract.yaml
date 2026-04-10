@@ -1,0 +1,468 @@
+package: bullmq
+semver: ">=5.0.0 <6.0.0"
+contract_version: "1.1.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-04"
+status: production  # Event listener detection now supported by EventListenerAnalyzer
+evidence_quality: confirmed
+coverage_score: 1.0  # 17 contracted / 17 non-omitted async functions (16 intentionally omitted)
+
+detection:
+  class_names:
+    - Queue
+    - Worker
+    - QueueEvents
+    - FlowProducer
+  type_names:
+    - Queue
+    - Worker
+    - QueueEvents
+    - FlowProducer
+  require_instance_tracking: true
+  await_patterns:
+    - ".add("
+    - ".addBulk("
+    - ".process("
+    - ".close("
+    - ".run("
+    - ".upsertJobScheduler("
+    - ".pause("
+    - ".resume("
+    - ".obliterate("
+    - ".waitUntilFinished("
+    - ".remove("
+    - ".retry("
+    - ".clean("
+    - ".drain("
+    - ".retryJobs("
+
+  # Required event listeners to prevent production issues
+  required_event_listeners:
+    - event: "error"
+      required: true
+      severity: error
+    - event: "failed"
+      required: true
+      severity: error
+
+functions:
+  - name: add
+    import_path: "bullmq"
+    description: "Adds a job to the queue with a payload"
+    postconditions:
+      # Evidence: seen in 1 primary firing across 1 repo in scan-bullmq-2026-04-02.json
+      # Top affected: panyanyany/Twocast
+      - id: queue-add-redis-error
+        condition: "Redis connection fails or is down during add operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller MUST wrap Queue.add() in try-catch to handle Redis connection errors. Redis downtime crashes application if unhandled. Use try-catch to gracefully degrade or retry."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: addBulk
+    import_path: "bullmq"
+    description: "Adds multiple jobs to the queue in bulk"
+    postconditions:
+      - id: queue-addbulk-redis-error
+        condition: "Redis connection fails during bulk operation"
+        throws: "Error causing partial or complete bulk operation failure"
+        required_handling: "Caller MUST wrap Queue.addBulk() in try-catch to handle Redis errors. Bulk operations can partially fail if Redis connection is lost - must handle to prevent data loss."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: process
+    import_path: "bullmq"
+    description: "Worker method that processes jobs from the queue"
+    postconditions:
+      - id: worker-process-job-error
+        condition: "job processing throws error or promise rejects"
+        throws: "Error causing job to fail and trigger retry logic if configured"
+        required_handling: "Worker processor SHOULD handle job errors gracefully with try-catch to control retry behavior and provide meaningful error messages. Unhandled errors in processor can cause worker to stop processing subsequent jobs."
+        sources:
+          - "https://docs.bullmq.io/guide/workers"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: close
+    import_path: "bullmq"
+    description: "Closes queue or worker Redis connection"
+    postconditions:
+      - id: close-error
+        condition: "connection close operation fails (timeout, Redis error)"
+        throws: "Error during connection cleanup"
+        required_handling: "Caller SHOULD handle close() errors during graceful shutdown to ensure proper cleanup. Use try-catch in shutdown handlers to log but not crash on close errors."
+        sources:
+          - "https://docs.bullmq.io/guide/connections"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: run
+    import_path: "bullmq"
+    description: >
+      Starts the worker's main processing loop. Continuously fetches and processes
+      jobs from the queue. This is the primary entry point for Worker operation.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/workers
+      # Worker.run() starts the main loop which calls Redis BRPOPLPUSH internally
+      - id: worker-run-no-error-listener
+        condition: "Worker started without 'error' event listener attached"
+        throws: "Unhandled Error event from EventEmitter when Redis errors occur"
+        required_handling: "Caller MUST attach worker.on('error', handler) BEFORE calling worker.run(). Without an error listener, Node.js throws an unhandled error event that crashes the process. The BullMQ docs explicitly warn: 'If the error handler is missing, your worker may stop processing jobs when an error is emitted.'"
+        sources:
+          - "https://docs.bullmq.io/guide/workers"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: worker-run-redis-connection-error
+        condition: "Redis connection fails during worker main loop"
+        throws: "Error emitted via 'error' event on worker instance"
+        required_handling: "Caller MUST wrap Worker usage with error event listeners. Redis connection loss during run() causes the worker to emit 'error' events. Without maxRetriesPerRequest set to null for consumers, the worker will throw after retry limit is reached."
+        sources:
+          - "https://docs.bullmq.io/guide/connections"
+          - "https://docs.bullmq.io/patterns/failing-fast-when-redis-is-down"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: FlowProducer.add
+    import_path: "bullmq"
+    description: >
+      Adds a flow (tree of dependent jobs) atomically. Either all jobs in the
+      flow are added or none are. Children jobs are processed before parents.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/flows
+      # FlowProducer.add() runs an atomic Redis MULTI/EXEC transaction
+      - id: flow-add-redis-error
+        condition: "Redis connection fails during atomic flow addition"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller MUST wrap FlowProducer.add() in try-catch. Flow additions are atomic (all-or-nothing) via Redis transactions, but Redis connection failure during the transaction causes the entire flow to fail. Without error handling, background pipeline orchestration silently stops."
+        sources:
+          - "https://docs.bullmq.io/guide/flows"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: FlowProducer.addBulk
+    import_path: "bullmq"
+    description: >
+      Adds multiple flows atomically. All flows succeed or all fail.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/flows
+      - id: flow-addbulk-redis-error
+        condition: "Redis connection fails during bulk flow addition"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller MUST wrap FlowProducer.addBulk() in try-catch. Bulk flow additions are atomic — Redis failure loses all flows in the batch. Must handle to prevent silent pipeline breakage."
+        sources:
+          - "https://docs.bullmq.io/guide/flows"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: upsertJobScheduler
+    import_path: "bullmq"
+    description: >
+      Creates or updates a job scheduler (cron/interval-based job factory).
+      The scheduler produces jobs based on repeat options. Upsert semantics
+      prevent duplicate schedulers.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/job-schedulers
+      # upsertJobScheduler uses Redis EVALSHA to atomically create/update scheduler
+      - id: scheduler-upsert-redis-error
+        condition: "Redis connection fails during scheduler upsert"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller MUST wrap upsertJobScheduler() in try-catch. Scheduler creation failure means recurring jobs silently stop being produced. This is especially dangerous during deployment — if scheduler registration fails, no cron jobs run until the next successful registration."
+        sources:
+          - "https://docs.bullmq.io/guide/job-schedulers"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: pause
+    import_path: "bullmq"
+    description: >
+      Pauses the processing of the queue globally (Queue.pause) or locally
+      (Worker.pause). Uses atomic RENAME on the wait queue.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/queues (atomic RENAME operation)
+      - id: queue-pause-redis-error
+        condition: "Redis connection fails during pause operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap pause() in try-catch. Pause failure during maintenance windows means jobs continue processing when they should be stopped. Handle errors to verify pause actually took effect."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: resume
+    import_path: "bullmq"
+    description: >
+      Resumes processing of a paused queue globally.
+    postconditions:
+      # Evidence: https://docs.bullmq.io/guide/queues
+      - id: queue-resume-redis-error
+        condition: "Redis connection fails during resume operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap resume() in try-catch. Resume failure means the queue stays paused — jobs accumulate in waiting state without being processed. Must verify resume succeeded."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: obliterate
+    import_path: "bullmq"
+    description: >
+      Completely destroys the queue and all of its contents irreversibly.
+      Requires no active jobs unless force option is used.
+    postconditions:
+      # Evidence: Queue.obliterate() source — throws if active jobs exist and force=false
+      - id: queue-obliterate-active-jobs-error
+        condition: "Queue has active jobs and force option is not set"
+        throws: "Error indicating queue cannot be obliterated with active jobs"
+        required_handling: "Caller MUST wrap obliterate() in try-catch. The method throws if there are active jobs and force=false. Additionally, this is an iterative SCAN-based operation — large queues may fail mid-obliteration on Redis errors, leaving the queue in a partially destroyed state."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: waitUntilFinished
+    import_path: "bullmq"
+    description: >
+      Returns a promise that resolves when the job completes (with return value)
+      or rejects when the job fails (with failedReason). Requires a QueueEvents instance.
+    postconditions:
+      # Evidence: Job.waitUntilFinished() source — rejects on job failure or timeout
+      - id: job-wait-until-finished-timeout
+        condition: "Job does not complete within the specified TTL"
+        throws: "Error indicating job timed out"
+        required_handling: "Caller MUST wrap waitUntilFinished() in try-catch. The promise rejects on both job failure AND timeout. Using waitUntilFinished() in request-response patterns (e.g., HTTP handler waits for job result) without timeout handling causes hung requests. Always set a TTL parameter."
+        sources:
+          - "https://docs.bullmq.io/guide/flows"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: job-wait-until-finished-job-failed
+        condition: "The job fails during processing"
+        throws: "Error with the job's failedReason"
+        required_handling: "Caller MUST handle rejection from waitUntilFinished(). When the job's processor throws, this promise rejects with the failure reason. Without try-catch, the calling code gets an unhandled rejection."
+        sources:
+          - "https://docs.bullmq.io/guide/flows"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Job.remove
+    import_path: "bullmq"
+    description: >
+      Completely removes the job from the queue. Throws if the job
+      is currently being processed (locked).
+    postconditions:
+      # Evidence: Job class source — throws on locked jobs
+      - id: job-remove-locked-error
+        condition: "Job is currently being processed by a worker (locked)"
+        throws: "Error indicating job is locked and cannot be removed"
+        required_handling: "Caller MUST wrap job.remove() in try-catch. Active jobs have locks and cannot be removed — the method throws rather than silently failing. Handle this to implement retry-after-completion logic."
+        sources:
+          - "https://docs.bullmq.io/guide/jobs"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: Job.retry
+    import_path: "bullmq"
+    description: >
+      Attempts to retry a failed or completed job. Moves the job back to
+      the waiting queue.
+    postconditions:
+      # Evidence: Job class source — throws on invalid state or missing job
+      - id: job-retry-invalid-state
+        condition: "Job is not in failed or completed state, or job does not exist"
+        throws: "Error indicating job cannot be retried (wrong state, locked, or missing)"
+        required_handling: "Caller MUST wrap job.retry() in try-catch. The method throws if the job is locked, does not exist, or is not in a finished state. Handle errors to avoid crashing retry-management code."
+        sources:
+          - "https://docs.bullmq.io/guide/retrying-failing-jobs"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: clean
+    import_path: "bullmq"
+    description: >
+      Cleans jobs from a queue by removing jobs older than a grace period.
+      Returns the IDs of removed jobs.
+    postconditions:
+      # Evidence: Queue.clean() uses Redis EVALSHA for atomic cleanup
+      - id: queue-clean-redis-error
+        condition: "Redis connection fails during clean operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap clean() in try-catch. Clean operations run Lua scripts against Redis — connection failures leave the queue in an inconsistent state. Handle errors in maintenance/cron code to prevent silent cleanup failures."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: drain
+    import_path: "bullmq"
+    description: >
+      Drains the queue by removing all waiting and delayed jobs. Does not
+      affect active, completed, or failed jobs.
+    postconditions:
+      # Evidence: Queue.drain() uses Redis Lua script
+      - id: queue-drain-redis-error
+        condition: "Redis connection fails during drain operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap drain() in try-catch. Drain failure during deployment/maintenance means stale jobs remain in queue. Handle to verify drain completed."
+        sources:
+          - "https://docs.bullmq.io/guide/queues"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: retryJobs
+    import_path: "bullmq"
+    description: >
+      Retries all failed (or completed) jobs by moving them back to wait status.
+      Iterates in batches controlled by count option.
+    postconditions:
+      # Evidence: Queue.retryJobs() iterates using Redis Lua scripts
+      - id: queue-retryjobs-redis-error
+        condition: "Redis connection fails during batch retry operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap retryJobs() in try-catch. Batch retry operations iterate over potentially large job sets — Redis failure mid-iteration causes partial retries. Handle to track which jobs were actually retried."
+        sources:
+          - "https://docs.bullmq.io/guide/retrying-failing-jobs"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+edge_cases:
+  - id: redis-connection-handling
+    description: "Configure connection event listeners on Queue/Worker to detect Redis disconnections - prevents silent failures and enables graceful degradation during Redis outages"
+    sources:
+      - "https://docs.bullmq.io/patterns/failing-fast-when-redis-is-down"
+    severity: warning
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium
+  - id: job-retry-strategy
+    description: "Configure retry attempts and backoff strategy in job options - unhandled job errors trigger automatic retries which may mask underlying issues if not properly configured"
+    sources:
+      - "https://docs.bullmq.io/guide/retrying-failing-jobs"
+    severity: info
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium
+
+# Category: cache
+# Latest version: 5.70.1
+# Generated: 2026-02-25

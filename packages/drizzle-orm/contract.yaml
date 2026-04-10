@@ -1,0 +1,239 @@
+package: drizzle-orm
+semver: ">=0.45.0 <1.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-02"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.60
+# coverage_score = 6 contracted functions / (10 total - 4 intentionally omitted) = 6/10 = 60%
+# Contracted: select, insert, update, delete, transaction, execute
+# Intentionally omitted: selectDistinct (same error profile as select),
+#   selectDistinctOn (same), refreshMaterializedView (rare), $count (read-only returns 0)
+
+detection:
+  type_names:
+    - DrizzleDB
+    - PgDatabase
+
+functions:
+  - name: select
+    import_path: "drizzle-orm"
+    description: "Executes a SELECT query"
+    postconditions:
+      # Evidence: seen in 9 primary firings across 4 repos in scan-drizzle-orm-2026-04-02.json
+      # Top affected: amruthpillai/reactive-resume (⭐ 35930), vercel/nextjs-postgres-nextauth-tailwindcss-template (⭐ 1589)
+      - id: select-query-error
+        condition: "query fails (connection lost, timeout, invalid column, SQL syntax error)"
+        throws: "Error with database-specific error details"
+        required_handling: "Caller MUST wrap select queries in try-catch to handle database errors. Connection failures and SQL errors crash application if unhandled."
+        sources:
+          - "https://orm.drizzle.team/docs/select"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: insert
+    import_path: "drizzle-orm"
+    description: "Executes an INSERT query"
+    postconditions:
+      # Evidence: seen in 4 primary firings across 3 repos in scan-drizzle-orm-2026-04-02.json
+      # Top affected: jnsahaj/tweakcn, openstatusHQ/data-table-filters
+      - id: insert-constraint-violation
+        condition: "insert violates constraint (unique, foreign key, not null, check constraint)"
+        throws: "Error with constraint violation details and database error code"
+        required_handling: "Caller MUST wrap insert operations in try-catch to handle constraint violations. Unique violations, foreign key errors, and validation failures crash application if unhandled."
+        sources:
+          - "https://orm.drizzle.team/docs/insert"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: update
+    import_path: "drizzle-orm"
+    description: "Executes an UPDATE query"
+    postconditions:
+      # Evidence: seen in 1 primary firing across 1 repo in scan-drizzle-orm-2026-04-02.json
+      # Top affected: vercel-labs/gemini-chatbot (⭐ 1306)
+      - id: update-constraint-violation
+        condition: "update violates constraint or fails (unique, foreign key, connection lost)"
+        throws: "Error with constraint violation or connection error details"
+        required_handling: "Caller MUST wrap update operations in try-catch to handle constraint violations and connection errors. Database errors crash application if unhandled."
+        sources:
+          - "https://orm.drizzle.team/docs/update"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: delete
+    import_path: "drizzle-orm"
+    description: "Executes a DELETE query"
+    postconditions:
+      # Evidence: seen in 1 primary firing across 1 repo in scan-drizzle-orm-2026-04-02.json
+      # Top affected: vercel/nextjs-postgres-nextauth-tailwindcss-template (⭐ 1589)
+      - id: delete-constraint-violation
+        condition: "delete violates foreign key constraint (referenced by other tables)"
+        throws: "Error with foreign key constraint violation details"
+        required_handling: "Caller MUST wrap delete operations in try-catch to handle foreign key constraint violations. Cascade deletes and constraint errors crash application if unhandled."
+        sources:
+          - "https://orm.drizzle.team/docs/delete"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: transaction
+    import_path: "drizzle-orm"
+    description: >
+      Executes multiple database operations atomically inside a PostgreSQL transaction.
+      The callback receives a `tx` object with the same API as `db`. If the callback
+      throws (or calls `tx.rollback()`), all changes are rolled back automatically.
+    postconditions:
+      # Evidence: drizzle-orm source — errors.ts confirms TransactionRollbackError class
+      # Source: https://orm.drizzle.team/docs/transactions
+      # Source: https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/errors.ts
+      - id: transaction-rollback-error
+        condition: "tx.rollback() is called inside the transaction callback"
+        throws: "TransactionRollbackError (extends DrizzleError) with message 'Rollback'"
+        required_handling: >
+          Caller wrapping db.transaction() MUST catch TransactionRollbackError to distinguish
+          intentional rollbacks (business logic rejected the transaction) from actual database
+          failures. If TransactionRollbackError is swallowed silently, the caller has no way
+          to tell whether the transaction committed or was intentionally aborted.
+          Pattern: catch (err) { if (err instanceof TransactionRollbackError) { /* intentional */ } else { throw err; } }
+        sources:
+          - "https://orm.drizzle.team/docs/transactions"
+          - "https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: transaction-db-error-no-try-catch
+        condition: "db.transaction() called without try-catch, and an operation inside throws"
+        throws: "Database-specific error (e.g. PostgreSQL error code 23505, 23503, ECONNRESET) that propagates through transaction() after automatic rollback"
+        required_handling: >
+          Caller MUST wrap db.transaction() in try-catch. When any operation inside the
+          callback throws, drizzle automatically rolls back the entire transaction and
+          re-throws the original error. Without try-catch at the call site, the error
+          propagates as an unhandled rejection, crashing the application while the
+          transaction is correctly rolled back — but the caller has no chance to retry
+          or return a meaningful error to the user.
+        sources:
+          - "https://orm.drizzle.team/docs/transactions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: transaction-nested-savepoint
+        condition: "db.transaction() called inside another transaction (nested transaction via PgTransaction.transaction())"
+        throws: "Uses SAVEPOINT semantics — inner rollback only affects savepoint, not outer transaction; outer tx.rollback() affects everything"
+        required_handling: >
+          Caller using nested transactions MUST understand savepoint semantics. A rollback
+          in an inner transaction only rolls back to the savepoint, not the entire outer
+          transaction. The outer transaction continues and MUST be explicitly committed or
+          rolled back. Missing this distinction causes partial data writes that appear
+          as correct commits to the application but only committed a subset of the intended work.
+        sources:
+          - "https://orm.drizzle.team/docs/transactions"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: execute
+    import_path: "drizzle-orm"
+    description: >
+      Executes a raw SQL query (db.execute(sql`...`)) or runs a prepared statement
+      (preparedQuery.execute({...})). For raw SQL: accepts a parameterized SQL template
+      literal from drizzle's `sql` tag. Returns raw result rows without ORM mapping.
+    postconditions:
+      # Evidence: drizzle-orm source — DrizzleQueryError wraps driver errors
+      # Source: https://orm.drizzle.team/docs/sql
+      # Source: https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/errors.ts
+      - id: execute-query-error
+        condition: "raw SQL fails — syntax error, table not found, type mismatch, constraint violation"
+        throws: "DrizzleQueryError with message 'Failed query: <sql>\\nparams: <params>', wrapping the original driver error as .cause"
+        required_handling: >
+          Caller MUST wrap db.execute() in try-catch. DrizzleQueryError includes the
+          executed query and params in the error message — NEVER log these unredacted
+          to external services (they may contain PII). Check err.cause for the underlying
+          PostgreSQL error code. Common codes: 42601 (syntax error), 42P01 (table not
+          found), 23505 (unique violation), 23503 (foreign key violation).
+        sources:
+          - "https://orm.drizzle.team/docs/sql"
+          - "https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: execute-type-mismatch-no-runtime-check
+        condition: "sql<T> generic parameter does not match actual result shape at runtime"
+        throws: "No error thrown — TypeScript type is a lie; runtime data is wrong shape silently"
+        required_handling: >
+          Caller MUST NOT rely on TypeScript generic type T for runtime validation.
+          Drizzle documentation explicitly states: 'sql<T> does not perform any runtime
+          mapping.' If the SQL result does not match the expected shape, TypeScript will
+          not catch this at runtime — you will get silent type mismatches causing
+          undefined property access or wrong data returned to users.
+          Validate with zod or manual shape checks after db.execute().
+        sources:
+          - "https://orm.drizzle.team/docs/sql"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+edge_cases:
+  - id: transaction-handling
+    description: "Use db.transaction() to wrap multiple operations - must handle transaction errors to ensure rollback and prevent partial commits"
+    sources:
+      - "https://orm.drizzle.team/docs/transactions"
+    severity: warning
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: lost_data
+      incident_cost_range: high
+
+# Category: database
+# Latest version: 0.45.1
+# Generated: 2026-02-25

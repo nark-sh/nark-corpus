@@ -1,0 +1,236 @@
+package: undici
+semver: ">=5.0.0"
+contract_version: "1.1.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-06"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.43
+category: http-client
+description: Official Node.js HTTP/1.1 client implementing the Fetch API standard
+
+detection:
+  factory_methods:
+    - request
+    - fetch
+    - stream
+    - connect
+    - upgrade
+
+functions:
+  - name: request
+    import_path: "undici"
+    description: "Makes HTTP request using undici's low-level API"
+    postconditions:
+      - id: network-error-handling
+        condition: "network failure, DNS error, timeout, connection refused"
+        throws: "Promise rejection with Error"
+        required_handling: "Use try-catch (async/await) or .catch() (promises)"
+        sources:
+          - "https://www.npmjs.com/package/undici"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: fetch
+    import_path: "undici"
+    description: "Makes HTTP request using Fetch API (similar to browser fetch)"
+    postconditions:
+      - id: network-error-handling
+        condition: "network failure, DNS error, timeout, connection refused, certificate errors"
+        throws: "TypeError with 'fetch failed' message and cause property containing underlying error (UND_ERR_SOCKET, etc.)"
+        required_handling: "Use try-catch (async/await) or .catch() (promises)"
+        sources:
+          - "https://undici.nodejs.org/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        notes: >
+          Per Fetch standard, HTTP error status codes (4xx, 5xx) do NOT throw.
+          Only network-level failures throw TypeError. Developers must check response.ok
+          for HTTP errors AND wrap in try-catch for network errors.
+        cve_references:
+          - CVE-2026-22036: Unbounded decompression can cause resource exhaustion
+          - CVE-2025-47279: Bad certificate data causes DoS
+          - CVE-2024-24750: Resource exhaustion on external URLs
+
+  - name: stream
+    import_path: "undici"
+    description: >
+      Faster alternative to request() that avoids buffering the full response body.
+      Calls a factory function with a Readable stream for the response body.
+      Returns Promise<StreamData> on success.
+    postconditions:
+      # Evidence: https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md
+      # Error types confirmed from types/errors.d.ts: UndiciError subclasses
+      # stream() rejects with the same network errors as request() plus factory errors
+      - id: stream-network-error
+        condition: "network failure, DNS error, timeout (UND_ERR_CONNECT_TIMEOUT, UND_ERR_HEADERS_TIMEOUT, UND_ERR_BODY_TIMEOUT, UND_ERR_SOCKET) before or during streaming"
+        throws: "ConnectTimeoutError (UND_ERR_CONNECT_TIMEOUT), HeadersTimeoutError (UND_ERR_HEADERS_TIMEOUT), BodyTimeoutError (UND_ERR_BODY_TIMEOUT), SocketError (UND_ERR_SOCKET)"
+        required_handling: "Wrap await stream() call in try-catch; check error.code for specific timeout vs socket failure"
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+          - "https://undici.nodejs.org/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          stream() rejects with typed UndiciError subclasses on network failure.
+          Unlike request(), stream() begins writing to the factory stream before the
+          full body arrives, so body-phase errors (UND_ERR_BODY_TIMEOUT,
+          UND_ERR_SOCKET mid-stream) can be masked if the await is not wrapped in
+          try-catch. This is particularly dangerous in file upload/download pipelines
+          where partial writes may leave corrupted data on disk.
+        evidence_quality: confirmed
+
+      - id: stream-factory-invalid-return
+        condition: "factory function returns non-Writable value"
+        throws: "InvalidReturnValueError (UND_ERR_INVALID_RETURN_VALUE)"
+        required_handling: "Wrap await stream() in try-catch; factory must return a stream.Writable"
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          If the factory function passed to stream() returns something other than a
+          Writable stream, undici throws InvalidReturnValueError (UND_ERR_INVALID_RETURN_VALUE).
+          This is a programmer error but occurs at runtime in production if factory
+          functions are dynamically constructed (e.g., conditional file writes).
+        evidence_quality: confirmed
+
+  - name: connect
+    import_path: "undici"
+    description: >
+      Initiates an HTTP CONNECT tunnel (used for HTTPS proxying, SSH over HTTP, etc.).
+      Returns Promise<ConnectData> with the raw duplex socket for the tunnel.
+    postconditions:
+      # Evidence: https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md
+      # connect() creates a raw TCP tunnel; all standard network errors apply plus proxy errors
+      - id: connect-network-error
+        condition: "connection refused, timeout, or proxy authentication failure"
+        throws: "ConnectTimeoutError (UND_ERR_CONNECT_TIMEOUT), SocketError (UND_ERR_SOCKET), SecureProxyConnectionError (UND_ERR_PRX_TLS)"
+        required_handling: "Wrap await connect() in try-catch; check error.code for UND_ERR_CONNECT_TIMEOUT vs UND_ERR_PRX_TLS"
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+          - "https://undici.nodejs.org/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          connect() is used to establish raw TCP tunnels through HTTP proxies. It
+          rejects with ConnectTimeoutError if the proxy doesn't respond within the
+          timeout, SocketError for network-level failures, or SecureProxyConnectionError
+          (UND_ERR_PRX_TLS) when TLS negotiation with the proxy fails. Applications
+          using connect() for proxy tunneling must handle all three to avoid crashes
+          when proxy infrastructure is unreachable or misconfigured.
+        evidence_quality: confirmed
+
+  - name: upgrade
+    import_path: "undici"
+    description: >
+      Upgrades an HTTP connection to a different protocol (e.g., WebSocket via
+      HTTP Upgrade header). Returns Promise<UpgradeData> with the raw socket.
+    postconditions:
+      # Evidence: https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md
+      # upgrade() is used for WebSocket and other protocol upgrades — network errors plus socket errors
+      - id: upgrade-network-error
+        condition: "network failure or server rejects upgrade request"
+        throws: "ConnectTimeoutError (UND_ERR_CONNECT_TIMEOUT), SocketError (UND_ERR_SOCKET), HeadersTimeoutError (UND_ERR_HEADERS_TIMEOUT)"
+        required_handling: "Wrap await upgrade() in try-catch"
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+          - "https://undici.nodejs.org/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          upgrade() is commonly used to establish WebSocket connections via undici's
+          low-level HTTP Upgrade mechanism. It rejects if the connection times out,
+          the server rejects the upgrade request, or network errors occur before
+          the upgrade completes. This is particularly impactful in real-time
+          applications where WebSocket connections are established at user login
+          time — unhandled rejections crash the Node.js process.
+        evidence_quality: confirmed
+
+  - name: json
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Parses the response body as JSON. Called as response.json() on a Response
+      object (fetch API) or on BodyMixin. Returns Promise<unknown>.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/json
+      # fetch() does NOT throw on 4xx/5xx — response.ok must be checked separately.
+      # response.json() throws SyntaxError if body is not valid JSON.
+      - id: response-json-parse-error
+        condition: "server returns non-JSON body (HTML error page, empty body, binary content)"
+        throws: "SyntaxError: Unexpected token in JSON"
+        required_handling: "Wrap await response.json() in try-catch; always check response.ok before calling .json()"
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/json"
+          - "https://undici.nodejs.org/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          This is one of the most common bugs with undici's fetch API. fetch() does
+          NOT throw on HTTP 4xx/5xx — it resolves with a Response where response.ok
+          is false. If the developer calls response.json() on an error response (e.g.,
+          a 404 HTML error page or a 500 with plain text), JSON.parse throws SyntaxError.
+          This means two layers of error handling are required: try-catch for network
+          errors (on fetch()) AND response.ok check + try-catch for JSON parsing errors
+          (on response.json()). Missing either layer causes unhandled rejections.
+        evidence_quality: confirmed
+
+      - id: response-ok-not-checked
+        condition: "response.json() called without checking response.ok first"
+        throws: "SyntaxError when server returns error page instead of JSON"
+        required_handling: "Always check response.ok or response.status before calling response.json()"
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/ok"
+          - "https://undici.nodejs.org/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: >
+          Per the Fetch API standard (implemented by undici), HTTP 4xx and 5xx
+          responses do NOT cause fetch() to reject. Instead response.ok is false
+          and response.status contains the HTTP error code. Calling response.json()
+          on a non-OK response that returns an HTML error page or plain text body
+          throws SyntaxError. The correct pattern is: check response.ok (or
+          response.status) first, throw a descriptive error if not OK, then call
+          response.json() only on success responses.
+        evidence_quality: confirmed

@@ -1,0 +1,374 @@
+package: mysql2
+semver: ">=3.9.8"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-03"
+status: production
+evidence_quality: confirmed
+
+# CRITICAL SECURITY NOTE:
+# mysql2 has 5 CRITICAL CVEs in versions < 3.9.8:
+# - CVE-2024-21508 (CVSS 9.8): RCE via supportBigNumbers validation
+# - CVE-2024-21511 (CVSS 9.8): Code injection via timezone parameter
+# - CVE-2024-21509 (CVSS 8.1): Prototype poisoning in results
+# - CVE-2024-21512 (CVSS 8.2): Prototype pollution via nestTables
+# - CVE-2024-21507 (CVSS 6.5): Cache poisoning via keyFromFields
+#
+# MINIMUM VERSION: 3.9.8 (released May 26, 2024)
+# ALL USERS MUST UPGRADE IMMEDIATELY
+#
+# Common production bugs:
+# 1. Connection leaks (forgot connection.release() in finally block) - MOST COMMON
+# 2. SQL injection (using query() instead of execute() for params)
+# 3. Multiple release() calls causing crashes
+# 4. pool.end() called while queries still running
+
+detection:
+  class_names: ["Connection", "Pool", "PoolConnection"]
+  type_names: ["Connection", "Pool", "PoolConnection", "ConnectionOptions"]
+  factory_methods: []
+  require_instance_tracking: true
+
+  await_patterns:
+    # Connection
+    - ".connect("
+    - ".getconnection("
+
+    # Query operations
+    - ".query("
+    - ".execute("
+
+    # Transaction operations
+    - ".beginTransaction("
+    - ".commit("
+    - ".rollback("
+
+functions:
+  - name: connect
+    import_path: "mysql2/promise"
+    description: "Establishes connection to MySQL server"
+    postconditions:
+      - id: connection-failure
+        condition: "Cannot connect (wrong credentials, host unreachable, etc.)"
+        throws: "Error with code 'ECONNREFUSED', 'ER_ACCESS_DENIED_ERROR', etc."
+        required_handling: >
+          Caller MUST catch connection errors.
+          Common error codes:
+          - ECONNREFUSED: MySQL server not running
+          - ER_ACCESS_DENIED_ERROR: Wrong username/password
+          - ETIMEDOUT: Network timeout
+          Implement retry with exponential backoff for transient issues.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: query
+    import_path: "mysql2/promise"
+    description: "Executes SQL query without prepared statements"
+
+    postconditions:
+      # Evidence: seen in 20 primary firings across 3 repos in scan-mysql2-2026-04-03.json
+      # Top affected: cita-777/metapi (⭐ 1176), xpf0000/FlyEnv (⭐ 2574)
+      - id: syntax-error
+        condition: "SQL syntax error"
+        throws: "Error with code 'ER_PARSE_ERROR' or similar"
+        required_handling: >
+          Caller MUST validate SQL syntax before execution.
+          DO NOT retry - indicates SQL syntax error.
+          Check error.sqlMessage for details.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: constraint-violation
+        condition: "Unique constraint, foreign key, or NOT NULL violation"
+        throws: "Error with code 'ER_DUP_ENTRY', 'ER_NO_REFERENCED_ROW', 'ER_BAD_NULL_ERROR'"
+        required_handling: >
+          Caller MUST handle constraint violations:
+          - ER_DUP_ENTRY (1062): Duplicate key violation
+          - ER_NO_REFERENCED_ROW_2 (1452): Foreign key constraint
+          - ER_BAD_NULL_ERROR (1048): NOT NULL constraint
+          Extract details from error.sqlMessage.
+          DO NOT retry without fixing data.
+        sources:
+          - "https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: connection-error
+        condition: "Connection lost during query execution"
+        throws: "Error with code 'PROTOCOL_CONNECTION_LOST', 'ECONNRESET'"
+        required_handling: >
+          Caller MUST handle connection errors.
+          Connection may be lost due to timeout or server restart.
+          Implement retry with exponential backoff.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: table-not-found
+        condition: "Table or view does not exist"
+        throws: "Error with code 'ER_NO_SUCH_TABLE' (1146)"
+        required_handling: >
+          Caller MUST verify table exists before querying.
+          DO NOT retry - indicates schema mismatch or missing migration.
+        sources:
+          - "https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: sql-injection-risk
+        description: >
+          NEVER use query() with string concatenation or template literals for user input.
+          Example VULNERABLE code: query(`SELECT * FROM users WHERE id = ${userId}`)
+          This creates SQL injection vulnerability. ALWAYS use execute() with parameters
+          instead: execute('SELECT * FROM users WHERE id = ?', [userId])
+        sources:
+          - "https://github.com/sidorares/node-mysql2/discussions/1601"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: execute
+    import_path: "mysql2/promise"
+    description: "Executes prepared statement (parameterized query)"
+    postconditions:
+      - id: syntax-error
+        condition: "SQL syntax error in prepared statement"
+        throws: "Error with code 'ER_PARSE_ERROR' or similar"
+        required_handling: >
+          Caller MUST validate SQL syntax.
+          Prepared statements prevent SQL injection but not syntax errors.
+          DO NOT retry - fix SQL syntax.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: constraint-violation
+        condition: "Unique, foreign key, or NOT NULL constraint violation"
+        throws: "Error with code 'ER_DUP_ENTRY', 'ER_NO_REFERENCED_ROW_2', 'ER_BAD_NULL_ERROR'"
+        required_handling: >
+          Caller MUST handle constraint violations gracefully.
+          DO NOT retry without changing violating data.
+        sources:
+          - "https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: connection-error
+        condition: "Connection lost or timeout"
+        throws: "Error with code 'PROTOCOL_CONNECTION_LOST', 'ETIMEDOUT'"
+        required_handling: >
+          Caller MUST handle connection errors.
+          May be transient - implement retry logic.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: prepared-statement-safety
+        description: >
+          execute() uses MySQL prepared statements which prevent SQL injection
+          by design. Parameters are sent separately from SQL query, making injection
+          impossible. This is the recommended method for all queries with user input.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getConnection
+    import_path: "mysql2/promise"
+    description: "Gets connection from pool"
+    postconditions:
+      # Evidence: seen in 5 primary firings across 2 repos in scan-mysql2-2026-04-03.json
+      # Top affected: pk910/PoWFaucet (⭐ 5454)
+      - id: pool-exhausted
+        condition: "All connections in pool are busy and timeout exceeded"
+        throws: "Error with message 'Pool is closed' or timeout error"
+        required_handling: >
+          Caller MUST handle pool exhaustion.
+          Root causes:
+          1. Connections not released (forgot connection.release())
+          2. Pool size too small for load
+          3. Queries taking too long
+          ALWAYS release connections in finally block.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: connection-failure
+        condition: "Cannot establish connection from pool"
+        throws: "Error with code 'ECONNREFUSED', 'ETIMEDOUT'"
+        required_handling: >
+          Caller MUST handle connection failures.
+          Implement retry with exponential backoff.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: connection-leak-prevention
+        description: >
+          MOST COMMON PRODUCTION BUG: Forgetting to call connection.release()
+          causes pool exhaustion. ALWAYS use try-finally pattern:
+          const conn = await pool.getConnection();
+          try {
+            await conn.query(...);
+          } finally {
+            conn.release(); // CRITICAL - must always execute
+          }
+          Failure to release leads to "Pool is closed" errors and application hangs.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/issues/1486"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: multiple-release-calls
+        description: >
+          Calling connection.release() multiple times on the same connection
+          causes "Error: connection already released" and crashes. Only call
+          release() once per getConnection(). Use boolean flag if needed to
+          track release state.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/issues/1234"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: beginTransaction
+    import_path: "mysql2/promise"
+    description: "Starts database transaction"
+    postconditions:
+      - id: transaction-start-failure
+        condition: "Cannot start transaction (connection error, etc.)"
+        throws: "Error with connection-related codes"
+        required_handling: >
+          Caller MUST catch transaction start errors.
+          Network errors may be transient and retriable.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: commit
+    import_path: "mysql2/promise"
+    description: "Commits transaction"
+    postconditions:
+      - id: commit-failure
+        condition: "Transaction commit fails (constraint violation, connection lost, etc.)"
+        throws: "Error with various codes depending on failure reason"
+        required_handling: >
+          Caller MUST catch commit errors.
+          If commit fails, transaction is rolled back.
+          Caller should handle rollback appropriately.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: rollback
+    import_path: "mysql2/promise"
+    description: "Rolls back transaction"
+    postconditions:
+      - id: rollback-failure
+        condition: "Rollback fails (connection lost, etc.)"
+        throws: "Error with connection-related codes"
+        required_handling: >
+          Caller MUST catch rollback errors.
+          Even rollback can fail due to connection issues.
+          Log rollback failures for investigation.
+        sources:
+          - "https://github.com/sidorares/node-mysql2"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

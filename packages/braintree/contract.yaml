@@ -1,0 +1,218 @@
+# Braintree Node.js SDK — dual error model: thrown exceptions + result objects.
+# ALL gateway methods throw on infrastructure failures (auth, network, timeout, not-found).
+# Exception classes: AuthenticationError, AuthorizationError, NotFoundError, ServerError,
+# GatewayTimeoutError, RequestTimeoutError, ServiceUnavailableError, TooManyRequestsError.
+# Separate pattern: result objects (result.success + result.errors) for business logic failures.
+# This contract covers the thrown-exception path (try-catch requirement).
+package: braintree
+semver: ">=3.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-03-13"
+status: production
+evidence_quality: partial
+
+detection:
+  class_names: ["BraintreeGateway"]
+  require_instance_tracking: true
+
+functions:
+  - name: sale
+    import_path: "braintree"
+    description: >
+      Processes a payment transaction (authorize + submit for settlement or just authorize).
+      The most critical Braintree operation — uncaught exceptions mean payment processing
+      silently fails. Throws on auth failure, network error, timeout, or server error.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Infrastructure failure: invalid API credentials (AuthenticationError), network
+          unreachable (ServiceUnavailableError), request timeout (GatewayTimeoutError),
+          Braintree server error (ServerError), or rate limit (TooManyRequestsError).
+          Distinct from business logic failures (result.success=false) which are returned
+          in the result object and do not throw.
+        throws: >
+          AuthenticationError (401 — wrong API credentials),
+          AuthorizationError (403 — key lacks permission),
+          ServerError (5xx — Braintree internal error),
+          GatewayTimeoutError (Braintree gateway timeout),
+          ServiceUnavailableError (Braintree down),
+          TooManyRequestsError (rate limit).
+          All are subclasses of BraintreeError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Payment processing errors must not propagate
+          unhandled — an uncaught exception means the user's payment status is unknown.
+
+          Minimum handling:
+            try {
+              const result = await gateway.transaction.sale({ amount, paymentMethodNonce });
+              if (result.success) {
+                // Payment processed: result.transaction.id
+              } else {
+                // Business logic failure: result.message, result.errors.deepErrors()
+              }
+            } catch (err) {
+              // Infrastructure failure: log and surface appropriate error to user
+            }
+
+          ALSO check result.success for business logic failures (declined, invalid card,
+          validation errors) — these are NOT thrown but returned in result.success=false.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/sale/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: generate
+    import_path: "braintree"
+    description: >
+      Generates a client token required to initialize Braintree's client-side SDK.
+      Must be called before every checkout session. Throws on auth failure or server error.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Infrastructure failure: invalid API credentials, network unreachable, server error,
+          or timeout. Without a valid client token, the client-side Braintree SDK cannot
+          initialize and the user cannot complete checkout.
+        throws: >
+          AuthenticationError, AuthorizationError, ServerError, GatewayTimeoutError,
+          ServiceUnavailableError, TooManyRequestsError.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed clientToken.generate() means
+          the checkout page cannot load Braintree's Drop-in UI or Hosted Fields.
+          Return a 5xx to the client; do not expose raw error details.
+
+          try {
+            const response = await gateway.clientToken.generate({});
+            return response.clientToken;
+          } catch (err) {
+            // Log and return 500 to client
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/client-token/generate/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: create
+    import_path: "braintree"
+    description: >
+      Creates a customer, payment method, or subscription in the Braintree vault.
+      Used for: gateway.customer.create(), gateway.paymentMethod.create(),
+      gateway.subscription.create(). All throw on infrastructure failures.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Infrastructure failure: invalid API credentials, network unreachable, server error,
+          timeout, or rate limit. Separate from validation failures returned in result object.
+        throws: >
+          AuthenticationError, AuthorizationError, ServerError, GatewayTimeoutError,
+          ServiceUnavailableError, TooManyRequestsError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Check result.success after for validation failures.
+
+          try {
+            const result = await gateway.customer.create({ ... });
+            if (result.success) {
+              // result.customer.id
+            } else {
+              // result.message, result.errors.deepErrors()
+            }
+          } catch (err) {
+            // Infrastructure failure
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/customer/create/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: find
+    import_path: "braintree"
+    description: >
+      Finds a transaction, customer, payment method, or subscription by ID.
+      Used for: gateway.transaction.find(), gateway.customer.find(),
+      gateway.subscription.find(). Throws NotFoundError if ID does not exist.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Infrastructure or lookup failure: NotFoundError (invalid/unknown ID),
+          AuthenticationError, ServerError, GatewayTimeoutError, or network failure.
+          NotFoundError is extremely common in production (stale IDs, expired records).
+        throws: >
+          NotFoundError (ID not found — very common in production),
+          AuthenticationError, AuthorizationError, ServerError,
+          GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch, specifically handling NotFoundError.
+
+          try {
+            const transaction = await gateway.transaction.find(transactionId);
+          } catch (err) {
+            if (err instanceof braintree.errorTypes.notFoundError) {
+              // Transaction not found — return 404
+            }
+            throw err;
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: refund
+    import_path: "braintree"
+    description: >
+      Refunds a settled or settling transaction. Throws if transaction is in the wrong
+      state for refunding, or on infrastructure failure.
+
+    postconditions:
+      - id: api-error
+        condition: >
+          Infrastructure failure or invalid transaction state: transaction not yet settled,
+          transaction already fully refunded, or network/server error.
+        throws: >
+          AuthenticationError, AuthorizationError, NotFoundError,
+          ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Failed refunds need explicit handling —
+          customer must be notified if refund cannot be processed.
+
+          try {
+            const result = await gateway.transaction.refund(transactionId, amount);
+            if (result.success) {
+              // Refund processed: result.transaction.id
+            }
+          } catch (err) {
+            // Log and notify: refund failed
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/refund/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high

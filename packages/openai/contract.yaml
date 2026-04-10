@@ -1,0 +1,639 @@
+package: openai
+semver: ">=4.0.0 <5.0.0"
+contract_version: "1.1.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-06"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.50  # 9 contracted functions / 18 async-callable functions (9 omitted as read-only or experimental)
+
+functions:
+  - name: create
+    import_path: "openai"
+    description: "Creates OpenAI resources (chat completions, embeddings, transcriptions, files, vector store files, etc.)"
+
+    postconditions:
+      # Evidence: 27 violations across 19 repos in scan-openai-2026-04-01.json
+      # Top affected: mfts/papermark (⭐8,147), cline/cline (⭐59,274), Codehagen/Badget (⭐2,728)
+      - id: authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Verify API key is correct and not revoked.
+          Use environment variables, never hardcode keys.
+          Alert operations team - this is a configuration error.
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: 37 violations across 19 repos in scan-openai-2026-04-01.json
+      # Top affected: mckaywrigley/chatbot-ui (⭐33,126), czlonkowski/n8n-mcp (⭐15,902), ItzCrazyKns/Vane (⭐33,343)
+      # Severity downgraded error→warning: SDK auto-retries 2× with exponential backoff; caller
+      # still SHOULD implement explicit handling for exhausted retries, but a missing explicit
+      # handler is not crash-severity since the SDK catches most cases automatically.
+      - id: rate-limit-error
+        condition: "Rate limit exceeded - RPM, TPM, RPD, TPD, or IPM (429)"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff retry logic for retries beyond the SDK's 2 automatic retries.
+          Check rate limit headers (x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens).
+          Different endpoints have different limits (IPM for images, RPM/TPM for text).
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://developers.openai.com/api/docs/guides/rate-limits/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: server-error
+        condition: "OpenAI server error (500, 502, 503)"
+        throws: "APIError with status >= 500"
+        required_handling: >
+          Caller SHOULD treat as transient failure and retry with exponential backoff.
+          SDK automatically retries 2 times.
+          If errors persist, check OpenAI status page.
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: timeout-error
+        condition: "Request timeout (default 10 minutes)"
+        throws: "APIConnectionTimeoutError"
+        required_handling: >
+          Caller SHOULD retry with exponential backoff.
+          SDK automatically retries.
+        sources:
+          - "https://www.npmjs.com/package/openai"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: invalid-request-error
+        condition: "Invalid parameters (e.g., model not found, invalid temperature, file too large)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate parameters before making API call.
+          Check error.message for specific parameter that failed.
+          DO NOT retry without fixing the parameter.
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  - name: generate
+    import_path: "openai"
+    description: "Generates images from text prompts using DALL-E"
+
+    postconditions:
+      - id: authentication-error
+        condition: "Invalid API key (401)"
+        throws: "AuthenticationError"
+        required_handling: "Verify API key, DO NOT retry. Alert operations."
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: rate-limit-error-images
+        condition: "Image generation rate limit exceeded (429) - measured in IPM (images per minute)"
+        throws: "RateLimitError"
+        required_handling: >
+          Implement exponential backoff.
+          Image generation has different rate limits than text completion (IPM vs RPM/TPM).
+        sources:
+          - "https://developers.openai.com/api/docs/guides/rate-limits/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: content-policy-violation
+        condition: "Prompt violates content policy"
+        throws: "BadRequestError with content policy violation message"
+        required_handling: >
+          DO NOT retry with same prompt.
+          Return user-friendly error about content policy.
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: server-error
+        condition: "Server error (500+)"
+        throws: "APIError"
+        required_handling: "Retry with exponential backoff. SDK auto-retries 2 times."
+        sources:
+          - "https://developers.openai.com/api/docs/guides/error-codes/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # embeddings.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/embeddings.ts
+  # Used heavily by RAG pipelines, semantic search, and vector indexing workflows.
+  # SDK provides no internal error handling — all errors bubble to caller.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: embeddings.create
+    import_path: "openai"
+    description: >
+      Generates vector embeddings for input text via openai.embeddings.create().
+      Used in RAG pipelines, semantic search, and similarity matching.
+      Errors bubble up to caller — no internal SDK error handling.
+
+    postconditions:
+      # Evidence: AuthenticationError class confirmed in openai-node/src/core/error.ts (status 401)
+      - id: embeddings-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Embedding pipelines often run in background batch jobs where auth failures
+          are silently swallowed, stopping the entire ingestion pipeline without alerting.
+          Alert operations team immediately — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      # Evidence: RateLimitError class confirmed in openai-node/src/core/error.ts (status 429)
+      # Embeddings have separate TPM limits from chat completions.
+      - id: embeddings-rate-limit-error
+        condition: "Rate limit exceeded (429) — TPM or RPM limits on embeddings endpoint"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff beyond the SDK's 2 automatic retries.
+          Large batch embedding jobs (e.g., indexing entire document stores) routinely
+          hit TPM limits. Without explicit handling, batch jobs fail mid-run and leave
+          the vector store in a partially-indexed state.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: BadRequestError confirmed in openai-node/src/core/error.ts (status 400)
+      # text-embedding-ada-002 has 8192 token limit; text-embedding-3-* has higher limits.
+      - id: embeddings-token-limit-error
+        condition: "Input exceeds model token limit (400) — 8192 tokens for ada-002"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST truncate or chunk input text before calling.
+          DO NOT retry without reducing input size.
+          text-embedding-ada-002 limit: 8192 tokens.
+          text-embedding-3-small/large: higher limits but still finite.
+          Silent swallowing means the document is never added to the index.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/embeddings.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # audio.transcriptions.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/transcriptions.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Accepts audio files up to 25 MB. Supports flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: audio.transcriptions.create
+    import_path: "openai"
+    description: >
+      Transcribes audio files to text via openai.audio.transcriptions.create().
+      Supports Whisper and gpt-4o-transcribe models. Max file size 25 MB.
+      Accepts: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+      No internal SDK error handling — errors bubble to caller.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400).
+      # Unsupported formats and files over 25 MB both produce 400 BadRequestError.
+      - id: transcription-invalid-file-error
+        condition: "Unsupported audio format or file exceeds 25 MB size limit (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate file format and size before upload.
+          Supported formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+          Maximum file size: 25 MB.
+          DO NOT retry with the same file — fix the file first.
+          Return user-friendly error indicating the file format or size issue.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/transcriptions.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: transcription-rate-limit-error
+        condition: "Rate limit exceeded (429) — audio transcription has separate RPM limits"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff for batch transcription workflows.
+          Whisper has stricter rate limits than text endpoints (measured in audio minutes/day).
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: transcription-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # audio.speech.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/speech.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # TTS (text-to-speech) endpoint. Input limit: 4096 characters.
+  # Models: tts-1, tts-1-hd, gpt-4o-mini-tts
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: audio.speech.create
+    import_path: "openai"
+    description: >
+      Generates audio from text via openai.audio.speech.create() (TTS).
+      Max input: 4096 characters. Models: tts-1, tts-1-hd, gpt-4o-mini-tts.
+      Returns binary audio data or stream. No internal SDK error handling.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # 4096 char limit confirmed in openai-node/src/resources/audio/speech.ts source
+      - id: speech-input-too-long-error
+        condition: "Input text exceeds 4096 character limit (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate input length before calling.
+          Split text into chunks of ≤4096 characters and concatenate audio outputs.
+          DO NOT retry with the same input without truncation.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/speech.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: speech-rate-limit-error
+        condition: "Rate limit exceeded (429) — TTS has separate character-per-day limits"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff.
+          TTS endpoints have character-per-minute and character-per-day quotas.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # responses.create()  (Responses API — structured outputs, tool use)
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # ResponseError codes confirmed from responses.ts source:
+  #   server_error, rate_limit_exceeded, invalid_prompt, vector_store_timeout,
+  #   invalid_image, image_too_large, image_content_policy_violation, etc.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: responses.create
+    import_path: "openai"
+    description: >
+      Generates model responses via openai.responses.create() (Responses API).
+      Supports tools, structured outputs, image inputs, and background execution.
+      Responses can be incomplete due to token limits or content filtering.
+      ResponseError codes are embedded in the response object, not thrown as exceptions.
+
+    postconditions:
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: responses-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: responses-rate-limit-error
+        condition: "Rate limit exceeded (429)"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff beyond SDK's 2 automatic retries.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: ResponseError.status='incomplete' with incomplete_details confirmed
+      # in responses.ts source. finish_reason='max_output_tokens' or 'content_filter'.
+      - id: responses-incomplete-output
+        condition: "Response truncated due to max_output_tokens limit or content filter"
+        throws: "Does not throw — response.status === 'incomplete' with incomplete_details field"
+        required_handling: >
+          Caller MUST check response.status === 'incomplete' before consuming output.
+          Check response.incomplete_details.reason: 'max_output_tokens' or 'content_filter'.
+          For max_output_tokens: increase max_output_tokens or chunk the prompt.
+          For content_filter: adjust the prompt or return user-friendly error.
+          Treating incomplete responses as complete causes silent data loss.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: ResponseError codes 'invalid_image', 'image_too_large',
+      # 'image_content_policy_violation' confirmed in responses.ts source.
+      - id: responses-image-error
+        condition: "Invalid image input — unsupported format, too large, or content policy violation"
+        throws: "BadRequestError with status 400 (or embedded in response.error)"
+        required_handling: >
+          Caller MUST validate image format, size, and content before sending.
+          Check error code: invalid_image, invalid_base64_image, image_too_large,
+          image_too_small, image_content_policy_violation, unsupported_image_media_type.
+          DO NOT retry with the same image without fixing the issue.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # moderations.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/moderations.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Content safety classification API. Returns flagged categories and scores.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: moderations.create
+    import_path: "openai"
+    description: >
+      Classifies if text and/or image inputs are potentially harmful via
+      openai.moderations.create(). Returns moderation scores per category.
+      No internal SDK error handling — errors bubble to caller.
+
+    postconditions:
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: moderation-rate-limit-error
+        condition: "Rate limit exceeded (429) — moderations endpoint has separate RPM limits"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff.
+          Moderation endpoints have independent RPM limits from completion endpoints.
+          Apps that pre-screen every user message before forwarding to a model
+          can easily hit per-minute limits.
+          SDK automatically retries 2 times.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: moderation-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          If moderation errors are silently swallowed, user content is forwarded
+          to the model without safety checks — a compliance and liability risk.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # batches.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/batches.ts
+  # Batch limits: 50,000 requests per file, 200 MB max file size, 24h window.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: batches.create
+    import_path: "openai"
+    description: >
+      Creates async batch jobs via openai.batches.create().
+      Accepts JSONL file with up to 50,000 requests (200 MB max).
+      Jobs run within a 24h completion window.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # Batch file limits confirmed in batches.ts: 50k requests, 200MB, JSONL format
+      - id: batches-invalid-file-error
+        condition: "Invalid batch file format, exceeds 50,000 requests, or exceeds 200 MB (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate file format (JSONL), request count (≤50,000),
+          and file size (≤200 MB) before calling.
+          DO NOT retry with the same file without fixing the validation issue.
+          Split large jobs into multiple smaller batch files.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/batches.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: Batch status 'failed' and 'expired' confirmed in batches.ts source
+      - id: batches-async-failure
+        condition: "Batch job fails or expires after submission (status: 'failed' or 'expired')"
+        throws: "Does not throw — batch.status becomes 'failed' or 'expired'; check batch.errors"
+        required_handling: >
+          Caller MUST poll batch status via batches.retrieve() until terminal state.
+          Terminal states: 'completed', 'failed', 'expired', 'cancelled'.
+          On 'failed': inspect batch.errors[] for per-request error codes and messages.
+          On 'expired': resubmit the job (24h window passed without completion).
+          Treating a 'failed' or 'expired' batch as completed causes silent data loss.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/batches.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # fine_tuning.jobs.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/fine-tuning/jobs/jobs.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Training file must be uploaded first via files.create() with purpose='fine-tune'.
+  # Job failures are reported in FineTuningJob.error, not thrown as exceptions.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: fine_tuning.jobs.create
+    import_path: "openai"
+    description: >
+      Creates a fine-tuning job via openai.fineTuning.jobs.create().
+      Requires a pre-uploaded training file (files.create() with purpose='fine-tune').
+      Job failure is reported in FineTuningJob.error, not thrown as an exception.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # FineTuningJob.Error.param = 'training_file' when file is invalid
+      - id: fine-tuning-invalid-file-error
+        condition: "Training file validation failed — invalid JSONL, wrong format, or file not ready (400)"
+        throws: "BadRequestError with status 400; or FineTuningJob.error.code with param='training_file'"
+        required_handling: >
+          Caller MUST validate training file format before submitting.
+          Training files must be JSONL with prompt/completion or messages format.
+          File must be uploaded with purpose='fine-tune' via files.create().
+          File status must be 'processed' before referencing it in fine-tuning.
+          Check FineTuningJob.error.code and FineTuningJob.error.message for details.
+          DO NOT retry with the same file without fixing the format.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/fine-tuning/jobs/jobs.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: Job status 'failed' confirmed in fine-tuning/jobs/jobs.ts source
+      - id: fine-tuning-async-job-failure
+        condition: "Fine-tuning job fails during training (status: 'failed')"
+        throws: "Does not throw — FineTuningJob.status becomes 'failed'; inspect FineTuningJob.error"
+        required_handling: >
+          Caller MUST poll job status via fineTuning.jobs.retrieve() until terminal state.
+          Terminal states: 'succeeded', 'failed', 'cancelled'.
+          On 'failed': inspect FineTuningJob.error.code and FineTuningJob.error.message.
+          Common failure causes: insufficient training data, data format errors,
+          quota exceeded, model availability.
+          Training compute costs are incurred even for failed jobs.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/fine-tuning/jobs/jobs.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high

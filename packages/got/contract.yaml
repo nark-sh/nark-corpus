@@ -1,0 +1,509 @@
+package: got
+semver: ">=12.0.0"
+contract_version: "2.0.0"
+maintainer: corpus-team
+last_verified: "2026-04-02"
+status: production
+evidence_quality: confirmed
+
+# Error class hierarchy (all extend RequestError which extends Error):
+#   RequestError         — base: any request failure (code = ECONNREFUSED, ETIMEDOUT, etc.)
+#     HTTPError          — non-2xx/3xx response (code = ERR_NON_2XX_3XX_RESPONSE)
+#     MaxRedirectsError  — >10 redirects (code = ERR_TOO_MANY_REDIRECTS)
+#     TimeoutError       — request aborted due to timeout (event = 'connect'|'request'|etc.)
+#     ReadError          — failure reading from response stream
+#     CacheError         — cache adapter failure
+#     UploadError        — failure reading from request body stream
+#     RetryError         — manual retry trigger (always triggers a new retry)
+#     AbortError         — aborted via AbortController (code = ERR_ABORTED)
+#   CancelError          — promise cancelled via .cancel() (Promise API only)
+#
+# throwHttpErrors (default: true):
+#   When true:  4xx/5xx → throws HTTPError
+#   When false: 4xx/5xx → resolves with response (no throw)
+#
+# Retry defaults: limit=2, methods=[GET,PUT,HEAD,DELETE,OPTIONS,TRACE], NOT POST/PATCH
+#   Status codes retried: 408, 413, 429, 500, 502, 503, 504, 521, 522, 524
+#   Network codes retried: ETIMEDOUT, ECONNRESET, EADDRINUSE, ECONNREFUSED, EPIPE, ENOTFOUND, ENETUNREACH, EAI_AGAIN
+#   After retries exhausted → throws RequestError or HTTPError
+#
+# Stream API (got.stream()): Returns a Duplex stream, NOT a Promise.
+#   Errors are emitted as 'error' events, not Promise rejections.
+#   Requires .on('error', handler) — not try-catch on await.
+#
+# got.extend(): Creates new Got instance inheriting all defaults. Identical error behavior.
+#   Extended instances (and instances of extended instances) throw the same error types.
+
+detection:
+  factory_methods:
+    - default
+    - extend
+
+functions:
+  - name: default
+    import_path: got
+    description: >
+      Makes an HTTP request (default method GET). Returns a CancelableRequest (Promise).
+      Throws on network failures, timeouts, and HTTP errors (4xx/5xx) by default.
+    postconditions:
+      - id: http-error
+        condition: >
+          Server responds with a non-2xx, non-3xx status code and throwHttpErrors is true (default).
+        throws: HTTPError with code ERR_NON_2XX_3XX_RESPONSE; error.response contains the full response
+        required_handling: >
+          Caller MUST wrap in try-catch (async/await) or .catch() (promise chain).
+          Inspect error.response.statusCode to distinguish client vs server errors.
+          Do not retry 4xx errors without user intervention (except 408, 413, 429).
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: >
+          Network-level failure: DNS resolution failure (ENOTFOUND, EAI_AGAIN), connection refused
+          (ECONNREFUSED), connection reset (ECONNRESET), timeout (ETIMEDOUT), no route (ENETUNREACH),
+          or pipe broken (EPIPE). This is thrown after all retries are exhausted.
+        throws: RequestError with a POSIX error code (e.g. ECONNREFUSED, ETIMEDOUT, ENOTFOUND)
+        required_handling: >
+          Caller MUST wrap in try-catch. Check error.code for specific network condition.
+          Got retries these automatically (limit=2 by default) before throwing — the thrown error
+          is from the final attempt. Implement additional retry logic only if default retry is disabled.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: timeout-error
+        condition: One of the timeout limits (connect, send, response, request, etc.) was exceeded.
+        throws: >
+          TimeoutError (subclass of RequestError) with error.event indicating which phase timed out
+          (e.g. 'connect', 'request', 'response'). Code is ETIMEDOUT.
+        required_handling: >
+          Caller MUST wrap in try-catch. Check error.event to understand which phase timed out.
+          ETIMEDOUT is in the default retry error codes — Got will retry before throwing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: max-redirects-error
+        condition: "The server redirected more than maxRedirects times (default: 10)."
+        throws: "MaxRedirectsError (subclass of RequestError) with code ERR_TOO_MANY_REDIRECTS"
+        required_handling: >
+          Caller MUST wrap in try-catch. This indicates a redirect loop or misconfigured server.
+          Do not retry automatically.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: throw-http-errors-false
+        description: >
+          When throwHttpErrors: false is set, 4xx and 5xx responses do NOT throw HTTPError.
+          Instead the promise resolves with the response object. Callers must check
+          response.statusCode manually. Network errors (RequestError, TimeoutError, etc.)
+          still throw regardless of this setting.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/2-options.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: retry-does-not-cover-post
+        description: >
+          By default, got does NOT retry POST or PATCH requests. Only GET, PUT, HEAD, DELETE,
+          OPTIONS, and TRACE are retried. The final error from a failed POST is thrown immediately
+          after the first failure (no automatic retry).
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/7-retry.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: get
+    import_path: got
+    description: Makes an HTTP GET request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with error.response containing status code and body
+        required_handling: Caller MUST wrap in try-catch or .catch(). Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, connection reset, timeout, or unreachable network (after retries).
+        throws: RequestError (or subclass TimeoutError) with a POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. GET is in the default retry methods list — got will
+          retry up to 2 times before throwing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: post
+    import_path: got
+    description: Makes an HTTP POST request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with error.response containing status code and body
+        required_handling: Caller MUST wrap in try-catch or .catch(). Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, connection reset, timeout, or unreachable network.
+        throws: RequestError or TimeoutError with POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. NOTE: POST is NOT in got's default retry methods list,
+          so the error is thrown after the first failure with no automatic retry.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-error
+        condition: The request body is a stream and an error occurs reading from that stream.
+        throws: UploadError (subclass of RequestError)
+        required_handling: Caller MUST wrap in try-catch. Validate body stream before sending.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: put
+    import_path: got
+    description: Makes an HTTP PUT request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with error.response containing status code and body
+        required_handling: Caller MUST wrap in try-catch or .catch(). Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, connection reset, timeout, or unreachable network (after retries).
+        throws: RequestError or TimeoutError with POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. PUT is in the default retry methods list — got will
+          retry up to 2 times before throwing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: patch
+    import_path: got
+    description: Makes an HTTP PATCH request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with error.response containing status code and body
+        required_handling: Caller MUST wrap in try-catch or .catch(). Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, connection reset, timeout, or unreachable network.
+        throws: RequestError or TimeoutError with POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. NOTE: PATCH is NOT in got's default retry methods list,
+          so the error is thrown after the first failure with no automatic retry.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: delete
+    import_path: got
+    description: Makes an HTTP DELETE request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with error.response containing status code and body
+        required_handling: Caller MUST wrap in try-catch or .catch(). Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, connection reset, timeout, or unreachable network (after retries).
+        throws: RequestError or TimeoutError with POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. DELETE is in the default retry methods list — got will
+          retry up to 2 times before throwing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: head
+    import_path: got
+    description: Makes an HTTP HEAD request. Returns a CancelableRequest (Promise).
+    postconditions:
+      - id: http-error
+        condition: Server responds with non-2xx/3xx status and throwHttpErrors is true (default).
+        throws: HTTPError with code ERR_NON_2XX_3XX_RESPONSE
+        required_handling: Caller MUST wrap in try-catch or .catch().
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-error
+        condition: DNS failure, connection refused, timeout, or unreachable network (after retries).
+        throws: RequestError or TimeoutError with POSIX error code
+        required_handling: >
+          Caller MUST wrap in try-catch. HEAD is in the default retry methods list.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stream
+    import_path: got
+    description: >
+      Returns a Duplex stream (NOT a Promise). Sets isStream: true internally.
+      Errors are emitted as 'error' events on the stream — they do NOT reject a Promise.
+      The stream also emits 'request', 'response', 'redirect', 'uploadProgress', 'downloadProgress'.
+    postconditions:
+      - id: stream-error-event
+        condition: >
+          Any error occurs during the request: network failure, timeout, HTTP error (when
+          throwHttpErrors is true), read error, or upload error.
+        throws: >
+          RequestError or subclass is emitted as an 'error' event on the stream.
+          This is NOT a Promise rejection. Without an error listener, Node.js will
+          throw an uncaught exception and crash the process.
+        required_handling: >
+          Caller MUST attach an 'error' event listener: stream.on('error', handler).
+          Using try-catch around got.stream() does NOT catch these errors.
+          When piping, the error listener must be on the got stream itself, not just the
+          destination stream.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: stream-no-retry
+        description: >
+          When using the Stream API, the beforeRetry hook is ignored. Retries do not
+          apply to the Stream API in the same way as the Promise API.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: stream-http-errors
+        description: >
+          HTTPError (non-2xx/3xx response) is still emitted as an 'error' event on the stream
+          when throwHttpErrors is true (default). Set throwHttpErrors: false to suppress this
+          and receive the error response body through the stream.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: paginate
+    import_path: got
+    description: >
+      Returns an AsyncIterableIterator that yields items across paginated responses.
+      Internally makes multiple got() requests. Also has got.paginate.all() which returns
+      Promise<T[]>. Errors propagate from the underlying got() requests.
+    postconditions:
+      - id: paginate-http-error
+        condition: >
+          Any paginated request receives a non-2xx/3xx response and throwHttpErrors is true (default).
+        throws: HTTPError from the failing request; iteration stops immediately
+        required_handling: >
+          Caller MUST wrap the for-await-of loop in try-catch.
+          got.paginate.all() returns a Promise and must be wrapped in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/4-pagination.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: paginate-network-error
+        condition: Any paginated request fails with a network error (after retries).
+        throws: RequestError or subclass; iteration stops immediately
+        required_handling: >
+          Caller MUST wrap the for-await-of loop (or got.paginate.all() await) in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/4-pagination.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: extend
+    import_path: got
+    description: >
+      Creates a new Got instance with merged default options. The returned instance has
+      identical method signatures (get, post, put, patch, delete, head, stream, paginate, extend).
+      All error behavior is identical to the base got instance.
+    postconditions:
+      - id: inherited-http-error
+        condition: >
+          Any request on the extended instance receives a non-2xx/3xx response
+          and throwHttpErrors is true (default, unless overridden in extend options).
+        throws: HTTPError — same as base got
+        required_handling: >
+          Caller MUST wrap in try-catch or .catch(). Extended instances inherit all retry
+          and error-throwing behavior from their parent. Check error.response.statusCode.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/10-instances.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: inherited-network-error
+        condition: Any request on the extended instance fails with a network error (after retries).
+        throws: RequestError or subclass — same as base got
+        required_handling: Caller MUST wrap in try-catch. Error behavior is identical to base got.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/10-instances.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

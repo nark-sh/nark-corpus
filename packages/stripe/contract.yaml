@@ -1,0 +1,598 @@
+package: stripe
+semver: ">=8.0.0 <16.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-06"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.56
+
+functions:
+  - name: create
+    import_path: "stripe"
+    description: "Creates a Stripe resource (charge, paymentIntent, customer, refund, etc.)"
+
+    postconditions:
+      # Evidence: seen in 50 primary firings across 36 repos in scan-stripe-2026-04-01.json
+      # Top affected: nextjs/saas-starter (15534★), ghostfolio/ghostfolio (7985★), sadmann7/skateshop (5493★)
+      - id: card-error
+        condition: "Card was declined or invalid"
+        throws: "StripeCardError with error.type === 'card_error'"
+        required_handling: >
+          Caller MUST catch StripeCardError and handle gracefully.
+          Display user-friendly message based on error.decline_code.
+          DO NOT retry card_error without user intervention.
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      # Evidence: seen in 76 primary firings + 115 sub-violation hits across 36 repos in scan-stripe-2026-04-01.json
+      # Top affected: shadcn-ui/taxonomy (19179★), nextjs/saas-starter (15534★), Snouzy/workout-cool (7137★)
+      - id: rate-limit-error
+        condition: "Too many API requests"
+        throws: "StripeRateLimitError with error.type === 'rate_limit_error'"
+        required_handling: >
+          Caller SHOULD implement exponential backoff retry logic OR explicitly catch
+          Stripe.errors.StripeRateLimitError with instanceof to handle gracefully.
+          An explicit instanceof Stripe.errors.StripeRateLimitError check satisfies this postcondition.
+          Stripe rate limits are per-account, not per-key.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://stripe.com/docs/rate-limits"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: seen in 115 sub-violation hits across 36 repos in scan-stripe-2026-04-01.json
+      # Top affected: nextjs/saas-starter (15534★), vercel/nextjs-subscription-payments (7713★), antiwork/shortest (5546★)
+      - id: authentication-error
+        condition: "Invalid API key"
+        throws: "StripeAuthenticationError with error.type === 'authentication_error'"
+        required_handling: >
+          Caller MUST NOT retry. This indicates configuration error.
+          Log error and alert operations team immediately.
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      # Evidence: seen in 115 sub-violation hits across 36 repos in scan-stripe-2026-04-01.json
+      # Top affected: nextjs/saas-starter (15534★), vercel/nextjs-subscription-payments (7713★), antiwork/shortest (5546★)
+      - id: network-error
+        condition: "Network connectivity issue"
+        throws: "Error with no error.type (connection error)"
+        required_handling: >
+          Caller MUST handle network errors separately from Stripe API errors.
+          Implement retry with exponential backoff (max 3 attempts).
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: confirm
+    import_path: "stripe"
+    description: "Confirms a PaymentIntent to complete the payment"
+
+    postconditions:
+      - id: card-error
+        condition: "Card declined during confirmation"
+        throws: "StripeCardError"
+        required_handling: "Return to payment form, allow user to update payment method"
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: rate-limit-error
+        condition: "Rate limit exceeded"
+        throws: "StripeRateLimitError"
+        required_handling: >
+          Caller SHOULD implement exponential backoff retry logic OR explicitly catch
+          Stripe.errors.StripeRateLimitError with instanceof to handle gracefully.
+          An explicit instanceof Stripe.errors.StripeRateLimitError check satisfies this postcondition.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://stripe.com/docs/rate-limits"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: authentication-error
+        condition: "Invalid API key"
+        throws: "StripeAuthenticationError"
+        required_handling: "DO NOT retry, alert operations"
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      - id: network-error
+        condition: "Network error during confirmation"
+        throws: "Network error"
+        required_handling: "Retry with idempotency key. Query payment status before creating new PaymentIntent."
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: constructEvent
+    import_path: "stripe"
+    description: "Verifies and constructs an event from webhook payload"
+
+    postconditions:
+      - id: signature-verification-failed
+        condition: "Webhook signature is invalid"
+        throws: "StripeSignatureVerificationError"
+        required_handling: >
+          Return 400 Bad Request immediately. DO NOT process the webhook.
+          Log the error for security monitoring (possible attack).
+        sources:
+          - "https://stripe.com/docs/webhooks/signatures"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: timestamp-too-old
+        condition: "Webhook timestamp is too old (replay attack)"
+        throws: "StripeSignatureVerificationError with 'Timestamp outside the tolerance zone' message"
+        required_handling: "Return 400. This prevents replay attacks."
+        sources:
+          - "https://stripe.com/docs/webhooks/signatures"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+  - name: retrieve
+    import_path: "stripe"
+    description: "Retrieves a Stripe resource (customer, paymentIntent, subscription, product, etc.)"
+
+    postconditions:
+      # Evidence: seen in 65 primary firings across 26 repos in scan-stripe-2026-04-01.json
+      # Top affected: shadcn-ui/taxonomy (19179★), nextjs/saas-starter (15534★), vercel/nextjs-subscription-payments (7713★)
+      - id: resource-not-found
+        condition: "Resource ID does not exist"
+        throws: "StripeInvalidRequestError with code 'resource_missing'"
+        required_handling: "Handle missing resource gracefully. DO NOT retry."
+        sources:
+          - "https://stripe.com/docs/api/errors"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: seen in 76 primary firings + 115 sub-violation hits across 26 repos in scan-stripe-2026-04-01.json
+      # Top affected: ghostfolio/ghostfolio (7985★), nextjs/saas-starter (15534★), skillrecordings/egghead-next (1448★)
+      - id: rate-limit-error
+        condition: "Rate limit exceeded"
+        throws: "StripeRateLimitError"
+        required_handling: >
+          Caller SHOULD implement exponential backoff retry logic OR explicitly catch
+          Stripe.errors.StripeRateLimitError with instanceof to handle gracefully.
+          An explicit instanceof Stripe.errors.StripeRateLimitError check satisfies this postcondition.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://stripe.com/docs/rate-limits"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: seen in 115 sub-violation hits across 26 repos in scan-stripe-2026-04-01.json
+      - id: authentication-error
+        condition: "Invalid API key"
+        throws: "StripeAuthenticationError"
+        required_handling: "DO NOT retry, alert operations"
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      # Evidence: seen in 115 sub-violation hits across 26 repos in scan-stripe-2026-04-01.json
+      - id: network-error
+        condition: "Network error"
+        throws: "Network error"
+        required_handling: "Retry with exponential backoff"
+        sources:
+          - "https://stripe.com/docs/error-handling"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: capture
+    import_path: "stripe"
+    description: >
+      Captures an authorized PaymentIntent or Charge. Used in two-step payment flows
+      where authorization and capture are separated (e.g., hotel holds, marketplace payouts).
+      Must be called within 7 days of authorization or the authorization expires.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-codes (capture_charge_authorization_expired, charge_already_captured, charge_expired_for_capture)
+      # Error class names confirmed from stripe node_modules/stripe/types/Errors.d.ts
+      - id: capture-authorization-expired
+        condition: "Authorization has expired (not captured within 7 days by default)"
+        throws: "StripeInvalidRequestError with code 'charge_expired_for_capture' or 'capture_charge_authorization_expired'"
+        required_handling: >
+          Caller MUST handle authorization expiry and inform the user that payment
+          authorization has expired. A new PaymentIntent must be created. DO NOT retry
+          the capture — create a fresh payment flow instead.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/api/payment_intents/capture"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: capture-already-captured
+        condition: "PaymentIntent or Charge has already been captured"
+        throws: "StripeInvalidRequestError with code 'charge_already_captured'"
+        required_handling: >
+          Caller MUST check for already-captured errors when using idempotency keys
+          or retry logic. Retrying a capture without an idempotency key can result in
+          double-capture attempts. Catch and treat as success if payment already captured.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: capture-invalid-state
+        condition: "PaymentIntent is not in a capturable state (e.g., already canceled, requires_action)"
+        throws: "StripeInvalidRequestError with type 'invalid_request_error'"
+        required_handling: >
+          Caller MUST handle invalid state errors. Check PaymentIntent status before
+          attempting capture. Only PaymentIntents in 'requires_capture' status can be captured.
+        sources:
+          - "https://docs.stripe.com/api/payment_intents/capture"
+          - "https://docs.stripe.com/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: capture-rate-limit
+        condition: "Rate limit exceeded"
+        throws: "StripeRateLimitError"
+        required_handling: >
+          Implement exponential backoff. Use idempotency keys to safely retry captures
+          without risk of double-charging.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://docs.stripe.com/rate-limits"
+          - "https://docs.stripe.com/error-handling"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: cancel
+    import_path: "stripe"
+    description: >
+      Cancels a subscription or PaymentIntent. For subscriptions, immediately cancels
+      billing and sets status to 'canceled'. This is irreversible — a canceled subscription
+      cannot be reactivated and the customer must subscribe again.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-codes (customer_max_subscriptions, resource_missing)
+      # Error class names confirmed from stripe node_modules/stripe/types/Errors.d.ts
+      - id: cancel-resource-not-found
+        condition: "Subscription or PaymentIntent ID does not exist"
+        throws: "StripeInvalidRequestError with code 'resource_missing'"
+        required_handling: >
+          Caller MUST handle missing resource errors. The resource may have been
+          deleted already or the ID may be incorrect. Log the error and treat as
+          already-canceled where appropriate.
+        sources:
+          - "https://docs.stripe.com/api/subscriptions/cancel"
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: cancel-already-canceled
+        condition: "Subscription is already canceled"
+        throws: "StripeInvalidRequestError — subscription is already canceled"
+        required_handling: >
+          Caller SHOULD handle idempotently. If the subscription is already canceled,
+          this is a no-op from a business perspective. Catch and treat as success.
+          Avoid surfacing this error to end users.
+        sources:
+          - "https://docs.stripe.com/api/subscriptions/cancel"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: cancel-authentication-error
+        condition: "Invalid or revoked API key"
+        throws: "StripeAuthenticationError"
+        required_handling: >
+          DO NOT retry. Log immediately and alert operations — the subscription
+          cancellation did not complete. The customer will continue to be billed
+          until this is resolved.
+        sources:
+          - "https://docs.stripe.com/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+  - name: refund
+    import_path: "stripe"
+    description: >
+      Creates a refund for a Charge or PaymentIntent. Refunds are irreversible — once
+      issued, they cannot be canceled. Partial refunds are supported. Refunds can take
+      5-10 business days to appear on a customer's statement.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-codes (charge_already_refunded, charge_disputed, refund_disputed_payment)
+      # Error class names confirmed from stripe node_modules/stripe/types/Errors.d.ts
+      - id: refund-already-refunded
+        condition: "Charge or PaymentIntent has already been fully refunded"
+        throws: "StripeInvalidRequestError with code 'charge_already_refunded'"
+        required_handling: >
+          Caller MUST check for already-refunded errors. This commonly occurs when
+          webhook retry logic or duplicate requests cause a second refund attempt.
+          Catch and treat as success if already refunded; do NOT surface to customer
+          as an error.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/api/refunds/create"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: refund-disputed-charge
+        condition: "Charge has been disputed (charged back by the customer's bank)"
+        throws: "StripeInvalidRequestError with code 'charge_disputed' or 'refund_disputed_payment'"
+        required_handling: >
+          Caller MUST handle disputed charges separately from standard refunds.
+          Refunding a disputed charge does not automatically close the dispute.
+          Respond to the dispute via the Stripe dashboard instead of issuing
+          a programmatic refund.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: refund-invalid-amount
+        condition: "Refund amount exceeds the remaining unrefunded amount"
+        throws: "StripeInvalidRequestError with type 'invalid_request_error'"
+        required_handling: >
+          Caller MUST validate refund amount against original charge amount and any
+          prior partial refunds before issuing. Partial refunds: track the sum of all
+          refunds to prevent over-refunding.
+        sources:
+          - "https://docs.stripe.com/api/refunds/create"
+          - "https://docs.stripe.com/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: refund-rate-limit
+        condition: "Rate limit exceeded"
+        throws: "StripeRateLimitError"
+        required_handling: >
+          Implement exponential backoff. Use idempotency keys to safely retry refunds
+          without risk of double-refunding.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://docs.stripe.com/rate-limits"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: attach
+    import_path: "stripe"
+    description: >
+      Attaches a PaymentMethod to a Customer, enabling it to be used for future charges
+      and subscriptions. A PaymentMethod can only be attached to one Customer at a time.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-handling (StripeInvalidRequestError for invalid state)
+      # Error class names confirmed from stripe node_modules/stripe/types/Errors.d.ts
+      - id: attach-already-attached
+        condition: "PaymentMethod is already attached to a different Customer"
+        throws: "StripeInvalidRequestError — PaymentMethod already attached to another Customer"
+        required_handling: >
+          Caller MUST handle already-attached errors. Detach the PaymentMethod from
+          the current Customer first, or clone it for Connect platforms using the
+          payment_method.clone endpoint. Do not surface as a generic error.
+        sources:
+          - "https://docs.stripe.com/api/payment_methods/attach"
+          - "https://docs.stripe.com/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: attach-authentication-required
+        condition: "Card requires additional authentication (3D Secure) before it can be attached"
+        throws: "StripeCardError with code 'authentication_required'"
+        required_handling: >
+          Caller MUST handle authentication_required by initiating a SetupIntent flow
+          to authenticate the card before attaching. Do not retry the attach directly.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/payments/3d-secure"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: detach
+    import_path: "stripe"
+    description: >
+      Detaches a PaymentMethod from a Customer. After detachment, the PaymentMethod
+      can no longer be used for future charges. If the PaymentMethod is the default
+      for a subscription, the subscription will fail to charge on the next billing cycle.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-handling (StripeInvalidRequestError)
+      # Error class names confirmed from stripe node_modules/stripe/types/Errors.d.ts
+      - id: detach-default-payment-method
+        condition: >
+          Detaching the default PaymentMethod from a Customer that has active
+          subscriptions will cause those subscriptions to fail on next billing cycle
+        throws: >
+          No immediate error thrown — but subsequent subscription charges throw
+          StripeCardError with code 'payment_method_unactivated' or 'card_declined'
+        required_handling: >
+          Caller MUST check whether the PaymentMethod being detached is the default
+          for any active subscription before detaching. Update the subscription's
+          default_payment_method first if needed. Silent subscription failures will
+          occur on the next billing cycle if this is not handled.
+        sources:
+          - "https://docs.stripe.com/api/payment_methods/detach"
+          - "https://docs.stripe.com/billing/subscriptions/overview"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: detach-not-attached
+        condition: "PaymentMethod is not attached to any Customer"
+        throws: "StripeInvalidRequestError — PaymentMethod is not attached to a customer"
+        required_handling: >
+          Caller SHOULD handle idempotently. If the PaymentMethod is already detached,
+          treat as success.
+        sources:
+          - "https://docs.stripe.com/api/payment_methods/detach"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low

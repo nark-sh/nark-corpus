@@ -1,0 +1,435 @@
+package: knex
+semver: '>=3.0.0 <4.0.0'
+contract_version: 1.0.0
+maintainer: corpus-team
+last_verified: '2026-04-06'
+status: production
+evidence_quality: confirmed
+coverage_score: 0.77
+detection:
+  type_names:
+    - Knex
+    - QueryBuilder
+    - Transaction
+functions:
+  - name: select
+    import_path: knex
+    description: Executes SELECT query
+    postconditions:
+      - id: select-query-error
+        condition: query fails (syntax error, connection lost, timeout, invalid table/column)
+        throws: Error with query details and database-specific error code
+        required_handling: >-
+          Caller MUST wrap select() in try-catch to handle SQL errors, connection failures, and timeouts. Query errors
+          crash application if unhandled.
+        sources:
+          - https://knexjs.org/guide/query-builder.html
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+  - name: insert
+    import_path: knex
+    description: Executes INSERT query
+    postconditions:
+      - id: insert-constraint-violation
+        condition: insert violates constraint (unique, foreign key, not null, type mismatch)
+        throws: Error with constraint violation details and database error code
+        required_handling: >-
+          Caller MUST wrap insert() in try-catch to handle constraint violations. Unique violations, foreign key errors,
+          and type mismatches crash application if unhandled.
+        sources:
+          - https://knexjs.org/guide/query-builder.html#insert
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+  - name: update
+    import_path: knex
+    description: >
+      Executes UPDATE query to modify existing rows. Returns the number of affected rows (or updated records with
+      RETURNING on PostgreSQL). Unlike insert(), update() silently succeeds with 0 affected rows when WHERE clause
+      matches nothing — a common silent data-loss bug.
+    postconditions:
+      - id: update-no-try-catch
+        condition: |
+          update() called in async context without try-catch or .catch() handler
+        throws: Error with database-specific error code and query details
+        severity: error
+        description: >
+          update() makes a network call to the database and can throw on connection failure, query timeout
+          (KnexTimeoutError after acquireConnectionTimeout ms, default 60s), invalid column names, type mismatches, and
+          check constraint violations. Unhandled rejection crashes the application or hangs the request.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#update
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: update-zero-rows-not-checked
+        condition: >
+          update() result (number of affected rows) is not checked after execution — caller assumes update succeeded
+          when WHERE matched nothing
+        throws: does not throw — returns 0 silently
+        severity: warning
+        description: >
+          update() returns the number of affected rows (integer). When the WHERE clause matches no rows, it returns 0
+          without throwing. This is a silent no-op: the caller's data was not updated, but no error is raised. Common
+          bug: updating a record by ID after it was deleted by another process — the update silently succeeds with 0
+          rows, leaving the caller believing the update succeeded.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#update
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: delete
+    import_path: knex
+    description: >
+      Executes DELETE query to remove rows. Aliased as del() in JavaScript since delete is a reserved keyword. Returns
+      the number of deleted rows. Like update(), silently succeeds with 0 when WHERE matches nothing.
+    postconditions:
+      - id: delete-no-try-catch
+        condition: |
+          del()/delete() called in async context without try-catch or .catch() handler
+        throws: Error with database-specific error code; KnexTimeoutError on connection timeout
+        severity: error
+        description: >
+          del()/delete() makes a network call to the database and can throw on connection failure, foreign key violation
+          (deleting parent of existing child rows), query timeout (KnexTimeoutError), and trigger errors. Unhandled
+          rejection crashes the application.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#del-delete
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: delete-foreign-key-violation
+        condition: >
+          delete() called on a parent row that has child rows in another table with a foreign key constraint, without
+          CASCADE
+        throws: Error with foreign key constraint violation from database driver
+        severity: error
+        description: >
+          Deleting a parent record when child records reference it via foreign key (without ON DELETE CASCADE) throws a
+          database-native error. The error message varies by driver: PostgreSQL throws "violates foreign key
+          constraint", MySQL throws "Cannot delete or update a parent row: a foreign key constraint fails". This is
+          distinct from the generic query error and requires specific handling to provide meaningful user feedback.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#del-delete
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: first
+    import_path: knex
+    description: >
+      Executes SELECT with LIMIT 1 and returns the first matching row, or undefined when no rows match. Unlike select()
+      which returns an array, first() returns a single object or undefined. The undefined return on no match is a
+      distinct failure mode — callers that don't null-check first() before accessing properties will throw TypeError at
+      runtime.
+    postconditions:
+      - id: first-no-try-catch
+        condition: |
+          first() called in async context without try-catch
+        throws: Error with database-specific error code on query failure
+        severity: error
+        description: >
+          first() executes a SELECT LIMIT 1 and throws on connection failure, timeout, invalid column, or syntax error.
+          Same error types as select() — KnexTimeoutError on connection pool exhaustion.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#first
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: first-undefined-not-checked
+        condition: >
+          first() result used directly without null/undefined check before accessing properties (e.g. result.id,
+          result.name)
+        throws: 'TypeError: Cannot read properties of undefined at runtime'
+        severity: error
+        description: >
+          first() returns undefined when no rows match the WHERE clause. Callers that immediately destructure or access
+          properties on the result without checking for undefined throw TypeError at runtime. This is the most common
+          knex first() bug: fetching a user by ID and accessing user.email without checking if user exists. The database
+          call succeeds, but the property access crashes.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html#first
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: raw
+    import_path: knex
+    description: >
+      Executes raw SQL with optional parameter binding. The primary escape hatch for complex queries not expressible via
+      query builder. Has two distinct error modes: binding errors (thrown synchronously before query execution) and SQL
+      execution errors (thrown async after database execution).
+    postconditions:
+      - id: raw-no-try-catch
+        condition: |
+          knex.raw() called in async context without try-catch
+        throws: Error with SQL error details from database; or binding Error synchronously on undefined binding
+        severity: error
+        description: >
+          raw() can throw in two ways: (1) synchronously with "Undefined binding(s) detected" when a named binding
+          references undefined — thrown before any network call from knex/lib/raw.js; (2) asynchronously with
+          database-native error on SQL execution failure (syntax error, permission denied, invalid table). Both must be
+          handled. The synchronous throw is particularly dangerous — it propagates as an unhandled rejection in async
+          contexts when the await is missing.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/raw.html
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: raw-sql-injection-risk
+        condition: >
+          knex.raw() called with user-provided input interpolated directly into the SQL string (template literal or
+          string concatenation) instead of using binding parameters
+        throws: does not throw — silently executes malicious SQL
+        severity: error
+        description: >
+          knex.raw('SELECT * FROM users WHERE id = ' + userId) is vulnerable to SQL injection. The knex docs explicitly
+          warn: "Avoid interpolating raw strings for lists when values come from users." The safe pattern is
+          knex.raw('SELECT * FROM users WHERE id = ?', [userId]) which passes values as bound parameters. Direct
+          interpolation allows attackers to exfiltrate or modify the entire database.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/raw.html#sql-injection
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: destroy
+    import_path: knex
+    description: >
+      Closes all connections in the connection pool and terminates the pool. Must be called during graceful shutdown.
+      Failure to call destroy() causes the process to hang indefinitely (the pool's event loop reference prevents exit).
+      Returns a Promise.
+    postconditions:
+      - id: destroy-not-called-on-shutdown
+        condition: >
+          knex instance is created but destroy() is never called — process exits (or tries to exit) without closing the
+          connection pool
+        throws: does not throw — process hangs indefinitely, never exits
+        severity: warning
+        description: >
+          The knex connection pool (backed by tarn) holds open database connections. These connections hold open the
+          Node.js event loop. If destroy() is not called before process exit, the event loop never drains and the
+          process hangs indefinitely. This is documented at https://knexjs.org/guide/#destroy. The pattern is especially
+          common in: CLI scripts, test files that spin up knex, and background workers that don't hook SIGTERM/SIGINT.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/#destroy
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: destroy-no-try-catch
+        condition: |
+          await knex.destroy() called without try-catch
+        throws: Error on pool teardown failure (rare but possible on network error)
+        severity: warning
+        description: >
+          knex.destroy() is async and can throw if pool teardown encounters an error (e.g., connection is mid-query
+          during forced shutdown). Typically used in finally blocks during graceful shutdown — if it throws and is
+          unhandled, the finally block exits abnormally.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/#destroy
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: batchInsert
+    import_path: knex
+    description: >
+      Inserts a large array of records in chunks within an automatic transaction. If no external transaction is
+      provided, knex.batchInsert() creates its own transaction wrapping all chunks. A failure in any chunk rolls back
+      all previously inserted chunks. chunk size defaults to 1000 rows.
+    postconditions:
+      - id: batch-insert-no-try-catch
+        condition: |
+          batchInsert() called without try-catch around the await
+        throws: >
+          Error on constraint violation or connection failure (same as insert()); TypeError for invalid chunkSize or
+          non-array batch input
+        severity: error
+        description: >
+          batchInsert() wraps all chunks in a transaction. If any chunk's insert fails (unique constraint, FK violation,
+          type mismatch), the entire batch is rolled back and an error is thrown. Constraint errors from individual rows
+          propagate as-is. Additionally, passing a non-array or invalid chunkSize throws TypeError synchronously before
+          any database call (confirmed: batch-insert.js lines 9-14).
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/utility.html#batch-insert
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: migrate.latest
+    import_path: knex
+    description: >
+      Runs all pending migrations in sequence. Acquires a migration lock (stored in the `_lock` table) to prevent
+      concurrent migration runs. Returns [batchNo, log] array. If the lock cannot be acquired (another process is
+      migrating), throws LockError. If any migration script throws, the error propagates and the lock is released.
+    postconditions:
+      - id: migrate-latest-no-try-catch
+        condition: |
+          await knex.migrate.latest() called without try-catch in server startup or deployment scripts
+        throws: >
+          LockError if migration table is already locked by another process; Error from migration scripts that throw;
+          KnexTimeoutError on database connection failure
+        severity: error
+        description: >
+          migrate.latest() acquires a migration lock using SELECT FOR UPDATE. If another process is already migrating
+          (common in multi-instance deployments), it throws LockError with message "Migration table is already locked".
+          If any migration script itself throws, the error propagates and the lock is released. If the process crashes
+          DURING migration (before lock release), the lock remains and must be manually released with `knex
+          migrate:unlock`. Unhandled errors in startup scripts cause the service to fail to boot.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: Caller MUST handle this condition appropriately.
+      - id: migrate-latest-lock-not-released-on-crash
+        condition: >
+          Process crashes during migrate.latest() execution (SIGKILL, OOM, power failure) leaving migration lock in
+          locked state
+        throws: LockError('Migration table is already locked') on all subsequent migrate.latest() calls
+        severity: error
+        description: >
+          If the process is killed during migration (not graceful shutdown), the migration lock row remains is_locked=1
+          in the database. ALL subsequent calls to migrate.latest() will throw LockError. This prevents the service from
+          ever starting again until an operator manually runs `knex migrate:unlock` or directly updates the lock table.
+          Documented explicitly at https://knexjs.org/guide/migrations.html: "if your process unfortunately crashes, the
+          lock will have to be manually removed with `knex migrate:unlock`".
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: migrate.rollback
+    import_path: knex
+    description: >
+      Rolls back the last batch of migrations. Takes the same lock as migrate.latest(). Throws LockError if lock cannot
+      be acquired. Returns [batchNo, log]. In production, rollbacks are typically run manually — the same lock and error
+      contracts as migrate.latest() apply.
+    postconditions:
+      - id: migrate-rollback-no-try-catch
+        condition: |
+          await knex.migrate.rollback() called without try-catch
+        throws: >
+          LockError if migration table is already locked; Error from down() migration scripts that throw; Error if named
+          migration not found
+        severity: error
+        description: >
+          migrate.rollback() acquires the same migration lock as latest(). LockError can occur if another process holds
+          the lock. Individual migration down() functions that throw propagate the error. If a specific migration name
+          is requested (knex.migrate.down({name})) but the migration was not run, throws Error("Migration X was not
+          run"). Unhandled rollback errors leave the database in a partially rolled-back state.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: Caller MUST handle this condition appropriately.
+  - name: transaction
+    import_path: knex
+    description: Executes queries within a transaction
+    postconditions:
+      - id: transaction-error
+        condition: query within transaction fails (constraint violation, deadlock, connection lost)
+        throws: Error causing automatic rollback if unhandled
+        required_handling: >-
+          Caller MUST wrap transaction callback in try-catch to handle errors and ensure proper rollback. Unhandled
+          errors may leave database in inconsistent state if transaction partially commits.
+        sources:
+          - https://knexjs.org/guide/transactions.html
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+edge_cases:
+  - id: connection-pool-exhaustion
+    description: >
+      When all pool connections are in use by long-running transactions and a new query tries to acquire a connection,
+      knex throws KnexTimeoutError after acquireConnectionTimeout (default 60000ms). Common cause: queries that call
+      knex() inside a transaction callback without using the trx object — they acquire a separate connection from the
+      pool, leading to deadlock when the pool is fully in use by transactions. Must call destroy() on knex instance
+      during graceful shutdown to close connection pool — unclosed connections prevent process exit.
+    sources:
+      - https://knexjs.org/guide/#destroy
+      - knex/lib/client.js line 425 — KnexTimeoutError wrapping tarn TimeoutError
+    severity: warning
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium

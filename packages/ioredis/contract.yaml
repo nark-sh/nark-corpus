@@ -1,0 +1,1106 @@
+package: ioredis
+semver: ">=4.27.8"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-02"
+status: production  # Event listener detection now supported by EventListenerAnalyzer
+evidence_quality: confirmed  # All postconditions cite Redis docs or ioredis source
+coverage_score: 0.83  # 25 contracted / 30 async-callable functions (5 omitted: scan streams, xadd/xread, select, watch)
+
+# CRITICAL SECURITY NOTE:
+# ioredis has prototype pollution vulnerability in versions < 4.27.8:
+# - SNYK-JS-IOREDIS-1567196: Prototype Pollution
+# - Multiple high severity CVEs (7-8.9 CVSS)
+#
+# MINIMUM VERSION: 4.27.8 (prototype pollution fix)
+# RECOMMENDED VERSION: 5.9.3+ (latest stable)
+#
+# Common production bugs:
+# 1. Missing error event handler - VERY COMMON (causes process crashes)
+# 2. No reconnection logic for pub/sub - COMMON (broken subscriptions)
+# 3. Pipeline errors not checked - COMMON (silent failures)
+# 4. Generic catch blocks - VERY COMMON (wrong retry logic)
+
+detection:
+  class_names: ["Redis", "Cluster", "Command"]
+  type_names: ["Redis", "Cluster", "RedisOptions", "ClusterOptions"]
+  factory_methods: []
+  require_instance_tracking: true
+  import_source: "ioredis"   # Scope to ioredis imports only — prevents false positives on @upstash/redis (HTTP-based, no EventEmitter)
+
+  await_patterns:
+    # Connection
+    - ".connect("
+
+    # String operations
+    - ".get("
+    - ".set("
+    - ".del("
+    - ".incr("
+    - ".decr("
+
+    # Hash operations
+    - ".hget("
+    - ".hset("
+    - ".hgetall("
+    - ".hdel("
+
+    # List operations
+    - ".lpush("
+    - ".rpush("
+    - ".lpop("
+    - ".rpop("
+    - ".lrange("
+    - ".brpop("
+    - ".blpop("
+
+    # Set operations
+    - ".sadd("
+    - ".smembers("
+    - ".srem("
+
+    # Sorted set operations
+    - ".zadd("
+    - ".zrange("
+    - ".zrem("
+
+    # Pub/Sub
+    - ".subscribe("
+    - ".publish("
+    - ".unsubscribe("
+
+    # Transactions and pipelines
+    - ".exec("
+    - ".eval("
+
+  # Required event listeners to prevent process crashes
+  required_event_listeners:
+    - event: "error"
+      required: true
+      severity: error
+
+functions:
+  - name: Redis
+    import_path: "ioredis"
+    description: "Redis client constructor - Creates a Redis connection instance"
+
+    postconditions:
+      # Evidence: seen in 12 primary firings across 7 repos in scan-ioredis-2026-04-02.json
+      # Top affected: soketi/soketi (⭐ 5565), campfirein/cipher (⭐ 3610), tlaverdure/laravel-echo-server (⭐ 2643)
+      # Note: ~2/7 repos attach error handler via helper fn — scanner FP pattern
+      - id: missing-error-listener
+        condition: "Redis instance created without error event listener"
+        throws: "Errors emitted as events, not exceptions - silent failures"
+        required_handling: >
+          Caller MUST attach an error listener immediately after creating Redis instance:
+          `redis.on('error', (err) => logger.error(err))`.
+          Without this listener, connection errors are silently logged to console and may crash the application.
+        sources:
+          - "https://github.com/redis/ioredis#error-handling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: connection-errors-not-handled
+        condition: "Connection fails (ECONNREFUSED, ETIMEDOUT, ECONNRESET, ENOTFOUND, EPIPE, EAI_AGAIN)"
+        throws: "Error event emitted with connection error"
+        required_handling: >
+          Caller MUST handle connection errors in the error event listener.
+          Common errors: ECONNREFUSED (Redis not running), ETIMEDOUT (network timeout),
+          ECONNRESET (connection dropped), ENOTFOUND (DNS failure).
+        sources:
+          - "https://github.com/redis/ioredis/issues/321"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: lazy-connection
+        description: "Connection is lazy by default - errors may occur after constructor returns"
+        sources:
+          - "https://github.com/redis/ioredis#connect-to-redis"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: get
+    import_path: "ioredis"
+    description: "Get value of key from Redis"
+
+    postconditions:
+      # Evidence: seen in 9 primary firings across 7 repos in scan-ioredis-2026-04-02.json
+      # Top affected: odota/core (⭐ 1601), spencerwooo/onedrive-vercel-index (⭐ 3132), surgioproject/surgio (⭐ 1784)
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning - will crash in future Node.js versions"
+        required_handling: >
+          Caller MUST use try-catch (async/await) or .catch() on all Redis commands.
+          Commands return promises that may reject due to: connection errors, WRONGTYPE,
+          timeout, or serialization failures.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: command-timeout
+        condition: "Command exceeds timeout (default: no timeout)"
+        throws: "MaxRetriesPerRequestError or CommandTimeoutError"
+        required_handling: >
+          Caller SHOULD set commandTimeout option to prevent hanging operations.
+          Without timeout, commands may hang indefinitely on network issues.
+        sources:
+          - "https://github.com/redis/ioredis#command-timeout"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: set
+    import_path: "ioredis"
+    description: "Set key to value in Redis"
+
+    postconditions:
+      # Evidence: seen in 12 primary firings across 7 repos in scan-ioredis-2026-04-02.json
+      # Top affected: Crossbell-Box/xLog (⭐ 2692), tlaverdure/laravel-echo-server (⭐ 2643), code100x/cms (⭐ 1446)
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pipeline
+    import_path: "ioredis"
+    description: "Create pipeline for batch command execution"
+
+    postconditions:
+      - id: pipeline-results-not-checked
+        condition: "Pipeline exec() results not checked for errors"
+        throws: "Individual command errors silently included in results array"
+        required_handling: >
+          Caller MUST check each result in pipeline.exec() return value.
+          Format: [[null, 'OK'], [Error, undefined], ...].
+          Pipeline does NOT reject on individual command failures.
+        sources:
+          - "https://github.com/redis/ioredis#pipelines"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: pipeline-exec-unhandled
+        condition: "Pipeline exec() promise rejected without catch"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on pipeline.exec().
+        sources:
+          - "https://github.com/redis/ioredis/issues/753"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: multi
+    import_path: "ioredis"
+    description: "Create transaction (MULTI/EXEC block)"
+
+    postconditions:
+      - id: watch-null-not-checked
+        condition: "WATCH violation causes exec() to return null, not checked"
+        throws: "null return value indicates transaction was aborted"
+        required_handling: >
+          Caller MUST check if exec() returns null after using WATCH.
+          Null indicates a watched key was modified, transaction aborted.
+          This is NOT an error/rejection - it's a null return value.
+        sources:
+          - "https://github.com/redis/ioredis/issues/883"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: exec-abort-not-handled
+        condition: "EXECABORT error in transaction not handled"
+        throws: "EXECABORT error if queued command fails validation"
+        required_handling: >
+          Caller MUST check exec() results for EXECABORT errors.
+          Happens when queued commands fail validation (WRONGTYPE, etc.).
+        sources:
+          - "https://github.com/redis/ioredis#transactions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: subscribe
+    import_path: "ioredis"
+    description: "Subscribe to Redis pub/sub channel"
+
+    postconditions:
+      - id: subscriber-mode-violation
+        condition: "Non-pub/sub commands used on subscriber connection"
+        throws: "Error: Connection in subscriber mode, only subscriber commands allowed"
+        required_handling: >
+          Caller MUST use separate Redis connection for pub/sub.
+          After subscribe(), only subscribe/unsubscribe/psubscribe/punsubscribe/quit/ping allowed.
+          Use redis.duplicate() to create separate connection for normal commands.
+        sources:
+          - "https://github.com/redis/ioredis#pub/sub"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: duplicate-for-commands
+        description: "Must use redis.duplicate() to create separate connection for normal commands while subscribed"
+        sources:
+          - "https://github.com/redis/ioredis/issues/944"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: brpop
+    import_path: "ioredis"
+    description: "Blocking pop from list (right side)"
+
+    postconditions:
+      - id: blocking-without-timeout
+        condition: "Blocking command without timeout parameter"
+        throws: "Command may block indefinitely, causing resource leak"
+        required_handling: >
+          Caller SHOULD provide timeout parameter to blocking commands (BRPOP, BLPOP, BZPOPMIN, BZPOPMAX).
+          Without timeout (or timeout=0), command blocks until data available, potentially forever.
+          Recommended: Set reasonable timeout (e.g., 5-30 seconds).
+        sources:
+          - "https://redis.io/commands/brpop/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: connect
+    import_path: "ioredis"
+    description: "Explicitly connect to Redis (usually automatic)"
+
+    postconditions:
+      - id: connect-promise-unhandled
+        condition: "connect() promise rejected without catch"
+        throws: "UnhandledPromiseRejectionWarning on connection failure"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on explicit connect() calls.
+        sources:
+          - "https://github.com/redis/ioredis#connect-to-redis"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: hget
+    import_path: "ioredis"
+    description: "Get hash field value"
+
+    postconditions:
+      - id: wrong-type-error
+        condition: "Key exists but is not a hash"
+        throws: "ReplyError with message containing 'WRONGTYPE'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors for hash operations.
+          This indicates key is not a hash - DO NOT retry.
+          Fix data model or use correct command for key type.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: hset
+    import_path: "ioredis"
+    description: "Set hash field value"
+
+    postconditions:
+      - id: wrong-type-error
+        condition: "Key exists but is not a hash"
+        throws: "ReplyError with message containing 'WRONGTYPE'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Key exists with different type - DO NOT retry.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: hgetall
+    import_path: "ioredis"
+    description: "Get all hash fields and values"
+
+    postconditions:
+      - id: wrong-type-error
+        condition: "Key exists but is not a hash"
+        throws: "ReplyError with message containing 'WRONGTYPE'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Key is not a hash - DO NOT retry.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: lpush
+    import_path: "ioredis"
+    description: "Push value to head of list"
+
+    postconditions:
+      - id: wrong-type-error
+        condition: "Key exists but is not a list"
+        throws: "ReplyError with message containing 'WRONGTYPE'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Key exists with different type - DO NOT retry.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: rpush
+    import_path: "ioredis"
+    description: "Push value to tail of list"
+
+    postconditions:
+      - id: wrong-type-error
+        condition: "Key exists but is not a list"
+        throws: "ReplyError with message containing 'WRONGTYPE'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Key exists with different type - DO NOT retry.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: unhandled-promise-rejection
+        condition: "Command promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on all Redis commands.
+        sources:
+          - "https://github.com/redis/ioredis/issues/433"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: publish
+    import_path: "ioredis"
+    description: "Publish message to Redis channel"
+
+    postconditions:
+      - id: publish-error
+        condition: "Publish fails (connection lost, etc.)"
+        throws: "Network error or UnhandledPromiseRejectionWarning"
+        required_handling: >
+          Caller MUST catch publish errors with try-catch or .catch().
+          Network errors may be transient - implement retry logic.
+          Returns number of subscribers that received the message (may be 0).
+        sources:
+          - "https://dev.to/franciscomendes10866/using-redis-pub-sub-with-node-js-13k3"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: eval
+    import_path: "ioredis"
+    description: "Execute Lua script on Redis server"
+
+    postconditions:
+      - id: script-error
+        condition: "Lua script has syntax or runtime error"
+        throws: "ReplyError with script error details"
+        required_handling: >
+          Caller MUST catch Lua script errors.
+          Script syntax errors should NOT be retried - fix script.
+          Script runtime errors depend on logic - may or may not be retriable.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: script-timeout
+        condition: "Lua script exceeds execution time limit"
+        throws: "ReplyError with timeout message"
+        required_handling: >
+          Caller MUST catch script timeout errors.
+          Redis has lua-time-limit configuration (default 5 seconds).
+          Optimize script or increase limit if needed.
+          DO NOT retry immediately - may cause cascading timeouts.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: quit
+    import_path: "ioredis"
+    description: "Send QUIT command and gracefully close the Redis connection"
+
+    postconditions:
+      # Evidence: confirmed from ioredis source — quit() returns Promise<'OK'>
+      # Source: https://github.com/redis/ioredis/blob/main/README.md#connection-events
+      - id: quit-promise-unhandled
+        condition: "quit() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning if connection already closed or network error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on quit().
+          quit() sends QUIT to server and waits for pending commands to complete.
+          May reject if connection is already closed or broken before quit completes.
+          Use disconnect() for immediate close if quit() is not available.
+        sources:
+          - "https://github.com/redis/ioredis#connection-events"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: quit-pending-commands-lost
+        condition: "quit() called while commands are still queued"
+        throws: "AbortError for queued commands that won't be executed"
+        required_handling: >
+          Caller MUST be aware that quit() waits for pending replies but new commands
+          added after quit() is called will receive AbortError.
+          Do not enqueue commands after calling quit().
+          Pattern: await all pending operations before calling quit() in shutdown handlers.
+        sources:
+          - "https://github.com/redis/ioredis#basic-usage"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: del
+    import_path: "ioredis"
+    description: "Delete one or more keys from Redis"
+
+    postconditions:
+      # Evidence: del is in the detection await_patterns — extremely common in SaaS apps
+      # Source: https://redis.io/docs/latest/develop/clients/error-handling/
+      - id: del-unhandled-promise-rejection
+        condition: "del() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on del() calls.
+          del() returns the count of deleted keys (0 if key doesn't exist — not an error).
+          Returns Promise<number> — check return value only if you need to verify deletion.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: expire
+    import_path: "ioredis"
+    description: "Set a timeout in seconds on a key (TTL expiry)"
+
+    postconditions:
+      # Evidence: extremely common in SaaS for session management, rate limiting, cache invalidation
+      # Source: https://redis.io/docs/latest/develop/clients/error-handling/
+      - id: expire-unhandled-promise-rejection
+        condition: "expire() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on expire() calls.
+          expire() returns 1 if timeout was set, 0 if key doesn't exist — 0 is NOT an error.
+          Silent expiry failures leave data in Redis indefinitely, causing memory leaks
+          and stale data bugs in session management and rate limiting.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: expire-returns-zero-not-checked
+        condition: "expire() called on non-existent key and return value not checked"
+        throws: "N/A (returns 0, not an error)"
+        required_handling: >
+          Caller SHOULD check expire() return value when setting TTL on critical keys.
+          Returns 0 if key does not exist — the set+expire pattern can fail silently
+          if the key was never written or was already deleted between set() and expire() calls.
+          Use SET with EX option (atomic) instead of separate set()+expire() calls:
+          `redis.set(key, value, 'EX', ttlSeconds)` to avoid the race condition.
+        sources:
+          - "https://redis.io/commands/expire/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: incr
+    import_path: "ioredis"
+    description: "Atomically increment integer value of key by 1 — common for rate limiting and counters"
+
+    postconditions:
+      # Evidence: extremely common in SaaS for rate limiting, request counting, ID generation
+      # Source: https://redis.io/docs/latest/develop/clients/error-handling/
+      - id: incr-wrong-type-error
+        condition: "Key exists but is not a string or integer"
+        throws: "ReplyError with 'ERR value is not an integer or out of range'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE/value-not-integer errors.
+          Happens when key holds a non-integer string (e.g., JSON blob) and incr() is called.
+          This is a programming error — do NOT retry. Fix the data model.
+        sources:
+          - "https://redis.io/commands/incr/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: incr-unhandled-promise-rejection
+        condition: "incr() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on incr() calls.
+          Silent incr failures cause rate limiters to fail open (no limiting applied),
+          which can lead to abuse, quota overruns, and billing errors.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: decr
+    import_path: "ioredis"
+    description: "Atomically decrement integer value of key by 1"
+
+    postconditions:
+      # Evidence: common for decrementing counters, quota consumption
+      # Source: https://redis.io/commands/decr/
+      - id: decr-wrong-type-error
+        condition: "Key exists but is not an integer, or decrement would go below -9223372036854775808"
+        throws: "ReplyError with 'ERR value is not an integer or out of range'"
+        required_handling: >
+          Caller MUST catch value-not-integer and overflow errors.
+          Overflow at 64-bit integer minimum causes ReplyError — not silent wrap-around.
+          Fix data model or use DECRBY with range validation.
+        sources:
+          - "https://redis.io/commands/decr/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: decr-unhandled-promise-rejection
+        condition: "decr() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on decr() calls.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: zadd
+    import_path: "ioredis"
+    description: "Add member with score to sorted set — used for leaderboards, priority queues, rate limiting"
+
+    postconditions:
+      # Evidence: common in SaaS for leaderboards, job queues, time-series data
+      # Source: https://redis.io/commands/zadd/
+      - id: zadd-wrong-type-error
+        condition: "Key exists but is not a sorted set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors for sorted set operations.
+          Key exists with different type — DO NOT retry. Fix data model.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: zadd-nan-score-error
+        condition: "Score value is NaN"
+        throws: "ReplyError with 'not a float'"
+        required_handling: >
+          Caller MUST validate score before calling zadd().
+          NaN scores cause immediate ReplyError. Common when score comes from
+          user input, division operations, or Date arithmetic.
+          Validate: if (isNaN(score) || !isFinite(score)) throw before zadd().
+        sources:
+          - "https://redis.io/commands/zadd/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: zadd-unhandled-promise-rejection
+        condition: "zadd() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on zadd() calls.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: zrange
+    import_path: "ioredis"
+    description: "Return range of members from sorted set by index, score, or lexicographic order"
+
+    postconditions:
+      # Evidence: common for leaderboard queries, paginated queue processing
+      # Source: https://redis.io/commands/zrange/
+      - id: zrange-wrong-type-error
+        condition: "Key exists but is not a sorted set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Key is not a sorted set — DO NOT retry. Fix data model.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: zrange-unhandled-promise-rejection
+        condition: "zrange() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on zrange() calls.
+          Returns empty array if key doesn't exist — not an error.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: zrem
+    import_path: "ioredis"
+    description: "Remove members from sorted set"
+
+    postconditions:
+      # Source: https://redis.io/commands/zrem/
+      - id: zrem-wrong-type-error
+        condition: "Key exists but is not a sorted set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Returns 0 if member doesn't exist (not an error).
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: zrem-unhandled-promise-rejection
+        condition: "zrem() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on zrem() calls.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: sadd
+    import_path: "ioredis"
+    description: "Add members to a set — used for unique collections, deduplication, membership tracking"
+
+    postconditions:
+      # Evidence: common in SaaS for session tracking, online user sets, feature flags
+      # Source: https://redis.io/commands/sadd/
+      - id: sadd-wrong-type-error
+        condition: "Key exists but is not a set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors for set operations.
+          Key exists with different type — DO NOT retry. Fix data model.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: sadd-unhandled-promise-rejection
+        condition: "sadd() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on sadd() calls.
+          Returns count of new members added (0 if already in set — not an error).
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: smembers
+    import_path: "ioredis"
+    description: "Return all members of a set"
+
+    postconditions:
+      # Source: https://redis.io/commands/smembers/
+      - id: smembers-wrong-type-error
+        condition: "Key exists but is not a set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Returns empty array if key doesn't exist — not an error.
+          For large sets, consider SSCAN instead to avoid blocking Redis.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: smembers-large-set-blocking
+        condition: "Set has thousands of members and smembers() is called in production"
+        throws: "N/A — but Redis blocks for the duration, causing latency for all other clients"
+        required_handling: >
+          Caller SHOULD use sscanStream() for large sets instead of smembers().
+          smembers() returns ALL members in one blocking call.
+          For sets > 1000 members, use cursor-based sscan() to avoid blocking Redis.
+        sources:
+          - "https://redis.io/commands/smembers/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: smembers-unhandled-promise-rejection
+        condition: "smembers() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on smembers() calls.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: srem
+    import_path: "ioredis"
+    description: "Remove members from a set"
+
+    postconditions:
+      # Source: https://redis.io/commands/srem/
+      - id: srem-wrong-type-error
+        condition: "Key exists but is not a set"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors.
+          Returns 0 if member doesn't exist (not an error).
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: srem-unhandled-promise-rejection
+        condition: "srem() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on srem() calls.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: blpop
+    import_path: "ioredis"
+    description: "Blocking pop from list (left side) — used for job queue consumption"
+
+    postconditions:
+      # Evidence: listed in detection await_patterns, used for job queues in SaaS
+      # Source: https://redis.io/commands/blpop/
+      - id: blpop-blocking-without-timeout
+        condition: "blpop() called without timeout parameter or with timeout=0"
+        throws: "Command may block indefinitely, causing resource exhaustion"
+        required_handling: >
+          Caller SHOULD always provide a non-zero timeout to blpop().
+          With timeout=0, command blocks until data is available — may be indefinite.
+          In SaaS apps, this can exhaust connection pool and cause other commands to queue.
+          Recommended: use a reasonable timeout (5-30 seconds) and loop to re-poll.
+          Pattern: while (running) { const result = await redis.blpop('queue', 5); ... }
+        sources:
+          - "https://redis.io/commands/blpop/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: blpop-unhandled-promise-rejection
+        condition: "blpop() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error or MaxRetriesPerRequestError"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on blpop() calls.
+          Connection errors during blocking commands return MaxRetriesPerRequestError.
+          Implement retry loop with backoff for job queue consumers.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: blpop-subscriber-mode-conflict
+        condition: "blpop() called on a connection in subscriber mode"
+        throws: "ReplyError: Connection in subscriber mode, only subscriber commands allowed"
+        required_handling: >
+          Caller MUST NOT mix blpop() with pub/sub subscriptions on the same connection.
+          Use a dedicated connection (redis.duplicate()) for job queue operations.
+        sources:
+          - "https://github.com/redis/ioredis#pub/sub"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium

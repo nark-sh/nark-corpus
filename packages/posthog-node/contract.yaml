@@ -1,0 +1,163 @@
+# capture(), identify(), alias(), groupIdentify() are fire-and-forget — they queue events internally and NEVER throw. Correct to call without try-catch.
+# Only the async network methods (getFeatureFlag, isFeatureEnabled, getAllFlags, shutdown) need error handling.
+# PostHog SDK does not define typed error subclasses for feature flag failures (unlike stripe or groq-sdk). Catch generic Error.
+# If PostHog API is unreachable, getFeatureFlag/isFeatureEnabled return undefined (not throw) in some versions — behavior depends on SDK version and configuration. Use try-catch to be safe.
+# Local evaluation (with personal API key) still makes an initial network call to fetch flag definitions. getAllFlags with local evaluation is not network-free.
+package: posthog-node
+semver: ">=3.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-04-01"
+status: production
+evidence_quality: partial
+
+functions:
+  - name: getFeatureFlag
+    import_path: "posthog-node"
+    description: >
+      Evaluates a feature flag for a given distinct ID. Makes a synchronous network
+      call to the PostHog API to retrieve the flag value. Returns string (multivariate),
+      boolean (boolean flag), or undefined (flag not found / error).
+      NOTE: capture(), identify(), alias(), groupIdentify() are fire-and-forget and
+      do NOT require try-catch — only the async network methods need error handling.
+
+    postconditions:
+      - id: network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable, API key
+          invalid, rate limit exceeded, or any server-side error (5xx)
+        throws: >
+          Error or unhandled Promise rejection with network/HTTP details.
+          PostHog SDK does not define a typed error class for feature flag calls;
+          the rejection is a generic Error with message describing the failure.
+        required_handling: >
+          Caller MUST wrap in try-catch (or use .catch()). Unlike capture()/identify()
+          which are fire-and-forget, getFeatureFlag() makes a live network call and
+          WILL reject on failure. Uncaught rejections crash the request handler or
+          produce unhandled rejection warnings in Node.js.
+
+          Minimum handling:
+            try {
+              const flag = await posthog.getFeatureFlag('my-flag', userId);
+              if (flag === true) { /* feature on */ }
+            } catch (err) {
+              console.error('Feature flag check failed:', err);
+              // Fall back to default behavior
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+          - "https://posthog.com/docs/feature-flags/bootstrapping-and-local-evaluation"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: isFeatureEnabled
+    import_path: "posthog-node"
+    description: >
+      Checks whether a boolean feature flag is enabled for a given distinct ID.
+      Makes a network call to PostHog API. Returns boolean or undefined.
+      This is a convenience wrapper around getFeatureFlag().
+
+    postconditions:
+      - id: network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable, or
+          server-side error
+        throws: >
+          Error or unhandled Promise rejection. Same error surface as getFeatureFlag().
+        required_handling: >
+          Caller MUST wrap in try-catch. isFeatureEnabled() makes a live network call
+          and rejects on failure. Missing error handling causes unhandled rejection.
+
+          Minimum handling:
+            try {
+              const enabled = await posthog.isFeatureEnabled('my-flag', userId);
+              if (enabled) { /* ... */ }
+            } catch (err) {
+              console.error('Feature flag check failed:', err);
+              // Fall back to default (disabled)
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getAllFlags
+    import_path: "posthog-node"
+    description: >
+      Retrieves all feature flag values for a given distinct ID in a single network
+      call. Returns a Record mapping flag keys to their values (boolean or string).
+      Used when multiple flags need to be evaluated at once.
+
+    postconditions:
+      - id: network-error
+        condition: >
+          Network failure, PostHog API unreachable, or server-side error
+        throws: >
+          Error or unhandled Promise rejection.
+        required_handling: >
+          Caller MUST wrap in try-catch. getAllFlags() makes a live network call and
+          rejects on failure. This is the most common source of unhandled PostHog
+          rejections in production (confirmed in n8n codebase).
+
+          Minimum handling:
+            try {
+              const flags = await posthog.getAllFlags(userId);
+              return flags;
+            } catch (err) {
+              console.error('Failed to fetch feature flags:', err);
+              return {}; // Safe default: all flags disabled
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: shutdown
+    import_path: "posthog-node"
+    description: >
+      Flushes all pending events from the queue and shuts down the PostHog client.
+      Should be called before process exit to ensure events are not lost.
+      Takes an optional timeoutMs parameter (default: 30000ms).
+
+    postconditions:
+      - id: flush-error
+        condition: >
+          Network failure during flush, timeout exceeded, or queue processing error
+        throws: >
+          Error or unhandled Promise rejection if the flush fails or times out.
+        required_handling: >
+          Caller SHOULD wrap in try-catch. shutdown() failures during app teardown
+          are non-critical (events may be lost) but unhandled rejections can interfere
+          with graceful shutdown in Node.js.
+
+          Recommended handling:
+            try {
+              await posthog.shutdown();
+            } catch (err) {
+              console.error('PostHog shutdown failed:', err);
+              // Continue with process exit — non-critical
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
