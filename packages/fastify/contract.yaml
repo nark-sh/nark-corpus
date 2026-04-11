@@ -1,10 +1,11 @@
 package: fastify
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.70
 
 detection:
   factory_methods:
@@ -35,6 +36,230 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: listen
+    import_path: "fastify"
+    description: "Binds server to a port and starts accepting connections. Returns a Promise<string> resolving to the server address. Must be awaited to detect startup failures."
+    postconditions:
+      - id: listen-port-in-use
+        condition: "port is already bound by another process (listen() called on occupied port)"
+        throws: "Error with code EADDRINUSE — Node.js system error"
+        required_handling: "Await listen() in try-catch. On EADDRINUSE, either use a different port or check that previous server instances were properly closed before restarting. Port 0 picks a random available port as an alternative."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/ — listen() section
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://nodejs.org/api/errors.html#common-system-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: listen-plugin-timeout
+        condition: "registered plugins do not call done() / resolve their promises within pluginTimeout ms (default 10000ms) before listen() completes initialization"
+        throws: "Error with code ERR_AVVIO_PLUGIN_TIMEOUT — thrown by fastify's avvio plugin system"
+        required_handling: "Await listen() in try-catch. Ensure all plugins call their done callback or resolve async. Set pluginTimeout option higher if plugins legitimately take longer (e.g., database connection pools). Log error and exit process cleanly on failure."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/ — pluginTimeout option and avvio docs
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://github.com/fastify/avvio"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: listen-container-binding
+        condition: "server needs to be reachable from outside its container/VM but listen() is called with '127.0.0.1' (localhost-only)"
+        throws: "No error thrown — server starts successfully but is unreachable externally; requests silently time out"
+        required_handling: "In containerized environments (Docker, Kubernetes, AWS ECS), call listen({ port: 3000, host: '0.0.0.0' }) to bind all interfaces. '127.0.0.1' is correct only for development where external access is not needed."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Guides/Getting-Started/ — deployment section
+          - "https://fastify.dev/docs/latest/Guides/Getting-Started/"
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: close
+    import_path: "fastify"
+    description: "Gracefully shuts down the server, stopping new connections and draining existing ones. Returns Promise<undefined>. Must be awaited to ensure complete shutdown."
+    postconditions:
+      - id: close-websocket-connection-leak
+        condition: "server has active WebSocket or HTTP upgrade connections when close() is called"
+        throws: "close() hangs indefinitely — upgraded connections are not tracked by fastify's connection counter and prevent shutdown from completing"
+        required_handling: "Track WebSocket connections manually. In an 'onClose' hook or preClose handler, explicitly call ws.terminate() on all active WebSocket clients before awaiting close(). Without this, process.exit() may be required to force shutdown, risking data loss."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#close — close() docs
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://github.com/fastify/fastify-websocket"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: close-hook-error
+        condition: "an onClose or preClose lifecycle hook throws or rejects during server shutdown"
+        throws: "Error from the hook propagates as close() promise rejection"
+        required_handling: "Await close() in try-catch. Log shutdown errors but still proceed with cleanup. Use finally block to ensure any remaining cleanup code runs even if a hook fails."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Hooks/#onclose"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: ready
+    import_path: "fastify"
+    description: "Waits for all registered plugins to finish loading. Returns SafePromiseLike. Must be awaited before injecting or if you need plugins fully loaded without calling listen()."
+    postconditions:
+      - id: ready-plugin-timeout
+        condition: "a registered plugin does not call done() or resolve its async function within pluginTimeout ms (default 10000ms)"
+        throws: "Error with code ERR_AVVIO_PLUGIN_TIMEOUT — thrown by avvio, fastify's plugin loading system"
+        required_handling: "Await ready() in try-catch. Identify the slow plugin by checking the error message which includes the plugin name. Fix the plugin to complete initialization or increase pluginTimeout in fastify options. Log the error with full stack trace for debugging."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#ready
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://github.com/fastify/avvio#ready"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: ready-plugin-init-error
+        condition: "a plugin's async initializer rejects with an error (e.g., database connection fails during plugin setup)"
+        throws: "The plugin's error propagates through ready() promise rejection"
+        required_handling: "Await ready() in try-catch. Handle initialization failures explicitly — log details, emit alerts, and exit process with non-zero code so process managers (systemd, k8s, Docker) restart the service."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Plugins/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: register
+    import_path: "fastify"
+    description: "Registers a plugin (encapsulated scope with routes, hooks, decorators). Internally schedules async plugin initialization via avvio. Errors surface at ready() or listen() time, not at register() call time."
+    postconditions:
+      - id: register-errors-deferred-to-ready
+        condition: "a plugin's async initializer throws or rejects (database connection, external service registration failure, missing configuration)"
+        throws: "Error is NOT thrown at register() call time — it defers and surfaces when ready() or listen() is awaited"
+        required_handling: "Always await ready() or listen() in try-catch after all register() calls. Do not assume that a synchronous register() call means the plugin loaded successfully. Plugin initialization errors will only surface asynchronously."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Plugins/
+          - "https://fastify.dev/docs/latest/Reference/Plugins/"
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: register-plugin-timeout
+        condition: "plugin async initializer takes longer than pluginTimeout (default 10000ms) to call done() or resolve"
+        throws: "Error with code ERR_AVVIO_PLUGIN_TIMEOUT — surfaces at ready() or listen(), not at register()"
+        required_handling: "Use fp-options or fastify-plugin options to set a per-plugin timeout, or increase global pluginTimeout. Ensure async plugin inits complete promptly. Log plugin name from error message to identify the culprit."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://github.com/fastify/avvio"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: after
+    import_path: "fastify"
+    description: "Registers a callback to run after the previous register() call completes loading its plugin. Used for imperative sequential plugin setup. Callback receives (err) parameter."
+    postconditions:
+      - id: after-error-parameter-unchecked
+        condition: "the previous register() call's plugin threw an error during initialization and after() callback ignores the err parameter"
+        throws: "Plugin initialization error is silently swallowed — no exception propagates, but the plugin is not loaded"
+        required_handling: "Always check the err parameter in after() callback: app.after((err) => { if (err) throw err; }). Re-throwing ensures the error propagates to ready()/listen() where it can be caught."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#after
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://github.com/fastify/avvio#afterfn"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: addHook
+    import_path: "fastify"
+    description: >
+      Registers a lifecycle hook function that runs during request or application
+      events. Async hooks must return a Promise; sync hooks use the done() callback.
+      Hook errors affect request handling or shutdown depending on hook type.
+    postconditions:
+      # Evidence: https://fastify.dev/docs/latest/Reference/Hooks/
+      # Error behavior confirmed from fastify source and docs
+      - id: addhook-async-hook-no-try-catch
+        condition: "async lifecycle hook (onRequest, preParsing, preValidation, preHandler, onSend, preSerialization) throws or rejects without try-catch"
+        throws: "Error triggers request error handling chain — passed to setErrorHandler if configured, otherwise returns 500 Internal Server Error"
+        required_handling: "Wrap async hook body in try-catch. Return a meaningful error response via reply.code(status).send(error) rather than letting the error propagate. Configure setErrorHandler for centralized error formatting."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Hooks/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: addhook-onclose-async-unhandled
+        condition: "async onClose hook throws or rejects, and close() is called without try-catch (e.g., in a SIGTERM handler)"
+        throws: "close() promise rejects — if not caught, becomes an unhandled rejection; database connection pool may not be released"
+        required_handling: "Await close() in try-catch in SIGTERM/SIGINT handlers. Wrap onClose hook body in try-catch and log errors. Use finally block to ensure cleanup code runs even if a hook fails."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Hooks/#onclose"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
   - id: error-handler-configuration
     description: "Configure setErrorHandler at app or route level for centralized error handling - prevents inconsistent error responses and provides proper error formatting"
@@ -49,6 +274,10 @@ edge_cases:
       incident_cost_range: medium
 
 # Category: framework
-# Latest version: 5.2.0
+# Latest version: 5.8.4
 # Generated: 2026-02-25
 # Audited: 2026-04-02 — scan-fastify-2026-04-02.json, 10 repos, 6 affected (60%), 111 violations, 0/100 FPs
+# Deepened: 2026-04-11 — deepen-stream-2 pass 1
+# Coverage: 7/10 non-omitted async-callable functions = 70%
+#   Contracted: get (route handlers), listen, close, ready, register, after, addHook
+#   Intentionally omitted: inject (testing utility), all/WebDAV route methods (same error profile as get)
