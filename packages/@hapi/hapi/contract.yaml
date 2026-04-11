@@ -1,10 +1,11 @@
 package: "@hapi/hapi"
 semver: ">=21.0.0 <22.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-01"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83
 
 detection:
   type_names:
@@ -53,6 +54,269 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: initialize
+    import_path: "@hapi/hapi"
+    description: >
+      Initializes the server (starts caches, finalizes plugin registration) without starting the
+      HTTP listener. Must be called before start() when using a separate initialize/start lifecycle,
+      e.g. in test environments or when the application needs to be ready to accept connections
+      but starts listening later.
+    postconditions:
+      # Evidence: lib/core.js _initialize() — throws when registring > 0 (plugins still registering),
+      #           or when not in 'stopped' phase. Cache start failures propagate via Promise.all(caches).
+      #           onPreStart lifecycle hooks can throw and set phase to 'invalid'.
+      # Source: https://hapi.dev/api/?v=21.4.6#-await-serverinitialize (raw.githubusercontent.com/hapijs/hapi master API.md)
+      - id: initialize-plugin-not-registered
+        condition: "called before async plugin registration callbacks have completed"
+        throws: "Error: 'Cannot start server before plugins finished registration'"
+        required_handling: >
+          Caller MUST await all server.register() calls to completion before calling
+          server.initialize(). Calling initialize() during concurrent plugin registration
+          throws synchronously and leaves server in an unusable state.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: initialize-invalid-phase
+        condition: "called when server is not in 'stopped' phase (already initializing, starting, or started)"
+        throws: "Error: 'Cannot initialize server while it is in <phase> phase'"
+        required_handling: >
+          Call server.initialize() only once from the 'stopped' phase. Repeated initialization
+          is a no-op if already 'initialized', but throws if in any other active phase.
+          Wrap in try-catch to handle race conditions in concurrent startup code.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: initialize-cache-start-error
+        condition: "cache engine fails to connect or start (Redis unavailable, Memcached unreachable)"
+        throws: "Error from catbox cache client — connection refused, authentication failure, or timeout"
+        required_handling: >
+          Wrap server.initialize() in try-catch. Cache connection failures during initialization
+          set the server phase to 'invalid', meaning the server CANNOT be recovered without
+          process restart. Log the error and exit the process.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/core.js"
+          - "https://github.com/hapijs/catbox"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stop
+    import_path: "@hapi/hapi"
+    description: >
+      Stops the server's HTTP listener, refusing new connections while allowing existing
+      connections to complete. After the timeout (default 5 seconds), remaining open sockets
+      are forcefully destroyed. Runs onPreStop and onPostStop lifecycle hooks. Errors in
+      lifecycle hooks set the server phase to 'invalid'.
+    postconditions:
+      # Evidence: lib/core.js _stop() — throws if phase is not one of ['stopped', 'initialized', 'started', 'invalid'].
+      #           onPreStop / onPostStop async hooks propagate errors and set phase to 'invalid'.
+      #           _unlisten() wraps listener.close() in a Promise — always resolves, never rejects.
+      #           Cache stop failures propagate via Promise.all(caches).
+      # Source: https://hapi.dev/api/?v=21.4.6#-await-serverstopoptions
+      - id: stop-invalid-phase
+        condition: "called while server is in 'stopping', 'starting', or 'initializing' phase"
+        throws: "Error: 'Cannot stop server while in <phase> phase'"
+        required_handling: >
+          Avoid calling stop() concurrently or during active phase transitions.
+          In graceful shutdown handlers (SIGTERM), check server state before calling stop().
+          Wrap in try-catch to handle phase errors in signal handlers — an unhandled
+          rejection in a shutdown hook terminates the process ungracefully.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: stop-lifecycle-hook-error
+        condition: "onPreStop or onPostStop extension method throws or rejects"
+        throws: "Error from the lifecycle method — sets server phase to 'invalid'"
+        required_handling: >
+          Extension methods registered with server.ext('onPreStop') or server.ext('onPostStop')
+          MUST handle their own errors internally. An error thrown from a stop lifecycle hook
+          sets the server phase to 'invalid', preventing future start/stop cycles and
+          leaving the process in an undefined state. Always wrap database disconnection,
+          cache flush, and external cleanup calls in try-catch inside these hooks.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: register
+    import_path: "@hapi/hapi"
+    description: >
+      Registers one or more plugins with the server. Plugin registration is async — the
+      plugin's register() function is awaited. Throws for duplicate plugin names (without
+      once: true), unmet version requirements, or errors thrown by the plugin's register
+      function itself.
+    postconditions:
+      # Evidence: lib/server.js register() — Hoek.assert for duplicate plugin ('Plugin X already registered'),
+      #           version mismatch ('Plugin X requires hapi version Y but found Z'),
+      #           plugin register() throws propagate directly.
+      # Source: https://hapi.dev/api/?v=21.4.6#-await-serverregisterplugins-options (raw.githubusercontent.com/hapijs/hapi master API.md)
+      - id: register-duplicate-plugin
+        condition: "same plugin registered twice without once: true option"
+        throws: "AssertionError: 'Plugin <name> already registered'"
+        required_handling: >
+          Always use once: true when there is any chance of duplicate plugin registration
+          (e.g. in tests that share a server instance, or in plugin dependency chains where
+          multiple plugins register the same utility plugin). Without once: true, the second
+          registration throws and aborts the entire startup sequence.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+          - "https://hapi.dev/api/?v=21.4.6#-await-serverregisterplugins-options"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: register-version-requirement-not-met
+        condition: "plugin specifies hapi or node version requirements that the current runtime does not satisfy"
+        throws: "AssertionError: 'Plugin <name> requires hapi version <x> but found <y>'"
+        required_handling: >
+          Wrap server.register() in try-catch and handle version mismatch errors at startup.
+          This error is not recoverable at runtime — the process must be restarted with a
+          compatible hapi or Node.js version. Log the error clearly before exiting.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: register-plugin-init-error
+        condition: "plugin's register() function throws an error or returns a rejected promise"
+        throws: "Error from plugin initialization — database connection, missing config, authentication setup failure"
+        required_handling: >
+          Wrap server.register() in try-catch. Plugin initialization errors (failed DB
+          connections, missing environment variables, invalid config) propagate directly
+          from the plugin's register() function. The server cannot start if any plugin
+          registration fails. Ensure all plugins validate their configuration before
+          performing async operations in their register() function.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+          - "https://hapi.dev/api/?v=21.4.6#-await-serverregisterplugins-options"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: auth.test
+    import_path: "@hapi/hapi"
+    description: >
+      Tests a request against a named authentication strategy outside of the normal
+      request lifecycle. Returns credentials and artifacts on success, throws on
+      failure. Commonly used in middleware or handlers that need to programmatically
+      verify authentication without relying on the route-level auth configuration.
+    postconditions:
+      # Evidence: lib/auth.js test() — throws response directly if !response.isAuth,
+      #           throws response.error if response.error exists.
+      #           Hoek.assert throws for unknown strategy name.
+      # Source: https://hapi.dev/api/?v=21.4.6#-await-serverauthteststrategy-request
+      - id: auth-test-unknown-strategy
+        condition: "strategy name passed to auth.test() is not registered on the server"
+        throws: "AssertionError: 'Unknown authentication strategy: <name>'"
+        required_handling: >
+          Validate strategy names at startup rather than at request time.
+          Wrap auth.test() calls in try-catch when the strategy name is dynamic
+          (e.g. from config or request parameters). An unknown strategy throws
+          synchronously inside the async function, causing an unhandled rejection
+          if not caught.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/auth.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: auth-test-authentication-failure
+        condition: "the strategy's authenticate() method returns an unauthenticated result (invalid token, missing credentials)"
+        throws: "Boom.unauthorized error with the authentication challenge details"
+        required_handling: >
+          Wrap server.auth.test() in try-catch. The method throws the full Boom error
+          from the authentication strategy, not a simple boolean. The error contains
+          statusCode, message, and WWW-Authenticate headers. Callers must catch and
+          handle this error to return appropriate responses rather than letting it
+          propagate as an unhandled 500.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/auth.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: auth.verify
+    import_path: "@hapi/hapi"
+    description: >
+      Verifies that a request's previously-issued authentication credentials are still valid
+      (not revoked or expired). Calls the strategy's verify() method if one is defined.
+      Returns void on success, throws on failure. Used in long-lived connection scenarios
+      like WebSocket handlers or background job processors where tokens may expire
+      mid-session.
+    postconditions:
+      # Evidence: lib/auth.js verify() — throws auth.error if request.auth.error is set,
+      #           awaits strategy.methods.verify() which can throw on credential revocation.
+      # Source: https://hapi.dev/api/?v=21.4.6#-await-serverauthverifyrequest
+      - id: auth-verify-credentials-invalid
+        condition: "strategy's verify() method determines credentials have been revoked, expired, or invalidated"
+        throws: "Error from the strategy's verify() implementation — typically Boom.unauthorized"
+        required_handling: >
+          Wrap server.auth.verify() in try-catch in any handler that re-validates
+          credentials after initial authentication (e.g. WebSocket message handlers,
+          long-polling endpoints). Failure to catch this error leaves the connection
+          open with invalid credentials and causes an unhandled rejection that may
+          crash the process or silently fail depending on the error handler setup.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/auth.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: centralized-error-handling
     description: "Configure onPreResponse extension point for centralized error handling - ensures consistent error responses across all routes and proper error formatting"
@@ -69,4 +333,5 @@ edge_cases:
 # Category: framework
 # Latest version: 21.4.6
 # Generated: 2026-02-26
-# Audited: 2026-04-01
+# Audited: 2026-04-11
+# Deepened: 2026-04-11 (deepen-stream-1 pass 4)
