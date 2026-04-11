@@ -1,10 +1,11 @@
 package: rxjs
 semver: ">=7.0.0 <8.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "agent-onboard"
-last_verified: "2026-04-06"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.80
 # Audit 2026-04-06: 1 repo scanned (nestjs/nest, 75011★), 1 affected (100%), 23 violations.
 # All violations in lastValueFrom — no try-catch wrapping in nestjs/nest core guards/helpers.
 # FP check: 0/20 FPs (0.0%). Contract confirmed accurate. No changes needed.
@@ -87,3 +88,103 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: forEach
+    import_path: "rxjs"
+    description: >
+      Observable.prototype.forEach() iterates over each emitted value by calling
+      the provided callback, returning a Promise<void> that resolves on Observable
+      completion or rejects on Observable error. Unlike subscribe(), forEach() cannot
+      be unsubscribed from once started. Confirmed from Observable.js source:
+      error callback routes to reject(), complete routes to resolve().
+    postconditions:
+      # Evidence: rxjs/dist/cjs/internal/Observable.js — forEach() implementation
+      # new promiseCtor((resolve, reject) => { subscriber = SafeSubscriber({ error: reject, complete: resolve }) })
+      - id: foreach-observable-error
+        condition: "The Observable emits an error notification at any point during iteration"
+        throws: "The error value from the Observable (re-thrown as Promise rejection)"
+        required_handling: >
+          Caller MUST wrap forEach() in try-catch. Observable errors become Promise rejections.
+          NestJS and Angular code that uses forEach() to process streams (e.g., database cursor
+          iteration, microservice response streaming) will throw unhandled rejections if not wrapped.
+        sources:
+          - "https://rxjs.dev/api/index/class/Observable#forEach"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: foreach-callback-throws
+        condition: "The next callback provided to forEach() throws an exception (e.g., JSON.parse failure, type error)"
+        throws: >
+          The exception thrown by the callback. The Observable is unsubscribed and the Promise rejects
+          with the callback's exception. Remaining stream values are silently dropped.
+        required_handling: >
+          Caller MUST wrap forEach() in try-catch. Callback exceptions unsubscribe the Observable
+          mid-stream, dropping remaining values. Partial processing causes data inconsistency if
+          the callback had side effects (e.g., DB writes). Ensure the callback itself handles errors
+          internally or wrap the entire forEach() call.
+        sources:
+          - "https://rxjs.dev/api/index/class/Observable#forEach"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: toPromise
+    import_path: "rxjs"
+    description: >
+      Observable.prototype.toPromise() converts an Observable to a Promise that
+      resolves with the LAST emitted value on completion, or undefined if no value
+      was emitted. Deprecated since rxjs v7 — replaced by lastValueFrom() and
+      firstValueFrom(). Still widely used in legacy Angular/NestJS codebases.
+      Confirmed from Observable.js source: error callback routes to reject(),
+      complete routes to resolve(value) where value is the last seen emission.
+    postconditions:
+      # Evidence: rxjs/dist/cjs/internal/Observable.js — toPromise() implementation
+      # subscribe(x => value = x, err => reject(err), () => resolve(value))
+      - id: topromise-observable-error
+        condition: "The Observable emits an error notification at any point"
+        throws: "The error value from the Observable (re-thrown as Promise rejection)"
+        required_handling: >
+          Caller MUST wrap toPromise() in try-catch. Despite being deprecated, toPromise() is
+          still used in thousands of NestJS and Angular apps via patterns like:
+          await httpClient.get(url).toPromise(). Missing try-catch causes unhandled rejections
+          that crash the async function or request handler.
+        sources:
+          - "https://rxjs.dev/api/index/class/Observable#toPromise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: topromise-undefined-on-empty
+        condition: "The Observable completes without emitting any value"
+        returns: "undefined (silently resolves to undefined instead of throwing EmptyError)"
+        required_handling: >
+          Caller MUST null-check the resolved value before use, or migrate to lastValueFrom()
+          which explicitly throws EmptyError for empty Observables. Common crash pattern in
+          Angular services: const data = await obs$.toPromise(); data.items.forEach() —
+          crashes with TypeError when Observable emits nothing.
+        sources:
+          - "https://rxjs.dev/api/index/class/Observable#toPromise"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed

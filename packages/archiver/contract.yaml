@@ -2,9 +2,10 @@ package: archiver
 semver: ">=5.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-11"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
+coverage_score: 0.85  # 6 of 7 async-callable method groups contracted (finalize, append, directory, file, glob, symlink, archiver); abort() omitted (sync, no errors emitted)
 
 # archiver: Streaming interface for archive generation (ZIP/TAR)
 # Event-driven error handling - NOW AUTOMATICALLY DETECTED
@@ -125,6 +126,364 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: finalize
+    import_path: "archiver"
+    description: >
+      Finalizes the archive and prevents further appending. Returns a Promise that resolves
+      when the archive module's internal stream ends. NOTE: the Promise resolving does NOT
+      guarantee the output destination stream has finished writing — callers must also wait
+      for the 'close' event on the piped destination stream.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js
+      # Source lines 770-812: finalize() emits ArchiverError('ABORTED') and ArchiverError('FINALIZING')
+      # Both cases: returns Promise.reject(archivedError) AND emits 'error' event
+      - id: finalize-after-abort
+        condition: "finalize() called after abort() has been called"
+        throws: "Emits 'error' event with ArchiverError code='ABORTED' and returns rejected Promise"
+        required_handling: >
+          If finalize() is called on an aborted archive, it emits an 'error' event with
+          ArchiverError{ code: 'ABORTED', message: 'archive was aborted' } and returns a
+          rejected Promise. Callers MUST handle the rejected promise (try/catch or .catch())
+          AND have an error event handler attached, as both are triggered simultaneously.
+          Silently swallowing the rejected Promise hides the abort error.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/error.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: finalize-double-call
+        condition: "finalize() called a second time while first finalization is in progress"
+        throws: "Emits 'error' event with ArchiverError code='FINALIZING' and returns rejected Promise"
+        required_handling: >
+          Calling finalize() a second time emits ArchiverError{ code: 'FINALIZING', message:
+          'archive already finalizing' } as an error event and returns a rejected Promise.
+          This commonly happens in request handlers that call finalize() in a finally block
+          after already calling it in a try block. Guard with a finalized flag.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: finalize-incomplete-output
+        condition: "await archive.finalize() resolves but output destination stream is not yet fully written"
+        throws: "No error — silently produces truncated/corrupt archive when output stream closes after finalize() resolves"
+        required_handling: >
+          The finalize() Promise resolves when the archive module's internal stream ends
+          (the 'end' event on the compression module), NOT when the piped destination
+          (e.g. fs.createWriteStream) finishes writing to disk. For large archives (100+
+          files or >100MB), the OS write buffer may not have flushed by the time the Promise
+          resolves. Callers MUST also await the 'close' event on the output stream:
+            const output = fs.createWriteStream('archive.zip');
+            archive.pipe(output);
+            await archive.finalize();
+            await new Promise((resolve, reject) => {
+              output.on('close', resolve);
+              output.on('error', reject);
+            });
+          Skipping the 'close' wait produces corrupt archives intermittently under load.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/issues/476"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: append
+    import_path: "archiver"
+    description: >
+      Appends a Buffer, Readable stream, or string to the archive with a given entry name.
+      Synchronous enqueue — errors are emitted asynchronously via the 'error' event, NOT thrown.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js lines 558-604
+      # Error codes confirmed from lib/error.js: QUEUECLOSED, ENTRYNAMEREQUIRED, DIRECTORYNOTSUPPORTED, INPUTSTEAMBUFFERREQUIRED
+      - id: append-after-finalize
+        condition: "append() called after finalize() or abort() has been called"
+        throws: "Emits 'error' event with ArchiverError code='QUEUECLOSED' — entry silently dropped"
+        required_handling: >
+          If append() is called after finalize() or abort(), it emits ArchiverError{ code:
+          'QUEUECLOSED', message: 'queue closed' } via the 'error' event and returns without
+          enqueuing the entry. The entry is SILENTLY DROPPED. This happens in background
+          workers that race with finalize() calls. Callers must check archive state before
+          calling append() in async contexts or catch the QUEUECLOSED error specifically.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/error.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: append-missing-entry-name
+        condition: "append() called without data.name or with empty string name"
+        throws: "Emits 'error' event with ArchiverError code='ENTRYNAMEREQUIRED'"
+        required_handling: >
+          If the entry data object is missing the 'name' field or name is an empty string,
+          archiver emits ArchiverError{ code: 'ENTRYNAMEREQUIRED', message: 'entry name must
+          be a non-empty string value' }. The entry is dropped. This silently produces archives
+          missing expected files. Always provide a non-empty name in data: { name: 'path/to/file' }.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/error.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: append-invalid-source-type
+        condition: "append() called with source that is not a Buffer, Readable stream, or string"
+        throws: "Emits 'error' event with ArchiverError code='INPUTSTEAMBUFFERREQUIRED'"
+        required_handling: >
+          If source is not a Buffer, Readable stream, or string, archiver emits
+          ArchiverError{ code: 'INPUTSTEAMBUFFERREQUIRED', message: 'input source must be
+          valid Stream or Buffer instance' }. This commonly happens when passing a Promise
+          instead of a stream, or passing null/undefined. Always validate source type before
+          calling append().
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/error.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: append-stream-error-not-propagated
+        condition: "Readable stream passed to append() emits its own 'error' event"
+        throws: "Stream error is NOT automatically forwarded to archiver's error event — process may crash"
+        required_handling: >
+          When a Readable stream passed to append() emits its own 'error' event (e.g. network
+          failure, file read error), that error is NOT automatically forwarded to the archiver
+          instance's 'error' event. The unhandled stream error event crashes the Node.js process.
+          Callers MUST attach an error handler to each stream before passing it to append():
+            const stream = fs.createReadStream('file.txt');
+            stream.on('error', (err) => archive.emit('error', err));
+            archive.append(stream, { name: 'file.txt' });
+        sources:
+          - "https://github.com/archiverjs/node-archiver/issues/321"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: directory
+    import_path: "archiver"
+    description: >
+      Appends a directory and all its contents recursively using glob under the hood.
+      Synchronous enqueue — errors are emitted asynchronously via the 'error' event.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js lines 605-699
+      # Error codes: QUEUECLOSED, DIRECTORYDIRPATHREQUIRED, DIRECTORYFUNCTIONINVALIDDATA
+      - id: directory-after-finalize
+        condition: "directory() called after finalize() or abort()"
+        throws: "Emits 'error' event with ArchiverError code='QUEUECLOSED'"
+        required_handling: >
+          If directory() is called after finalize() or abort(), it emits ArchiverError{
+          code: 'QUEUECLOSED' }. The directory contents are silently dropped from the archive.
+          Guard directory() calls with state checks or avoid calling after finalize().
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: directory-invalid-dirpath
+        condition: "directory() called with non-string or empty dirpath"
+        throws: "Emits 'error' event with ArchiverError code='DIRECTORYDIRPATHREQUIRED'"
+        required_handling: >
+          If dirpath is not a string or is an empty string, archiver emits ArchiverError{
+          code: 'DIRECTORYDIRPATHREQUIRED', message: 'diretory dirpath argument must be a
+          non-empty string value' }. Validate dirpath before calling directory().
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: directory-function-invalid-return
+        condition: "Data transformation function passed to directory() returns invalid value (not false or EntryData object)"
+        throws: "Emits 'error' event with ArchiverError code='DIRECTORYFUNCTIONINVALIDDATA'"
+        required_handling: >
+          The optional third argument to directory() can be a function that transforms
+          EntryData per-file. If this function returns anything other than false (to skip the
+          entry) or a valid EntryData object, archiver emits ArchiverError{ code:
+          'DIRECTORYFUNCTIONINVALIDDATA' }. Return false to skip a file or the modified entry
+          object to include it. Never return null, undefined, or other falsy values.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: file
+    import_path: "archiver"
+    description: >
+      Appends a single file by filepath using a lazystream wrapper to avoid open file
+      descriptor limits. Synchronous enqueue — errors are emitted asynchronously.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js lines 700-724
+      # Error codes: QUEUECLOSED, FILEFILEPATHREQUIRED
+      - id: file-after-finalize
+        condition: "file() called after finalize() or abort()"
+        throws: "Emits 'error' event with ArchiverError code='QUEUECLOSED'"
+        required_handling: >
+          If file() is called after finalize() or abort(), the file is silently dropped and
+          archiver emits ArchiverError{ code: 'QUEUECLOSED' }. Avoid calling file() after
+          finalize() or guard with a state check.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: file-invalid-filepath
+        condition: "file() called with non-string or empty filepath"
+        throws: "Emits 'error' event with ArchiverError code='FILEFILEPATHREQUIRED'"
+        required_handling: >
+          If filepath is not a string or is an empty string, archiver emits ArchiverError{
+          code: 'FILEFILEPATHREQUIRED', message: 'file filepath argument must be a non-empty
+          string value' }. Always validate filepath before passing to file().
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: glob
+    import_path: "archiver"
+    description: >
+      Appends multiple files matched by a glob pattern. Uses readdir-glob internally.
+      Glob errors are forwarded to the archiver's 'error' event.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js lines 725-769
+      # Glob errors: propagated via onGlobError → archive.emit('error', err)
+      - id: glob-no-matches
+        condition: "glob() pattern matches zero files and finalize() is called"
+        throws: "No error emitted — archive is empty (zero bytes content), but finalize() resolves normally"
+        required_handling: >
+          If a glob pattern matches no files, no error is emitted and the archive is finalized
+          with zero entries. This produces a valid but empty archive. Applications that expect
+          at least one file must validate the 'entry' event count or pointer() > 0 after
+          finalize() to detect unexpected empty archives.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://www.archiverjs.com/docs/archiver/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: glob-filesystem-error
+        condition: "readdir-glob encounters a filesystem error (EACCES, ENOENT on root pattern dir)"
+        throws: "Emits 'error' event via onGlobError forwarding — same as archiver 'error' event"
+        required_handling: >
+          readdir-glob errors (e.g. permission denied on the root glob directory, or invalid
+          cwd path) are forwarded to the archiver 'error' event via the internal onGlobError
+          handler. These errors terminate the glob traversal. Callers must have an 'error'
+          event handler to catch these. Validate the cwd option is a real accessible directory
+          before calling glob().
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: symlink
+    import_path: "archiver"
+    description: >
+      Programmatically creates a symlink entry in the archive (does not touch filesystem).
+      Only supported in tar format archives — zip format emits SYMLINKNOTSUPPORTED.
+    postconditions:
+      # Evidence: https://github.com/archiverjs/node-archiver/blob/master/lib/core.js lines 857-901
+      # Error codes: QUEUECLOSED, SYMLINKFILEPATHREQUIRED, SYMLINKTARGETREQUIRED, SYMLINKNOTSUPPORTED
+      - id: symlink-zip-format-unsupported
+        condition: "symlink() called on a zip-format archiver instance"
+        throws: "Emits 'error' event with ArchiverError code='SYMLINKNOTSUPPORTED'"
+        required_handling: >
+          ZIP format does not support symlinks. If symlink() is called on a zip archiver,
+          it emits ArchiverError{ code: 'SYMLINKNOTSUPPORTED', message: 'support for symlink
+          entries not defined by module' }. Only use symlink() with tar-format archives.
+          Check archive format before calling symlink() or use a tar archive when symlinks
+          are required.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/error.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: symlink-after-finalize
+        condition: "symlink() called after finalize() or abort()"
+        throws: "Emits 'error' event with ArchiverError code='QUEUECLOSED'"
+        required_handling: >
+          If symlink() is called after finalize() or abort(), it emits ArchiverError{
+          code: 'QUEUECLOSED' }. The symlink entry is silently dropped.
+        sources:
+          - "https://github.com/archiverjs/node-archiver/blob/master/lib/core.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
 
     edge_cases:
       - id: no-error-handler

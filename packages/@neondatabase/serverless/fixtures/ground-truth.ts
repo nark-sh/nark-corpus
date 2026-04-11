@@ -239,3 +239,34 @@ export async function neonTaggedTemplateWithTryCatch() {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. sql.transaction() — bare calls (no try-catch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function neonTransactionBareNoCatch(name: string, email: string) {
+  // SHOULD_FIRE: transaction-statement-error — sql.transaction() can throw NeonDbError, no try-catch
+  const [insertedUser] = await sqlFn.transaction([
+    sqlFn`INSERT INTO users (name, email) VALUES (${name}, ${email}) RETURNING *`,
+    sqlFn`UPDATE counts SET user_count = user_count + 1`,
+  ]);
+  return insertedUser;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. sql.transaction() — properly wrapped
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function neonTransactionWithTryCatch(name: string, email: string) {
+  try {
+    // SHOULD_NOT_FIRE: transaction-statement-error — sql.transaction() wrapped in try-catch
+    const [insertedUser] = await sqlFn.transaction([
+      sqlFn`INSERT INTO users (name, email) VALUES (${name}, ${email}) RETURNING *`,
+      sqlFn`UPDATE counts SET user_count = user_count + 1`,
+    ]);
+    return insertedUser;
+  } catch (error) {
+    console.error('Transaction failed:', error);
+    throw error;
+  }
+}

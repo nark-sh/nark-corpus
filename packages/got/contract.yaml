@@ -1,21 +1,24 @@
 package: got
 semver: ">=12.0.0"
-contract_version: "2.0.0"
+contract_version: "2.1.0"
 maintainer: corpus-team
-last_verified: "2026-04-02"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 # Error class hierarchy (all extend RequestError which extends Error):
 #   RequestError         — base: any request failure (code = ECONNREFUSED, ETIMEDOUT, etc.)
 #     HTTPError          — non-2xx/3xx response (code = ERR_NON_2XX_3XX_RESPONSE)
 #     MaxRedirectsError  — >10 redirects (code = ERR_TOO_MANY_REDIRECTS)
 #     TimeoutError       — request aborted due to timeout (event = 'connect'|'request'|etc.)
-#     ReadError          — failure reading from response stream
-#     CacheError         — cache adapter failure
-#     UploadError        — failure reading from request body stream
-#     RetryError         — manual retry trigger (always triggers a new retry)
+#     ReadError          — failure reading from response stream (code = ERR_READING_RESPONSE_STREAM)
+#     CacheError         — cache adapter failure (code = ERR_CACHE_ACCESS)
+#     UploadError        — failure reading from request body stream (code = ERR_UPLOAD)
+#     RetryError         — manual retry trigger (always triggers a new retry) (code = ERR_RETRYING)
 #     AbortError         — aborted via AbortController (code = ERR_ABORTED)
+#   ParseError           — 2xx response body parsing failed (code = ERR_BODY_PARSE_FAILURE)
+#                          declared in core/response.d.ts, exported from index.d.ts
 #   CancelError          — promise cancelled via .cancel() (Promise API only)
 #
 # throwHttpErrors (default: true):
@@ -117,6 +120,61 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: dist/source/core/response.d.ts (ParseError class declaration)
+      # Evidence: dist/source/as-promise/index.js (throw new ParseError(...) when parseBody fails)
+      # Evidence: https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+      - id: parse-error
+        condition: >
+          Server responds with a 2xx status code, responseType is 'json' (or .json() shortcut
+          is called), and the response body cannot be parsed as JSON. Also triggered when
+          responseType is set to an unknown value. ParseError extends RequestError and includes
+          a .response property with the raw body available at response.rawBody.
+        throws: >
+          ParseError with code ERR_BODY_PARSE_FAILURE. Declared in core/response.d.ts.
+          error.response.rawBody contains the raw Uint8Array. error.message includes
+          the JSON parse error message and the request URL.
+        required_handling: >
+          Caller MUST wrap in try-catch. Distinguish from HTTPError by checking
+          error instanceof got.ParseError (or error.code === 'ERR_BODY_PARSE_FAILURE').
+          This error means the HTTP request succeeded (2xx) but the body was not valid JSON.
+          The raw body is accessible via error.response.rawBody for debugging.
+          ParseError is NOT retried automatically (it's a successful HTTP response with bad content).
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+          - https://github.com/sindresorhus/got/blob/main/dist/source/core/response.d.ts
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: dist/source/core/index.js (this.destroy(new AbortError(this)))
+      # Evidence: dist/source/core/errors.d.ts (AbortError class with code ERR_ABORTED)
+      - id: abort-error
+        condition: >
+          An AbortController's .abort() method is called while the request is in-flight.
+          The AbortController signal is passed via options.signal.
+        throws: >
+          AbortError (subclass of RequestError) with code ERR_ABORTED.
+          This is a Promise rejection, not an event emission.
+        required_handling: >
+          Caller MUST wrap in try-catch. Check error.code === 'ERR_ABORTED' or
+          error instanceof got.AbortError. This is commonly used for request cancellation
+          in UI components or when switching users/sessions. Note: AbortError is NOT
+          automatically retried.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+          - https://github.com/sindresorhus/got/blob/main/dist/source/core/errors.d.ts
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
 
     edge_cases:
       - id: throw-http-errors-false
@@ -500,6 +558,137 @@ functions:
         required_handling: Caller MUST wrap in try-catch. Error behavior is identical to base got.
         sources:
           - https://github.com/sindresorhus/got/blob/main/documentation/10-instances.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: dist/source/as-promise/types.d.ts (json/buffer/text shortcut declarations)
+  # Evidence: dist/source/as-promise/index.js (shortcut implementations using parseBody())
+  # Evidence: dist/source/core/response.d.ts (ParseError class, code ERR_BODY_PARSE_FAILURE)
+  - name: json
+    import_path: got
+    description: >
+      Shortcut method on a CancelableRequest (Promise) that forces JSON response parsing
+      regardless of the configured responseType. Returns a new Promise resolving to the
+      parsed JSON value. Called as: got(url).json<T>(). Semantically equivalent to
+      setting { resolveBodyOnly: true, responseType: 'json' }. Also sets the Accept:
+      application/json header if not already set.
+    postconditions:
+      - id: json-parse-error
+        condition: >
+          The HTTP request succeeds with a 2xx status code but the response body is not
+          valid JSON (malformed, truncated, or empty). Common when an upstream service
+          returns HTML error pages (e.g., a proxy 502 with HTML body) with a 2xx status,
+          or when the Content-Type is wrong.
+        throws: >
+          ParseError with code ERR_BODY_PARSE_FAILURE. Declared in core/response.d.ts,
+          exported from index.d.ts. error.response.rawBody contains the raw Uint8Array.
+          error.message includes the JSON parse error and request URL.
+        required_handling: >
+          Caller MUST wrap in try-catch. This is NOT the same as HTTPError (which means
+          non-2xx response). ParseError means the HTTP handshake succeeded but data is unusable.
+          Access error.response.rawBody for debugging. Check error.code === 'ERR_BODY_PARSE_FAILURE'
+          or error instanceof ParseError to distinguish from network/HTTP errors.
+          ParseError is NOT retried automatically.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+          - https://github.com/sindresorhus/got/blob/main/dist/source/as-promise/types.d.ts
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: json-http-error
+        condition: >
+          Server responds with a non-2xx/3xx status code and throwHttpErrors is true (default).
+          This propagates from the underlying got() call.
+        throws: HTTPError with code ERR_NON_2XX_3XX_RESPONSE
+        required_handling: >
+          Caller MUST wrap in try-catch. Same as the underlying got() call behavior.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: buffer
+    import_path: got
+    description: >
+      Shortcut method on a CancelableRequest (Promise) that forces buffer (Uint8Array)
+      response parsing regardless of the configured responseType. Returns a new Promise
+      resolving to a Uint8Array. Called as: got(url).buffer(). Semantically equivalent
+      to setting { resolveBodyOnly: true, responseType: 'buffer' }.
+    postconditions:
+      - id: buffer-http-error
+        condition: >
+          Server responds with a non-2xx/3xx status code and throwHttpErrors is true (default).
+        throws: HTTPError with code ERR_NON_2XX_3XX_RESPONSE
+        required_handling: Caller MUST wrap in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: buffer-network-error
+        condition: Network failure during the request (after retries exhausted).
+        throws: RequestError or subclass (TimeoutError, etc.)
+        required_handling: Caller MUST wrap in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: text
+    import_path: got
+    description: >
+      Shortcut method on a CancelableRequest (Promise) that forces text (string) response
+      parsing regardless of the configured responseType. Returns a new Promise resolving
+      to a string. Called as: got(url).text(). Semantically equivalent to setting
+      { resolveBodyOnly: true, responseType: 'text' }. Handles BOM stripping for UTF-8
+      encoded responses (removes leading \uFEFF if UTF-8 encoding is detected).
+    postconditions:
+      - id: text-http-error
+        condition: >
+          Server responds with a non-2xx/3xx status code and throwHttpErrors is true (default).
+        throws: HTTPError with code ERR_NON_2XX_3XX_RESPONSE
+        required_handling: Caller MUST wrap in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: text-network-error
+        condition: Network failure during the request (after retries exhausted).
+        throws: RequestError or subclass (TimeoutError, etc.)
+        required_handling: Caller MUST wrap in try-catch.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
         severity: error
         business_impact:
           incident_label: DOWNTIME

@@ -2,9 +2,10 @@ package: "@neondatabase/serverless"
 semver: ">=0.7.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-01"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 # Official Neon serverless driver for JavaScript/TypeScript.
 # Carries SQL over HTTP (neon() tagged template) and WebSockets (Pool/Client).
@@ -126,6 +127,11 @@ functions:
       (Vercel Edge, Cloudflare Workers) where WebSocket Pool/Client is not available.
 
     postconditions:
+      # Evidence: seen in 16 primary firings across 13 repos in scan-neondatabase-serverless-2026-04-11.json
+      # Note: scanner currently flags neon(connectionString) factory calls in drizzle-orm setups (FP pattern)
+      # True positives are direct sql`...` tagged template calls without try-catch
+      # Top affected: ahmedkhaleel2004/gitdiagram (⭐7k+), noodle-run/noodle, jnsahaj/tweakcn
+      # FP check: 0/20 type-A FPs confirmed across non-user repos
       - id: neon-db-error
         condition: >
           PostgreSQL error (syntax error, constraint violation, undefined table, permission denied,
@@ -147,3 +153,83 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: transaction
+    import_path: "@neondatabase/serverless"
+    description: >
+      HTTP-transport batch transaction. Called as sql.transaction([sql`...`, sql`...`])
+      or sql.transaction(txn => [...queries]). Wraps multiple SQL statements in a single
+      HTTP request with BEGIN/COMMIT. All queries run atomically. Returns an array of
+      results. Throws NeonDbError if any statement fails, rolling back the transaction.
+
+    postconditions:
+      # Evidence: https://neon.tech/docs/serverless/serverless-driver#transaction-function
+      # Error types confirmed from @neondatabase/serverless source: NeonDbError hierarchy
+      - id: transaction-statement-error
+        condition: >
+          Any statement within the transaction fails — constraint violation (23505 unique,
+          23503 foreign key), syntax error (42601), serialization failure (40001), or deadlock (40P01).
+          The entire transaction is rolled back; no partial commits occur.
+        throws: >
+          NeonDbError carrying the PostgreSQL SQLSTATE code of the first failing statement.
+        required_handling: >
+          Caller MUST wrap sql.transaction() in try-catch. Because all statements are
+          batched into a single HTTP request, partial results are never returned — on
+          any failure the entire array rejects. Uncaught NeonDbError crashes the request
+          handler (Next.js route, Cloudflare Worker, etc.).
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver#transaction-function"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: transaction-isolation-conflict
+        condition: >
+          Transaction isolation level is REPEATABLE READ or SERIALIZABLE and a concurrent
+          write conflict is detected (SQLSTATE 40001 serialization_failure or 40P01 deadlock).
+        throws: >
+          NeonDbError with SQLSTATE 40001 or 40P01. These errors require retry logic —
+          they are expected under high concurrency and do not indicate a bug.
+        required_handling: >
+          Callers using isolationLevel: 'RepeatableRead' or 'Serializable' MUST implement
+          retry logic for SQLSTATE 40001/40P01 errors. Treating serialization failures as
+          fatal errors causes unnecessary user-visible failures under load.
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver#transaction-function"
+          - "https://www.postgresql.org/docs/current/transaction-iso.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: transaction-network-error
+        condition: >
+          HTTP request to Neon's proxy fails mid-transaction (network timeout, Neon scale-to-zero
+          activation delay, connection reset). Transaction state is unknown — may have committed
+          or rolled back on the server side.
+        throws: >
+          NeonDbError with sourceError set to the underlying network error.
+        required_handling: >
+          Callers MUST handle NeonDbError where sourceError is set (network errors) separately
+          from SQLSTATE errors. For idempotent transactions, implement retry with exponential
+          backoff. For non-idempotent transactions (e.g. payment processing), do NOT blindly
+          retry — implement idempotency keys to safely detect duplicate commits.
+        sources:
+          - "https://neon.tech/docs/serverless/serverless-driver#transaction-function"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed

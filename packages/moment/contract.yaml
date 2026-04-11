@@ -1,10 +1,11 @@
 package: moment
 semver: ">=2.29.0 <3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.73
 
 functions:
   - name: moment
@@ -80,8 +81,233 @@ functions:
           incident_cost_range: medium
         cve: "CVE-2022-24785"
 
+  - name: parseZone
+    import_path: "moment"
+    description: "Parses a date string while preserving the original UTC offset from the string"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/parsing/parse-zone/
+      # Source confirmed: createInZone() calls createLocal().parseZone() — same parse path as moment()
+      # Invalid input produces invalid Moment with isValid()=false and utcOffset()=NaN
+      - id: parsezone-invalid-date
+        condition: "input string is not a valid date format"
+        returns: "Invalid moment object (moment.isValid() returns false, utcOffset() returns NaN)"
+        required_handling: >
+          Caller MUST check isValid() before using the moment object.
+          moment.parseZone() is often used to preserve timezone offset from API responses
+          (e.g., "2013-01-01T00:00:00-13:00"). If the input string is malformed,
+          the returned moment is invalid AND utcOffset() returns NaN — both the
+          date and the offset are silently broken.
+          Use pattern: const m = moment.parseZone(input); if (!m.isValid()) { /* handle */ }
+        sources:
+          - "https://momentjs.com/docs/#/parsing/parse-zone/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: unix
+    import_path: "moment"
+    description: "Creates a moment from a Unix timestamp (seconds since epoch)"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/parsing/unix-timestamp/
+      # Source confirmed: createUnix(input) calls createLocal(input * 1000)
+      # NaN*1000 = NaN → invalid moment. Non-numeric strings produce NaN via *1000.
+      - id: unix-nan-timestamp
+        condition: "input is NaN, null, undefined, or a non-numeric string"
+        returns: "Invalid moment object (moment.isValid() returns false)"
+        required_handling: >
+          Caller MUST validate that the Unix timestamp is a finite number before calling
+          moment.unix(). Common sources of invalid timestamps: API responses where a field
+          is null/undefined (e.g., user.lastLoginAt), database values that are 0 or negative
+          (treated as valid by moment — epoch-relative), or string values not cast to number.
+          moment.unix(NaN) silently returns an invalid moment object.
+          Use pattern: const ts = getTimestamp(); if (typeof ts === 'number' && isFinite(ts)) { moment.unix(ts) }
+        sources:
+          - "https://momentjs.com/docs/#/parsing/unix-timestamp/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: duration
+    import_path: "moment"
+    description: "Creates a Duration object representing a length of time"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/durations/
+      # Source confirmed: createDuration.invalid = createInvalid$1 which calls createDuration(NaN)
+      # Duration.isValid() is mapped to isValid$1() which returns this._isValid (often undefined unless NaN input)
+      - id: duration-nan-propagation
+        condition: "input to duration-based arithmetic is NaN or invalid"
+        returns: "NaN values in all numeric outputs (asMilliseconds(), asSeconds(), etc.)"
+        required_handling: >
+          moment.duration() does not throw when given NaN inputs. Instead all numeric
+          extraction methods (asMilliseconds(), asSeconds(), asMinutes(), etc.) return NaN,
+          which propagates silently through calculations.
+          Common pattern causing issues: computing duration from two moment objects where
+          one is invalid — moment.duration(invalid.diff(valid)) produces NaN duration.
+          Check isValid() on both moments before computing diffs:
+          if (start.isValid() && end.isValid()) { const d = moment.duration(end.diff(start)); }
+        sources:
+          - "https://momentjs.com/docs/#/durations/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: defineLocale
+    import_path: "moment"
+    description: "Defines a new custom locale for Moment.js"
+    postconditions:
+      # Evidence: https://nvd.nist.gov/vuln/detail/CVE-2022-24785
+      # Source confirmed: isLocaleNameSane() checks for '/' and '\' but only in loadLocale(),
+      # not in defineLocale() itself. The path traversal CVE affects moment.locale() call
+      # which calls loadLocale() if locale is not preloaded.
+      # defineLocale() also calls getSetGlobalLocale(name) → setGlobalLocale() → locale()
+      - id: definelocale-path-traversal
+        condition: "locale name is user-provided and contains path traversal sequences"
+        vulnerability: "CVE-2022-24785"
+        throws: "Path traversal vulnerability — the locale name is later used as a file path in require('./locale/' + name)"
+        required_handling: >
+          When the locale name comes from user input, MUST validate against an allowlist
+          of known safe locale codes (e.g., ['en', 'fr', 'de', 'es', 'zh']).
+          The name is passed through isLocaleNameSane() in loadLocale() (checks for '/' and '\'),
+          but this check is insufficient against other path traversal vectors or
+          locale names used in string interpolation elsewhere in the application.
+          Patched in moment 2.29.2. If on older version, validate before calling.
+        sources:
+          - "https://nvd.nist.gov/vuln/detail/CVE-2022-24785"
+          - "https://momentjs.com/docs/#/i18n/defining-locale/"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+        cve: "CVE-2022-24785"
+
+  - name: updateLocale
+    import_path: "moment"
+    description: "Updates an existing locale definition for Moment.js"
+    postconditions:
+      # Evidence: https://nvd.nist.gov/vuln/detail/CVE-2022-24785
+      # Source confirmed: updateLocale() calls getSetGlobalLocale(name) → locale(name)
+      # which calls loadLocale(name) if not preloaded — same path traversal vector as locale()
+      - id: updatelocale-path-traversal
+        condition: "locale name is user-provided and contains path traversal sequences"
+        vulnerability: "CVE-2022-24785"
+        throws: "Path traversal vulnerability — the locale name is later used as a file path"
+        required_handling: >
+          Same risk as moment.locale() and moment.defineLocale(). When updating locales
+          dynamically (e.g., in multi-tenant SaaS where tenant sets their locale preference),
+          MUST validate against an allowlist of known locale codes.
+          Use pattern: const ALLOWED_LOCALES = ['en', 'fr', 'de']; if (ALLOWED_LOCALES.includes(tenantLocale)) { moment.updateLocale(tenantLocale, config); }
+        sources:
+          - "https://nvd.nist.gov/vuln/detail/CVE-2022-24785"
+          - "https://momentjs.com/docs/#/i18n/changing-locale/"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+        cve: "CVE-2022-24785"
+
+  - name: format
+    import_path: "moment"
+    description: "Formats a Moment object into a string according to a format string"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/displaying/format/
+      # Source confirmed: formatMoment() checks isValid() and returns locale's invalidDate string
+      # The default invalidDate string is 'Invalid date' (source: defaultInvalidDate = 'Invalid date')
+      # This is a STRING return — not an exception — so it silently gets stored in DB, logs, API responses
+      - id: format-invalid-date-string
+        condition: "moment object is invalid (parsed from malformed input)"
+        returns: "The string 'Invalid date' (or locale-specific equivalent) instead of a formatted date"
+        required_handling: >
+          Caller MUST check isValid() before calling format(). The string 'Invalid date'
+          is silently returned and easily gets stored in databases, API responses, or
+          displayed to users without error. This is the #1 moment.js footgun in production:
+          moment(userInput).format('YYYY-MM-DD') returns "Invalid date" instead of throwing.
+          Use pattern: const m = moment(input); if (!m.isValid()) { throw new Error('invalid date'); } return m.format('YYYY-MM-DD');
+        sources:
+          - "https://momentjs.com/docs/#/displaying/format/"
+          - "https://momentjs.com/docs/#/parsing/is-valid/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: https://nvd.nist.gov/vuln/detail/CVE-2022-31129
+      # Affected versions: 2.18.0 - 2.29.3, patched in 2.29.4
+      # ReDoS triggered by RFC2822 parsing of strings > 10,000 chars
+      - id: format-redos-unvalidated-input
+        condition: "format string or input string from user-provided data is excessively long (>10,000 chars)"
+        vulnerability: "CVE-2022-31129"
+        throws: "ReDoS (Regular Expression Denial of Service) — quadratic time complexity in RFC2822 date parsing"
+        required_handling: >
+          MUST validate input string length before parsing untrusted strings with moment().
+          The RFC2822 date format regex has quadratic (N²) complexity for strings exceeding
+          10,000 characters. A 50,000-char input can cause 25+ second blocking on the event loop.
+          Use pattern: if (typeof input === 'string' && input.length > 1000) { throw new Error('date input too long'); }
+          Patched in moment 2.29.4. If on vulnerable version, add length validation.
+        sources:
+          - "https://nvd.nist.gov/vuln/detail/CVE-2022-31129"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        cve: "CVE-2022-31129"
+
+  - name: toISOString
+    import_path: "moment"
+    description: "Returns an ISO 8601 string representation of the moment object"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/parsing/is-valid/
+      # Source confirmed: toISOString() returns null when !this.isValid() (line 3994-3995)
+      # This causes JSON.stringify to include null in the output, or calling code that expects
+      # a string to crash with TypeError: Cannot read property 'split' of null
+      - id: toisostring-null-for-invalid
+        condition: "moment object is invalid (parsed from malformed input)"
+        returns: "null instead of an ISO string"
+        required_handling: >
+          Caller MUST check isValid() before calling toISOString(). The null return value
+          is a common source of TypeErrors: code that chains .split('T') or .substring(0, 10)
+          on the toISOString() result crashes at runtime.
+          Also affects JSON.stringify(obj) when obj contains a moment in toJSON() call —
+          toJSON() calls toISOString() and returns null for invalid moments.
+          Use pattern: const m = moment(input); if (!m.isValid()) { return null; } return m.toISOString();
+        sources:
+          - "https://momentjs.com/docs/#/parsing/is-valid/"
+          - "https://momentjs.com/docs/#/displaying/as-iso-string/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 # Category: utilities
+
 # npm: https://www.npmjs.com/package/moment
 # Repository: https://github.com/moment/moment
 # Note: Moment.js is in maintenance mode (no new features), but still widely used
 # Security: CVE-2022-24785 (path traversal), CVE-2022-31129 (ReDoS)
+# coverage_score: 0.73  # 8 contracted out of 11 meaningful api functions (3 omitted: diff/toDate/valueOf — NaN propagation covered by format/toISOString contracts)
