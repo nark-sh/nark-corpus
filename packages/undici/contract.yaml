@@ -1,11 +1,11 @@
 package: undici
 semver: ">=5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.43
+coverage_score: 0.91
 category: http-client
 description: Official Node.js HTTP/1.1 client implementing the Fetch API standard
 
@@ -16,6 +16,14 @@ detection:
     - stream
     - connect
     - upgrade
+  # WebSocket is a constructor (new WebSocket(url)) imported from undici.
+  # It requires an onerror handler — connection failures fire the error event, not a throw.
+  class_names:
+    - WebSocket
+  required_event_listeners:
+    - event: "error"
+      required: true
+      severity: error
 
 functions:
   - name: request
@@ -233,4 +241,281 @@ functions:
           throws SyntaxError. The correct pattern is: check response.ok (or
           response.status) first, throw a descriptive error if not OK, then call
           response.json() only on success responses.
+        evidence_quality: confirmed
+
+  - name: text
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Reads the response body and returns it as a UTF-8 string. Called as
+      response.text() on a Response object (Fetch API). Returns Promise<string>.
+      Commonly used after fetch() to read HTML, plain text, or error responses.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/text
+      # Error types confirmed from undici source: lib/web/fetch/body.js
+      # body.js line 430: Promise.reject(new TypeError('Body is unusable: Body has already been read'))
+      # NOTE: response-text-no-try-catch is listed first because the scanner fires the first
+      # error-severity postcondition, and the missing-try-catch case is far more common and
+      # statically detectable than double-read.
+      - id: response-text-no-try-catch
+        condition: >
+          response.text() called in async context without try-catch wrapping the await.
+          Network failure during body streaming (UND_ERR_SOCKET, UND_ERR_BODY_TIMEOUT)
+          after headers arrive causes the body promise to reject.
+        throws: >
+          BodyTimeoutError (UND_ERR_BODY_TIMEOUT) if body download exceeds bodyTimeout.
+          SocketError (UND_ERR_SOCKET) if TCP connection drops mid-body.
+          RequestAbortedError (UND_ERR_ABORTED) if AbortSignal fires during body read.
+        required_handling: >
+          Wrap await response.text() in try-catch. Network can fail AFTER headers
+          are received — a successful fetch() does not guarantee the body will arrive
+          intact. Critical in streaming scenarios or large response bodies.
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/text#exceptions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          HTTP responses are received in two phases: headers and body. fetch() resolves
+          when headers arrive (status 200). The body arrives separately and can fail
+          independently. Developers who wrap only fetch() in try-catch but not
+          response.text() will have unhandled rejections from body timeout or socket
+          errors. This is especially common in high-latency APIs or large file downloads.
+        evidence_quality: confirmed
+
+      - id: response-text-body-already-read
+        condition: >
+          response.text() called after the body has already been consumed by a previous
+          call to .text(), .json(), .arrayBuffer(), .blob(), .bytes(), or .body.getReader().
+        throws: >
+          TypeError: 'Body is unusable: Body has already been read'
+          (confirmed from undici/lib/web/fetch/body.js source)
+        required_handling: >
+          Caller MUST call response.text() only once per Response object. If the same
+          response body needs to be read multiple times, clone the Response before
+          consuming: const cloned = response.clone(); await cloned.text().
+          Alternatively, store the result in a variable and reuse it.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/text"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          A common footgun when reading response bodies: once .json() fails and a
+          developer retries with .text() on the same response object (to log the
+          raw error body), both .text() and .json() reject because the body stream
+          is already disturbed. Pattern: logging middleware that reads the body
+          for debugging AND the handler that tries to parse the JSON — both calls
+          fail. The fix is response.clone() before any consumption or a single
+          consumption path.
+        evidence_quality: confirmed
+
+  - name: arrayBuffer
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Reads the response body and returns it as an ArrayBuffer. Called as
+      response.arrayBuffer() on a Response object. Returns Promise<ArrayBuffer>.
+      Used for binary data: images, PDFs, audio, or any non-text response.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/arrayBuffer
+      # Error types confirmed from undici source: lib/web/fetch/body.js
+      # Same consumeBody() code path as text() and blob()
+      # NOTE: response-arraybuffer-no-try-catch is listed first because the scanner fires the
+      # first error-severity postcondition, and missing-try-catch is more common and detectable.
+      - id: response-arraybuffer-no-try-catch
+        condition: >
+          response.arrayBuffer() called without try-catch. Body streaming errors
+          (timeout, socket drop) cause the promise to reject.
+        throws: >
+          BodyTimeoutError (UND_ERR_BODY_TIMEOUT), SocketError (UND_ERR_SOCKET),
+          RequestAbortedError (UND_ERR_ABORTED), ResponseExceededMaxSizeError
+          (UND_ERR_RES_EXCEEDED_MAX_SIZE) when Client configured with maxResponseSize.
+        required_handling: >
+          Wrap await response.arrayBuffer() in try-catch. Large binary downloads are
+          especially vulnerable to BodyTimeoutError. If a maxResponseSize limit is
+          configured on the Client, ResponseExceededMaxSizeError will be thrown for
+          files that exceed the limit.
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+          - "https://github.com/nodejs/undici/blob/main/lib/dispatcher/client-h1.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Binary downloads are more likely to hit body-phase errors than text responses:
+          larger payloads hit bodyTimeout (default 300s) or ResponseExceededMaxSizeError
+          when a Client is configured with maxResponseSize for memory protection. The
+          ResponseExceededMaxSizeError is unique to arrayBuffer/blob/bytes usage since
+          they buffer the entire body in memory — unlike stream() which avoids buffering.
+          Code that downloads files or binary assets must handle this case.
+        evidence_quality: confirmed
+
+      - id: response-arraybuffer-body-already-read
+        condition: >
+          response.arrayBuffer() called after the body has already been consumed by
+          a previous call to any body-reading method or .body.getReader().
+        throws: >
+          TypeError: 'Body is unusable: Body has already been read'
+        required_handling: >
+          Use response.clone() before consuming the body if multiple reads are needed.
+          Store the ArrayBuffer result in a variable rather than calling arrayBuffer() twice.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/arrayBuffer"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Binary response handling is particularly prone to double-consumption: logging
+          middleware reads the body as text for audit logging, then the handler tries to
+          parse it as ArrayBuffer. Both fail. File upload proxies that read the body twice
+          for validation then forwarding also hit this error. Use clone() when multiple
+          consumers of the same response body are needed.
+        evidence_quality: confirmed
+
+  - name: WebSocket
+    import_path: "undici"
+    description: >
+      WebSocket client constructor. Creates a WebSocket connection to the given URL.
+      The constructor is synchronous and initiates the connection asynchronously.
+      Implements the W3C WebSocket API spec (RFC 6455). Available as undici.WebSocket
+      or via globalThis after undici.install().
+    postconditions:
+      # Evidence: https://github.com/nodejs/undici/blob/main/lib/web/websocket/websocket.js
+      # WebSocket constructor throws DOMException(SyntaxError) for invalid URLs/protocols synchronously.
+      # Connection failures dispatched as 'error' event (NOT thrown from constructor).
+      # MDN: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket
+      - id: websocket-constructor-syntax-error
+        condition: >
+          new WebSocket(url) called with an invalid URL format, non-ws/wss scheme,
+          or duplicate/invalid subprotocol strings in the protocols array.
+        throws: >
+          DOMException with name 'SyntaxError'. Thrown synchronously from the constructor,
+          not from an event or promise. Occurs immediately when new WebSocket() is called.
+        required_handling: >
+          Wrap new WebSocket(url) in try-catch if the URL comes from user input or
+          configuration. Static URLs (hardcoded ws://...) are safe to skip try-catch.
+          Dynamic URLs from config files or env vars should be validated or wrapped.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket#exceptions"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/websocket/websocket.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          The WebSocket constructor validates the URL synchronously before initiating
+          any network connection. If WEBSOCKET_URL env var is misconfigured (e.g. uses
+          http:// instead of ws://, or contains whitespace), the constructor throws
+          immediately. In server startup code this crash is visible; in middleware or
+          per-request WebSocket creation it causes unhandled exceptions. Env var
+          misconfiguration is the most common cause.
+        evidence_quality: confirmed
+
+      - id: websocket-connection-error-not-handled
+        condition: >
+          WebSocket connection failure (server unreachable, TLS handshake failure, server
+          rejected upgrade) occurs but no 'onerror' or 'error' event handler is registered.
+          Connection errors are dispatched via the error event, NOT thrown from the constructor.
+        throws: >
+          Does NOT throw. Instead dispatches an ErrorEvent to the 'error' event listener.
+          If no error listener is registered, the error is silently swallowed in browsers
+          but in Node.js the uncaught error causes process crash (UnhandledErrorEvent).
+          After the error event, the 'close' event fires with code 1006 (abnormal closure).
+        required_handling: >
+          Always register ws.onerror or ws.addEventListener('error', handler) before
+          the connection attempt. A missing error handler means connection failures are
+          invisible. Example:
+            const ws = new WebSocket('wss://api.example.com/ws');
+            ws.onerror = (event) => {
+              logger.error('WebSocket connection failed', event);
+            };
+            ws.onclose = (event) => {
+              if (!event.wasClean) reconnect();
+            };
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/WebSocket#events"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/websocket/websocket.js"
+          - "https://www.rfc-editor.org/rfc/rfc6455"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Unlike request() and fetch() which reject promises on failure, WebSocket
+          connection errors follow the DOM event model. A server that drops the connection,
+          rejects the TLS handshake, or returns non-101 status causes the error event to fire.
+          In Node.js with undici's WebSocket, missing error handlers can crash the process
+          via unhandled error events. Real-time features (chat, live updates, collaborative
+          editing) that use WebSocket typically have long-lived connections — a missing
+          reconnect + error handler means permanent loss of real-time functionality after
+          any network blip.
+        evidence_quality: confirmed
+
+  - name: close
+    import_path: "undici"
+    namespace: "Dispatcher"
+    description: >
+      Gracefully closes the dispatcher (Client, Pool, or Agent). Waits for all
+      in-flight requests to complete before resolving. Called on Client, Pool,
+      or Agent instances created with new undici.Client() / new undici.Pool().
+      Returns Promise<void>.
+    postconditions:
+      # Evidence: undici/lib/dispatcher/dispatcher-base.js source
+      # close() rejects with ClientDestroyedError if destroy() was called first.
+      # Confirmed from source: line 53-55 dispatcher-base.js
+      - id: dispatcher-close-already-destroyed
+        condition: >
+          client.close() / pool.close() called AFTER client.destroy() has already
+          been called. The close() promise will reject with ClientDestroyedError.
+        throws: >
+          ClientDestroyedError (UND_ERR_DESTROYED): 'The client is destroyed'
+          Confirmed from undici/lib/dispatcher/dispatcher-base.js source.
+        required_handling: >
+          Track dispatcher lifecycle state. In graceful shutdown handlers, do not
+          call close() if destroy() may have been called on error paths. Use the
+          destroyed property to check: if (!client.destroyed) await client.close().
+          In finally blocks that attempt cleanup: wrap close() in try-catch.
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/lib/dispatcher/dispatcher-base.js"
+          - "https://undici.nodejs.org/#/docs/api/Dispatcher"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          In server shutdown sequences, both error recovery code paths (which call
+          destroy()) and normal shutdown code paths (which call close()) may run.
+          If destroy() fires on error first and then the normal shutdown also calls
+          close(), the close() call rejects with ClientDestroyedError. This crashes
+          graceful shutdown handlers that don't handle the rejection. Check
+          client.destroyed before calling close() in shutdown code.
         evidence_quality: confirmed

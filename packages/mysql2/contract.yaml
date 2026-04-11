@@ -1,10 +1,11 @@
 package: mysql2
 semver: ">=3.9.8"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-11"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.87
 
 # CRITICAL SECURITY NOTE:
 # mysql2 has 5 CRITICAL CVEs in versions < 3.9.8:
@@ -372,3 +373,339 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: createConnection
+    import_path: "mysql2/promise"
+    description: >
+      Establishes a promise-based MySQL connection. Equivalent to calling createConnection()
+      and waiting for the 'connect' event. Returns a PromiseConnection on success, rejects
+      if the server is unreachable or credentials are invalid.
+    postconditions:
+      # Evidence: https://github.com/sidorares/node-mysql2/blob/master/promise.js lines 17-40
+      # Source confirmed: coreConnection.once('error', err => reject()) — all connect errors forwarded
+      - id: createconnection-host-unreachable
+        condition: "MySQL server is not running, host is wrong, or port is unreachable"
+        throws: "Promise rejects with Error: ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:3306)"
+        required_handling: >
+          Wrap await createConnection() in try-catch. Handle ECONNREFUSED at application
+          startup and retry with backoff. In containerized deployments, add readiness
+          checks before attempting connection.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/promise.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >
+          Rejects with ECONNREFUSED when the MySQL server is not running or the host/port
+          is wrong. This is an OS-level TCP error — not a MySQL protocol error. Common in
+          containerized deployments where the database container is not yet healthy.
+        evidence_quality: confirmed
+
+      - id: createconnection-access-denied
+        condition: "Username, password, or database name is not authorized on the MySQL server"
+        throws: "Promise rejects with Error: ER_ACCESS_DENIED_ERROR (MySQL errno 1045, SQLSTATE 28000)"
+        required_handling: >
+          Wrap await createConnection() in try-catch. Check err.code === 'ER_ACCESS_DENIED_ERROR'
+          and log a clear error message. Verify credentials in environment variables before
+          deployment. Do not expose err.message to users.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/promise.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >
+          Rejects with ER_ACCESS_DENIED_ERROR (MySQL errno 1045, SQLSTATE 28000) when
+          username, password, or host is not authorized. The error includes err.code,
+          err.errno, err.sqlState fields. This is the #1 cause of failed DB connections
+          in staging environments where credentials differ from production.
+        evidence_quality: confirmed
+
+      - id: createconnection-too-many-connections
+        condition: "MySQL server has reached its max_connections limit"
+        throws: "Promise rejects with Error: ER_CON_COUNT_ERROR (MySQL errno 1040, SQLSTATE 08004)"
+        required_handling: >
+          Wrap await createConnection() in try-catch. Implement connection pooling (use
+          createPool() instead of createConnection() per-request) to avoid exhausting
+          the server's connection limit. Retry with exponential backoff when ER_CON_COUNT_ERROR.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/promise.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Rejects with ER_CON_COUNT_ERROR (MySQL errno 1040, SQLSTATE 08004) when the
+          MySQL server has reached its max_connections limit. Common under load when
+          connection pooling is not used, or when connections are leaked (not released).
+        evidence_quality: confirmed
+
+  - name: end
+    import_path: "mysql2/promise"
+    description: >
+      Gracefully terminates a Connection or Pool. For Connection, sends COM_QUIT to
+      MySQL server and waits for acknowledgment. For Pool, waits for in-flight queries
+      to finish then closes all connections. Used in graceful shutdown handlers.
+    postconditions:
+      # Evidence: mysql2/lib/promise/pool.js lines 68-82 — pool.end() rejects if connection.end() fails
+      # Evidence: mysql2/lib/promise/connection.js lines 64-66 — wraps end in Promise but always resolves
+      - id: end-pool-connection-error
+        condition: "Pool.end() called while queries are in-flight or connections fail to close"
+        throws: "Promise rejects with PROTOCOL_CONNECTION_LOST or connection close error"
+        required_handling: >
+          Wrap pool.end() or connection.end() in try-catch in shutdown handlers (SIGTERM,
+          process.on('exit')). Log the error but do not re-throw — the goal is graceful
+          shutdown, not failing on cleanup.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/pool.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Pool.end() rejects if any underlying connection fails to close cleanly (e.g.,
+          PROTOCOL_CONNECTION_LOST error during shutdown). A single connection failure
+          causes the entire pool.end() to reject. Common in applications that call
+          pool.end() while queries are still running.
+        evidence_quality: confirmed
+
+      - id: end-called-on-closed-connection
+        condition: "pool.end() called while pool.getConnection() calls are still pending"
+        throws: "Pending getConnection() calls receive Error: 'Pool is closed.'"
+        required_handling: >
+          Drain in-flight requests before calling pool.end(). In graceful shutdown,
+          stop accepting new requests first, then wait for in-flight handlers to complete,
+          then call pool.end(). Wrap pool.end() in try-catch.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/pool.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Calling connection.end() or pool.end() a second time after it has already
+          been called is a no-op for the promise wrapper (the Promise always resolves),
+          but the underlying callback may receive a 'Connection already closed' error
+          which is silently swallowed. The real footgun is calling pool.end() while
+          pool.getConnection() calls are still pending — those pending calls will
+          receive a 'Pool is closed.' error.
+        evidence_quality: confirmed
+
+  - name: prepare
+    import_path: "mysql2/promise"
+    description: >
+      Manually creates a server-side prepared statement for the given SQL template.
+      Returns a PreparedStatementInfo that can be executed multiple times with different
+      parameters. Unlike execute() which auto-manages a statement LRU cache, prepare()
+      gives explicit lifecycle control (caller must call statement.close()).
+    postconditions:
+      # Evidence: mysql2/lib/promise/connection.js lines 126-147
+      # Source: prepare() wraps addCommand(new Commands.Prepare()) — rejects with ER_PARSE_ERROR on bad SQL
+      - id: prepare-sql-syntax-error
+        condition: "SQL template passed to prepare() has a syntax error"
+        throws: "Promise rejects with Error: ER_PARSE_ERROR (MySQL errno 1064)"
+        required_handling: >
+          Wrap await prepare() in try-catch. Validate SQL templates in CI/CD rather
+          than at runtime. Check err.code === 'ER_PARSE_ERROR' to distinguish syntax
+          errors from connection failures.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/connection.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Rejects with ER_PARSE_ERROR (MySQL errno 1064) when the SQL template has a
+          syntax error. Because prepare() is typically called at startup or module load,
+          syntax errors often crash the entire service initialization rather than a
+          single request.
+        evidence_quality: confirmed
+
+      - id: prepare-connection-error
+        condition: "Connection drops between createConnection() and prepare(), or is invalidated by changeUser()"
+        throws: "Promise rejects with PROTOCOL_CONNECTION_LOST or ECONNRESET"
+        required_handling: >
+          Wrap await prepare() in try-catch. Re-prepare statements after any connection
+          reset or changeUser(). Do not cache PreparedStatementInfo objects across
+          connection lifecycle events.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/connection.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Rejects with PROTOCOL_CONNECTION_LOST or ECONNRESET if the connection drops
+          between createConnection() and prepare(). After a changeUser() or reset(),
+          all previously prepared statements are invalidated and will throw on execute().
+          The documentation notes: "you need to prepare statement for each new connection."
+        evidence_quality: confirmed
+
+  - name: PreparedStatementInfo.execute
+    import_path: "mysql2/promise"
+    description: >
+      Executes a manually-prepared statement (returned by connection.prepare()) with
+      the given parameter array. Unlike connection.execute() which auto-manages statement
+      caching, this executes the already-prepared statement directly.
+    postconditions:
+      # Evidence: mysql2/lib/promise/prepared_statement_info.js lines 7-16
+      # Source: makeDoneCb(resolve, reject) — rejects on MySQL execution errors
+      - id: prepared-statement-constraint-violation
+        condition: "Bound parameters violate a database constraint (unique, FK, NOT NULL)"
+        throws: "Promise rejects with ER_DUP_ENTRY (1062), ER_NO_REFERENCED_ROW_2 (1452), or ER_BAD_NULL_ERROR (1048)"
+        required_handling: >
+          Wrap await stmt.execute() in try-catch. Check err.code to distinguish constraint
+          violations (do not retry without fixing data) from connection errors (may retry).
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/prepared_statement_info.js"
+          - "https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html"
+        severity: error
+        description: >
+          Rejects with ER_DUP_ENTRY (1062), ER_NO_REFERENCED_ROW_2 (1452), or
+          ER_BAD_NULL_ERROR (1048) when the bound parameters violate database
+          constraints. Prepared statements prevent SQL injection but do not prevent
+          constraint violations — the parameters are still validated against the schema
+          at execution time.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: prepared-statement-stale-after-reconnect
+        condition: "PreparedStatementInfo used after connection reset, changeUser(), or reconnection"
+        throws: "Promise rejects with unknown statement ID error or PROTOCOL_CONNECTION_LOST"
+        required_handling: >
+          Do not cache PreparedStatementInfo objects across connection lifecycle events.
+          Re-call connection.prepare() after any changeUser(), reset(), or reconnection.
+          Wrap await stmt.execute() in try-catch.
+        sources:
+          - "https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements"
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/prepared_statement_info.js"
+        severity: error
+        description: >
+          Executing a PreparedStatementInfo after the underlying connection has been
+          reset via reset(), changeUser(), or reconnected after PROTOCOL_CONNECTION_LOST
+          will throw because the statement ID is no longer valid on the server. The
+          MySQL documentation states prepared statements are connection-scoped and do
+          not survive reconnection.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: changeUser
+    import_path: "mysql2/promise"
+    description: >
+      Changes the currently authenticated user on an existing connection without
+      closing and reopening it. Used in multi-tenant apps that share a connection
+      pool but need per-tenant database/user context. After changeUser(), all
+      previously prepared statements are invalidated.
+    postconditions:
+      # Evidence: mysql2/lib/base/connection.js lines 874-912 — err.fatal = true on failure
+      # Source confirmed: changeUser callback sets err.fatal = true, marking connection unrecoverable
+      - id: changeuser-access-denied
+        condition: "New user credentials are invalid or not authorized for the target database"
+        throws: "Promise rejects with ER_ACCESS_DENIED_ERROR (errno 1045); connection marked fatal (err.fatal = true)"
+        required_handling: >
+          Wrap await connection.changeUser() in try-catch. On ER_ACCESS_DENIED_ERROR,
+          destroy the connection and create a new one — the connection is permanently
+          unusable after a fatal changeUser error. Do not return it to the pool.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/base/connection.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >
+          Rejects with ER_ACCESS_DENIED_ERROR (errno 1045) when the new user credentials
+          are invalid. Critically, the error handler in mysql2 source sets err.fatal = true
+          on changeUser failure, which means the connection is marked as permanently
+          unusable after a failed changeUser(). The connection must be closed and
+          re-established — it cannot be reused for further queries.
+        evidence_quality: confirmed
+
+      - id: changeuser-prepared-statements-invalidated
+        condition: "changeUser() called on a connection that has cached PreparedStatementInfo objects"
+        throws: "Does not throw on changeUser() itself, but subsequent stmt.execute() throws unknown statement ID error"
+        required_handling: >
+          After calling changeUser(), invalidate all cached PreparedStatementInfo objects
+          for that connection. Re-call connection.prepare() before using any statement
+          on the connection after changeUser().
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/base/connection.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          After a successful changeUser(), all previously prepared statements on this
+          connection are invalidated by the MySQL server. Executing a cached
+          PreparedStatementInfo from before the changeUser() will throw with an unknown
+          statement ID error. This is documented behavior in MySQL protocol spec.
+        evidence_quality: confirmed
+
+  - name: ping
+    import_path: "mysql2/promise"
+    description: >
+      Sends a COM_PING packet to the MySQL server and waits for a response.
+      Used to verify that a connection is still alive before use, or as a
+      keepalive mechanism to prevent connection timeouts.
+    postconditions:
+      # Evidence: mysql2/lib/promise/connection.js lines 94-111
+      # Source: ping() rejects with error if server doesn't respond — includes code, errno, sqlState
+      - id: ping-connection-dead
+        condition: "Connection to MySQL is no longer alive (server closed due to wait_timeout or network failure)"
+        throws: "Promise rejects with PROTOCOL_CONNECTION_LOST or ECONNRESET"
+        required_handling: >
+          Wrap await connection.ping() in try-catch. In health check handlers, catch
+          the error and return a 503/unhealthy status rather than letting it propagate
+          as a 500. After a failed ping, destroy the connection and establish a new one.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/connection.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Rejects with PROTOCOL_CONNECTION_LOST or ECONNRESET when the connection to
+          MySQL is no longer alive. This is the expected outcome in keepalive checks
+          when the server has closed the connection due to wait_timeout or
+          interactive_timeout. The error.code field identifies the specific failure.
+        evidence_quality: confirmed
