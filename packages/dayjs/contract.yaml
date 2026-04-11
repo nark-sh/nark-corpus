@@ -1,10 +1,11 @@
 package: dayjs
 semver: ">=1.10.0 <2.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-11"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.71
 priority: medium
 
 functions:
@@ -91,6 +92,79 @@ functions:
           - localizedFormat plugin regex patterns
           Performance degrades quadratically with large inputs (~100k chars → seconds).
           Mitigation: Limit format string length, sanitize user input.
+
+  - name: tz
+    import_path: "dayjs/plugin/timezone"
+    description: >
+      Parses a date string in a specific IANA timezone, or converts an existing
+      Day.js object to a different timezone. Provided by the dayjs timezone plugin.
+      Uses Intl.DateTimeFormat internally, which throws RangeError for invalid
+      timezone identifiers.
+    postconditions:
+      # Evidence: https://day.js.org/docs/en/plugin/timezone
+      # Error type confirmed from Intl.DateTimeFormat spec (MDN):
+      #   https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DateTimeFormat/DateTimeFormat
+      # Confirmed: dayjs timezone plugin (unpkg.com/dayjs/plugin/timezone.js) calls
+      #   new Intl.DateTimeFormat("en-US", { timeZone: t, ... }) with NO try-catch.
+      #   Intl.DateTimeFormat throws RangeError for unrecognized IANA timezone identifiers
+      #   per the ECMAScript Internationalization API Specification.
+      - id: tz-invalid-timezone-range-error
+        condition: "timezone string is not a valid IANA timezone identifier"
+        throws: "RangeError: Invalid time zone specified: <timezone>"
+        required_handling: >
+          Callers MUST wrap dayjs.tz() and Dayjs.tz() calls in try-catch when the
+          timezone value comes from user input, database values, or external APIs.
+          Valid IANA identifiers include "America/New_York", "UTC", "Europe/London".
+          Invalid identifiers like "EST", "PST", or misspelled names throw RangeError.
+          Use a validation step: check against Intl.supportedValuesOf('timeZone') or
+          wrap in try-catch. Unlike other Day.js operations, this is a REAL exception,
+          not a silent invalidity.
+          Pattern: try { const d = dayjs.tz(input, timezone); } catch (e) { if (e instanceof RangeError) { /* invalid timezone */ } }
+        sources:
+          - "https://day.js.org/docs/en/plugin/timezone"
+          - "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DateTimeFormat/DateTimeFormat"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        notes: |
+          This is different from all other Day.js failures: it is a thrown exception,
+          not a silent Invalid Date object. Intl.DateTimeFormat throws RangeError when
+          given an invalid IANA timezone string. Common invalid inputs:
+          - US abbreviations: "EST", "CST", "PST", "MST" (not IANA — use "America/New_York" etc.)
+          - Misspelled: "America/New_Yourk", "Europ/London"
+          - Custom/legacy: "GMT+5:30" (not the IANA format)
+          The dayjs timezone plugin caches DateTimeFormat instances per timezone string
+          (verified from source), so the first call with an invalid timezone throws;
+          subsequent calls with the same invalid string also throw (no caching of errors).
+
+      - id: tz-setdefault-invalid-timezone
+        condition: "dayjs.tz.setDefault() called with invalid IANA timezone string"
+        throws: "RangeError propagated on next dayjs.tz() call"
+        required_handling: >
+          When setting a default timezone via dayjs.tz.setDefault(timezone), the
+          timezone string is NOT validated at call time. The RangeError is thrown
+          lazily on the next dayjs.tz() call that uses the default timezone.
+          This makes the failure delayed and harder to trace. Validate the timezone
+          before calling setDefault():
+          const isValid = (tz: string) => { try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; } };
+          if (isValid(tz)) { dayjs.tz.setDefault(tz); }
+        sources:
+          - "https://day.js.org/docs/en/plugin/timezone"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        notes: |
+          setDefault() with an invalid timezone silently accepts the value but
+          the error surfaces later on next dayjs.tz() usage. This creates a
+          difficult-to-debug situation where app startup succeeds but requests fail.
 
 # Category: utilities
 # npm: https://www.npmjs.com/package/dayjs

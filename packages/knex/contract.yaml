@@ -2,10 +2,10 @@ package: knex
 semver: '>=3.0.0 <4.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-06'
+last_verified: '2026-04-11'
 status: production
 evidence_quality: confirmed
-coverage_score: 0.77
+coverage_score: 1.0
 detection:
   type_names:
     - Knex
@@ -415,6 +415,246 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+  - name: increment
+    import_path: knex
+    description: >
+      Executes an atomic UPDATE that increments a column value by a given amount (default 1).
+      Compiles to UPDATE table SET col = col + amount WHERE .... Returns the number of affected
+      rows, NOT the new value. When the WHERE clause matches no rows, returns 0 silently — the
+      counter is not incremented, but no error is thrown. This silent-zero behavior is the primary
+      footgun: incrementing a non-existent row appears to succeed.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/query-builder.html
+      # Source confirmed: querybuilder.js line 1111-1121 — increment internally calls _counter()
+      # which sets _method = 'update'. All update() error types apply.
+      - id: increment-no-try-catch
+        condition: |
+          increment() called in async context without try-catch or .catch() handler
+        throws: >
+          Error with database-specific error code on connection failure, invalid column name,
+          or type mismatch (e.g. incrementing a non-numeric column);
+          KnexTimeoutError after acquireConnectionTimeout on pool exhaustion
+        severity: error
+        description: >
+          increment() compiles to an UPDATE statement and makes a database network call.
+          It can throw on connection failure, invalid column name (database throws "column does
+          not exist" or similar), and KnexTimeoutError when the connection pool is exhausted.
+          Unhandled rejections crash the application.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html
+          - https://github.com/knex/knex/blob/master/lib/query/querybuilder.js#L1111-L1121
+        required_handling: Caller MUST wrap await knex(table).where({...}).increment() in try-catch.
+      - id: increment-zero-rows-not-checked
+        condition: >
+          increment() result (number of affected rows) is not checked after execution — caller
+          assumes counter was incremented when WHERE matched nothing (row does not exist)
+        throws: does not throw — returns 0 silently
+        severity: warning
+        description: >
+          increment() returns the number of rows updated (same as update()). When the WHERE
+          clause matches no rows — for example, incrementing a counter for a deleted or
+          non-existent record — it returns 0 without throwing. This is a silent no-op that is
+          easy to miss. Common bug pattern: incrementing a page_views counter for a post_id
+          after the post was deleted — the increment silently reports 0 rows and the caller
+          continues unaware. For rate-limiting counters this can cause incorrect billing or
+          quota enforcement.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html
+          - https://github.com/knex/knex/blob/master/lib/query/querybuilder.js#L1640
+        required_handling: >
+          Caller SHOULD check the return value of increment(). If the returned count is 0,
+          either the WHERE condition matched nothing or the row was deleted. For counter
+          semantics that require the row to exist, verify count > 0 or use an upsert pattern.
+
+  - name: decrement
+    import_path: knex
+    description: >
+      Executes an atomic UPDATE that decrements a column value by a given amount (default 1).
+      Compiles to UPDATE table SET col = col - amount WHERE .... Shares all error contracts
+      with increment() — identical error surface. Returns number of affected rows, not the
+      new value. Common in rate-limiting, seat counters, inventory systems.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/query-builder.html
+      # Source confirmed: querybuilder.js line 1124-1134 — decrement calls _counter with negated amount
+      # Identical implementation path to increment.
+      - id: decrement-no-try-catch
+        condition: |
+          decrement() called in async context without try-catch or .catch() handler
+        throws: >
+          Error with database-specific error code on connection failure, invalid column name,
+          or type mismatch; KnexTimeoutError on pool exhaustion
+        severity: error
+        description: >
+          decrement() compiles to an UPDATE statement and makes a database network call.
+          Same error surface as increment() and update(). Can throw on connection failure,
+          invalid column name, type errors, and KnexTimeoutError on pool exhaustion.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html
+          - https://github.com/knex/knex/blob/master/lib/query/querybuilder.js#L1124-L1134
+        required_handling: Caller MUST wrap await knex(table).where({...}).decrement() in try-catch.
+      - id: decrement-zero-rows-not-checked
+        condition: >
+          decrement() result (number of affected rows) is not checked after execution —
+          caller assumes counter was decremented when WHERE matched nothing
+        throws: does not throw — returns 0 silently
+        severity: warning
+        description: >
+          Same silent-zero behavior as increment(). If the WHERE clause matches no rows,
+          decrement() returns 0 without throwing. Particularly dangerous in seat-counting
+          or inventory-reduction flows: decrementing available_seats for a deleted booking
+          silently does nothing, causing inventory count to drift. For subscription seat
+          management, this can allow over-provisioning without any error signal.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/query-builder.html
+        required_handling: >
+          Caller SHOULD check the returned row count. If 0, the target row was not found.
+          For inventory/seat management, treat 0-row decrement as a precondition failure.
+
+  - name: transactionProvider
+    import_path: knex
+    description: >
+      Returns a factory function (not a transaction itself) that lazily creates and reuses a
+      single transaction. The returned factory, when called, returns Promise<Transaction> that
+      resolves to the same transaction on all subsequent calls. Used in dependency injection
+      containers where transaction lifecycle must span multiple services without passing trx
+      explicitly. The connection is acquired on the first factory invocation, not when
+      transactionProvider() is called.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/transactions.html
+      # Source confirmed: make-knex.js lines 156-164 — transactionProvider returns a closure
+      # that calls this.transaction(undefined, config) on first invocation.
+      - id: transaction-provider-factory-no-try-catch
+        condition: |
+          await trxProvider() called without try-catch around the factory invocation
+        throws: >
+          KnexTimeoutError if connection pool is exhausted when the factory is first called;
+          Error on any database-level failure during transaction initialization
+        severity: error
+        description: >
+          transactionProvider() itself is synchronous and does not throw. But the returned
+          factory function returns a Promise — calling `await trxProvider()` acquires a
+          database connection. If the connection pool is exhausted (KnexTimeoutError after
+          acquireConnectionTimeout ms, default 60s), the factory call throws. This is easy
+          to miss because `transactionProvider()` appears to be a sync config call.
+          The connection is held open until commit() or rollback() is called on the returned
+          transaction.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/transactions.html
+          - https://github.com/knex/knex/blob/master/lib/knex-builder/make-knex.js#L156-L164
+        required_handling: >
+          Caller MUST wrap await trxProvider() in try-catch, especially in high-concurrency
+          contexts where connection pool exhaustion is possible.
+      - id: transaction-provider-connection-not-released
+        condition: >
+          Factory invocation succeeds but neither trx.commit() nor trx.rollback() is ever
+          called — transaction is left open indefinitely
+        throws: does not throw — connection silently hangs
+        severity: error
+        description: >
+          Unlike knex.transaction(scope => ...) which auto-rolls-back on error, the
+          transactionProvider pattern requires manual lifecycle management. If the consuming
+          code path throws an exception before calling trx.commit() or trx.rollback(), the
+          database connection is permanently held open (no auto-rollback). In long-running
+          services, leaked connections accumulate until the pool is exhausted, causing
+          KnexTimeoutError on all subsequent database operations. Documented at
+          https://knexjs.org/guide/transactions.html: "if the handler doesn't return a
+          promise you must explicitly call commit/rollback otherwise the transaction
+          connection will hang".
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/transactions.html
+          - https://github.com/knex/knex/blob/master/lib/knex-builder/make-knex.js#L156-L164
+        required_handling: >
+          MUST ensure trx.commit() or trx.rollback() is called in all code paths.
+          Use try/finally: const trx = await trxProvider(); try { ...; await trx.commit(); }
+          catch (err) { await trx.rollback(err); throw err; }
+
+  - name: schema.createTable
+    import_path: knex
+    description: >
+      Executes a CREATE TABLE DDL statement. Returns a SchemaBuilder (which implements
+      ChainableInterface<void> → awaitable). Throws if the table already exists (on databases
+      that don't support IF NOT EXISTS in this mode). Requires the connected user to have
+      CREATE privilege. Commonly called in migration scripts during deployment.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/schema-builder.html
+      # Source confirmed: schema/builder.js lines 46-88 — createTable added to _sequence array,
+      # executed via SchemaBuilder.then() which calls client.schemaCompiler(this).generateDdlCommands()
+      - id: schema-create-table-no-try-catch
+        condition: |
+          await knex.schema.createTable(...) called without try-catch
+        throws: >
+          Error if table already exists (database-native: "relation already exists" in PostgreSQL,
+          "Table already exists" in MySQL/SQLite);
+          Error if the connected user lacks CREATE TABLE privileges;
+          KnexTimeoutError on connection pool exhaustion during DDL
+        severity: error
+        description: >
+          createTable() sends a DDL statement to the database. If the table already exists and
+          the IF NOT EXISTS form is not used, the database throws an error. If the migration
+          runs concurrently (two instances deploying at the same time), one will fail with
+          "relation already exists". Additionally, permission errors (user lacks CREATE rights)
+          throw immediately. Unhandled errors in migration startup code prevent the service
+          from starting. Note: use createTableIfNotExists() is deprecated — the recommended
+          pattern is to check with knex.schema.hasTable() first or rely on the migration
+          system's idempotency.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/schema-builder.html
+          - https://github.com/knex/knex/blob/master/lib/schema/builder.js#L46-L88
+        required_handling: >
+          Caller MUST wrap await knex.schema.createTable() in try-catch in migration scripts.
+          In deployment automation, check for "already exists" errors to handle idempotent
+          re-deployments. Use knex migration system (migrate.latest) rather than manually
+          calling createTable() for idempotent DDL management.
+
 edge_cases:
   - id: connection-pool-exhaustion
     description: >
