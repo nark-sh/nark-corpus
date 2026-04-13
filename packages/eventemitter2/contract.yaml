@@ -1,12 +1,14 @@
 package: "eventemitter2"
 semver: ">=6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
 # Audit 2026-04-02: 5 repos scanned, 3 affected (60%), 3 violations. 0/84 FPs.
 # EventEmitter2 constructor missing .on('error') confirmed in high-star repos.
+# Deepen pass 2026-04-13 (deepen-stream-1): added emit, emitAsync, waitFor, static once, listenTo
+# coverage_score: 0.2 → 1.0 (5 async/error-throwing functions, all contracted)
 description: "Event emitter with namespaces, wildcards, and additional features"
 
 detection:
@@ -40,3 +42,293 @@ functions:
           incident_cost_range: medium
         sources:
           - "https://github.com/EventEmitter2/EventEmitter2"
+
+  - name: emit
+    import_path: "eventemitter2"
+    description: >
+      Synchronously invokes all listeners registered for the named event. When the
+      event is 'error' and no listener is registered (and ignoreErrors is false),
+      throws the error directly — crashing the process in unhandled contexts.
+    postconditions:
+      # Evidence: lib/eventemitter2.js lines 1051-1055 (source confirmed)
+      # Source: throw arguments[1] (instanceof Error) or throw new Error("Uncaught, unspecified 'error' event.")
+      # Same behavior as Node.js built-in EventEmitter.
+      - id: eventemitter2-emit-unhandled-error
+        condition: "error event emitted with no listener and ignoreErrors: false (default)"
+        throws: "Error — either re-throws the emitted Error instance or throws new Error(\"Uncaught, unspecified 'error' event.\")"
+        required_handling: "Caller MUST attach .on('error', handler) before emitting error events, or pass ignoreErrors:true to the constructor"
+        severity: error
+        description: >
+          When emit('error', err) is called and no 'error' listener is registered,
+          EventEmitter2 throws synchronously. This is identical to Node.js core EventEmitter
+          behavior. The exception propagates up the call stack and, if unhandled, crashes
+          the process. This is the most common cause of unexpected service restarts in
+          event-driven applications using EventEmitter2.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+  - name: emitAsync
+    import_path: "eventemitter2"
+    description: >
+      Invokes all listeners and collects their return values via Promise.all, allowing
+      listeners to return Promises. Unlike emit(), when an 'error' event is emitted
+      without a listener, returns a rejected Promise rather than throwing synchronously.
+      This makes the failure mode subtly different — callers awaiting emitAsync must
+      handle rejections.
+    postconditions:
+      # Evidence: lib/eventemitter2.js lines 1166-1170 (source confirmed)
+      # return Promise.reject(arguments[1]) for Error instances
+      # return Promise.reject("Uncaught, unspecified 'error' event.") for non-Error
+      - id: eventemitter2-emit-async-unhandled-error
+        condition: "emitAsync('error', err) called with no 'error' listener registered and ignoreErrors: false"
+        throws: "Returns Promise.reject(err) — a rejected Promise with the error or a string message"
+        required_handling: "Caller MUST attach .on('error', handler) OR wrap emitAsync() in try/catch or .catch()"
+        severity: error
+        description: >
+          When emitAsync('error', err) is called with no error listener, the method
+          returns a rejected Promise. Unlike emit(), it does NOT throw synchronously —
+          the rejection only surfaces if the caller awaits or chains .catch(). Code that
+          fire-and-forgets emitAsync('error', ...) without await will silently swallow
+          the error. Node.js unhandledRejection will fire if no handler is attached.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: Promise.all semantics — any listener returning a rejected Promise
+      # causes the entire emitAsync call to reject with the first rejection reason.
+      - id: eventemitter2-emit-async-listener-rejection
+        condition: "any registered listener throws or returns a rejected Promise"
+        throws: "Returns rejected Promise with the first listener's rejection reason (Promise.all semantics)"
+        required_handling: "Caller MUST await emitAsync() and wrap in try/catch, or chain .catch()"
+        severity: warning
+        description: >
+          emitAsync() uses Promise.all() to aggregate listener results. If any listener
+          rejects, the entire emitAsync call rejects with that reason. Subsequent listener
+          results are silently discarded. This is a common source of partial-execution bugs
+          in event pipelines where multiple listeners handle the same event.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+          - "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all"
+
+  - name: waitFor
+    import_path: "eventemitter2"
+    description: >
+      Returns a CancelablePromise that resolves when the named event fires. Supports
+      timeout, filter function, and handleError mode. Used to turn event-based APIs
+      into async/await-compatible code. Can reject for multiple reasons: timeout expiry,
+      explicit cancellation, or when handleError mode is enabled and the first argument
+      is truthy.
+    postconditions:
+      # Evidence: lib/eventemitter2.js lines 1480-1530 (source confirmed)
+      # makeCancelablePromise with timeout option → Error('timeout')
+      - id: eventemitter2-wait-for-timeout
+        condition: "timeout option is > 0 and the event is not emitted within that duration"
+        throws: "Rejects with Error('timeout') — the rejection message is literally 'timeout'"
+        required_handling: "Caller MUST wrap waitFor() in try/catch or .catch() when using timeout option"
+        severity: warning
+        description: >
+          When the timeout option is set, waitFor() rejects after the specified milliseconds
+          with Error('timeout'). No event listener cleanup is needed as the library handles
+          unsubscription. However, any code awaiting the promise must handle TimeoutError.
+          A common anti-pattern is using waitFor() with timeout without error handling,
+          causing an unhandled rejection that crashes the process.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: makeCancelablePromise implements .cancel() → Error('canceled')
+      - id: eventemitter2-wait-for-cancel
+        condition: "promise.cancel() is called before the event fires"
+        throws: "Rejects with Error('canceled')"
+        required_handling: "Caller MUST handle rejection if cancel() can be called on in-flight promises"
+        severity: warning
+        description: >
+          CancelablePromise returned by waitFor() can be canceled by calling promise.cancel().
+          This rejects the promise with Error('canceled'). Code that cancels waitFor promises
+          without a .catch() handler will trigger unhandledRejection. This is a common
+          pattern in cleanup/abort workflows where the rejection is not always handled.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: handleError option causes first argument to be treated as an error
+      - id: eventemitter2-wait-for-handle-error
+        condition: "handleError: true in options AND the event fires with a truthy first argument"
+        throws: "Rejects with the first argument as the error reason"
+        required_handling: "Caller MUST wrap in try/catch when handleError option is enabled"
+        severity: warning
+        description: >
+          When handleError is true, waitFor() treats the first argument of the fired event as
+          an error (Node.js callback convention: (err, ...data)). If the event fires with a
+          truthy first argument, the promise rejects with that argument. Callers enabling
+          handleError must handle both resolved and rejected states.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/README.md"
+
+  - name: "EventEmitter2.once"
+    import_path: "eventemitter2"
+    description: >
+      Static method. Creates a CancelablePromise that resolves when the named event
+      fires on the given emitter. Automatically registers an error listener that rejects
+      the promise if the emitter emits 'error' before the target event fires.
+      This is the async/await equivalent of once() for one-shot event handling.
+    postconditions:
+      # Evidence: lib/eventemitter2.js lines 1530-1600 (source confirmed)
+      # errorListener = function(err){ emitter.removeListener(name, eventListener); reject(err); }
+      # emitter.once('error', errorListener) — auto-rejection on error event
+      - id: eventemitter2-static-once-error-rejection
+        condition: "the emitter emits 'error' before the target event fires"
+        throws: "Rejects with the error emitted — the rejection reason is the Error object from the error event"
+        required_handling: "Caller MUST wrap EventEmitter2.once() in try/catch or chain .catch()"
+        severity: error
+        description: >
+          EventEmitter2.once() automatically listens for 'error' events and rejects the
+          promise if one fires before the target event. This is intentional protective
+          behavior, but callers must handle the rejection. When error events are common
+          (e.g., network errors in stream-based code), this rejection is likely and should
+          not be swallowed silently.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: timeout option uses same makeCancelablePromise mechanism as waitFor
+      - id: eventemitter2-static-once-timeout
+        condition: "timeout option is > 0 and the event does not fire within that duration"
+        throws: "Rejects with Error('timeout')"
+        required_handling: "Caller MUST wrap in try/catch or .catch() when using timeout option"
+        severity: warning
+        description: >
+          When the timeout option is set on EventEmitter2.once(), the promise rejects with
+          Error('timeout') if the event is not emitted within the timeout window. This is
+          the same mechanism as waitFor(). Unhandled timeout rejections crash the process.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: CancelablePromise cancel() → Error('canceled')
+      - id: eventemitter2-static-once-cancel
+        condition: "promise.cancel() is called before the event fires"
+        throws: "Rejects with Error('canceled')"
+        required_handling: "Caller MUST handle rejection if cancel() can be called on in-flight promises"
+        severity: warning
+        description: >
+          The CancelablePromise returned by EventEmitter2.once() can be canceled via
+          promise.cancel(). This rejects the promise with Error('canceled'). The library
+          automatically cleans up the event listener on cancel. The rejection must still
+          be handled by the caller to avoid unhandledRejection.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+  - name: listenTo
+    import_path: "eventemitter2"
+    description: >
+      Subscribes to events emitted by an external emitter (any object that implements
+      addEventListener/removeEventListener, on/off, or addListener/removeListener)
+      and propagates them through the EventEmitter2 instance. Throws TypeError/Error
+      synchronously for invalid target objects or options, before any subscription occurs.
+    postconditions:
+      # Evidence: lib/eventemitter2.js lines 797-870 (source confirmed)
+      # throw TypeError('target musts be an object') — at line 799
+      # throw Error('target does not implement any known event API') — at line 135
+      # throw TypeError('events must be an object') — at line 816
+      - id: eventemitter2-listen-to-invalid-target
+        condition: "target parameter is not an object, or target does not implement addEventListener/on/addListener"
+        throws: "TypeError('target musts be an object') or Error('target does not implement any known event API')"
+        required_handling: "Caller MUST validate target implements an event API before calling listenTo()"
+        severity: error
+        description: >
+          listenTo() validates its target synchronously. Passing null, undefined, a primitive,
+          or an object without any known event subscription methods throws immediately.
+          This is a programming error that typically surfaces during development, but in
+          dynamic code paths (e.g., when target arrives from external API responses),
+          it can crash production processes.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"
+
+      # Evidence: throw TypeError('on method must be a function') line 139
+      # throw TypeError('off method must be a function') line 143
+      - id: eventemitter2-listen-to-invalid-options
+        condition: "options.on or options.off are provided but are not functions"
+        throws: "TypeError('on method must be a function') or TypeError('off method must be a function')"
+        required_handling: "Caller MUST ensure on/off hooks in options are valid functions when using custom subscription API"
+        severity: warning
+        description: >
+          When custom on/off hooks are provided via the options parameter, listenTo()
+          validates they are functions before subscribing. Non-function values throw TypeError.
+          This catches misconfigured options objects where the hook name is correct but
+          the value is undefined (e.g., a property that was not initialized).
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/EventEmitter2/EventEmitter2/blob/master/lib/eventemitter2.js"

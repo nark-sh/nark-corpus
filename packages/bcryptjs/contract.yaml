@@ -2,9 +2,10 @@ package: bcryptjs
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   # bcryptjs is a pure JavaScript library with simple function exports
@@ -275,6 +276,204 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: hashSync
+    import_path: "bcryptjs"
+    description: >
+      Synchronously generates a bcrypt hash for a password. Blocks the Node.js event loop
+      for the full duration of the hashing operation (100ms+ at 10 rounds, 400ms+ at 12 rounds).
+      Must NOT be used in request handlers or any event-loop-sensitive context.
+      Use the async hash() for web servers. hashSync is appropriate only in CLI scripts,
+      one-time migration scripts, and test setup.
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 153-163)
+      # Confirmed from source: hashSync throws synchronously with no Promise rejection
+      - id: hash-sync-type-error
+        condition: "password is not a string or salt is not a string/number"
+        throws: "Error: Illegal arguments: [typeof password], [typeof salt]"
+        required_handling: >
+          Caller MUST wrap hashSync() in a try-catch block. Type errors throw synchronously.
+          Most common cause: passing undefined/null password (unvalidated input) or an
+          already-hashed password Buffer from a database query instead of a string.
+          Unlike the async hash(), there is no .catch() available — only try-catch.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: hash-sync-rounds-out-of-range
+        condition: "salt is a number and rounds < 4 or > 31"
+        throws: "Error: Illegal number of rounds (4-31): [N]"
+        required_handling: >
+          Caller MUST wrap hashSync() in try-catch when rounds parameter comes from
+          configuration or environment variables. Validate rounds is 4-31 before calling.
+          Production minimum recommended: 12.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: hash-sync-blocks-event-loop
+        condition: "hashSync() is called in a Node.js HTTP request handler or any async context"
+        throws: "Does not throw — instead blocks event loop for 100ms-400ms+"
+        required_handling: >
+          Caller MUST NOT use hashSync() in Express/Fastify/Next.js API routes, background
+          workers serving concurrent requests, or any code running in the main event loop.
+          The operation blocks all other requests for its duration. Use async hash() instead.
+          hashSync is ONLY appropriate in: CLI scripts, database seed files, one-time migration
+          scripts, and test setup (beforeAll/beforeEach fixtures).
+        sources:
+          - "https://raw.githubusercontent.com/dcodeIO/bcrypt.js/master/README.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+    edge_cases:
+      - id: hash-sync-password-truncation
+        description: >
+          Passwords longer than 72 bytes (UTF-8 encoded) are silently truncated.
+          hashSync does not warn, throw, or reject — it silently produces a valid-looking
+          hash for a truncated password. Use bcrypt.truncates(password) before calling
+          hashSync() when handling user-provided passwords of arbitrary length.
+        sources:
+          - "https://raw.githubusercontent.com/dcodeIO/bcrypt.js/master/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: compareSync
+    import_path: "bcryptjs"
+    description: >
+      Synchronously tests a plaintext password against a bcrypt hash. Returns a boolean.
+      Like hashSync, blocks the event loop for the full comparison duration. The critical
+      footgun is the SILENT RETURN OF FALSE for invalid/malformed hashes — it does NOT
+      throw an error when the hash is the wrong length, which causes silent authentication
+      bypass if the caller does not distinguish false (wrong password) from false (bad hash).
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 226-234)
+      # Source confirmed: compareSync returns false (not throws) when hash.length !== 60
+      - id: compare-sync-type-error
+        condition: "password or hash is not a string"
+        throws: "Error: Illegal arguments: [typeof password], [typeof hash]"
+        required_handling: >
+          Caller MUST wrap compareSync() in try-catch. Common cause: retrieving hash
+          from database as Buffer instead of string, or passing undefined when the
+          user record is not found. Unlike the async compare(), no .catch() is available.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: compare-sync-silent-false-on-bad-hash
+        condition: "hash parameter is a string but not exactly 60 characters (malformed bcrypt hash)"
+        returns: "false — NOT an error, not a throw. Silent authentication failure."
+        required_handling: >
+          Callers who only check `if (isMatch)` without validating that the stored hash
+          is well-formed will silently deny authentication for ALL users whose hashes were
+          truncated, corrupted, or stored in a VARCHAR(40) column. Always validate that
+          the hash column is VARCHAR(60) or CHAR(60) in the database schema and that the
+          hash was not corrupted in transit. This is the #1 silent authentication bug with
+          bcryptjs — the function returns false for wrong-password AND bad-hash, making it
+          impossible to distinguish them without additional checks.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+          - "https://github.com/dcodeIO/bcrypt.js/issues/20"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: compare-sync-blocks-event-loop
+        condition: "compareSync() is called in a Node.js HTTP request handler or async context"
+        throws: "Does not throw — instead blocks event loop for 100ms-400ms+"
+        required_handling: >
+          Caller MUST NOT use compareSync() in Express/Fastify/Next.js API routes or any
+          code running in the main event loop. Use async compare() for all authentication
+          endpoints. compareSync is ONLY appropriate in: CLI scripts, test setup, and
+          one-off verification scripts.
+        sources:
+          - "https://raw.githubusercontent.com/dcodeIO/bcrypt.js/master/README.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: genSaltSync
+    import_path: "bcryptjs"
+    description: >
+      Synchronously generates a bcrypt salt. Typically used in conjunction with hashSync()
+      in non-async contexts. The same event-loop-blocking concern applies. In most cases,
+      simply passing a numeric rounds value to hashSync() or hash() is preferable to calling
+      genSaltSync() + hashSync() separately.
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 87-103)
+      # Source confirmed: genSaltSync throws for invalid rounds type and out-of-range values
+      - id: gensalt-sync-invalid-rounds
+        condition: "rounds is not a number, or rounds < 4 or rounds > 31"
+        throws: "Error: Illegal arguments: [typeof rounds] (wrong type) or Error: Illegal number of rounds (4-31): [N] (out of range)"
+        required_handling: >
+          Caller MUST wrap genSaltSync() in try-catch when rounds comes from
+          configuration or user input. Validate rounds is an integer between 4 and 31.
+          Common error: reading BCRYPT_ROUNDS from environment variable as string without
+          parseInt() — e.g., process.env.BCRYPT_ROUNDS returns '12' (string) not 12 (number).
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: gensalt-sync-rng-failure
+        condition: "called in a browser environment without setting a random fallback via setRandomFallback()"
+        throws: "Error: Secure random number generator not available"
+        required_handling: >
+          In browser environments, bcryptjs requires calling bcrypt.setRandomFallback()
+          with a CSPRNG implementation before using any salt-generating functions.
+          Node.js environments use crypto.randomBytes() automatically and are unaffected.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 # SOURCES.md has comprehensive documentation of all error conditions
 # See: corpus/packages/bcryptjs/SOURCES.md (489 lines)
 #
@@ -284,8 +483,17 @@ functions:
 # - Phase 3: CVE analysis (ZERO vulnerabilities found)
 # - Phase 4: Production usage analysis (5 repos, 20+ code examples)
 #
+# Depth pass 2026-04-13 (deepen-stream-2 pass 18):
+# - Added hashSync (3 postconditions + 1 edge case)
+# - Added compareSync (3 postconditions)
+# - Added genSaltSync (2 postconditions)
+# - Coverage: 50% → 100% (3/6 → 6/6 contractable async+sync-throwable functions)
+#
 # Key findings:
 # - Most common mistake: Missing try-catch around bcrypt operations
 # - #1 production bug: Database hash corruption (trimming, encoding, wrong field type)
+# - #1 SILENT bug: compareSync() returns false (not throws) for malformed hash —
+#   impossible to distinguish wrong-password from corrupted-hash without schema validation
+# - Sync functions block the event loop for 100ms-400ms+ — MUST NOT use in HTTP handlers
 # - Security: Zero CVEs, actively maintained, widely used
 # - Detection focus: Missing error handling on async operations
