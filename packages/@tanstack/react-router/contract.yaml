@@ -1,10 +1,11 @@
 package: "@tanstack/react-router"
 semver: ">=1.0.0 <2.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "agent-001"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.60
 
 functions:
   - name: useNavigate
@@ -463,3 +464,291 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: useBlocker
+    import_path: "@tanstack/react-router"
+    description: >
+      Hook that registers a navigation blocker. Accepts a shouldBlockFn callback
+      (which may be async) that returns true to block navigation or false to allow
+      it. When withResolver: true, returns a BlockerResolver object with proceed/reset
+      controls for custom confirmation UIs.
+
+    postconditions:
+      # Evidence: source inspection — packages/@tanstack/react-router/dist/cjs/useBlocker.cjs
+      # shouldBlockFn is called inside `await shouldBlockFn({...})` with no try-catch wrapper.
+      # The blockerFnComposed is passed to history.block() which does not catch async errors.
+      - id: blocker-shouldblock-fn-uncaught-rejection
+        condition: If shouldBlockFn is async and its returned Promise rejects, the rejection
+        severity: error
+        description: >
+          If shouldBlockFn is async and its returned Promise rejects, the rejection
+          propagates uncaught inside the history.block() callback. There is no try-catch
+          around the await. Unhandled promise rejections in navigation blockers can
+          crash the app or silently allow navigation to proceed, bypassing the intended
+          block — leaving users on the page in an inconsistent state.
+        required_handling: >
+          Caller MUST wrap shouldBlockFn body in try-catch and resolve to a boolean
+          even on error. Do not let shouldBlockFn reject — catch errors internally
+          and return false (allow navigation) or true (block) as a safe default.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/useBlocker.tsx"
+        evidence_quality: confirmed
+
+      # Evidence: source inspection — router.cjs navigate() implementation
+      # navigate() calls blocker.blockerFn() for external/reloadDocument navigations.
+      # shouldBlockFn returning true causes navigate() to return early (allows partial navigation).
+      - id: blocker-external-navigation-bypass
+        condition: For external/reloadDocument navigations, the router calls each registered
+        severity: warning
+        description: >
+          For external/reloadDocument navigations, the router calls each registered
+          blocker's blockerFn sequentially and returns early if any blocker returns true.
+          If multiple blockers are registered and one throws, subsequent blockers may not
+          run, silently allowing navigation despite other active guards.
+        required_handling: >
+          Caller SHOULD ensure only one navigation blocker is active per component to avoid
+          ordering dependencies. Defensive shouldBlockFn implementations should never throw.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router-core/src/router.ts"
+        evidence_quality: confirmed
+
+  - name: useAwaited
+    import_path: "@tanstack/react-router"
+    description: >
+      Hook that suspends the component until a deferred promise (created with defer())
+      resolves. Uses React Suspense protocol — throws the pending promise to suspend,
+      throws the rejection error when the deferred promise fails. The Await component
+      is a wrapper around useAwaited with optional Suspense fallback.
+
+    postconditions:
+      # Evidence: source inspection — packages/@tanstack/react-router/dist/cjs/awaited.cjs
+      # `if (promise[TSR_DEFERRED_PROMISE].status === "error") throw promise[TSR_DEFERRED_PROMISE].error`
+      # The thrown error is the raw rejection value from the deferred promise.
+      - id: awaited-deferred-rejection-no-error-boundary
+        condition: When the deferred Promise passed to useAwaited rejects, the rejection error is
+        severity: error
+        description: >
+          When the deferred Promise passed to useAwaited rejects, the rejection error is
+          thrown directly into the React render tree. Without a parent error boundary
+          (React ErrorBoundary, CatchBoundary, or route errorComponent), this error
+          crashes the subtree and displays a blank white screen to the user. The error
+          is thrown on every render until the boundary catches it.
+        required_handling: >
+          Caller MUST wrap useAwaited/Await usage in either: (1) a route errorComponent
+          defined on the route that passes loader data, (2) a React Suspense + ErrorBoundary
+          pair, or (3) the CatchBoundary component from @tanstack/react-router.
+          Without an error boundary, deferred data loading failures crash the UI.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/awaited.tsx"
+        evidence_quality: confirmed
+
+      # Evidence: source inspection — awaited.cjs line: "if (status === 'pending') throw promise"
+      # React 18 use() hook is used when available; otherwise Suspense throw protocol is used.
+      - id: awaited-missing-suspense-boundary
+        condition: useAwaited throws a Promise when the deferred data is still pending, triggering
+        severity: error
+        description: >
+          useAwaited throws a Promise when the deferred data is still pending, triggering
+          React Suspense. Without a Suspense boundary in the ancestor tree, this throws
+          an uncaught error about missing Suspense boundary. The Await component
+          accepts an optional fallback prop that wraps in Suspense — but only if provided.
+          A bare useAwaited call without Suspense boundary crashes the render tree.
+        required_handling: >
+          Caller MUST either: (1) use Await with a fallback prop to auto-wrap in Suspense,
+          (2) wrap useAwaited calls in a React.Suspense boundary, or (3) use within a
+          route that has pendingComponent defined. Every deferred data access point needs
+          a Suspense boundary.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/awaited.tsx"
+        evidence_quality: confirmed
+
+  - name: lazyRouteComponent
+    import_path: "@tanstack/react-router"
+    description: >
+      Wraps a dynamic import function to create a lazy-loaded route component that
+      supports .preload() and handles module-not-found errors with automatic page
+      reload (once per session). When the component has not yet loaded, throws a
+      Promise for Suspense. When the import fails and is not a module-not-found error,
+      throws the error directly into the render tree.
+
+    postconditions:
+      # Evidence: source inspection — lazyRouteComponent.cjs
+      # `if (error) throw error` — any non-ModuleNotFound import error is thrown into React render
+      # For ModuleNotFoundError: sessionStorage-gated auto-reload, then throws indefinitely
+      - id: lazy-route-component-import-failure
+        condition: When the dynamic import passed to lazyRouteComponent() fails (network error,
+        severity: error
+        description: >
+          When the dynamic import passed to lazyRouteComponent() fails (network error,
+          bundler chunk hash mismatch after deploy, import path wrong), the import error
+          is stored and re-thrown into the React render tree on every subsequent render.
+          This causes the route component to permanently fail rendering until a Suspense
+          boundary or error boundary resets it. In production after a new deploy, chunk
+          hash mismatches are very common and crash the route.
+        required_handling: >
+          Caller MUST define an errorComponent on the route that uses lazyRouteComponent,
+          or wrap the route in a CatchBoundary. Without an error boundary, import failures
+          permanently crash the route subtree. Additionally, the parent route should define
+          errorComponent to catch lazy load failures during navigation.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/lazyRouteComponent.tsx"
+          - "https://tanstack.com/router/latest/docs/framework/react/api/router/lazyRouteComponentFunction"
+        evidence_quality: confirmed
+
+      # Evidence: source inspection — lazyRouteComponent.cjs
+      # ModuleNotFoundError detection: checks for browser-specific "Failed to fetch dynamically imported module" etc.
+      # Auto-reload fires once (sessionStorage gate), then if reload doesn't fix it, the error is thrown.
+      - id: lazy-route-component-chunk-hash-mismatch-loop
+        condition: When a chunk is not found after a new deployment (hash changed), lazyRouteComponent
+        severity: warning
+        description: >
+          When a chunk is not found after a new deployment (hash changed), lazyRouteComponent
+          triggers a page reload once via sessionStorage gate. If the reload does not resolve
+          the module (e.g., CDN cache still serving old assets, offline), the component
+          enters an infinite throw loop on every render call. The sessionStorage key
+          "tanstack_router_reload:<error.message>" prevents a second reload.
+        required_handling: >
+          Caller SHOULD implement errorComponent on routes using lazy components to display
+          a user-friendly "Please refresh the page" message when the auto-reload cannot
+          resolve the chunk. This catches the post-reload throw loop.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/lazyRouteComponent.tsx"
+        evidence_quality: confirmed
+
+  - name: useLoaderDeps
+    import_path: "@tanstack/react-router"
+    description: >
+      Hook that returns the current route's loader dependency object — the values
+      that trigger loader re-runs when they change. Follows the same strict/from
+      parameter pattern as useLoaderData. Throws when strict: true and the current
+      route doesn't match the 'from' parameter.
+
+    postconditions:
+      # Evidence: source inspection — useLoaderDeps.d.cts and useLoaderData behavior
+      # Same StrictOrFrom type constraint as useLoaderData — same throw pattern applies.
+      # router-core matchRoutes enforces strict route matching when strict: true (default).
+      - id: loader-deps-route-mismatch-strict
+        condition: useLoaderDeps uses the same strict/from parameter contract as useLoaderData.
+        severity: error
+        description: >
+          useLoaderDeps uses the same strict/from parameter contract as useLoaderData.
+          When strict: true (default) and the current route doesn't match 'from',
+          TanStack Router throws an error indicating the route mismatch. This commonly
+          occurs when a component is rendered on a different route than expected, or when
+          route IDs change after refactoring file-based routes.
+        required_handling: >
+          Caller MUST either: (1) use the correct 'from' route ID matching the current route,
+          (2) set strict: false when using in shared components rendered across multiple routes,
+          or (3) wrap in error boundary. TypeScript strict route types catch most cases at
+          compile time when using file-based routing.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://tanstack.com/router/latest/docs/framework/react/api/router/useLoaderDepsHook"
+          - "https://tanstack.com/router/latest/docs/guide/type-safety"
+        evidence_quality: confirmed
+
+  - name: RouterProvider
+    import_path: "@tanstack/react-router"
+    description: >
+      Top-level component that renders the active route matches and provides the
+      router instance to the React tree via context. Must receive a router instance
+      created with createRouter(). Calls router.load() on mount to execute initial
+      route loading. Router initialization errors surface as render-time throws.
+
+    postconditions:
+      # Evidence: source inspection — RouterProvider.cjs and router.cjs load() implementation
+      # router.load() runs beforeLoad hooks and route loaders. If a loader throws non-redirect/notFound,
+      # the error propagates to the route's errorComponent or crashes the app.
+      - id: router-provider-loader-initialization-error
+        condition: RouterProvider calls router.load() on mount which runs all matched route loaders
+        severity: error
+        description: >
+          RouterProvider calls router.load() on mount which runs all matched route loaders
+          and beforeLoad hooks. If a loader throws a non-redirect, non-notFound error and
+          no route errorComponent is defined, the error crashes the entire React tree.
+          Unlike client-side navigation errors which are scoped to route segments,
+          initialization errors on the root route crash the whole app.
+        required_handling: >
+          Caller MUST define errorComponent on the root route or wrap RouterProvider in
+          a top-level React ErrorBoundary to catch initialization failures. Root-level
+          loaders (e.g., auth checks in beforeLoad) that throw will crash the app if
+          no error boundary exists at or above RouterProvider.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/RouterProvider.tsx"
+          - "https://tanstack.com/router/latest/docs/framework/react/guide/error-handling"
+        evidence_quality: confirmed
+
+      # Evidence: source inspection — router.cjs navigate() dangerous protocol check
+      # `if (require_utils.isDangerousProtocol(...)) console.warn(...); return Promise.resolve()`
+      # Also useRouter.cjs: returns null outside RouterProvider context (no throw, just null)
+      - id: router-provider-missing-context
+        condition: Any TanStack Router hook (useNavigate, useMatch, useLoaderData, etc.) that
+        severity: error
+        description: >
+          Any TanStack Router hook (useNavigate, useMatch, useLoaderData, etc.) that
+          internally calls useRouter() will receive null when used outside RouterProvider.
+          In production, useRouter() returns null silently (console.warn only in dev).
+          Hooks that immediately dereference the router instance (router.navigate, etc.)
+          will throw "Cannot read properties of null" — a generic TypeError with no
+          useful context, making the root cause difficult to diagnose.
+        required_handling: >
+          Caller MUST ensure all TanStack Router hooks are used within a component tree
+          that has RouterProvider as an ancestor. For components used in both router and
+          non-router contexts (e.g., Storybook), wrap hook usage in conditional checks
+          or use useRouter({ warn: false }) and check for null before calling methods.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://github.com/TanStack/router/blob/main/packages/react-router/src/useRouter.tsx"
+        evidence_quality: confirmed

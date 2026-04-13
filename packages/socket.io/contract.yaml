@@ -1,10 +1,11 @@
 package: socket.io
 semver: ^4.0.0
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-13"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
+coverage_score: 0.80  # 8 contracted / 10 async-callable (2 omitted: socket.leave, Namespace.serverSideEmitWithAck)
 
 detection:
   class_names:
@@ -48,7 +49,7 @@ functions:
         rationale: "Emit can fail if client disconnected or data serialization fails"
         sources:
           - "https://socket.io/docs/v4/emitting-events/"
-  - name: on
+  - name: "on"
     import_path: "socket.io"
     description: "Registers event handler"
     postconditions:
@@ -69,3 +70,331 @@ functions:
         rationale: "Unhandled errors in event handlers crash the server"
         sources:
           - "https://socket.io/docs/v4/listening-to-events/"
+
+  - name: emitWithAck
+    import_path: "socket.io"
+    description: >
+      Emits an event and returns a Promise that resolves with the client's acknowledgement.
+      Requires the caller to first chain .timeout(ms) to set a deadline; without a timeout,
+      the promise will never reject (it hangs indefinitely if the client never acks).
+      When combined with .timeout(), throws Error("operation has timed out") after the
+      deadline passes without acknowledgement. Used for reliable request/response over WebSocket.
+    postconditions:
+      # Evidence: source confirmed — socket.js registerAckCallback():
+      #   ack.call(this, new Error("operation has timed out"))
+      # Documentation: https://socket.io/docs/v4/server-api/#socketemitwithacheck
+      - id: emit-with-ack-no-timeout-hangs
+        condition: >
+          socket.emitWithAck() called without a prior .timeout(ms) call, and the client
+          never sends an acknowledgement (disconnects, ignores the event, or crashes).
+        throws: >
+          The Promise NEVER rejects — it hangs indefinitely until the server process exits
+          or the socket is garbage collected. There is no built-in deadline.
+        required_handling: >
+          Caller MUST chain .timeout(ms) before .emitWithAck() in production code:
+            const response = await socket.timeout(5000).emitWithAck("my-event", payload);
+          Without timeout(), a missed acknowledgement leaks the Promise and its registered
+          ack callback permanently. In high-traffic servers, this causes memory exhaustion.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        sources:
+          - "https://socket.io/docs/v4/server-api/#socketemitwithacheck"
+          - "https://socket.io/docs/v4/emitting-events/#acknowledgements"
+
+      - id: emit-with-ack-timeout-unhandled
+        condition: >
+          socket.timeout(ms).emitWithAck() called but the returned Promise is not wrapped
+          in try-catch, and the client fails to acknowledge within the timeout window.
+        throws: >
+          Error with message "operation has timed out" — thrown as an unhandled promise
+          rejection, confirmed from socket.js source: new Error("operation has timed out").
+        required_handling: >
+          Caller MUST wrap in try-catch when using timeout:
+            try {
+              const response = await socket.timeout(5000).emitWithAck("confirm", data);
+            } catch (err) {
+              // err.message === "operation has timed out"
+              // Client did not acknowledge — handle timeout (retry, fallback, log)
+            }
+          Unhandled rejection crashes the server process in Node.js versions < 15,
+          or exits the process with unhandledRejection in Node.js >= 15 depending on config.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/server-api/#socketemitwithacheck"
+          - "https://socket.io/docs/v4/emitting-events/#acknowledgements"
+
+  - name: socket.join
+    import_path: "socket.io"
+    description: >
+      Joins the socket to one or more rooms. Internally delegates to adapter.addAll().
+      With the default in-memory adapter, this is synchronous and always succeeds.
+      With distributed adapters (Redis, MongoDB, Postgres), this is async and can fail
+      if the adapter's backend is unavailable. The return type is Promise<void> | void
+      depending on the adapter — callers that await it with a Redis adapter can observe failures.
+    postconditions:
+      # Evidence: socket.js source — join() calls this.adapter.addAll()
+      # Redis adapter propagates network errors from ioredis as rejected Promises.
+      # Documentation: https://socket.io/docs/v4/rooms/
+      - id: socket-join-adapter-error
+        condition: >
+          socket.join() called with a distributed adapter (e.g., @socket.io/redis-adapter,
+          @socket.io/mongo-adapter) and the adapter's backend is unreachable or returns an error.
+        throws: >
+          Promise rejects with the adapter's error — for Redis adapter this is an IORedisError
+          or generic Error from ioredis when Redis is unavailable. With in-memory adapter, join()
+          is synchronous and never throws.
+        required_handling: >
+          When using distributed adapters, MUST wrap await socket.join() in try-catch:
+            try {
+              await socket.join(roomName);
+            } catch (err) {
+              // Adapter (Redis/Mongo) failed — socket not in room
+              // Log error and decide: disconnect socket, retry, or proceed without room
+            }
+          A failed join means the socket is NOT in the room — any subsequent room broadcasts
+          will miss this client, causing silent message delivery failures.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/rooms/"
+          - "https://socket.io/docs/v4/redis-adapter/"
+
+  - name: fetchSockets
+    import_path: "socket.io"
+    description: >
+      Returns all Socket instances matching the current filter (rooms, namespace).
+      In single-server deployments, fetches from in-memory adapter synchronously.
+      In clustered deployments with a distributed adapter, queries all servers in the
+      cluster and returns RemoteSocket proxies. Relies on adapter.fetchSockets() which
+      is async and can fail with distributed backends.
+    postconditions:
+      # Evidence: broadcast-operator.js — fetchSockets() calls this.adapter.fetchSockets()
+      # and maps results to RemoteSocket instances. Adapter errors propagate as rejections.
+      # Documentation: https://socket.io/docs/v4/server-api/#serverfetchsockets
+      - id: fetch-sockets-adapter-error
+        condition: >
+          io.fetchSockets() called in a clustered deployment with a distributed adapter
+          (Redis, Postgres, etc.) and the adapter's backend is unavailable or times out.
+        throws: >
+          Promise rejects with the adapter-specific error. For Redis adapter: IORedisError
+          or connection-related Error from ioredis. For Postgres adapter: database Error.
+          With in-memory adapter, fetchSockets() does not fail.
+        required_handling: >
+          Caller MUST wrap in try-catch in clustered deployments:
+            try {
+              const sockets = await io.fetchSockets();
+            } catch (err) {
+              // Adapter failed — socket list is unavailable
+              // Return partial data or 503 to API caller
+            }
+          Unhandled rejection in an HTTP handler or cron job crashes the handler.
+          Common use case: admin endpoint listing connected users — if unhandled,
+          entire admin API returns 500.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/server-api/#serverfetchsockets"
+          - "https://socket.io/docs/v4/redis-adapter/"
+
+      - id: fetch-sockets-dynamic-namespace
+        condition: >
+          io.fetchSockets() called on a dynamic namespace (created via io.of(regex) pattern)
+          which has no adapter assigned.
+        throws: >
+          Error("No adapter for this namespace, are you trying to get the list of clients
+          of a dynamic namespace?") — thrown synchronously from broadcast-operator.js.
+        required_handling: >
+          Do not call fetchSockets() on dynamic parent namespaces. Call it on specific
+          namespace instances or on the default namespace (io). If unsure which namespace
+          to query, use the specific namespace reference:
+            const nsp = io.of("/my-namespace");
+            const sockets = await nsp.fetchSockets(); // correct
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          - "https://socket.io/docs/v4/namespaces/#dynamic-namespaces"
+
+  - name: Server.close
+    import_path: "socket.io"
+    description: >
+      Gracefully closes the Socket.IO server. Disconnects all sockets across all namespaces,
+      closes the adapter on each namespace, stops the engine.io server, then closes the
+      underlying HTTP server. Returns a Promise<void>. The optional callback receives any
+      error from httpServer.close() (e.g., if the HTTP server was not running).
+    postconditions:
+      # Evidence: index.js close() source — uses Promise.allSettled for adapter close,
+      # then httpServer.close(err => { fn && fn(err); }). Error is passed via callback.
+      # Documentation: https://socket.io/docs/v4/server-api/#serverclose
+      - id: server-close-http-server-error
+        condition: >
+          io.close() called and the underlying HTTP server was not running or has already
+          been closed (e.g., calling close() twice).
+        throws: >
+          The Promise resolves regardless (never rejects). However, the optional callback
+          receives an Error: the HTTP server error is passed to fn(err) where err is
+          "Server is not running." or similar Node.js http.Server close error.
+          If close() is called without a callback, HTTP server errors are silently swallowed.
+        required_handling: >
+          Always pass a callback to detect HTTP server close failures:
+            await io.close((err) => {
+              if (err) {
+                console.error('HTTP server close error:', err.message);
+              }
+            });
+          Or use the Promise return value for sequencing, but note that errors from the HTTP
+          layer are only surfaced via the callback, not via Promise rejection.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        sources:
+          - "https://socket.io/docs/v4/server-api/#serverclose"
+
+  - name: Server.use
+    import_path: "socket.io"
+    description: >
+      Registers a global middleware that executes for every incoming socket connection
+      (before the "connection" event fires). Used for authentication, authorization, and
+      connection validation. Middleware MUST call next() in all code paths — calling
+      next(err) rejects the connection and emits connect_error on the client side.
+      Not calling next() at all leaves the connection hanging until timeout.
+    postconditions:
+      # Evidence: https://socket.io/docs/v4/middlewares/
+      # Confirmed: "If the next method is called with an Error object, the connection will be refused"
+      # "The client will receive a connect_error event"
+      - id: server-use-middleware-missing-next
+        condition: >
+          Middleware registered via io.use() has a code path that does not call next()
+          (e.g., early return without calling next, thrown error not caught before next).
+        throws: >
+          Connection hangs — no error is thrown to the caller. The socket connection
+          stays in connecting state until it times out (connectTimeout, default 45000ms).
+          During this time the socket consumes resources but cannot communicate.
+        required_handling: >
+          MUST call next() in every code path within middleware:
+            io.use((socket, next) => {
+              if (!isAuthenticated(socket)) {
+                return next(new Error("unauthorized"));  // reject
+              }
+              next();  // allow
+            });
+          Async middleware MUST handle all error paths:
+            io.use(async (socket, next) => {
+              try {
+                await authenticate(socket.handshake.auth.token);
+                next();
+              } catch (err) {
+                next(new Error("authentication failed"));  // MUST catch and next(err)
+              }
+            });
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://socket.io/docs/v4/middlewares/"
+
+      - id: server-use-middleware-async-unhandled-error
+        condition: >
+          Async middleware registered via io.use() throws or rejects without catching the
+          error and calling next(err). The middleware uses async/await but has no try-catch.
+        throws: >
+          Unhandled promise rejection — Node.js emits an unhandledRejection event.
+          In Node.js >= 15 with default settings, process exits. The connection hangs
+          until timeout because next() was never called.
+        required_handling: >
+          Async middleware MUST use try-catch:
+            io.use(async (socket, next) => {
+              try {
+                const user = await verifyToken(socket.handshake.auth.token);
+                socket.data.user = user;
+                next();
+              } catch (err) {
+                next(new Error("authentication failed"));
+              }
+            });
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://socket.io/docs/v4/middlewares/"
+
+  - name: serverSideEmitWithAck
+    import_path: "socket.io"
+    description: >
+      Sends an event to all other Socket.IO servers in the cluster and waits for
+      acknowledgements from all of them. Used for cluster-wide coordination (e.g.,
+      invalidating caches, broadcasting configuration changes). Returns a Promise that
+      resolves with an array of responses (one per server) or rejects if any server
+      fails to acknowledge within the timeout window set by the adapter.
+    postconditions:
+      # Evidence: namespace.js source — serverSideEmitWithAck() wraps serverSideEmit
+      # in a Promise that rejects via callback(err) when adapter timeout fires.
+      # Documentation: https://socket.io/docs/v4/server-api/#serverserversideemitwithack
+      - id: server-side-emit-with-ack-timeout
+        condition: >
+          io.serverSideEmitWithAck() called in a multi-server deployment and one or more
+          servers fail to acknowledge within the adapter's default timeout window.
+        throws: >
+          Promise rejects with an Error. The error object has an additional .responses
+          property containing the acknowledgements received before the timeout:
+            err.responses = [...responses from servers that did respond...]
+          The default timeout is set by the adapter (varies by adapter implementation).
+        required_handling: >
+          Caller MUST wrap in try-catch:
+            try {
+              const responses = await io.serverSideEmitWithAck("invalidate-cache", key);
+              // all servers acknowledged
+            } catch (err) {
+              // err.responses contains partial responses
+              // Some servers may have processed the event even though we got an error
+              // Log err.responses for reconciliation
+            }
+          Partial responses (err.responses) are important — some servers may have already
+          processed the event. This is especially critical for cache invalidation or
+          configuration changes where partial application causes inconsistency.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/server-api/#serverserversideemitwithack"
