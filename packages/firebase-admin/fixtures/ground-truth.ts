@@ -4,16 +4,23 @@
  *
  * Contracted functions from corpus/packages/firebase-admin/contract.yaml:
  *   Auth: verifyIdToken, createUser, getUser, updateUser, deleteUser, getUserByEmail, setCustomUserClaims
- *   Auth (new): createSessionCookie, verifySessionCookie, createCustomToken, revokeRefreshTokens, generatePasswordResetLink
+ *   Auth (new 2026-04-06): createSessionCookie, verifySessionCookie, createCustomToken, revokeRefreshTokens, generatePasswordResetLink
+ *   Auth (new 2026-04-13): importUsers, generateSignInWithEmailLink
+ *   Auth (new 2026-04-13 pass 14): createProviderConfig, updateProviderConfig, deleteProviderConfig, getProviderConfig
+ *   Tenant (new 2026-04-13 pass 14): createTenant, updateTenant, deleteTenant, getTenant
  *   Firestore: get, add, set, update, delete
  *   Firestore (new): runTransaction, commit (WriteBatch)
  *   Messaging: send, sendMulticast
  *   Messaging (new): sendEach, subscribeToTopic
  *   RTDB: once, set, update, remove
+ *   RTDB (new 2026-04-13 pass 14): setRules
+ *   Remote Config (new 2026-04-13): getTemplate, publishTemplate
+ *   Storage (new 2026-04-13 pass 14): getDownloadURL
  *
  * Detection note: namespace API (admin.auth()) and stored instances are fully detected.
  * Modular getAuth().verifyIdToken() pattern is not currently detected (analyzer limitation).
  * Modular getFirestore().collection().get() and getDatabase().ref().once() ARE detected.
+ * Remote Config: getRemoteConfig() modular API used. Detection requires factory_method tracking.
  */
 
 import * as admin from 'firebase-admin';
@@ -464,6 +471,274 @@ async function gt_subscribeToTopic_proper(tokens: string[], topic: string) {
     const response = await admin.messaging().subscribeToTopic(tokens, topic);
     return response.successCount;
   } catch (error) {
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 22. importUsers — added 2026-04-13 depth pass (deepen-stream-1)
+// ──────────────────────────────────────────────
+// Note: importUsers RESOLVES even on partial failure — partial failure is in
+// result.failureCount. The test annotates import-users-partial-failure because
+// callers that don't check failureCount silently lose users.
+
+async function gt_importUsers_missing(users: admin.auth.UserImportRecord[]) {
+  // SHOULD_FIRE: import-users-batch-too-large — importUsers without try-catch (batch-too-large fires first)
+  const result = await admin.auth().importUsers(users);
+  return result.successCount;
+}
+
+// @expect-clean
+async function gt_importUsers_proper(users: admin.auth.UserImportRecord[]) {
+  try {
+    // SHOULD_NOT_FIRE: importUsers inside try-catch with result.failureCount check
+    const result = await admin.auth().importUsers(users);
+    if (result.failureCount > 0) {
+      throw new Error(`${result.failureCount} users failed to import`);
+    }
+    return result.successCount;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 23. generateSignInWithEmailLink — added 2026-04-13 depth pass (deepen-stream-1)
+// ──────────────────────────────────────────────
+
+async function gt_generateSignInWithEmailLink_missing(email: string) {
+  // SHOULD_FIRE: sign-in-link-missing-action-code-settings — generateSignInWithEmailLink without try-catch
+  const link = await admin.auth().generateSignInWithEmailLink(email, {
+    url: 'https://example.com/finishSignIn',
+    handleCodeInApp: true,
+  });
+  return link;
+}
+
+// @expect-clean
+async function gt_generateSignInWithEmailLink_proper(email: string) {
+  try {
+    // SHOULD_NOT_FIRE: generateSignInWithEmailLink inside try-catch
+    const link = await admin.auth().generateSignInWithEmailLink(email, {
+      url: 'https://example.com/finishSignIn',
+      handleCodeInApp: true,
+    });
+    return link;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 24. Remote Config — getTemplate — added 2026-04-13 depth pass (deepen-stream-1)
+// ──────────────────────────────────────────────
+
+import { getRemoteConfig } from 'firebase-admin/remote-config';
+
+async function gt_remoteConfig_getTemplate_missing() {
+  const rc = getRemoteConfig();
+  // SHOULD_FIRE: remote-config-get-permission-denied — getTemplate without try-catch
+  const template = await rc.getTemplate();
+  return template;
+}
+
+// @expect-clean
+async function gt_remoteConfig_getTemplate_proper() {
+  try {
+    // SHOULD_NOT_FIRE: getTemplate inside try-catch
+    const rc = getRemoteConfig();
+    const template = await rc.getTemplate();
+    return template;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 25. Remote Config — publishTemplate — added 2026-04-13 depth pass (deepen-stream-1)
+// ──────────────────────────────────────────────
+
+async function gt_remoteConfig_publishTemplate_missing(template: admin.remoteConfig.RemoteConfigTemplate) {
+  const rc = getRemoteConfig();
+  // SHOULD_FIRE: remote-config-publish-etag-mismatch — publishTemplate without try-catch
+  const published = await rc.publishTemplate(template);
+  return published;
+}
+
+// @expect-clean
+async function gt_remoteConfig_publishTemplate_proper(template: admin.remoteConfig.RemoteConfigTemplate) {
+  try {
+    // SHOULD_NOT_FIRE: publishTemplate inside try-catch
+    const rc = getRemoteConfig();
+    const published = await rc.publishTemplate(template);
+    return published;
+  } catch (error) {
+    if ((error as any).code === 'remote-config/aborted') {
+      // ETag mismatch — fetch fresh template and retry
+      throw new Error('Template was modified by another process. Please retry.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 26. Auth — createProviderConfig — added 2026-04-13 depth pass 14 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getAuth } from 'firebase-admin/auth';
+
+// @expect-violation: create-provider-config-invalid-provider-id
+// @expect-violation: create-provider-config-quota-exceeded
+// @expect-violation: create-provider-config-insufficient-permission
+async function gt_createProviderConfig_missing() {
+  const auth = getAuth();
+  // SHOULD_FIRE: createProviderConfig without try-catch
+  const config = await auth.createProviderConfig({
+    providerId: 'oidc.my-provider',
+    displayName: 'My OIDC Provider',
+    enabled: true,
+    clientId: 'client-id',
+    issuer: 'https://accounts.example.com',
+  });
+  return config;
+}
+
+// @expect-clean
+async function gt_createProviderConfig_proper() {
+  try {
+    // SHOULD_NOT_FIRE: createProviderConfig inside try-catch
+    const auth = getAuth();
+    const config = await auth.createProviderConfig({
+      providerId: 'oidc.my-provider',
+      displayName: 'My OIDC Provider',
+      enabled: true,
+      clientId: 'client-id',
+      issuer: 'https://accounts.example.com',
+    });
+    return config;
+  } catch (error) {
+    if ((error as any).code === 'auth/invalid-provider-id') {
+      throw new Error('Invalid provider ID: must start with oidc. or saml.');
+    }
+    if ((error as any).code === 'auth/quota-exceeded') {
+      throw new Error('Provider config quota exceeded — delete unused configurations.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 27. Auth — createTenant — added 2026-04-13 depth pass 14 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+// @expect-violation: create-tenant-invalid-tenant-id
+// @expect-violation: create-tenant-missing-display-name
+// @expect-violation: create-tenant-quota-exceeded
+async function gt_createTenant_missing() {
+  const auth = getAuth();
+  const tm = auth.tenantManager();
+  // SHOULD_FIRE: createTenant without try-catch
+  const tenant = await tm.createTenant({
+    displayName: 'Acme Corp',
+    emailSignInConfig: { enabled: true },
+  });
+  return tenant;
+}
+
+// @expect-clean
+async function gt_createTenant_proper() {
+  try {
+    // SHOULD_NOT_FIRE: createTenant inside try-catch
+    const auth = getAuth();
+    const tm = auth.tenantManager();
+    const tenant = await tm.createTenant({
+      displayName: 'Acme Corp',
+      emailSignInConfig: { enabled: true },
+    });
+    return tenant;
+  } catch (error) {
+    if ((error as any).code === 'auth/quota-exceeded') {
+      throw new Error('Tenant quota exceeded — contact Google Cloud support.');
+    }
+    if ((error as any).code === 'auth/missing-display-name') {
+      throw new Error('Tenant displayName is required.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 28. RTDB — setRules — added 2026-04-13 depth pass 14 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getDatabase } from 'firebase-admin/database';
+
+// @expect-violation: set-rules-invalid-argument
+// @expect-violation: set-rules-permission-denied
+async function gt_setRules_missing() {
+  const db = getDatabase();
+  const rules = JSON.stringify({
+    rules: {
+      '.read': 'auth != null',
+      '.write': 'auth != null',
+    },
+  });
+  // SHOULD_FIRE: setRules without try-catch
+  await db.setRules(rules);
+}
+
+// @expect-clean
+async function gt_setRules_proper() {
+  try {
+    // SHOULD_NOT_FIRE: setRules inside try-catch
+    const db = getDatabase();
+    const rules = JSON.stringify({
+      rules: {
+        '.read': 'auth != null',
+        '.write': 'auth != null',
+      },
+    });
+    await db.setRules(rules);
+  } catch (error) {
+    if ((error as any).code === 'database/invalid-argument') {
+      throw new Error('Invalid rules source: must be non-empty string, Buffer, or object.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 29. Storage — getDownloadURL — added 2026-04-13 depth pass 14 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getStorage, getDownloadURL } from 'firebase-admin/storage';
+
+// @expect-violation: get-download-url-no-token
+// @expect-violation: get-download-url-file-not-found
+async function gt_getDownloadURL_missing(filePath: string) {
+  const storage = getStorage();
+  const bucket = storage.bucket();
+  const file = bucket.file(filePath);
+  // SHOULD_FIRE: getDownloadURL without try-catch
+  const url = await getDownloadURL(file);
+  return url;
+}
+
+// @expect-clean
+async function gt_getDownloadURL_proper(filePath: string) {
+  try {
+    // SHOULD_NOT_FIRE: getDownloadURL inside try-catch
+    const storage = getStorage();
+    const bucket = storage.bucket();
+    const file = bucket.file(filePath);
+    const url = await getDownloadURL(file);
+    return url;
+  } catch (error) {
+    if ((error as any).code === 'storage/no-download-token') {
+      throw new Error(
+        'File has no download token. Upload via Firebase SDK or add token metadata manually.'
+      );
+    }
     throw error;
   }
 }

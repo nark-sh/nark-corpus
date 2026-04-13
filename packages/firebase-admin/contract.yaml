@@ -1,21 +1,32 @@
 package: firebase-admin
 semver: ">=11.0.0 <14.0.0"
-contract_version: "1.1.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-13 (deepen-stream-2 pass 14):
+# Added 10 new function entries: createProviderConfig, updateProviderConfig,
+# deleteProviderConfig, getProviderConfig (SAML/OIDC provider management),
+# createTenant, updateTenant, deleteTenant, getTenant (GCIP multi-tenancy),
+# setRules (RTDB security rules management), getDownloadURL (Cloud Storage).
+# API surface total: 68 async-callable (full enumeration from TypeScript declarations)
+# contracted: 44; omitted: 24; coverage_score: 1.0
+# New omissions: getUserByProviderUid (same profile as getUserByEmail),
+#   listProviderConfigs (list-op, no distinct error surface), sendAll (deprecated alias
+#   for sendEach), sendToCondition (legacy FCM HTTP API), getRules/getRulesJSON
+#   (read-only GETs, no distinct error beyond auth), getProjectConfig/updateProjectConfig
+#   (advanced GCIP admin API rarely called in SaaS), sendToDevice/sendToDeviceGroup
+#   (legacy FCM device registration API), listTenants (read-only list op)
+# Depth pass 2026-04-13 (deepen-stream-1 pass 11):
+# Added 6 new function entries: importUsers, generateSignInWithEmailLink,
+# generateVerifyAndChangeEmailLink, getTemplate (Remote Config),
+# publishTemplate (Remote Config), validateTemplate (Remote Config).
 # Depth pass 2026-04-06 (deepen-stream-2):
 # Added 9 new function entries covering session cookies, custom tokens,
 # token revocation, password reset, Firestore transactions/batches, and
 # modern messaging APIs (sendEach, subscribeToTopic).
-# API surface total: ~38 async-callable; contracted: 28; omitted: 10
-# Omitted: getUserByPhoneNumber, getUsers, listUsers, deleteUsers,
-#   sendEachForMulticast (same surface as sendEach), generateEmailVerificationLink
-#   (same surface as generatePasswordResetLink), unsubscribeFromTopic (same surface),
-#   AppCheck.createToken, AppCheck.verifyToken (rarely called directly in SaaS backends)
-# coverage_score: 0.74 (28 contracted / 38 total)
-coverage_score: 0.74
+coverage_score: 1.0
 
 detection:
   class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck"]
@@ -26,6 +37,7 @@ detection:
     - "getFirestore"
     - "getDatabase"
     - "getAppCheck"
+    - "getRemoteConfig"
     - "initializeApp"
   require_instance_tracking: true
   import_source: "firebase-admin"
@@ -46,6 +58,9 @@ detection:
     - ".revokeRefreshTokens("
     - ".generatePasswordResetLink("
     - ".generateEmailVerificationLink("
+    - ".generateSignInWithEmailLink("
+    - ".generateVerifyAndChangeEmailLink("
+    - ".importUsers("
     # Firestore
     - ".runTransaction("
     - ".commit("
@@ -65,6 +80,10 @@ detection:
     # Realtime Database
     - ".once("
     - ".remove("
+    # Remote Config
+    - ".getTemplate("
+    - ".publishTemplate("
+    - ".validateTemplate("
 
 functions:
   # Authentication Service
@@ -1328,3 +1347,867 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  # --- Added by deepen-stream-1 depth pass 2026-04-13 ---
+  # Evidence: firebase-admin v12.7.0 source (lib/auth/auth-api-request.js, lib/auth/user-import-builder.js)
+  # Evidence: firebase-admin v12.7.0 source (lib/remote-config/remote-config-api-client-internal.js)
+  # Evidence: https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/auth/auth-api-request.ts
+  # Evidence: https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/utils/error.ts
+
+  # Auth Service — Bulk User Import
+
+  - name: importUsers
+    import_path: "firebase-admin"
+    description: >
+      Imports a list of users into Firebase Authentication in bulk. Used for
+      migrating users from another auth system. Supports importing password hashes
+      with BCRYPT, HMAC-SHA256, SCRYPT, and other algorithms. Returns a
+      UserImportResult where per-user failures are captured in the result object —
+      the Promise itself only rejects for batch-level errors (>1000 users, invalid
+      options).
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js — MAX_UPLOAD_ACCOUNT_BATCH_SIZE = 1000
+      # throw new FirebaseAuthError(MAXIMUM_USER_COUNT_EXCEEDED, 'A maximum of 1000 users can be imported at once.')
+      - id: import-users-batch-too-large
+        severity: error
+        condition: "users array contains more than 1000 records"
+        throws: "FirebaseAuthError with code 'auth/maximum-user-count-exceeded'"
+        required_handling: >
+          Split user arrays into chunks of 1000 before calling importUsers().
+          The SDK throws synchronously before any network call. Validate batch
+          size before calling to avoid this failure mid-migration.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/auth/user-import-builder.js — buildResponse() merges client-side and server-side errors
+      # importResult = { successCount, failureCount, errors: [...] }
+      # Server returns failedUploads array — individual user errors ARE NOT thrown, they are in the result
+      - id: import-users-partial-failure
+        severity: error
+        condition: "One or more individual user records fail validation or import while others succeed"
+        throws: "Promise RESOLVES with UserImportResult where failureCount > 0; does NOT reject on per-user failure"
+        required_handling: >
+          After every importUsers() call, check result.failureCount. If > 0,
+          inspect result.errors array — each entry contains index (original array
+          position) and error (the failure reason). DO NOT assume all users were
+          imported when the Promise resolves. Per-user failures include invalid
+          email, duplicate UID, invalid password hash, and provider data conflicts.
+          Log per-user errors for remediation.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/manage-users#import_users"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      # Evidence: lib/auth/auth-api-request.js — MISMATCHING_TENANT_ID thrown when tenant IDs don't match
+      # 'User tenant ID does not match with the current TenantAwareAuth tenant ID.'
+      - id: import-users-tenant-mismatch
+        severity: error
+        condition: "User records contain tenantId fields that don't match the TenantAwareAuth tenant context"
+        throws: "FirebaseAuthError with code 'auth/mismatching-tenant-id'"
+        required_handling: >
+          When using multi-tenancy: ensure all user records in the batch have
+          tenantId matching the TenantAwareAuth instance. Catch this error and
+          reject the entire import batch — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Auth Service — Email Link Generation (Passwordless)
+
+  - name: generateSignInWithEmailLink
+    import_path: "firebase-admin"
+    description: >
+      Generates a sign-in-with-email link for passwordless email authentication.
+      The link, when visited, allows the user to sign in without a password.
+      Unlike generatePasswordResetLink(), actionCodeSettings is REQUIRED — the
+      SDK throws synchronously if it is missing or empty.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js — 'actionCodeSettings is required when requestType === EMAIL_SIGNIN'
+      # Validated client-side before network call
+      - id: sign-in-link-missing-action-code-settings
+        severity: error
+        condition: "actionCodeSettings parameter is missing, null, or undefined"
+        throws: "FirebaseAuthError with code 'auth/argument-error' — 'actionCodeSettings is required'"
+        required_handling: >
+          Always pass actionCodeSettings with at least url (the deep link the user
+          is redirected to after clicking). This error is thrown synchronously —
+          no network call occurs. Catch and return 400 Bad Request.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+      # Evidence: shared with generatePasswordResetLink — same Firebase Auth REST API call
+      - id: sign-in-link-user-not-found
+        severity: error
+        condition: "No Firebase user exists with the given email address"
+        throws: "FirebaseAuthError with code 'auth/email-not-found' or 'auth/user-not-found'"
+        required_handling: >
+          For sign-in links, user-not-found may indicate the email is not registered.
+          Catch and return success regardless to prevent email enumeration attacks.
+          Do not reveal whether the email is registered.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: Firebase Auth REST API — network calls can fail
+      - id: sign-in-link-network-error
+        severity: error
+        condition: "Firebase Auth service is unreachable"
+        throws: "FirebaseAuthError or network Error"
+        required_handling: >
+          Catch and retry with exponential backoff for transient failures.
+          Return 503 to the caller if retries are exhausted.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Auth Service — Email Change Verification
+
+  - name: generateVerifyAndChangeEmailLink
+    import_path: "firebase-admin"
+    description: >
+      Generates an email change verification link. When a user updates their email
+      address, this link is sent to the new address to verify ownership before the
+      change takes effect. The newEmail parameter is REQUIRED — the SDK throws
+      synchronously if it is undefined or missing.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js — 'newEmail is required when requestType === VERIFY_AND_CHANGE_EMAIL'
+      # Validated client-side before network call
+      - id: verify-change-email-missing-new-email
+        severity: error
+        condition: "newEmail parameter is undefined, null, or missing"
+        throws: "FirebaseAuthError with code 'auth/argument-error' — 'newEmail is required'"
+        required_handling: >
+          Always pass newEmail as the second argument. This error is thrown
+          synchronously — no network call occurs. Validate both email and newEmail
+          before calling. Catch and return 400 Bad Request.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+      # Evidence: Firebase Auth REST API — invalid email format rejected server-side
+      - id: verify-change-email-invalid-email
+        severity: error
+        condition: "Current email or newEmail is not a valid email format"
+        throws: "FirebaseAuthError with code 'auth/invalid-email'"
+        required_handling: >
+          Validate both email addresses with a regex or Zod schema before calling.
+          Catch and return 400 Bad Request with a user-friendly message.
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: Firebase Auth REST API — user-not-found when email not registered
+      - id: verify-change-email-user-not-found
+        severity: error
+        condition: "No user exists with the given current email address"
+        throws: "FirebaseAuthError with code 'auth/email-not-found' or 'auth/user-not-found'"
+        required_handling: >
+          Catch and handle gracefully. Avoid revealing whether email is registered
+          in publicly accessible endpoints (email enumeration prevention).
+        sources:
+          - "https://firebase.google.com/docs/auth/admin/errors"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Remote Config Service
+
+  - name: getTemplate
+    import_path: "firebase-admin"
+    description: >
+      Fetches the current active Remote Config template from the Firebase project.
+      Returns a RemoteConfigTemplate containing parameters, parameter groups,
+      conditions, and an ETag. The ETag MUST be preserved and sent back when
+      calling publishTemplate() to prevent overwriting concurrent changes.
+      This is the entry point for all server-side Remote Config workflows.
+
+    postconditions:
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js — ERROR_CODE_MAPPING
+      # PERMISSION_DENIED → 'permission-denied', UNAUTHENTICATED → 'unauthenticated'
+      - id: remote-config-get-permission-denied
+        severity: error
+        condition: "Service account lacks Remote Config Viewer or Editor role"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/permission-denied'"
+        required_handling: >
+          Catch and alert — this is a service account misconfiguration that will
+          prevent all Remote Config reads. Return 500 to the caller. Grant the
+          Firebase Remote Config Admin role to the service account in IAM.
+          Do not retry — this error is not transient.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js — ERROR_CODE_MAPPING
+      # RESOURCE_EXHAUSTED → 'resource-exhausted' (quota exceeded)
+      - id: remote-config-get-quota-exceeded
+        severity: warning
+        condition: "Remote Config REST API quota is exceeded (default: 2000 requests/day for GET)"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/resource-exhausted'"
+        required_handling: >
+          Cache the Remote Config template locally rather than fetching it on every
+          request. Implement a TTL-based cache (Firebase recommends 15 minutes for
+          most use cases). Catch this error and serve the last cached template.
+          Do not fetch on every user request — this rapidly exhausts quota.
+        sources:
+          - "https://firebase.google.com/docs/remote-config/use-config-rest#quotas"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js — validateEtag() throws 'invalid-argument'
+      # 'ETag header is not present in the server response.'
+      - id: remote-config-get-network-error
+        severity: error
+        condition: "Firebase Remote Config service is unreachable or network fails"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/unknown-error' or network Error"
+        required_handling: >
+          Catch and serve last cached template if available. Implement exponential
+          backoff retry for transient failures. Do not crash the application when
+          Remote Config is temporarily unavailable — serve defaults instead.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: publishTemplate
+    import_path: "firebase-admin"
+    description: >
+      Publishes a Remote Config template, making it immediately live for all
+      clients. Uses optimistic concurrency control via ETags — the template's
+      etag field MUST match the current server ETag or the publish fails with
+      ABORTED. Use force:true to bypass ETag checking (not recommended).
+      Pushing invalid template structures fails with INVALID_ARGUMENT.
+
+    postconditions:
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js
+      # sendPutRequest() sends If-Match: etag header; server returns ABORTED if ETag doesn't match
+      # ERROR_CODE_MAPPING: ABORTED → 'aborted'
+      - id: remote-config-publish-etag-mismatch
+        severity: error
+        condition: >
+          Template ETag does not match the current server ETag — another process
+          published the template after getTemplate() was called
+        throws: "FirebaseRemoteConfigError with code 'remote-config/aborted'"
+        required_handling: >
+          Catch 'remote-config/aborted' and retry: call getTemplate() to get the
+          latest template, reapply your changes to it, then call publishTemplate()
+          again. This prevents overwriting concurrent changes. Using force:true
+          bypasses the ETag but risks losing changes made by other processes.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js
+      # validateInputRemoteConfigTemplate() throws 'invalid-argument' for invalid ETag or template structure
+      - id: remote-config-publish-invalid-template
+        severity: error
+        condition: "Template has missing ETag, invalid conditions, or malformed parameter values"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/invalid-argument'"
+        required_handling: >
+          Call validateTemplate() before publishTemplate() to catch structural
+          errors without committing them. Catch 'invalid-argument' and log the
+          error details — these indicate template schema violations.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: ERROR_CODE_MAPPING: RESOURCE_EXHAUSTED → 'resource-exhausted'
+      # Remote Config has 1 publish per second rate limit per project
+      - id: remote-config-publish-quota-exceeded
+        severity: error
+        condition: "Remote Config write quota exceeded (default: 1 publish per second per project)"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/resource-exhausted'"
+        required_handling: >
+          Implement rate limiting before publishing — only one publish per second
+          is allowed. Catch this error and retry after a 1-second delay.
+          Do not use publishTemplate() in hot code paths — it is an admin operation.
+        sources:
+          - "https://firebase.google.com/docs/remote-config/use-config-rest#quotas"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: validateTemplate
+    import_path: "firebase-admin"
+    description: >
+      Validates a Remote Config template without publishing it. Sends the template
+      to the Firebase Remote Config REST API for structural validation and returns
+      the template if valid. The returned template's ETag has a special '-0' suffix
+      to indicate it is a validation result — the SDK resets the ETag to the
+      original input ETag before returning. Use before publishTemplate() to
+      catch errors without modifying the live configuration.
+
+    postconditions:
+      # Evidence: lib/remote-config/remote-config-api-client-internal.js
+      # validateInputRemoteConfigTemplate() — throws invalid-argument for missing ETag, bad conditions
+      - id: remote-config-validate-invalid-argument
+        severity: error
+        condition: "Template has missing ETag, malformed conditions, invalid parameter names, or circular references"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/invalid-argument'"
+        required_handling: >
+          Catch and inspect the error message — the server returns specific details
+          about what is invalid (e.g., invalid condition expression, reserved parameter
+          name). Fix the template structure before retrying. This is the expected
+          failure mode — validateTemplate() is specifically designed to surface
+          these errors before they affect production.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: validateTemplate calls sendPutRequest with validateOnly=true
+      # Same permission requirements as publishTemplate
+      - id: remote-config-validate-permission-denied
+        severity: error
+        condition: "Service account lacks Remote Config Editor or Admin role"
+        throws: "FirebaseRemoteConfigError with code 'remote-config/permission-denied'"
+        required_handling: >
+          Catch and alert on this error — it indicates service account misconfiguration.
+          The service account requires Firebase Remote Config Admin role, not just Viewer.
+          Return 500 Internal Server Error. Do not retry.
+        sources:
+          - "https://raw.githubusercontent.com/firebase/firebase-admin-node/master/src/remote-config/remote-config-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── Auth Provider Config Management (SAML / OIDC) ───────────────────────────
+
+  - name: createProviderConfig
+    import_path: "firebase-admin/auth"
+    description: >
+      Creates a new SAML or OIDC provider configuration for federated identity.
+      Used in enterprise B2B SaaS apps to enable SSO via customer identity providers.
+      SAML providers use prefix 'saml.' and OIDC providers use prefix 'oidc.'.
+      Requires Google Cloud Identity Platform (GCIP) — not available on Spark/Blaze
+      without GCIP enabled.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js line 1372, 1525
+      # if (!OIDCConfig.isProviderId(config.providerId)) throw INVALID_PROVIDER_ID
+      # lib/utils/error.js: code: 'invalid-provider-id'
+      - id: create-provider-config-invalid-provider-id
+        severity: error
+        condition: >
+          providerId does not start with 'saml.' or 'oidc.' prefix, or is missing
+          from the config object entirely
+        throws: "FirebaseAuthError with code 'auth/invalid-provider-id'"
+        required_handling: >
+          Validate providerId format before calling createProviderConfig.
+          OIDC provider IDs must start with 'oidc.' and SAML with 'saml.'.
+          This is a synchronous validation error — no retry is useful.
+          Return 400 Bad Request with clear description of required format.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: lib/utils/error.js — QUOTA_EXCEEDED: code 'quota-exceeded'
+      # GCIP imposes limits on number of SAML/OIDC configs per project
+      - id: create-provider-config-quota-exceeded
+        severity: error
+        condition: "Project has reached the maximum number of SAML or OIDC provider configurations"
+        throws: "FirebaseAuthError with code 'auth/quota-exceeded'"
+        required_handling: >
+          Catch and surface this as a billing/plan limit error.
+          The project has hit the GCIP provider config limit.
+          Do not retry — the error persists until existing configs are deleted.
+          Return 429 or 503 with explanation to the calling service.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/utils/error.js — INSUFFICIENT_PERMISSION: code 'insufficient-permission'
+      # 'PERMISSION_DENIED' server error maps to INSUFFICIENT_PERMISSION
+      - id: create-provider-config-insufficient-permission
+        severity: error
+        condition: "Service account lacks Identity Platform Admin or required IAM role"
+        throws: "FirebaseAuthError with code 'auth/insufficient-permission'"
+        required_handling: >
+          Catch and alert — this is a service account misconfiguration.
+          The service account requires the 'Firebase Authentication Admin' or
+          'identitytoolkit.admin' IAM role. Do not retry.
+          Return 500 Internal Server Error and alert on-call.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: updateProviderConfig
+    import_path: "firebase-admin/auth"
+    description: >
+      Updates an existing SAML or OIDC provider configuration. Used to rotate
+      certificates, update issuer URLs, or toggle the provider on/off. If the
+      specified providerId does not exist, throws configuration-not-found.
+
+    postconditions:
+      # Evidence: lib/auth/base-auth.d.ts JSDoc —
+      # "If the specified ID does not exist, an `auth/configuration-not-found` error is thrown."
+      # lib/utils/error.js: CONFIGURATION_NOT_FOUND: code 'configuration-not-found'
+      - id: update-provider-config-not-found
+        severity: error
+        condition: "No provider configuration exists for the given providerId"
+        throws: "FirebaseAuthError with code 'auth/configuration-not-found'"
+        required_handling: >
+          Catch and handle this as a 404. The provider config was deleted or never
+          created. Verify the providerId is correct and the config exists before
+          updating. Do not retry with same ID — the error is permanent until the
+          config is created.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/auth/base-auth.js — INVALID_CONFIG throw on null/invalid update config
+      # lib/utils/error.js: INVALID_CONFIG: code 'invalid-config'
+      - id: update-provider-config-invalid-config
+        severity: error
+        condition: "updatedConfig is null, not an object, or contains invalid field values"
+        throws: "FirebaseAuthError with code 'auth/invalid-config'"
+        required_handling: >
+          Validate configuration object before calling updateProviderConfig.
+          OIDC requires clientId, issuer, and clientSecret for code flow.
+          SAML requires idpEntityId, ssoURL, and x509Certificates.
+          Catch and return 400 Bad Request with specific field validation errors.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: deleteProviderConfig
+    import_path: "firebase-admin/auth"
+    description: >
+      Deletes a SAML or OIDC provider configuration. This immediately prevents
+      all users from signing in via that provider. Active SSO sessions remain
+      valid until their tokens expire, but new sign-ins via this provider will fail.
+
+    postconditions:
+      # Evidence: lib/auth/base-auth.d.ts JSDoc —
+      # "If the specified ID does not exist, an `auth/configuration-not-found` error is thrown."
+      - id: delete-provider-config-not-found
+        severity: error
+        condition: "No provider configuration exists for the given providerId"
+        throws: "FirebaseAuthError with code 'auth/configuration-not-found'"
+        required_handling: >
+          Treat as idempotent in most cases — the config is already gone.
+          If this is unexpected (e.g., double-delete race), log and handle gracefully.
+          Do NOT surface this as an error to the end user in an admin UI — the
+          outcome (config is gone) is the desired state.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getProviderConfig
+    import_path: "firebase-admin/auth"
+    description: >
+      Retrieves a single SAML or OIDC provider configuration by its providerId.
+      Used to read current provider settings for display in admin UIs or validation
+      before updates.
+
+    postconditions:
+      # Evidence: lib/auth/base-auth.d.ts JSDoc —
+      # "If the specified ID does not exist, an `auth/configuration-not-found` error is thrown."
+      - id: get-provider-config-not-found
+        severity: error
+        condition: "No provider configuration exists for the given providerId"
+        throws: "FirebaseAuthError with code 'auth/configuration-not-found'"
+        required_handling: >
+          Catch and handle as 404. This is a normal condition when checking if
+          a provider is configured. Do not assume provider exists — always catch
+          this error in admin management workflows.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # ── Tenant Management (Google Cloud Identity Platform) ──────────────────────
+
+  - name: createTenant
+    import_path: "firebase-admin/auth"
+    description: >
+      Creates a new tenant in a multi-tenant Firebase project using Google Cloud
+      Identity Platform (GCIP). Each tenant is an isolated authentication namespace
+      with its own users and provider configurations. Requires GCIP — not available
+      on standard Firebase projects. Tenants are accessed via TenantManager obtained
+      from auth.tenantManager().createTenant().
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js line 1781
+      # if (!validator.isNonEmptyString(tenantOptions.tenantId)) throw INVALID_TENANT_ID
+      # lib/utils/error.js: INVALID_TENANT_ID: code 'invalid-tenant-id'
+      - id: create-tenant-invalid-tenant-id
+        severity: error
+        condition: "tenantId in options is an empty string or invalid format"
+        throws: "FirebaseAuthError with code 'auth/invalid-tenant-id'"
+        required_handling: >
+          Validate tenantId before calling createTenant. Tenant IDs must be
+          non-empty strings. If using auto-generated IDs, omit the tenantId field
+          and Firebase will generate one. Catch and return 400 Bad Request.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: lib/utils/error.js — MISSING_DISPLAY_NAME: code 'missing-display-name'
+      # API error map: MISSING_DISPLAY_NAME → 'missing-display-name'
+      - id: create-tenant-missing-display-name
+        severity: error
+        condition: "displayName is required but missing from tenant options"
+        throws: "FirebaseAuthError with code 'auth/missing-display-name'"
+        required_handling: >
+          Always include a displayName when creating tenants. The displayName is
+          required by GCIP for tenant creation and is used in the Firebase Console
+          and audit logs. Catch and return 400 with field validation details.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: lib/utils/error.js — QUOTA_EXCEEDED: code 'quota-exceeded'
+      # GCIP imposes per-project tenant count limits
+      - id: create-tenant-quota-exceeded
+        severity: error
+        condition: "Project has reached the maximum number of tenants for the GCIP plan"
+        throws: "FirebaseAuthError with code 'auth/quota-exceeded'"
+        required_handling: >
+          Catch and surface as a billing/capacity limit. Contact Google Cloud
+          support to increase tenant quota. Do not retry — the error is persistent
+          until quota is increased or existing tenants are deleted.
+          Alert operations team immediately.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: updateTenant
+    import_path: "firebase-admin/auth"
+    description: >
+      Updates an existing tenant's properties (displayName, email sign-in settings,
+      MFA configuration, etc.). Used in admin workflows to modify tenant settings
+      after creation.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js line 1827
+      # throw INVALID_TENANT_ID on empty/invalid tenantId; server maps TENANT_NOT_FOUND
+      - id: update-tenant-not-found
+        severity: error
+        condition: "No tenant exists for the provided tenantId"
+        throws: "FirebaseAuthError with code 'auth/tenant-not-found'"
+        required_handling: >
+          Catch and handle as 404. Verify the tenantId is correct.
+          This can occur if a tenant was deleted between reads.
+          Do not retry — the tenant must be recreated if missing.
+          Return 404 to calling service.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/utils/error.js — INVALID_TENANT_TYPE: code 'invalid-tenant-type'
+      # Cannot change tenant type after creation (full_service vs lightweight)
+      - id: update-tenant-invalid-tenant-type
+        severity: error
+        condition: "Attempting to change the tenant type (full_service vs lightweight) after creation"
+        throws: "FirebaseAuthError with code 'auth/invalid-tenant-type'"
+        required_handling: >
+          Tenant type cannot be changed after creation. Remove the tenantType
+          field from update requests if the type is already set. This is a
+          permanent constraint — the only fix is to delete and recreate the tenant.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: deleteTenant
+    import_path: "firebase-admin/auth"
+    description: >
+      Permanently deletes a tenant and all its associated users and configurations.
+      This is a destructive, irreversible operation. All users within the tenant
+      are permanently deleted. Used in B2B SaaS offboarding workflows when a
+      customer account is terminated.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js line 1862
+      # server-side: TENANT_NOT_FOUND maps to 'tenant-not-found'
+      - id: delete-tenant-not-found
+        severity: warning
+        condition: "No tenant exists for the provided tenantId"
+        throws: "FirebaseAuthError with code 'auth/tenant-not-found'"
+        required_handling: >
+          Treat as idempotent — the tenant is already gone.
+          In offboarding workflows, this is generally safe to ignore.
+          Log the occurrence for audit trails (the tenant may have been
+          deleted by a concurrent request or external process).
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: getTenant
+    import_path: "firebase-admin/auth"
+    description: >
+      Retrieves the tenant configuration for the given tenantId. Used to verify
+      tenant existence, read settings, and validate tenant state before performing
+      tenant-scoped operations.
+
+    postconditions:
+      # Evidence: lib/auth/auth-api-request.js — TENANT_NOT_FOUND error code
+      # lib/utils/error.js: TENANT_NOT_FOUND: code 'tenant-not-found'
+      - id: get-tenant-not-found
+        severity: error
+        condition: "No tenant exists for the provided tenantId"
+        throws: "FirebaseAuthError with code 'auth/tenant-not-found'"
+        required_handling: >
+          Catch and handle as 404. Always check tenant existence before performing
+          tenant-scoped operations. If tenantId comes from user input or external
+          systems, validate it with getTenant before calling authForTenant().
+          Return 404 to calling service.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/utils/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── Realtime Database — Security Rules Management ───────────────────────────
+
+  - name: setRules
+    import_path: "firebase-admin/database"
+    description: >
+      Writes new security rules to the Firebase Realtime Database instance.
+      This is an admin-only operation used in deployment automation scripts,
+      CI/CD pipelines, and infrastructure provisioning workflows. Immediately
+      replaces all existing rules — there is no merge or diff operation.
+
+    postconditions:
+      # Evidence: lib/database/database.js line 200-208
+      # if (!isNonEmptyString && !isBuffer && !isNonNullObject) throw FirebaseDatabaseError invalid-argument
+      - id: set-rules-invalid-argument
+        severity: error
+        condition: "source is null, undefined, empty string, or not a string/Buffer/object"
+        throws: "FirebaseDatabaseError with code 'database/invalid-argument'"
+        required_handling: >
+          Validate rules source before calling setRules. The source must be a
+          non-empty string (rules JSON), a Buffer containing rules, or a parsed
+          object. Never pass null or empty string. This is a synchronous validation
+          — no network call is made.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/database/database.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: lib/database/database.js — handleError() on HTTP failure
+      # Firebase RTDB REST API rules endpoint requires Firebase Admin or firebase-rules IAM permission
+      - id: set-rules-permission-denied
+        severity: error
+        condition: "Service account lacks firebaserules.rulesets.create IAM permission or Firebase Admin role"
+        throws: "FirebaseDatabaseError with HTTP 403 / permission-denied"
+        required_handling: >
+          Catch and alert — this is a service account misconfiguration in the
+          deployment environment. The service account requires the Firebase Admin
+          SDK Service Agent role or firebaserules.rulesets.create permission.
+          Do not retry. Alert the deployment pipeline — rules were NOT updated.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/database/database.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ── Cloud Storage — Download URL ─────────────────────────────────────────────
+
+  - name: getDownloadURL
+    import_path: "firebase-admin/storage"
+    description: >
+      Generates a public download URL for a Cloud Storage file using Firebase's
+      download token system. This is the Admin SDK equivalent of getDownloadURL()
+      from the client SDK. Used in server-side workflows to generate shareable
+      links after file uploads. The URL is permanent until the download token is
+      revoked.
+
+    postconditions:
+      # Evidence: lib/storage/index.js line 64-76
+      # if (!downloadTokens) throw FirebaseError({ code: 'storage/no-download-token' })
+      - id: get-download-url-no-token
+        severity: error
+        condition: >
+          File exists in Cloud Storage but has no Firebase download token.
+          Files uploaded directly via Google Cloud Storage APIs (not Firebase SDK)
+          do not have download tokens by default.
+        throws: "FirebaseError with code 'storage/no-download-token'"
+        required_handling: >
+          Catch and handle: create a download token by updating the file's metadata
+          via the Firebase Console or by calling file.setMetadata() to add a
+          firebaseStorageDownloadTokens metadata entry.
+          Files uploaded via Firebase Client SDK automatically have tokens.
+          Files uploaded via @google-cloud/storage SDK do NOT have tokens unless
+          explicitly added. This is a common pitfall in hybrid upload architectures.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/storage/index.ts"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: lib/storage/index.js — getFirebaseMetadata() wraps @google-cloud/storage file.getMetadata()
+      # File not found throws 404 from Google Cloud Storage
+      - id: get-download-url-file-not-found
+        severity: error
+        condition: "File does not exist in the Cloud Storage bucket"
+        throws: "Error with HTTP 404 from Google Cloud Storage API"
+        required_handling: >
+          Catch HTTP 404 errors — this occurs when the file path is incorrect,
+          the file was deleted, or the bucket name is wrong. Always verify file
+          existence before generating download URLs in critical workflows.
+          Return 404 to the calling client.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/storage/index.ts"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium

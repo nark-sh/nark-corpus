@@ -1,11 +1,11 @@
 package: fastify
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.70
+coverage_score: 0.90
 
 detection:
   factory_methods:
@@ -18,7 +18,7 @@ detection:
 functions:
   - name: get
     import_path: "fastify"
-    description: "Registers GET route handler. Also applies to post, put, delete, patch, options, head route registration methods which have identical error handling behavior."
+    description: "Registers GET route handler. Also applies to post, put, delete, patch, options, head, and route() registration methods which have identical error handling behavior."
     postconditions:
       - id: route-handler-async-error
         condition: "async route handler throws error or promise rejects (database error, validation error)"
@@ -35,6 +35,26 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: high
+
+      - id: route-handler-timeout
+        # Evidence: https://fastify.dev/docs/latest/Reference/Server/#handlertimeout
+        # Error code confirmed from fastify/lib/errors.js: FST_ERR_HANDLER_TIMEOUT, status 503
+        # Source: handlerTimeout option added in Fastify 5. Default 0 (disabled). Per-route override supported.
+        condition: "route handler does not send a response within handlerTimeout milliseconds (when handlerTimeout > 0 is configured at server or route level)"
+        throws: "FST_ERR_HANDLER_TIMEOUT — 503 Service Unavailable sent through error handler. Handler async work continues running unless request.signal is monitored."
+        required_handling: "Use request.signal for cooperative cancellation: pass it to fetch(), database queries, and stream.pipeline() so async work stops when the timeout fires. Override FST_ERR_HANDLER_TIMEOUT in setErrorHandler or route-level errorHandler to return 504 instead of 503 for downstream timeouts. Without signal monitoring, background work leaks resources after the client receives the 503."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#handlertimeout
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://fastify.dev/docs/latest/Reference/Request/#requestsignal"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
   - name: listen
     import_path: "fastify"
@@ -260,6 +280,148 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: setErrorHandler
+    import_path: "fastify"
+    description: >
+      Registers a global error handler for all unhandled exceptions in the request lifecycle.
+      Must be called before server.listen() or server.ready(). The handler receives
+      (error, request, reply) and can be async. Scoped per-plugin via Fastify's encapsulation.
+      Does NOT catch onResponse hook errors or 404 errors (use setNotFoundHandler for 404s).
+    postconditions:
+      # Evidence: https://fastify.dev/docs/latest/Reference/Server/#seterrorhandler
+      # Error codes confirmed from fastify/fastify.js and fastify/lib/errors.js
+      - id: seterrorhandler-called-after-start
+        # Source: throwIfAlreadyStarted('Cannot call "setErrorHandler"!') — fastify.js:742
+        condition: "setErrorHandler() is called after fastify.listen() or fastify.ready() has been awaited (server already started)"
+        throws: "Error: Cannot call \"setErrorHandler\" when fastify instance is already started!"
+        required_handling: "Call setErrorHandler() during server setup, before awaiting listen() or ready(). In plugins, setErrorHandler() is always safe to call since plugins execute before server starts."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#seterrorhandler
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: seterrorhandler-not-function
+        # Source: FST_ERR_ERROR_HANDLER_NOT_FN in fastify/lib/errors.js — 'Error Handler must be a function'
+        condition: "setErrorHandler() is called with a non-function argument (undefined, null, an object)"
+        throws: "FST_ERR_ERROR_HANDLER_NOT_FN — TypeError: Error Handler must be a function"
+        required_handling: "Pass a function to setErrorHandler(). This is a programming error that surfaces at startup time, not in production traffic."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: seterrorhandler-already-set
+        # Source: FST_ERR_ERROR_HANDLER_ALREADY_SET in fastify/lib/errors.js
+        # 'Error Handler already set in this scope. Set allowErrorHandlerOverride: true to allow overriding.'
+        condition: "setErrorHandler() is called twice in the same plugin scope without allowErrorHandlerOverride: true"
+        throws: "FST_ERR_ERROR_HANDLER_ALREADY_SET — TypeError thrown synchronously"
+        required_handling: "Set allowErrorHandlerOverride: true in fastify() options when you need to replace an existing error handler (e.g., during testing or plugin composition). Each encapsulated plugin scope can have its own error handler without this issue."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#allowerrorhandleroverride
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: seterrorhandler-handler-itself-throws
+        # Source: fastify/lib/error-handler.js — handleError() function
+        # 'In case the error handler throws, we set the next errorHandler so we can error again'
+        # Fastify walks up the prototype chain of error handlers if one throws
+        condition: "the registered error handler function itself throws synchronously or its Promise rejects"
+        throws: "Error propagates to the parent plugin scope's error handler. If no parent handler exists, the root default handler handles it. A completely broken error handler chain causes an unformatted 500 response from the fallback handler."
+        required_handling: "Wrap error handler body in try-catch. Log errors before sending the response. If the error handler throws, Fastify will NOT retry with the same handler — it falls back to the parent scope or root default handler, which may return a different error format than expected by clients."
+        sources:
+          # Confirmed from fastify/lib/error-handler.js — handleError() kReplyNextErrorHandler pattern
+          - "https://fastify.dev/docs/latest/Reference/Server/#seterrorhandler"
+          - "https://fastify.dev/docs/latest/Reference/Hooks/#onerror"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: addContentTypeParser
+    import_path: "fastify"
+    description: >
+      Registers a custom body parser for a specific content-type. The parser function
+      receives (request, rawBody) and can be synchronous (callback-based with done(err, body))
+      or async (returning Promise). Errors from parsers flow through the standard
+      setErrorHandler chain with appropriate HTTP status codes.
+    postconditions:
+      # Evidence: https://fastify.dev/docs/latest/Reference/ContentTypeParser/
+      # Error codes confirmed from fastify/lib/errors.js
+      - id: addcontenttype-body-too-large
+        # Source: FST_ERR_CTP_BODY_TOO_LARGE in errors.js — 'Request body is too large', status 413 (RangeError)
+        condition: "request body size exceeds the bodyLimit configured in fastify options (default 1MB) or per-route bodyLimit"
+        throws: "FST_ERR_CTP_BODY_TOO_LARGE — 413 Request Entity Too Large. Thrown before the custom parser is called."
+        required_handling: "Handle FST_ERR_CTP_BODY_TOO_LARGE in setErrorHandler to return a user-friendly 413 message. Increase bodyLimit per-route for file upload routes. Do not increase globally as it expands the attack surface for DoS."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/ContentTypeParser/
+          - "https://fastify.dev/docs/latest/Reference/ContentTypeParser/"
+          - "https://fastify.dev/docs/latest/Reference/Server/#bodylimit"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: addcontenttype-invalid-media-type
+        # Source: FST_ERR_CTP_INVALID_MEDIA_TYPE in errors.js — 'Unsupported Media Type', status 415
+        condition: "client sends a content-type for which no parser is registered (neither default JSON/text parser nor a custom addContentTypeParser)"
+        throws: "FST_ERR_CTP_INVALID_MEDIA_TYPE — 415 Unsupported Media Type. Returned before any route handler is called."
+        required_handling: "Register parsers for all content-types your API accepts. Add a catch-all parser with '*' or 'application/*' for APIs accepting arbitrary binary payloads. Handle FST_ERR_CTP_INVALID_MEDIA_TYPE in setErrorHandler to return consistent error format."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/ContentTypeParser/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: addcontenttype-async-parser-rejects
+        # Source: content-type-parser.d.ts — FastifyBodyParser supports: (req, body) => Promise<any>
+        # Async parsers are documented: https://fastify.dev/docs/latest/Reference/ContentTypeParser/
+        condition: "an async custom parser rejects or throws (invalid encoding, decompression error, schema mismatch)"
+        throws: "The rejection error propagates to setErrorHandler with the same status code the parser set, or 500 if none was set. The raw error object is passed as-is."
+        required_handling: "Wrap async parser body in try-catch and set err.statusCode before throwing to control the HTTP response code. Pass errors to done(err) for callback-based parsers. Without explicit status codes, parsing errors return 500 instead of the semantically correct 400."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/ContentTypeParser/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 edge_cases:
   - id: error-handler-configuration
     description: "Configure setErrorHandler at app or route level for centralized error handling - prevents inconsistent error responses and provides proper error formatting"
@@ -278,6 +440,9 @@ edge_cases:
 # Generated: 2026-02-25
 # Audited: 2026-04-02 — scan-fastify-2026-04-02.json, 10 repos, 6 affected (60%), 111 violations, 0/100 FPs
 # Deepened: 2026-04-11 — deepen-stream-2 pass 1
-# Coverage: 7/10 non-omitted async-callable functions = 70%
-#   Contracted: get (route handlers), listen, close, ready, register, after, addHook
+# Deepened: 2026-04-13 — deepen-stream-2 pass 2
+# Coverage: 9/10 non-omitted async-callable functions = 90%
+#   Contracted: get (route handlers + handlerTimeout), listen, close, ready, register, after, addHook,
+#               setErrorHandler (3 postconditions), addContentTypeParser (3 postconditions)
 #   Intentionally omitted: inject (testing utility), all/WebDAV route methods (same error profile as get)
+#   Not yet contracted: route() — same error profile as get, FST_ERR_DUPLICATED_ROUTE is startup-time programming error

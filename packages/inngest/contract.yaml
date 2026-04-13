@@ -5,6 +5,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   class_names:
@@ -61,6 +62,237 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: step.waitForEvent
+    import_path: "inngest"
+    description: >
+      Pauses an Inngest function step until a matching event is received or the
+      timeout elapses. Used for human-in-the-loop workflows, approval flows, and
+      event-driven coordination. Returns null when the timeout elapses without
+      a matching event — this is not an error, it is a documented return value.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/reference/functions/step-wait-for-event
+      # TypeScript SDK source: return type is `Promise<EventPayload | null>`
+      # Confirmed: null returned on timeout, not an error — but .data access on null throws TypeError
+      - id: wait-for-event-null-not-checked
+        condition: >
+          step.waitForEvent() result is used without a null check before accessing
+          properties. When the timeout elapses, the function returns null instead of
+          an event payload. Accessing event.data, event.name, or any property on
+          the null result throws a TypeError at runtime.
+        throws: >
+          TypeError: Cannot read properties of null (reading 'data') — thrown when
+          the waitForEvent result is accessed without checking for null first.
+          This is a silent failure mode because the timeout is a normal operational
+          condition (event simply wasn't received in time).
+        required_handling: >
+          Callers MUST null-check the result before accessing any properties:
+
+            const event = await step.waitForEvent("wait-for-approval", {
+              event: "app/approval.submitted",
+              timeout: "1h",
+            });
+
+            if (!event) {
+              // Timeout — handle the "no response" case
+              await step.run("handle-timeout", async () => {
+                await sendTimeoutNotification();
+              });
+              return { status: "timed_out" };
+            }
+
+            // Safe to access event.data here
+            const approved = event.data.approved;
+        source: "https://www.inngest.com/docs/reference/functions/step-wait-for-event"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-wait-for-event"
+          - "https://www.inngest.com/docs/learn/inngest-steps"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: step.invoke
+    import_path: "inngest"
+    description: >
+      Invokes another Inngest function and waits for its result. Returns a Promise
+      that resolves with the return value of the invoked function. When the invoked
+      function fails (exhausts retries), the invocation is rate-limited, debounced,
+      or times out, step.invoke() throws a NonRetriableError. The invoked function
+      continues running even if the step times out.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/reference/functions/step-invoke
+      # Confirmed from docs: "If a step.invoke() fails for any of the reasons below,
+      # it will throw a NonRetriableError"
+      # Documented failure scenarios: function not found, invoked fn exhausts retries,
+      # timeout exceeded, rate limiting, debouncing
+      - id: invoke-no-try-catch
+        condition: >
+          step.invoke() called without a surrounding try/catch block inside an
+          Inngest function handler. Invocation failures throw NonRetriableError —
+          if uncaught, this terminates the entire calling function and marks it
+          as failed. The docs explicitly recommend wrapping step.invoke() in
+          try/catch to handle rate limiting and other failure scenarios.
+        throws: >
+          NonRetriableError — thrown in all failure scenarios to prevent compounding
+          retries in function chains. Specific cases:
+          - Function ID not found
+          - Invoked function exhausts all retries
+          - Timeout duration exceeded (invoked function continues running)
+          - Invoked function is rate-limited (skipped)
+          - Invoked function is debounced (skipped after timeout)
+        required_handling: >
+          Callers should wrap step.invoke() in try/catch when failure is recoverable:
+
+            try {
+              const result = await step.invoke("invoke-processing-fn", {
+                function: processingFunction,
+                data: { id: payload.id },
+                timeout: "30 mins",
+              });
+              return { success: true, result };
+            } catch (error) {
+              // NonRetriableError — the invoked function failed or was skipped
+              await step.run("handle-invocation-failure", async () => {
+                await notifyFailure(payload.id, error.message);
+              });
+              return { success: false };
+            }
+
+          Note: step.invoke throws NonRetriableError specifically to prevent
+          exponential retry multiplication across nested function chains.
+        source: "https://www.inngest.com/docs/reference/functions/step-invoke"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-invoke"
+          - "https://www.inngest.com/docs/reference/typescript/functions/errors"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: step.run
+    import_path: "inngest"
+    description: >
+      Executes a callback function as a durable, memoized step. Each call is retried
+      independently on failure. After all retries are exhausted, step.run() throws a
+      StepError. If uncaught, the StepError propagates and marks the entire Inngest
+      function as failed. StepError can be caught with try/catch to implement rollbacks
+      or fallback logic within the same function run.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/features/inngest-functions/error-retries/rollbacks
+      # Evidence: https://www.inngest.com/docs/reference/typescript/functions/errors
+      # Confirmed: "After a step exhausts all of its retries, it throws a StepError"
+      # Confirmed: "If a step failure isn't handled in a try-catch, the error will bubble
+      # up to the function itself, which will then be marked as failed"
+      - id: step-run-step-error-uncaught
+        condition: >
+          step.run() is called in a function handler without awareness that after
+          all retries are exhausted a StepError is thrown. Without try/catch around
+          step.run(), step failures that exhaust retries mark the entire function
+          as permanently failed with no opportunity for rollback or graceful recovery.
+          This is particularly impactful for multi-step workflows where earlier steps
+          have already committed side effects.
+        throws: >
+          StepError (available in TypeScript SDK v3.12.0+) — thrown after a step
+          exhausts all configured retries. Extends Error with step-specific context.
+          If StepError propagates uncaught, the Inngest function is marked as failed
+          and the onFailure handler fires (if configured).
+        required_handling: >
+          For multi-step workflows with side effects, wrap critical steps in try/catch
+          to enable rollback or fallback behavior:
+
+            try {
+              await step.run("charge-payment", async () => {
+                await stripe.charges.create({ amount: 1000 });
+              });
+            } catch (err) {
+              // StepError: payment step exhausted all retries
+              await step.run("rollback-order", async () => {
+                await cancelOrder(orderId);
+              });
+              return { status: "payment_failed" };
+            }
+
+          Alternatively, use .catch() chaining for inline rollbacks:
+
+            await step.run("create-record", async () => { ... })
+              .catch((err) => step.run("rollback-record", async () => { ... }));
+
+          Note: for simple single-step functions, uncaught StepError is acceptable
+          if the onFailure handler is configured to handle all terminal failures.
+        source: "https://www.inngest.com/docs/features/inngest-functions/error-retries/rollbacks"
+        sources:
+          - "https://www.inngest.com/docs/features/inngest-functions/error-retries/rollbacks"
+          - "https://www.inngest.com/docs/reference/typescript/functions/errors"
+          - "https://www.inngest.com/docs/reference/functions/step-run"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: step.sendEvent
+    import_path: "inngest"
+    description: >
+      Sends one or more events from within an Inngest function handler. Unlike
+      inngest.send(), step.sendEvent() is memoized — it will not re-send events
+      on function retries, preventing duplicate event delivery. Must be awaited
+      to ensure the function sleeps correctly until the event is confirmed sent.
+      Returns an object with `ids: string[]` of the sent event IDs.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/reference/functions/step-send-event
+      # Confirmed: "step.sendEvent() must be called using await or some other Promise
+      # handler to ensure your function sleeps correctly"
+      # Behavior: same network-call semantics as inngest.send() but memoized
+      - id: step-send-event-not-awaited
+        condition: >
+          step.sendEvent() is called without await or a Promise handler inside
+          an Inngest function handler. The documentation explicitly states this
+          MUST be awaited. Without await, the function execution continues before
+          the event is confirmed sent, breaking the function's execution flow and
+          potentially causing the event to never be delivered.
+        throws: >
+          Silent failure: the event send may be incomplete or never executed if the
+          function completes before the Promise resolves. In retry scenarios, the
+          non-awaited call may cause duplicate or missed event delivery since
+          memoization only works correctly with awaited calls.
+        required_handling: >
+          Always await step.sendEvent():
+
+            await step.sendEvent("emit-fan-out-events", [
+              { name: "app/user.welcome-email", data: { userId } },
+              { name: "app/user.setup-workspace", data: { userId } },
+            ]);
+
+          Use inside function handlers for fan-out patterns. Do NOT use inngest.send()
+          inside function handlers — it is not memoized and will re-send on retries.
+        source: "https://www.inngest.com/docs/reference/functions/step-send-event"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-send-event"
+          - "https://www.inngest.com/docs/learn/inngest-steps"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "inngest.send() makes an HTTP call to the Inngest API — always needs try-catch"
   - "serve() (from inngest/next, inngest/hono, etc.) does NOT need try-catch — factory only"
@@ -70,3 +302,7 @@ notes:
   - "Use step.sendEvent() inside function handlers instead of inngest.send() — avoids duplicate sends on retry"
   - "Default retry count: 4 attempts for function steps; send() itself has no built-in retry"
   - "INNGEST_EVENT_KEY env var is auto-detected; hardcoding eventKey in constructor is a secret leak risk"
+  - "step.invoke() throws NonRetriableError (not a regular Error) to prevent compounding retries in function chains"
+  - "step.run() throws StepError after all retries exhausted — catch it to implement rollback patterns"
+  - "step.waitForEvent() null return is NOT an error — it means timeout elapsed, handle it explicitly"
+  - "step.sendEvent() must be awaited — non-awaited call breaks memoization and function execution flow"
