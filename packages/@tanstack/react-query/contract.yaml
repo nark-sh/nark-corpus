@@ -1,10 +1,11 @@
 package: "@tanstack/react-query"
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.0.0"
+contract_version: "2.0.0"
 maintainer: "behavioral-contracts"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 14 contracted / 14 non-omitted = 100%. Pass 2: corrected total to 21 (was 18), added ensureInfiniteQueryData; usePrefetchQuery/usePrefetchInfiniteQuery correctly classified as intentionally omitted (same never-throws profile as prefetchQuery/prefetchInfiniteQuery). 7 total omissions out of 21 async-callable functions.
 
 functions:
   - name: useQuery
@@ -434,4 +435,590 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseQuery
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/suspense
+  - name: useSuspenseQuery
+    import_path: "@tanstack/react-query"
+    description: >
+      Suspense-enabled variant of useQuery. Instead of returning error/loading state, it
+      suspends the component (throws a Promise) while loading and throws errors to the
+      nearest ErrorBoundary when the query fails. data is always defined on success — no
+      undefined checks needed. Status is either 'success' or 'error', never 'pending'.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseQuery
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/suspense
+      # Error types: whatever queryFn throws (re-thrown to ErrorBoundary)
+      - id: suspense-query-error-boundary-required
+        condition: "queryFn throws any error"
+        throws: "Error thrown by queryFn — propagated to nearest ErrorBoundary (not returned in result)"
+        required_handling: |
+          Unlike useQuery, useSuspenseQuery does NOT return errors in the result object.
+          All errors are thrown to the nearest ErrorBoundary.
+
+          Caller MUST:
+          1. Wrap the component tree in a React ErrorBoundary to catch thrown errors, AND
+          2. Wrap with QueryErrorResetBoundary (or use useQueryErrorResetBoundary) to allow retry.
+
+          Required pattern:
+          ```tsx
+          <QueryErrorResetBoundary>
+            {({ reset }) => (
+              <ErrorBoundary onReset={reset} fallback={<ErrorUI />}>
+                <ComponentUsingSuspenseQuery />
+              </ErrorBoundary>
+            )}
+          </QueryErrorResetBoundary>
+          ```
+
+          Without ErrorBoundary, errors propagate unhandled and crash the component tree.
+          Without QueryErrorResetBoundary, users cannot retry failed queries.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/suspense"
+          - "https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseQuery"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: suspense-query-stale-cache-hides-errors
+        condition: "background refetch fails but stale cached data exists"
+        throws: "Error is NOT thrown to ErrorBoundary when cached data exists (even if stale)"
+        required_handling: |
+          When cached data exists and a background refetch fails, React Query does NOT
+          throw the error to the ErrorBoundary — it continues showing stale data silently.
+
+          To catch all errors regardless of cache state:
+          ```tsx
+          const { data, error, isFetching } = useSuspenseQuery(...)
+          if (error && !isFetching) {
+            throw error // Manually propagate to ErrorBoundary
+          }
+          ```
+
+          Or use throwOnError: true in query options to always throw.
+          Silent background failures leave users viewing stale data with no indication.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/suspense"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: suspense-cancellation-not-supported
+        condition: "component unmounts while query is in-flight"
+        throws: "CancelledError may not propagate as expected — cancellation does not work with Suspense hooks"
+        required_handling: |
+          Cancellation via AbortSignal does not function correctly with useSuspenseQuery.
+          Do not rely on query cancellation patterns when using Suspense variants.
+
+          If cancellation on unmount is required, use standard useQuery instead.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseQuery"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseInfiniteQuery
+  - name: useSuspenseInfiniteQuery
+    import_path: "@tanstack/react-query"
+    description: >
+      Suspense-enabled variant of useInfiniteQuery. Like useSuspenseQuery, it suspends on
+      loading and throws errors to the nearest ErrorBoundary. Used for infinite scroll/
+      pagination with Suspense support. data is always defined on success.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseInfiniteQuery
+      - id: suspense-infinite-error-boundary-required
+        condition: "any page fetch throws an error"
+        throws: "Error thrown by queryFn — propagated to nearest ErrorBoundary"
+        required_handling: |
+          All errors from page fetches are thrown to the nearest ErrorBoundary.
+          throwOnError cannot be configured (always true).
+
+          Caller MUST wrap in QueryErrorResetBoundary + ErrorBoundary:
+          ```tsx
+          <QueryErrorResetBoundary>
+            {({ reset }) => (
+              <ErrorBoundary onReset={reset} fallback={<ErrorUI />}>
+                <InfiniteList />
+              </ErrorBoundary>
+            )}
+          </QueryErrorResetBoundary>
+          ```
+
+          Without this, any pagination error crashes the entire component tree.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/reference/useSuspenseInfiniteQuery"
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/suspense"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useQueries
+  - name: useQueries
+    import_path: "@tanstack/react-query"
+    description: >
+      Runs multiple queries in parallel and returns an array of results. Each result has
+      independent status, data, and error properties. The combine option can aggregate
+      results but loses access to individual error states if not explicitly included.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/reference/useQueries
+      - id: parallel-query-partial-failure
+        condition: "one or more queries in the array fail while others succeed"
+        throws: "Individual errors are returned in each result's error property (not thrown)"
+        required_handling: |
+          When some queries fail and others succeed, the results array contains mixed states.
+          Errors are NOT thrown — they are in result[i].error for each failed query.
+
+          Caller MUST check each result independently:
+          ```tsx
+          const results = useQueries({ queries: [...] })
+          const errors = results.filter(r => r.isError).map(r => r.error)
+          const allLoaded = results.every(r => !r.isPending)
+          ```
+
+          Ignoring per-query error states means some data silently fails while UI renders
+          partial results — a hard-to-debug data consistency problem.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/reference/useQueries"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: combine-loses-error-info
+        condition: "combine option is used and error properties are not explicitly forwarded"
+        throws: "N/A — errors become inaccessible if combine does not include error properties"
+        required_handling: |
+          The combine function transforms results into a single value. If error properties
+          are not explicitly included in the combine output, they are lost.
+
+          Bad (errors lost):
+          ```tsx
+          combine: (results) => results.map(r => r.data)  // error info discarded
+          ```
+
+          Good (errors preserved):
+          ```tsx
+          combine: (results) => ({
+            data: results.map(r => r.data),
+            errors: results.filter(r => r.isError).map(r => r.error),
+            hasError: results.some(r => r.isError),
+          })
+          ```
+
+          Dropped errors create invisible failures — queries fail silently, users see
+          incomplete data with no error indication.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/reference/useQueries"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/ssr
+  - name: fetchQuery
+    import_path: "@tanstack/react-query"
+    description: >
+      Imperative QueryClient method that fetches query data and returns it directly.
+      Unlike prefetchQuery, fetchQuery THROWS on error. Used in server-side rendering
+      (Next.js getServerSideProps/RSC), route loaders, and imperative data fetching.
+      Must be called on a QueryClient instance (queryClient.fetchQuery(...)).
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/ssr
+      # "will either resolve with the data or throw with the error" — official docs
+      - id: fetchquery-throws-on-error
+        condition: "queryFn throws an error (network failure, HTTP error, etc.)"
+        throws: "Error from queryFn — thrown directly (not returned in result object)"
+        required_handling: |
+          fetchQuery THROWS on error. Unlike useQuery, there is no .error property.
+
+          Caller MUST wrap in try-catch:
+          ```typescript
+          try {
+            const data = await queryClient.fetchQuery({ queryKey, queryFn })
+            return { props: { data } }
+          } catch (error) {
+            // Handle appropriately for context:
+            // SSR: return { notFound: true } or { redirect: { destination: '/error' } }
+            // Route loader: throw new Response('Not Found', { status: 404 })
+            // Component: propagate or show error state
+          }
+          ```
+
+          In SSR contexts (Next.js getServerSideProps), uncaught fetchQuery errors cause
+          500 responses and crash the server-side render. Users see blank pages or generic
+          error pages.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient"
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/ssr"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: fetchquery-ssr-uncaught-error
+        condition: "fetchQuery called during SSR without try-catch"
+        throws: "Error propagates to SSR framework — causes 500 response or build failure"
+        required_handling: |
+          In Next.js App Router (RSC), Remix loaders, or similar SSR contexts,
+          an uncaught fetchQuery error causes the entire page render to fail.
+
+          Pattern for critical SSR data:
+          ```typescript
+          // Next.js getServerSideProps
+          export async function getServerSideProps(context) {
+            try {
+              await queryClient.fetchQuery({ queryKey: ['user', id], queryFn })
+            } catch (e) {
+              return { redirect: { destination: '/404', permanent: false } }
+            }
+            return { props: { dehydratedState: dehydrate(queryClient) } }
+          }
+          ```
+
+          For non-critical data, use prefetchQuery instead (never throws).
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/ssr"
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/prefetching"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+  - name: fetchInfiniteQuery
+    import_path: "@tanstack/react-query"
+    description: >
+      Imperative QueryClient method for fetching infinite (paginated) query data.
+      Like fetchQuery, it THROWS on error. Returns InfiniteData with all prefetched
+      pages. Used in SSR to hydrate infinite query state on the server.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+      # "will either resolve with the data or throw with the error" — same contract as fetchQuery
+      - id: fetchinfinitequery-throws-on-error
+        condition: "any page fetch fails"
+        throws: "Error from queryFn for the failing page"
+        required_handling: |
+          fetchInfiniteQuery THROWS on error. Must be wrapped in try-catch.
+
+          ```typescript
+          try {
+            await queryClient.fetchInfiniteQuery({
+              queryKey: ['posts'],
+              queryFn: fetchPosts,
+              initialPageParam: 0,
+              getNextPageParam: (lastPage) => lastPage.nextCursor,
+            })
+          } catch (error) {
+            // Handle SSR failure — fallback or error response
+          }
+          ```
+
+          In SSR contexts, uncaught errors cause 500 responses.
+          For non-critical prefetching, use prefetchInfiniteQuery instead.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+  - name: ensureQueryData
+    import_path: "@tanstack/react-query"
+    description: >
+      Imperative QueryClient method that returns cached data if fresh, otherwise
+      fetches and caches it. Like fetchQuery, THROWS on error when a fetch is needed.
+      Used in loaders and RSC to ensure data is available before rendering.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+      - id: ensurequerydata-throws-when-fetch-needed
+        condition: "cache miss or stale data triggers a fetch that fails"
+        throws: "Error from queryFn — thrown when underlying fetch is needed and fails"
+        required_handling: |
+          ensureQueryData fetches if no fresh cache exists. When the fetch fails, it throws.
+
+          ```typescript
+          try {
+            const data = await queryClient.ensureQueryData({
+              queryKey: ['user', userId],
+              queryFn: () => fetchUser(userId),
+            })
+          } catch (error) {
+            // Handle: redirect to error page, return fallback, etc.
+          }
+          ```
+
+          Called in Next.js Route Handlers or RSC without try-catch, a fetch failure
+          causes an unhandled rejection that crashes the request handler.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+  - name: invalidateQueries
+    import_path: "@tanstack/react-query"
+    description: >
+      Marks matching queries as stale and optionally refetches them. Returns a Promise
+      that resolves when refetching completes (or immediately if no active queries).
+      Used after mutations to ensure UI shows fresh data.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+      # "throwOnError: true" option causes it to throw if refetch tasks fail
+      - id: invalidatequeries-silent-refetch-failure
+        condition: "refetch triggered by invalidation fails and throwOnError is not set"
+        throws: "No error thrown by default (throwOnError defaults to false)"
+        required_handling: |
+          By default, invalidateQueries does NOT throw if refetch tasks fail.
+          Failed refetches populate the individual query's error state silently.
+
+          If post-mutation error handling is needed:
+          ```typescript
+          // Option 1: throwOnError to catch failures in calling code
+          try {
+            await queryClient.invalidateQueries({
+              queryKey: ['todos'],
+              throwOnError: true,  // throws if any refetch fails
+            })
+          } catch (error) {
+            toast.error('Failed to refresh data')
+          }
+
+          // Option 2: rely on per-query error state in useQuery components
+          // (default behavior — no action needed here)
+          ```
+
+          Without throwOnError, silent refetch failures leave UI showing stale data
+          after a mutation with no user notification.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+  - name: refetchQueries
+    import_path: "@tanstack/react-query"
+    description: >
+      Triggers an immediate refetch of matching queries, regardless of stale time.
+      Returns a Promise. Like invalidateQueries, has throwOnError option for error
+      propagation. Used to force-refresh data on demand.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient
+      - id: refetchqueries-silent-failure
+        condition: "refetch fails and throwOnError is not set"
+        throws: "No error thrown by default (throwOnError defaults to false)"
+        required_handling: |
+          refetchQueries does NOT throw on failure by default. Errors go into the
+          individual query's error state, not the refetchQueries Promise.
+
+          To catch refetch failures explicitly:
+          ```typescript
+          try {
+            await queryClient.refetchQueries({
+              queryKey: ['dashboard'],
+              throwOnError: true,
+            })
+          } catch (error) {
+            toast.error('Failed to refresh dashboard')
+          }
+          ```
+
+          Common in "pull-to-refresh" patterns where users expect visible feedback on failure.
+          Without throwOnError, a failed manual refresh is invisible to the caller.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/prefetching
+  - name: prefetchQuery
+    import_path: "@tanstack/react-query"
+    description: >
+      Prefetches a query and populates the cache. Unlike fetchQuery, prefetchQuery
+      NEVER throws errors — failures are silently swallowed with the expectation that
+      useQuery will retry on the client. Returns Promise<void>.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/framework/react/guides/prefetching
+      # "The prefetch functions never throw errors" — official docs
+      - id: prefetchquery-silently-swallows-errors
+        condition: "queryFn throws an error during prefetch"
+        throws: "No error thrown — error is silently discarded"
+        required_handling: |
+          prefetchQuery intentionally swallows all errors. This is by design.
+          The query will be retried by useQuery when the component mounts on the client.
+
+          If you NEED to handle prefetch failures (e.g., for critical SSR content where
+          a missing resource should return 404), use fetchQuery instead:
+          ```typescript
+          // Use fetchQuery when failure requires an error response:
+          try {
+            await queryClient.fetchQuery({ queryKey, queryFn })
+          } catch (error) {
+            return { notFound: true }
+          }
+
+          // Use prefetchQuery when graceful degradation is acceptable:
+          await queryClient.prefetchQuery({ queryKey, queryFn }) // never throws
+          ```
+
+          Misusing prefetchQuery for critical data means SSR silently serves incomplete
+          pages while clients retry, causing flash of missing content.
+        sources:
+          - "https://tanstack.com/query/latest/docs/framework/react/guides/prefetching"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensureinfinitequerydata
+  # Source inspection: ensureInfiniteQueryData calls ensureQueryData internally with infinite query behavior
+  # (node_modules/@tanstack/query-core/build/modern/queryClient.js:
+  #   ensureInfiniteQueryData(options) { options.behavior = infiniteQueryBehavior(options.pages); return this.ensureQueryData(options); })
+  # Error behavior: throws on fetch failure when cache is empty or stale — same contract as ensureQueryData/fetchInfiniteQuery
+  - name: ensureInfiniteQueryData
+    import_path: "@tanstack/react-query"
+    description: >
+      Imperative QueryClient method that returns cached infinite query data if fresh,
+      otherwise fetches and caches it by calling fetchInfiniteQuery internally.
+      Like ensureQueryData for regular queries, THROWS on error when a fetch is triggered.
+      Used in SSR (Next.js loaders, RSC) and route loaders to ensure paginated data
+      is available before rendering. Has a revalidateIfStale option for background refresh.
+
+    postconditions:
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensureinfinitequerydata
+      # Source confirmed: delegates to ensureQueryData which delegates to fetchInfiniteQuery on cache miss
+      - id: ensureinfinitequerydata-throws-when-fetch-needed
+        condition: "cache miss or stale data triggers a fetchInfiniteQuery call that fails"
+        throws: "Error from queryFn for the failing page — thrown directly (not returned in result)"
+        required_handling: |
+          ensureInfiniteQueryData fetches if no fresh infinite query cache exists.
+          When the underlying fetchInfiniteQuery fails, the error is thrown to the caller.
+
+          Caller MUST wrap in try-catch when used in SSR or route loaders:
+          ```typescript
+          try {
+            const data = await queryClient.ensureInfiniteQueryData({
+              queryKey: ['posts'],
+              queryFn: ({ pageParam = 0 }) => fetchPosts(pageParam),
+              initialPageParam: 0,
+              getNextPageParam: (lastPage) => lastPage.nextCursor,
+            })
+          } catch (error) {
+            // Handle: redirect to error page, return fallback, return 404
+            return { notFound: true }
+          }
+          ```
+
+          In Next.js App Router (RSC) or Remix loaders, an uncaught error causes the
+          entire page render to fail with a 500 response.
+          For non-critical prefetching where graceful degradation is acceptable,
+          use prefetchInfiniteQuery instead (never throws).
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensureinfinitequerydata"
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensurequerydata"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensureinfinitequerydata
+      # revalidateIfStale: true causes background refetch — the background error is silently discarded
+      # Developers often set revalidateIfStale: true expecting to catch background fetch errors, but the error is NOT thrown
+      - id: ensureinfinitequerydata-revalidate-if-stale-silent-background-error
+        condition: "revalidateIfStale: true is set, cache is stale, and the background refetch fails"
+        throws: "No error thrown — stale cached data is returned immediately, background refetch error is silently discarded"
+        required_handling: |
+          When revalidateIfStale: true is configured and the cache is stale:
+          1. Stale data is returned immediately (the call resolves with stale data), AND
+          2. A background refetch is triggered but any failure is silently swallowed.
+
+          The background error will appear in the individual query's error state
+          (accessible via useInfiniteQuery error property) but NOT propagated to the caller.
+
+          ```typescript
+          // This resolves with stale data — background error is NOT thrown
+          const data = await queryClient.ensureInfiniteQueryData({
+            queryKey: ['posts'],
+            queryFn: fetchPosts,
+            initialPageParam: 0,
+            getNextPageParam: (lastPage) => lastPage.nextCursor,
+            revalidateIfStale: true,  // background refetch; error silently discarded
+          })
+          // data may be stale if background refetch failed
+          ```
+
+          To detect background refresh failures, monitor the query error state via
+          useInfiniteQuery or configure a global QueryCache.onError handler.
+        sources:
+          - "https://tanstack.com/query/latest/docs/reference/QueryClient#queryclientensureinfinitequerydata"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
           incident_cost_range: medium
