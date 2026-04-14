@@ -1,19 +1,26 @@
 package: "busboy"
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.71
 # description: "A streaming parser for HTML form data for Node.js"
 
 functions:
   - name: Busboy
     import_path: "busboy"
-    description: "Creates Busboy parser instance"
+    description: >
+      Creates a Busboy parser instance — a Writable stream that parses incoming
+      HTML form data (multipart/form-data and application/x-www-form-urlencoded).
+      The factory function is synchronous and can throw immediately if headers are
+      invalid. Data is received through event callbacks ('file', 'field') and errors
+      arrive via the 'error' event on the returned stream instance.
     postconditions:
       # Evidence: seen in 3 primary firings across 2 repos in scan-busboy-2026-04-02.json
       # Top affected: rejetto/hfs, CaviraOSS/PageLM
+      # Source: https://github.com/mscdex/busboy/issues/234 (error handling docs gap)
       - id: busboy-001
         condition: "parsing fails due to limits or malformed data"
         throws: "Error emitted via 'error' event"
@@ -27,3 +34,110 @@ functions:
           incident_cost_range: medium
         sources:
           - "https://github.com/mscdex/busboy"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/lib/index.js
+      # Source confirms three synchronous throw conditions in the factory function:
+      #   1. throw new Error('Missing Content-Type') — when headers['content-type'] is missing
+      #   2. throw new Error('Malformed content type') — when parseContentType() returns falsy
+      #   3. throw new Error(`Unsupported content type: ...`) — when no parser matches
+      - id: busboy-002
+        condition: "constructor called with invalid or missing Content-Type header"
+        throws: "Error (synchronous throw, not an event)"
+        error_messages:
+          - "Missing Content-Type"
+          - "Malformed content type"
+          - "Unsupported content type: <type>"
+        required_handling: >
+          Caller MUST wrap busboy() constructor call in try/catch. These are
+          synchronous throws — an error event listener is NOT sufficient to catch them.
+          Any request without a valid Content-Type (e.g. GET requests misrouted to a
+          POST handler) will crash the process if not caught.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy/blob/master/lib/index.js"
+          - "https://github.com/mscdex/busboy/issues/140"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js
+      # Source: When limits.parts, limits.files, or limits.fields are hit, a limit event
+      # is emitted but no error is raised — the parser simply stops emitting more data.
+      # Without a listener, limits are silently reached with no indication to the caller.
+      - id: busboy-003
+        condition: "form data exceeds configured parts, files, or fields limits"
+        throws: "No error — emits 'partsLimit', 'filesLimit', or 'fieldsLimit' event then silently stops"
+        required_handling: >
+          Caller SHOULD attach listeners for 'partsLimit', 'filesLimit', and 'fieldsLimit'
+          events to detect when limits are reached. Without these listeners, the upload
+          appears to succeed but data is silently truncated — fields and files beyond the
+          limit are never delivered to the 'field' or 'file' handlers. This is especially
+          dangerous when limits are set intentionally as a security measure: an attacker
+          can send more fields/files than the limit and the overflow is silently dropped
+          with no error to the caller.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js"
+          - "https://github.com/mscdex/busboy/issues/287"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js
+      # Source confirms: when limits.fileSize is reached, file stream emits 'limit' event
+      # and sets stream.truncated = true. The file is silently saved as a partial file
+      # unless the caller checks file.truncated after the stream ends.
+      - id: busboy-004
+        condition: "uploaded file exceeds configured limits.fileSize"
+        throws: "No error — emits 'limit' event on the file stream and sets file.truncated = true"
+        required_handling: >
+          Caller MUST check file.truncated after the file stream ends (in the 'close'
+          or 'end' event handler). Without this check, the upload handler saves a partial
+          file as if it were complete, silently corrupting stored data. The caller should
+          also attach a 'limit' event listener on the file stream to detect the truncation
+          in real time and abort the upload (e.g. delete the partial file, return 413).
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js"
+          - "https://www.npmjs.com/package/busboy"
+
+      # Evidence: https://github.com/mscdex/busboy#api (README, file event documentation)
+      # Source confirms: "If you listen for this event, you should always consume the stream
+      # whether you care about its contents or not... otherwise the 'finish'/'close' event
+      # will never fire on the busboy parser stream."
+      - id: busboy-005
+        condition: "file event listener registered but file stream not consumed"
+        throws: "No error — causes stream deadlock; busboy 'close'/'finish' event never fires"
+        required_handling: >
+          When registering a 'file' event listener on a Busboy instance, the caller MUST
+          consume every file stream. Use stream.resume() to discard contents if the file
+          is not needed. Failing to consume the stream blocks all further parsing — the
+          busboy 'close' event never fires, the request hangs indefinitely, and subsequent
+          requests are blocked if using connection pooling. This is a common source of
+          upload handler timeouts in production.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy#api"
+          - "https://bytearcher.com/articles/terminate-busboy/"
