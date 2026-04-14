@@ -1,29 +1,43 @@
 package: formidable
 semver: ">=3.5.3"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.92
 
 functions:
   - name: parse
     import_path: "formidable"
-    description: "Parses multipart form data from HTTP request (promise-based, async/await)"
+    description: >
+      Parses multipart/form-data, urlencoded, JSON, and octet-stream bodies from
+      an incoming HTTP request. Returns a Promise resolving to [fields, files] when
+      called without a callback (v3+ promise-based usage). The single most critical
+      method in the formidable API — all upload handling passes through here.
+      Internally emits events and coordinates plugin execution, file writing, and
+      content-type detection. Any parsing, size-limit, or filesystem error rejects
+      the promise (or delivers err to callback).
 
     postconditions:
-      # Evidence: seen in 5 primary firings across 5 repos in scan-formidable-2026-04-02.json
+      # Evidence: FormidableError source confirmed at
+      # https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js
+      # Scan data: 5 violations across 5 repos (scan-formidable-2026-04-02.json)
       # Top affected: djyde/cusdis (⭐ 2777), notea-org/notea (⭐ 2148), dashpresshq/dashpress (⭐ 1886)
+
       - id: formidable-parse-error
         condition: "form parsing fails due to invalid data, size limits, or filesystem errors"
-        throws: "Error with code and httpCode properties (e.g., maxFieldsExceeded, maxFileSizeExceeded)"
+        throws: "FormidableError (extends Error) with .code (numeric) and .httpCode (HTTP status)"
         required_handling: >
           Caller MUST handle parsing errors with try-catch (promise-based) or callback error parameter.
           Without error handling, the server will crash when: maxFileSize exceeded (default 200MB),
           maxFields exceeded (default 1000), invalid multipart data is received, filesystem errors occur,
-          or filter function validation fails. Promise-based (v3+): try { const [fields, files] = await form.parse(req); } catch (err) { /* handle */ }
+          or filter function validation fails.
+          Promise-based (v3+): try { const [fields, files] = await form.parse(req); } catch (err) { res.status(err.httpCode || 400).send(err.message); }
+          Callback: form.parse(req, (err, fields, files) => { if (err) { res.status(err.httpCode || 400).send(err.message); return; } })
         sources:
           - "https://github.com/node-formidable/formidable/blob/master/README.md"
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -31,3 +45,202 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      - id: formidable-max-file-size-exceeded
+        condition: "uploaded file exceeds options.maxFileSize (default: 200MB)"
+        throws: "FormidableError with .code === 1016 (biggerThanMaxFileSize) and .httpCode === 413"
+        required_handling: >
+          Catch the error and return HTTP 413 Payload Too Large to the client.
+          If not caught, the server process throws an unhandled rejection.
+          Set maxFileSize explicitly in options to enforce your business limits
+          rather than relying on the 200MB default.
+          Example: if (err.code === errors.biggerThanMaxFileSize) { res.status(413).json({ error: 'File too large' }); }
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: formidable-max-total-file-size-exceeded
+        condition: "aggregate size of all uploaded files exceeds options.maxTotalFileSize (defaults to maxFileSize value)"
+        throws: "FormidableError with .code === 1009 (biggerThanTotalMaxFileSize) and .httpCode === 413"
+        required_handling: >
+          Catch the error and return HTTP 413 to the client.
+          This limit applies to the sum of all files in a multi-file upload.
+          Without explicit maxTotalFileSize, it defaults to maxFileSize — meaning
+          100 small files each under the per-file limit can still exceed total size.
+          Must be caught separately from the per-file limit (different error code).
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: formidable-max-fields-exceeded
+        condition: "number of submitted fields exceeds options.maxFields (default: 1000)"
+        throws: "FormidableError with .code === 1007 (maxFieldsExceeded) and .httpCode === 413"
+        required_handling: >
+          Catch the error and return HTTP 413. This is a security control to prevent
+          hash-collision DoS attacks via crafted field names. Without catching it,
+          a malicious client can crash the server by submitting thousands of fields.
+          Servers processing user-supplied forms must explicitly handle this to avoid
+          being taken down by a single malicious request.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/README.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: formidable-max-fields-size-exceeded
+        condition: "total size of all form fields exceeds options.maxFieldsSize (default: 20MB)"
+        throws: "FormidableError with .code === 1006 (maxFieldsSizeExceeded) and .httpCode === 413"
+        required_handling: >
+          Catch the error and return HTTP 413. This limit applies to text fields only
+          (not file uploads), protecting against memory exhaustion from very large
+          text field payloads. Without catching it, a client sending a 20MB+ text
+          field causes an unhandled rejection that crashes the server.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: formidable-max-files-exceeded
+        condition: "number of uploaded files exceeds options.maxFiles (default: Infinity)"
+        throws: "FormidableError with .code === 1015 (maxFilesExceeded) and .httpCode === 413"
+        required_handling: >
+          Catch the error and return HTTP 413. When maxFiles is not set (Infinity default),
+          this error never fires — but setting a sane limit (e.g., 10) and not catching
+          the resulting error will crash the server when exceeded.
+          Always pair maxFiles configuration with proper error handling.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: formidable-missing-content-type
+        condition: "request has no Content-Type header or an unsupported content type"
+        throws: "FormidableError with .code === 1011 (missingContentType) and .httpCode === 400, or .code === 1003 (noParser) with .httpCode === 415"
+        required_handling: >
+          Catch the error and return the appropriate HTTP status to the client.
+          This fires when form.parse() is called on a non-form request (e.g., a JSON
+          request without the JSON plugin, or a raw request with no Content-Type).
+          Common in API endpoints that receive form data from clients that forget
+          the Content-Type header or send the wrong MIME type.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: formidable-malformed-multipart
+        condition: "multipart body is malformed, corrupted, or missing boundary"
+        throws: "FormidableError with .code === 1012 (malformedMultipart) or 1013 (missingMultipartBoundary) and .httpCode === 400"
+        required_handling: >
+          Catch the error and return HTTP 400 Bad Request.
+          This fires when the client sends a Content-Type: multipart/form-data header
+          but the body is corrupted, truncated, or missing the required boundary parameter.
+          Can occur from client bugs, network corruption, or crafted malicious requests.
+          Without catching it, malformed uploads crash the server.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: formidable-request-aborted
+        condition: "client disconnects mid-upload (request aborted)"
+        throws: "FormidableError with .code === 1002 (aborted) and .httpCode === 400"
+        required_handling: >
+          Catch the error. Request aborts are normal client behavior (user cancels
+          upload, network drops, browser navigates away) and should not crash the server.
+          Without catching, every cancelled upload causes an unhandled rejection.
+          In high-traffic applications with large file uploads, this is a common
+          production failure mode.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: formidable-no-empty-files
+        condition: "options.allowEmptyFiles is false (default) and client sends a 0-byte file"
+        throws: "FormidableError with .code === 1010 (noEmptyFiles) and .httpCode === 400"
+        required_handling: >
+          Catch the error and return HTTP 400 to the client.
+          With default settings (allowEmptyFiles: false), any 0-byte file upload
+          triggers this error. This catches browsers that submit file inputs without
+          selecting a file, resulting in an empty Blob upload.
+          The default behavior enforces non-empty files — callers must handle the
+          rejection or explicitly set allowEmptyFiles: true.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: formidable-cannot-create-dir
+        condition: "options.createDirsFromUploads is true and the upload directory cannot be created"
+        throws: "FormidableError with .code === 1018 (cannotCreateDir) and .httpCode === 409"
+        required_handling: >
+          Catch the error and return HTTP 409 or HTTP 500 to the client.
+          This error only fires when createDirsFromUploads is explicitly enabled
+          (for directory-structured uploads using webkitdirectory). Filesystem permission
+          errors or path traversal prevention triggers this. Without catching, the
+          server crashes on the first directory-based upload to an unwritable path.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
