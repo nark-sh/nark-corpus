@@ -2,9 +2,11 @@ package: "@upstash/ratelimit"
 semver: ">=1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
+# Audit 2026-04-13: 3 repos scanned (small sample), 0 violations. FP rate 0% (from Apr-02, 0/100).
 status: production
 evidence_quality: confirmed
+coverage_score: 0.89
 # Evidence: scan-upstash-ratelimit-2026-04-02.json — 27 repos scanned, 12 affected (44%), 22 violations
 # Top affected: zaidmukaddam/scira (⭐ 11555), e2b-dev/fragments (⭐ 6217), nickscamara/open-deep-research (⭐ 6196)
 
@@ -64,4 +66,262 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: resetUsedTokens
+    import_path: "@upstash/ratelimit"
+    description: >
+      Resets the rate limit state for a given identifier, restoring their full
+      token allowance immediately. Makes a Redis call via the underlying algorithm's
+      resetTokens() method. Used for admin operations, testing, or granting exceptions.
+      If Redis is unreachable and no timeout is set to fail-open, the call throws.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js — resetUsedTokens calls
+      # this.limiter().resetTokens(this.ctx, pattern) which executes Redis commands.
+      # The method has no try-catch and no timeout protection of its own.
+      # Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/methods
+      - id: ratelimit-resetusedtokens-no-try-catch
+        condition: >
+          Underlying Redis HTTP call fails due to network failure or auth error.
+          Unlike limit(), resetUsedTokens() does NOT have a timeout/fail-open mechanism —
+          it will always propagate the Redis error to the caller.
+        throws: "Error (network failure or auth error from @upstash/redis HTTP client)"
+        required_handling: >
+          Caller MUST wrap ratelimit.resetUsedTokens() in try-catch. Unlike limit(),
+          there is no built-in timeout/fail-open for this method. A Redis failure during
+          an admin reset operation will throw and crash the calling request handler.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/ratelimit.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: getRemaining
+    import_path: "@upstash/ratelimit"
+    description: >
+      Returns the remaining token count and reset timestamp for an identifier.
+      Makes a Redis call via the underlying algorithm's getRemaining() method.
+      Commonly used to show quota/rate-limit status to users in API responses
+      or dashboards. Has no timeout/fail-open mechanism — Redis failures propagate.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js — getRemaining calls
+      # this.limiter().getRemaining(this.ctx, pattern) which executes Redis EVALSHA.
+      # No try-catch in the method. Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/methods
+      - id: ratelimit-getremaining-no-try-catch
+        condition: >
+          Underlying Redis HTTP call fails due to network failure or auth error.
+          getRemaining() has no timeout or fail-open mechanism — it propagates
+          all Redis errors to the caller.
+        throws: "Error (network failure or auth error from @upstash/redis HTTP client)"
+        required_handling: >
+          Caller MUST wrap ratelimit.getRemaining() in try-catch. Used in response
+          headers (X-RateLimit-Remaining) or dashboard endpoints — an unhandled Redis
+          error here crashes the API response. Fail gracefully by returning cached
+          or default values when Redis is unreachable.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/ratelimit.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: setDynamicLimit
+    import_path: "@upstash/ratelimit"
+    description: >
+      Sets or removes a global dynamic rate limit at runtime, overriding the
+      default limit configured at construction time. Requires dynamicLimits: true
+      in the Ratelimit constructor. Throws synchronously if dynamicLimits is not
+      enabled. Also makes a Redis SET/DEL call which can fail on network error.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js lines 1030-1042.
+      # Throws Error synchronously if this.dynamicLimits is false.
+      # Then calls this.primaryRedis.set() or .del() — Redis call can throw on failure.
+      # Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/methods
+      - id: ratelimit-setdynamiclimit-not-enabled
+        condition: >
+          Called when dynamicLimits was NOT set to true in the Ratelimit constructor.
+          Throws synchronously before any Redis call is made.
+        throws: "Error('dynamicLimits must be enabled in the Ratelimit constructor to use setDynamicLimit()')"
+        required_handling: >
+          Caller MUST wrap setDynamicLimit() in try-catch when dynamicLimits enablement
+          is not guaranteed at the call site. This is a configuration error that indicates
+          a code bug — the constructor option must be set to use this method.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/ratelimit.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: ratelimit-setdynamiclimit-redis-failure
+        condition: >
+          dynamicLimits is enabled but the underlying Redis SET or DEL call fails
+          due to network failure or auth error.
+        throws: "Error (network failure from @upstash/redis HTTP client)"
+        required_handling: >
+          Caller MUST wrap setDynamicLimit() in try-catch. A failure to set a dynamic
+          limit means the override was NOT applied — the rate limiter will continue
+          using the old limit. This is especially dangerous in incident response
+          scenarios where operators use setDynamicLimit() to throttle load.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: getDynamicLimit
+    import_path: "@upstash/ratelimit"
+    description: >
+      Returns the currently active global dynamic rate limit value, or null if
+      no dynamic limit is set. Requires dynamicLimits: true in the constructor.
+      Throws synchronously if dynamicLimits is not enabled. Makes a Redis GET call.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js lines 1050-1060.
+      # Same synchronous throw pattern as setDynamicLimit when not enabled.
+      # Then calls this.primaryRedis.get(globalKey) — can fail on network error.
+      # Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/methods
+      - id: ratelimit-getdynamiclimit-not-enabled
+        condition: >
+          Called when dynamicLimits was NOT set to true in the Ratelimit constructor.
+          Throws synchronously, identical pattern to setDynamicLimit.
+        throws: "Error('dynamicLimits must be enabled in the Ratelimit constructor to use getDynamicLimit()')"
+        required_handling: >
+          Caller MUST wrap getDynamicLimit() in try-catch when dynamicLimits enablement
+          is not guaranteed. This is a code configuration error.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: ratelimit-getdynamiclimit-redis-failure
+        condition: >
+          dynamicLimits is enabled but the Redis GET call fails due to network
+          failure or auth error.
+        throws: "Error (network failure from @upstash/redis HTTP client)"
+        required_handling: >
+          Caller MUST wrap getDynamicLimit() in try-catch. Typically called in
+          admin/monitoring endpoints — an uncaught error crashes the admin API.
+        sources:
+          - "https://upstash.com/docs/redis/sdks/ratelimit-ts/methods"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: updateIpDenyList
+    import_path: "@upstash/ratelimit"
+    description: >
+      Fetches the latest IP deny list from the stamparm/ipsum GitHub project and
+      updates the deny list in Redis. Used with enableProtection: true to block
+      known malicious IPs. Makes an external HTTP fetch to GitHub raw content,
+      then executes a Redis multi-command transaction. Throws ThresholdError if
+      threshold is not 1-8, network Error if GitHub is unreachable, and Redis
+      errors if the transaction fails.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js lines 644-682.
+      # ThresholdError thrown if threshold < 1 or > 8.
+      # Error('Error fetching data: ...') thrown if GitHub response not ok.
+      # Error('Failed to fetch ip deny list: ...') wraps any fetch error.
+      # Redis transaction (multi/exec) can fail on Redis network error.
+      # Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/features
+      - id: ratelimit-updateipdenylist-threshold-error
+        condition: >
+          threshold parameter is not an integer between 1 and 8 (inclusive).
+          ThresholdError is thrown synchronously before any network call.
+        throws: "ThresholdError('Allowed threshold values are from 1 to 8, 1 and 8 included. Received: <n>')"
+        required_handling: >
+          Caller MUST wrap updateIpDenyList() in try-catch and handle ThresholdError
+          separately for clear error messaging. Pass a value from 1 to 8 where lower
+          values include more (less certain) IPs and higher values are more conservative.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/deny-list/ip-deny-list.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: ratelimit-updateipdenylist-network-failure
+        condition: >
+          External HTTP fetch to https://raw.githubusercontent.com/stamparm/ipsum/master/levels
+          fails (GitHub unreachable, DNS failure, non-200 response). The error is
+          wrapped in Error('Failed to fetch ip deny list: ...').
+        throws: "Error('Failed to fetch ip deny list: <original error>')"
+        required_handling: >
+          Caller MUST wrap updateIpDenyList() in try-catch. This function makes
+          an external HTTP call to GitHub, not Upstash — it can fail independently
+          of Redis availability. Run in a background job with retry logic rather
+          than in a hot request path.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/deny-list/ip-deny-list.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: disableIpDenyList
+    import_path: "@upstash/ratelimit"
+    description: >
+      Removes the IP deny list from Redis and marks its status as disabled.
+      Executes a Redis multi-command transaction (SDIFFSTORE, DEL, SET).
+      Used to turn off IP protection without recreating the ratelimit instance.
+      Can fail if Redis is unreachable.
+
+    postconditions:
+      # Evidence: source inspection of dist/index.js lines 680-690.
+      # Executes transaction.exec() which can throw on Redis network failure.
+      # Docs: https://upstash.com/docs/redis/sdks/ratelimit-ts/features
+      - id: ratelimit-disableipdenylist-redis-failure
+        condition: >
+          Redis multi-command transaction (SDIFFSTORE, DEL, SET) fails due to
+          network failure or auth error. The deny list is NOT disabled if this throws.
+        throws: "Error (network failure from @upstash/redis HTTP client)"
+        required_handling: >
+          Caller MUST wrap disableIpDenyList() in try-catch. A failure here means
+          the IP deny list remains active — requests from blocked IPs continue to
+          be rejected. Used in emergency scenarios (false positives blocking
+          legitimate users) so uncaught failure is operationally dangerous.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/ratelimit-js/main/src/deny-list/ip-deny-list.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
           incident_cost_range: medium
