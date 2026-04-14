@@ -1,10 +1,11 @@
 package: plaid
 semver: ">=9.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83  # 20 contracted / 24 total async-callable (4 intentionally-omitted: categoriesGet, institutionsGet/Search/GetById)
 
 # Official Plaid Node.js/TypeScript SDK — OpenAPI-generated (v9+/v14+).
 # All methods are called on a PlaidApi instance and return AxiosResponse<T>.
@@ -128,7 +129,7 @@ functions:
           or network failure.
         throws: >
           Axios error with PlaidError in error.response.data.
-          ITEM_LOGIN_REQUIRED is the most common production error — the user's
+          ITEM_LOGIN_REQUIRED is the most common production error -- the user's
           bank session expired and they must re-link.
         required_handling: >
           Caller MUST wrap in try-catch. Surface ITEM_LOGIN_REQUIRED to the user
@@ -196,7 +197,7 @@ functions:
           AUTHORIZATION_EXPIRED is common if too much time passes between authorization
           and creation. DUPLICATE_TRANSFER prevents double-charging.
         required_handling: >
-          Caller MUST wrap in try-catch. This is a financial operation — an unhandled
+          Caller MUST wrap in try-catch. This is a financial operation -- an unhandled
           error can result in a silent failure where money was not moved but the app
           treats it as success. Log error.response.data.request_id for reconciliation.
           NEVER retry without checking transfer status first.
@@ -210,3 +211,730 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # -- Phase 3 depth pass additions (2026-04-13) ------------------------------
+
+  - name: identityGet
+    import_path: "plaid"
+    description: >
+      Returns identity data (names, emails, phone numbers, addresses) associated
+      with bank accounts on an Item. Used for KYC/AML verification and
+      account ownership confirmation. If error is swallowed, identity
+      verification silently fails and may result in fraudulent onboarding.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/identity/#identityget
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's bank credentials
+          have expired or been revoked. Identity data cannot be refreshed
+          without re-authentication.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Propagate ITEM_LOGIN_REQUIRED to
+          trigger a re-link flow for the user. KYC verification must not
+          silently proceed with stale or missing identity data.
+        sources:
+          - "https://plaid.com/docs/api/products/identity/#identityget"
+          - "https://plaid.com/docs/errors/item/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: institution-error
+        condition: >
+          INSTITUTION_ERROR / INSTITUTION_DOWN or INSTITUTION_NOT_RESPONDING
+          when the bank is unavailable and identity data cannot be fetched.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INSTITUTION_ERROR'. Transient -- institution may
+          recover without user action.
+        required_handling: >
+          Caller MUST wrap in try-catch. Return a 503 to the client;
+          do NOT mark KYC as failed. Queue for retry with backoff.
+        sources:
+          - "https://plaid.com/docs/errors/"
+          - "https://plaid.com/docs/api/products/identity/#identityget"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: liabilitiesGet
+    import_path: "plaid"
+    description: >
+      Returns liability data (credit cards, student loans, mortgages) for
+      an Item. Used for credit underwriting, debt-to-income calculations,
+      and financial health dashboards. Fails if the institution does not
+      support the liabilities product or no liability accounts exist.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/liabilities/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: no-liability-accounts
+        condition: >
+          ITEM_ERROR / NO_LIABILITY_ACCOUNTS when the Item has no credit,
+          student loan, PayPal, or mortgage accounts matching the product scope.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'NO_LIABILITY_ACCOUNTS'.
+        required_handling: >
+          Caller MUST wrap in try-catch. This is a legitimate data absence,
+          not a service failure. Surface a user-friendly message: "No liability
+          accounts found." Do not treat as a generic error.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/liabilities/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: products-not-supported
+        condition: >
+          ITEM_ERROR / PRODUCTS_NOT_SUPPORTED when the financial institution
+          does not support the liabilities product. Common for smaller or
+          international banks.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'PRODUCTS_NOT_SUPPORTED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Show user an institution-not-supported
+          message and prompt to connect a different account. Do not retry.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/liabilities/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's credentials have
+          expired and liability data cannot be refreshed.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Trigger re-link flow. Liability data
+          used for underwriting must not be based on stale pre-error snapshots.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/liabilities/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: investmentsHoldingsGet
+    import_path: "plaid"
+    description: >
+      Returns investment holdings (positions, securities, quantities, values)
+      for an Item. Used in investment tracking dashboards and portfolio
+      analysis features. Fails if the institution does not support investments
+      or no investment accounts exist.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/investments/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: no-investment-accounts
+        condition: >
+          ITEM_ERROR / NO_INVESTMENT_ACCOUNTS when the Item has no investment
+          accounts at the institution.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'NO_INVESTMENT_ACCOUNTS'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Show a user-friendly message;
+          this is a data absence, not a service error. Do not retry.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/investments/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when credentials have expired
+          and investment holdings data cannot be refreshed.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Portfolio display must not show
+          stale data without warning. Prompt re-link and flag holdings as
+          potentially outdated.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/investments/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: investmentsTransactionsGet
+    import_path: "plaid"
+    description: >
+      Returns investment transaction history (buys, sells, dividends, fees)
+      for an Item within a date range. Used for tax reporting, performance
+      tracking, and audit trails. Shares the same error surface as investmentsHoldingsGet.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/investments/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: no-investment-accounts
+        condition: >
+          ITEM_ERROR / NO_INVESTMENT_ACCOUNTS when no investment accounts
+          are available on the Item.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'NO_INVESTMENT_ACCOUNTS'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Tax reporting features must handle
+          this gracefully; do not attempt to generate empty tax forms on error.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/investments/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when credentials have expired.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Investment transaction history for
+          tax reporting cannot be incomplete. Prompt re-link immediately.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/investments/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: transactionsGet
+    import_path: "plaid"
+    description: >
+      Legacy transactions endpoint (replaced by transactionsSync for new integrations).
+      Returns transactions for an Item within a date range. Still widely used in
+      existing integrations. Throws on ITEM_LOGIN_REQUIRED, PRODUCT_NOT_READY.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/transactions/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's credentials have
+          expired and transaction data cannot be fetched.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Transaction pipelines (ETL jobs,
+          background sync) must detect ITEM_LOGIN_REQUIRED and notify the
+          user to re-link, not silently skip the fetch.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: product-not-ready
+        condition: >
+          ITEM_ERROR / PRODUCT_NOT_READY when the initial transaction pull
+          is still in progress. Common immediately after Item creation.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'PRODUCT_NOT_READY'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Use webhook (INITIAL_UPDATE,
+          HISTORICAL_UPDATE) to trigger the first call rather than polling.
+          Unhandled PRODUCT_NOT_READY in a sync job crashes the job loop.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: transactionsRefresh
+    import_path: "plaid"
+    description: >
+      Forces Plaid to initiate a new pull of transactions from the institution.
+      Triggers TRANSACTIONS webhooks when complete. Used to immediately fetch
+      fresh data rather than waiting for Plaid's scheduled refresh cycle.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/transactions/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when credentials have expired and
+          a fresh pull cannot be initiated.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed refresh means the webhook
+          will never fire. Notify the user to re-link rather than waiting
+          indefinitely for a webhook that won't arrive.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: institution-error
+        condition: >
+          INSTITUTION_ERROR when the bank is temporarily unavailable and
+          the refresh request cannot be queued.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INSTITUTION_ERROR'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Retry with exponential backoff.
+          Do not surface institution errors to the user as permanent failures.
+        sources:
+          - "https://plaid.com/docs/errors/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: accountsBalanceGet
+    import_path: "plaid"
+    description: >
+      Returns real-time (non-cached) balance data for accounts on an Item.
+      Unlike accountsGet, this makes a live call to the institution for
+      current balance. Used before payment initiation to verify sufficient
+      funds. Higher latency and higher error rate than accountsGet.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/accounts/#accountsbalanceget
+      # Evidence: https://plaid.com/docs/errors/
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the institution session has
+          expired. Real-time balance cannot be fetched without valid credentials.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. A balance check failure before a
+          payment MUST halt the payment flow. Do not use stale cached balance
+          as a fallback; it may be outdated by hours or days.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/accounts/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: institution-error
+        condition: >
+          INSTITUTION_ERROR / INSTITUTION_DOWN or INSTITUTION_NOT_RESPONDING
+          when the bank cannot respond in real time. More frequent than with
+          accountsGet since accountsBalanceGet forces a live fetch.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INSTITUTION_ERROR'.
+        required_handling: >
+          Caller MUST wrap in try-catch. If checking balance before a payment,
+          fail-safe by blocking the payment rather than proceeding without
+          balance verification. Return a user-friendly retry message.
+        sources:
+          - "https://plaid.com/docs/errors/"
+          - "https://plaid.com/docs/api/accounts/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: itemGet
+    import_path: "plaid"
+    description: >
+      Returns metadata for a Plaid Item: item_id, institution_id, webhook URL,
+      available products, error status (if ITEM_LOGIN_REQUIRED). Commonly
+      used to check whether an Item needs re-linking before attempting
+      data-fetching calls.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/items/#itemget
+      # Evidence: https://plaid.com/docs/errors/
+      - id: item-not-found
+        condition: >
+          INVALID_INPUT / ITEM_NOT_FOUND when the access_token references
+          a deleted or non-existent Item. Common if the Item was removed via
+          itemRemove but the access token is still stored in the database.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_INPUT', error_code = 'ITEM_NOT_FOUND'
+          (or 'INVALID_ACCESS_TOKEN').
+        required_handling: >
+          Caller MUST wrap in try-catch. ITEM_NOT_FOUND means the stored
+          access_token is stale. Delete the token from the database and
+          prompt the user to relink. Do not treat as a transient error.
+        sources:
+          - "https://plaid.com/docs/api/items/#itemget"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: itemRemove
+    import_path: "plaid"
+    description: >
+      Invalidates an access_token and all associated processor/bank account tokens.
+      All subsequent API calls using the token will fail. Used when a user
+      disconnects their bank account. If the error is not handled, the access_token
+      remains in the database and Plaid may continue billing for the Item.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/items/#itemremove
+      # Evidence: https://plaid.com/docs/errors/
+      - id: api-error
+        condition: >
+          INVALID_INPUT / ITEM_NOT_FOUND (token already removed), API_ERROR,
+          or network failure. A failed itemRemove means the Item is NOT removed
+          from Plaid's system and billing continues.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          ITEM_NOT_FOUND is benign (already removed); API_ERROR should be retried.
+        required_handling: >
+          Caller MUST wrap in try-catch. Log the request_id for reconciliation.
+          ITEM_NOT_FOUND should be treated as success (idempotent removal).
+          API_ERROR must be retried to stop subscription billing.
+          Only delete the access_token from the database after confirmed removal.
+        sources:
+          - "https://plaid.com/docs/api/items/#itemremove"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: transferAuthorizationCreate
+    import_path: "plaid"
+    description: >
+      Creates a transfer authorization before calling transferCreate. Evaluates
+      the transfer for risk and verifies the account is eligible for the
+      requested ACH class. Authorization IDs are short-lived. Must succeed
+      before transferCreate can be called.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/transfer/
+      # Evidence: https://plaid.com/docs/errors/transfer/
+      - id: transfer-account-blocked
+        condition: >
+          TRANSFER_ERROR / TRANSFER_ACCOUNT_BLOCKED when a previous transfer
+          involving the same end-user account resulted in an error (e.g., NSF,
+          unauthorized return). Plaid blocks the account from future transfers.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'TRANSFER_ERROR', error_code = 'TRANSFER_ACCOUNT_BLOCKED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Account is permanently blocked for
+          transfers -- do not retry. Prompt the user to link a different account.
+          This is a risk signal, not a transient error.
+        sources:
+          - "https://plaid.com/docs/errors/transfer/"
+          - "https://plaid.com/docs/api/products/transfer/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: transfer-unsupported-account-type
+        condition: >
+          TRANSFER_ERROR / TRANSFER_UNSUPPORTED_ACCOUNT_TYPE when the account
+          type does not support the requested ACH class (e.g., credit card
+          account selected for an ACH debit).
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'TRANSFER_ERROR', error_code = 'TRANSFER_UNSUPPORTED_ACCOUNT_TYPE'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Show a clear error: the selected
+          account type does not support this payment method. Ask the user
+          to select a checking or savings account.
+        sources:
+          - "https://plaid.com/docs/errors/transfer/"
+          - "https://plaid.com/docs/api/products/transfer/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's credentials have
+          expired and the authorization cannot be evaluated.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Block the payment flow and prompt
+          re-link before retrying the transfer. Authorization cannot proceed
+          without valid credentials.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transfer/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transferGet
+    import_path: "plaid"
+    description: >
+      Returns the current status of a specific transfer by transfer_id. Used
+      for reconciliation, webhook verification, and confirming whether a transfer
+      was submitted or returned. Essential for idempotent payment flows.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/transfer/
+      # Evidence: https://plaid.com/docs/errors/
+      - id: api-error
+        condition: >
+          INVALID_INPUT when the transfer_id is invalid or does not exist
+          in this client's scope, or API_ERROR on Plaid infrastructure failure.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_INPUT' or 'API_ERROR'.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed transferGet should trigger
+          a retry with backoff -- the transfer may still exist and be processing.
+          Do not assume a failed GET means the transfer failed.
+        sources:
+          - "https://plaid.com/docs/api/products/transfer/"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: signalEvaluate
+    import_path: "plaid"
+    description: >
+      Evaluates an ACH transaction for return risk before submission.
+      Returns a risk score (0-99) and risk tier. Used to decide whether
+      to proceed with a transfer or require additional verification.
+      If this call fails and is ignored, a high-risk transfer may be submitted.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/signal/
+      # Evidence: https://plaid.com/docs/errors/
+      - id: signal-error
+        condition: >
+          SIGNAL_ERROR / INVALID_ACCOUNT_ID when the account has been removed
+          or the account_id is no longer valid. Also ITEM_LOGIN_REQUIRED when
+          bank data cannot be accessed.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'SIGNAL_ERROR', error_code = 'INVALID_ACCOUNT_ID'
+          or error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed signal evaluation means
+          risk cannot be assessed. Fail-safe by blocking the transfer rather
+          than proceeding without a risk score. Log the request_id.
+        sources:
+          - "https://plaid.com/docs/api/products/signal/"
+          - "https://plaid.com/docs/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: itemWebhookUpdate
+    import_path: "plaid"
+    description: >
+      Updates the webhook URL for an Item. If the webhook URL is wrong or
+      outdated, no transaction/sync notifications will arrive. A silently
+      failed update means webhooks continue firing to the wrong endpoint.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/items/#itemwebhookupdate
+      # Evidence: https://plaid.com/docs/errors/
+      - id: api-error
+        condition: >
+          INVALID_INPUT (invalid webhook URL format or HTTPS requirement not met),
+          ITEM_ERROR / ITEM_NOT_FOUND (stale access_token), or API_ERROR.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          Webhook URLs must be HTTPS; HTTP URLs are rejected with INVALID_INPUT.
+        required_handling: >
+          Caller MUST wrap in try-catch. A failed webhook update means
+          future transaction events won't reach the application. Verify
+          webhook URL is HTTPS and retry on API_ERROR.
+        sources:
+          - "https://plaid.com/docs/api/items/#itemwebhookupdate"
+          - "https://plaid.com/docs/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: transactionsRecurringGet
+    import_path: "plaid"
+    description: >
+      Returns recurring transaction streams (subscriptions, bills, payroll)
+      for an Item. Used for personal finance features, bill prediction, and
+      cash flow analysis. Requires transactions product to be initialized.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/transactions/
+      # Evidence: https://plaid.com/docs/errors/item/
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's credentials have
+          expired and recurring transaction analysis cannot be refreshed.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Recurring transaction data used
+          for bill prediction must not be stale. Surface re-link prompt.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: product-not-ready
+        condition: >
+          ITEM_ERROR / PRODUCT_NOT_READY when the transactions product has not
+          yet completed its initial pull for this Item.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'PRODUCT_NOT_READY'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Wait for HISTORICAL_UPDATE webhook
+          before calling this endpoint. Show a loading state to the user.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/api/products/transactions/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low

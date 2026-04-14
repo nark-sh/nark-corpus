@@ -6,6 +6,17 @@
  *
  * Contracted functions (from import "@aws-sdk/client-ses"):
  *   - sesClient.send()  postcondition: ses-send-no-try-catch
+ *   - SendTemplatedEmailCommand  postconditions: ses-template-does-not-exist,
+ *       ses-template-rendering-failure-silent, ses-template-missing-rendering-attribute
+ *   - SendBulkTemplatedEmailCommand  postconditions: ses-bulk-template-does-not-exist,
+ *       ses-bulk-partial-destination-failure
+ *   - SendRawEmailCommand  postconditions: ses-raw-email-size-limit, ses-raw-email-recipient-limit
+ *   - SendCustomVerificationEmailCommand  postconditions: ses-custom-verification-template-missing,
+ *       ses-custom-verification-sender-not-verified, ses-custom-verification-sandbox-restriction
+ *   - CreateTemplateCommand  postconditions: ses-create-template-already-exists,
+ *       ses-create-template-invalid-syntax
+ *   - UpdateTemplateCommand  postconditions: ses-update-template-not-found,
+ *       ses-update-template-invalid-syntax
  *
  * Detection pattern:
  *   - SESClient is imported from @aws-sdk/client-ses
@@ -20,6 +31,9 @@ import {
   SendRawEmailCommand,
   SendTemplatedEmailCommand,
   SendBulkTemplatedEmailCommand,
+  SendCustomVerificationEmailCommand,
+  CreateTemplateCommand,
+  UpdateTemplateCommand,
 } from '@aws-sdk/client-ses';
 
 const sesClient = new SESClient({ region: 'us-east-1' });
@@ -175,6 +189,179 @@ export async function sendBulkEmailWithCatch(users: { email: string; name: strin
     }));
   } catch (err) {
     console.error('Bulk email failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. SendBulkTemplatedEmailCommand — partial failure pattern (ses-bulk-partial-destination-failure)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-bulk-partial-destination-failure
+// The bulk send succeeds (no exception) but per-destination Status array is never checked.
+// Failed recipients are silently dropped.
+export async function sendBulkEmailIgnoringPartialFailures(users: { email: string; name: string }[]) {
+  try {
+    // SHOULD_FIRE: ses-bulk-partial-destination-failure — response.Status array not inspected
+    await sesClient.send(new SendBulkTemplatedEmailCommand({
+      Source: 'digest@example.com',
+      Template: 'WeeklyDigest',
+      DefaultTemplateData: '{}',
+      Destinations: users.map(u => ({
+        Destination: { ToAddresses: [u.email] },
+        ReplacementTemplateData: JSON.stringify({ name: u.name }),
+      })),
+    }));
+    // No response.Status inspection — partial failures silently swallowed
+  } catch (err) {
+    console.error('Bulk send error:', err);
+    throw err;
+  }
+}
+
+// @expect-clean
+// Correct pattern: catches exception AND inspects per-destination Status array
+export async function sendBulkEmailCheckingEachDestination(users: { email: string; name: string }[]) {
+  try {
+    // SHOULD_NOT_FIRE: try-catch present AND Status array inspected
+    const response = await sesClient.send(new SendBulkTemplatedEmailCommand({
+      Source: 'digest@example.com',
+      Template: 'WeeklyDigest',
+      DefaultTemplateData: '{}',
+      Destinations: users.map(u => ({
+        Destination: { ToAddresses: [u.email] },
+        ReplacementTemplateData: JSON.stringify({ name: u.name }),
+      })),
+    }));
+    for (const result of (response.Status ?? [])) {
+      if (result.Status !== 'Success') {
+        console.error('Destination failed in bulk send:', { status: result.Status, messageId: result.MessageId });
+      }
+    }
+  } catch (err) {
+    console.error('Bulk send failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. SendCustomVerificationEmailCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-custom-verification-template-missing
+// @expect-violation: ses-custom-verification-sender-not-verified
+// @expect-violation: ses-custom-verification-sandbox-restriction
+export async function sendCustomVerificationNoCatch(email: string) {
+  // SHOULD_FIRE: ses-custom-verification-* — no try-catch, multiple distinct errors possible
+  await sesClient.send(new SendCustomVerificationEmailCommand({
+    EmailAddress: email,
+    TemplateName: 'EmailVerification',
+  }));
+}
+
+// @expect-clean
+export async function sendCustomVerificationWithCatch(email: string) {
+  try {
+    // SHOULD_NOT_FIRE: custom verification email inside try-catch
+    await sesClient.send(new SendCustomVerificationEmailCommand({
+      EmailAddress: email,
+      TemplateName: 'EmailVerification',
+    }));
+  } catch (err) {
+    if (err instanceof Error) {
+      if (err.name === 'CustomVerificationEmailTemplateDoesNotExistException') {
+        console.error('Verification template not found — contact ops to recreate');
+      } else if (err.name === 'ProductionAccessNotGrantedException') {
+        console.error('SES sandbox: can only send to verified addresses');
+      } else {
+        throw err;
+      }
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. CreateTemplateCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-template-already-exists
+// @expect-violation: ses-create-template-invalid-syntax
+export async function createSesTemplateNoCatch(name: string, subject: string, html: string) {
+  // SHOULD_FIRE: ses-create-template-* — no try-catch, AlreadyExistsException or InvalidTemplateException possible
+  await sesClient.send(new CreateTemplateCommand({
+    Template: {
+      TemplateName: name,
+      SubjectPart: subject,
+      HtmlPart: html,
+      TextPart: 'Please view in an HTML-capable email client.',
+    },
+  }));
+}
+
+// @expect-clean
+export async function createSesTemplateIdempotent(name: string, subject: string, html: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateTemplateCommand inside try-catch with AlreadyExists handling
+    await sesClient.send(new CreateTemplateCommand({
+      Template: {
+        TemplateName: name,
+        SubjectPart: subject,
+        HtmlPart: html,
+        TextPart: 'Please view in an HTML-capable email client.',
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AlreadyExistsException') {
+      // Template already exists — this is expected in idempotent deployments
+      console.log('Template already exists, skipping creation:', name);
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. UpdateTemplateCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-update-template-not-found
+// @expect-violation: ses-update-template-invalid-syntax
+export async function updateSesTemplateNoCatch(name: string, html: string) {
+  // SHOULD_FIRE: ses-update-template-* — no try-catch, TemplateDoesNotExistException or InvalidTemplateException possible
+  await sesClient.send(new UpdateTemplateCommand({
+    Template: {
+      TemplateName: name,
+      HtmlPart: html,
+    },
+  }));
+}
+
+// @expect-clean
+export async function updateSesTemplateWithFallback(name: string, subject: string, html: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateTemplateCommand inside try-catch with TemplateDoesNotExist fallback
+    await sesClient.send(new UpdateTemplateCommand({
+      Template: {
+        TemplateName: name,
+        SubjectPart: subject,
+        HtmlPart: html,
+        TextPart: 'Please view in an HTML-capable email client.',
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TemplateDoesNotExistException') {
+      // Template doesn't exist — create instead
+      await sesClient.send(new CreateTemplateCommand({
+        Template: {
+          TemplateName: name,
+          SubjectPart: subject,
+          HtmlPart: html,
+          TextPart: 'Please view in an HTML-capable email client.',
+        },
+      }));
+      return;
+    }
     throw err;
   }
 }

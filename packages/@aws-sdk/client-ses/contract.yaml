@@ -1,10 +1,15 @@
 package: "@aws-sdk/client-ses"
 semver: "^3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.50
+# coverage_score = 7 contracted / 14 total API functions (7 contracted + 7 intentionally omitted)
+# Intentionally omitted: VerifyEmailIdentityCommand, VerifyDomainIdentityCommand, DeleteTemplateCommand,
+#   GetTemplateCommand, ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
+# All omitted functions are either read-only GETs or have no distinct errors beyond generic SESServiceException
 
 functions:
   - name: send
@@ -79,6 +84,396 @@ functions:
           - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/"
           - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendEmail.html"
           - "https://docs.aws.amazon.com/ses/latest/APIReference/CommonErrors.html"
+
+  - name: SendTemplatedEmailCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Sends an email using a pre-created SES email template. Composes message
+      by substituting TemplateData JSON values into the template body. Used for
+      transactional emails with personalized content (welcome, password reset,
+      notifications). Unlike SendEmailCommand, requires a template to exist in
+      SES and all template variables to be present in TemplateData.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SendTemplatedEmail.html
+      # Error types confirmed from @aws-sdk/client-ses dist-types/commands/SendTemplatedEmailCommand.d.ts
+      # All @throws annotations verified from TypeScript declarations.
+      - id: ses-template-does-not-exist
+        condition: >-
+          sesClient.send(new SendTemplatedEmailCommand(...)) called with a Template
+          name that does not exist in the SES account
+        throws: TemplateDoesNotExistException
+        required_handling: >
+          MUST wrap in try-catch. TemplateDoesNotExistException is thrown immediately
+          when the template name is not found — the email is NOT sent.
+          Catch block SHOULD log the template name to aid debugging. This error
+          commonly occurs when templates are deleted or when code is deployed to a new
+          AWS account/region without running the template setup step.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendTemplatedEmail.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendTemplatedEmailCommand/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: ses-template-rendering-failure-silent
+        condition: >-
+          sesClient.send(new SendTemplatedEmailCommand(...)) returns a MessageId
+          successfully but the template contains rendering errors (missing partial,
+          malformed Handlebars syntax, undefined helper)
+        returns: >-
+          AWS SES accepts the message and returns a 200 with a MessageId, but the
+          email is NOT sent. Rendering failures are reported only via SNS event
+          notifications (RenderingFailure event type) — NOT as an exception.
+          This is a silent failure: the caller receives a successful response but
+          the recipient never gets the email.
+        required_handling: >
+          MUST configure SNS event notifications for RenderingFailure events on the
+          configuration set. Do NOT assume a returned MessageId means the email was
+          delivered — it only means SES accepted the request for processing.
+          Validate TemplateData JSON matches all template variable names before sending.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendTemplatedEmail.html"
+          - "https://docs.aws.amazon.com/ses/latest/dg/send-personalized-email-api.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: ses-template-missing-rendering-attribute
+        condition: >-
+          sesClient.send(new SendTemplatedEmailCommand(...)) called with TemplateData
+          JSON that is missing one or more required template variable values that the
+          template references
+        throws: MissingRenderingAttributeException
+        required_handling: >
+          MUST wrap in try-catch. MissingRenderingAttributeException is thrown at
+          request time when TemplateData does not include all variables referenced
+          in the template. Catch block SHOULD log the template name and the
+          missing attribute names. Fix by ensuring TemplateData contains all
+          required keys, or make template variables optional with defaults.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendTemplatedEmail.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: SendBulkTemplatedEmailCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Sends personalized email messages to multiple recipients in a single API call.
+      Each destination receives the same template with per-recipient TemplateData
+      substitutions. More efficient than looping SendTemplatedEmailCommand but
+      requires careful handling of partial failures: some destinations may succeed
+      while others fail within the same request.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBulkTemplatedEmail.html
+      # Error types confirmed from dist-types/commands/SendBulkTemplatedEmailCommand.d.ts
+      # Partial failure pattern confirmed from API response structure (Status array per destination)
+      - id: ses-bulk-template-does-not-exist
+        condition: >-
+          sesClient.send(new SendBulkTemplatedEmailCommand(...)) called with a
+          Template name that does not exist in the SES account
+        throws: TemplateDoesNotExistException
+        required_handling: >
+          MUST wrap in try-catch. TemplateDoesNotExistException fails the entire
+          batch — no emails are sent. This is distinct from per-destination failures.
+          Ensure the template exists in the target account/region before calling.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBulkTemplatedEmail.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: ses-bulk-partial-destination-failure
+        condition: >-
+          sesClient.send(new SendBulkTemplatedEmailCommand(...)) succeeds overall
+          (no exception thrown) but one or more individual destinations in the
+          Destinations array fail (e.g., invalid address, blacklisted recipient,
+          per-destination rendering failure)
+        returns: >-
+          API returns 200 with a SendBulkTemplatedEmailResponse. The response contains
+          a Status array with one entry per destination. Each entry has a Status field
+          ('Success' or failure message) and a MessageId (only set on success).
+          Failed destinations have Status set to the failure reason. If the caller
+          does not inspect the Status array, failed recipients are silently dropped.
+        required_handling: >
+          MUST inspect the response.Status array after a successful API call.
+          For each entry: if entry.Status !== 'Success', log the failure and
+          consider requeuing that destination. Pattern:
+            const response = await sesClient.send(new SendBulkTemplatedEmailCommand(...));
+            for (const result of response.Status) {
+              if (result.Status !== 'Success') {
+                logger.error('Bulk email failed for destination', { status: result.Status });
+              }
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBulkTemplatedEmail.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: SendRawEmailCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Sends raw email with full MIME control. Used when attachments, custom headers,
+      inline images, or non-standard MIME structures are required. The caller is
+      responsible for constructing a valid RFC 5321-compliant MIME message as a
+      base64-encoded string. More flexible than SendEmailCommand but more error-prone
+      due to MIME formatting requirements.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SendRawEmail.html
+      # Error types confirmed from dist-types/commands/SendRawEmailCommand.d.ts
+      - id: ses-raw-email-size-limit
+        condition: >-
+          sesClient.send(new SendRawEmailCommand(...)) called with a message
+          (including all attachments) that exceeds 10 MB total size
+        throws: MessageRejected
+        required_handling: >
+          MUST enforce a 10 MB total message size limit before calling SendRawEmail.
+          The limit includes all headers, body, and attachment data after MIME encoding.
+          Note that base64 encoding adds ~33% overhead — a 7.5 MB file becomes ~10 MB
+          after encoding. Validate message size in application code before sending.
+          For large attachments, use S3 pre-signed URLs in the email body instead.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendRawEmail.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-raw-email-recipient-limit
+        condition: >-
+          sesClient.send(new SendRawEmailCommand(...)) called with more than 50
+          total recipients combined across To:, Cc:, and Bcc: headers
+        throws: MessageRejected
+        required_handling: >
+          MUST split recipient lists exceeding 50 total recipients into separate
+          SendRawEmail calls. The 50-recipient limit applies to the total across
+          all recipient types combined. This limit is separate from the daily
+          sending quota. Enforce this constraint in the caller before invoking.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendRawEmail.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: SendCustomVerificationEmailCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Sends a custom verification email to a new email address using a pre-configured
+      custom verification email template. Used to verify recipient email addresses
+      before adding them to mailing lists or granting access. Requires the sender
+      address to already be verified in SES and the custom verification template to
+      exist.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SendCustomVerificationEmail.html
+      # Error types confirmed from dist-types/commands/SendCustomVerificationEmailCommand.d.ts
+      - id: ses-custom-verification-template-missing
+        condition: >-
+          sesClient.send(new SendCustomVerificationEmailCommand(...)) called with a
+          TemplateName that does not exist in the SES account
+        throws: CustomVerificationEmailTemplateDoesNotExistException
+        required_handling: >
+          MUST wrap in try-catch. Template must be created via
+          CreateCustomVerificationEmailTemplate before this call.
+          This error is common in new account setup or when templates are deleted.
+          Catch block SHOULD log the template name and alert operators to recreate it.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendCustomVerificationEmail.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-custom-verification-sender-not-verified
+        condition: >-
+          sesClient.send(new SendCustomVerificationEmailCommand(...)) where the
+          sender email address stored in the template is not verified in SES
+        throws: FromEmailAddressNotVerifiedException
+        required_handling: >
+          MUST ensure the sender email address (stored in the custom verification
+          template, not the caller's input) is verified in SES before calling.
+          This error occurs after template setup if the verified identity is deleted.
+          Catch block SHOULD log the unverified sender address and alert operators.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendCustomVerificationEmail.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-custom-verification-sandbox-restriction
+        condition: >-
+          sesClient.send(new SendCustomVerificationEmailCommand(...)) called on an
+          AWS account that has not been granted production access (account is still
+          in SES sandbox)
+        throws: ProductionAccessNotGrantedException
+        required_handling: >
+          In sandbox mode, custom verification emails can only be sent to verified
+          email addresses. ProductionAccessNotGrantedException is thrown when sending
+          to unverified addresses in sandbox. Request production access through
+          the AWS console before using this in production. In development/staging,
+          either test with verified addresses or mock this call.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendCustomVerificationEmail.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateTemplateCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates a new email template in SES. Templates are reusable email structures
+      with Handlebars-style variable substitution. Used during application setup
+      or deployment to provision transactional email templates. Rate-limited to 1
+      call per second. AlreadyExistsException is the most common failure in CI/CD
+      pipelines that run template setup on every deployment.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateTemplate.html
+      # Error types confirmed from dist-types/commands/CreateTemplateCommand.d.ts
+      # Rate limit (1 call/second) confirmed from API docs.
+      - id: ses-create-template-already-exists
+        condition: >-
+          sesClient.send(new CreateTemplateCommand(...)) called with a TemplateName
+          that already exists in the SES account
+        throws: AlreadyExistsException
+        required_handling: >
+          MUST wrap in try-catch. In idempotent deployment scripts, catch
+          AlreadyExistsException and either skip (template already exists) or
+          switch to UpdateTemplateCommand for updates. Do NOT let this exception
+          fail a CI/CD deployment pipeline — it is a recoverable condition.
+          Pattern: try { create } catch(AlreadyExistsException) { update instead }.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateTemplate.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-template-invalid-syntax
+        condition: >-
+          sesClient.send(new CreateTemplateCommand(...)) called with a template
+          whose HtmlPart/TextPart/SubjectPart contains invalid Handlebars syntax or
+          refers to a partial that does not exist
+        throws: InvalidTemplateException
+        required_handling: >
+          MUST wrap in try-catch. InvalidTemplateException is thrown when the
+          template syntax is malformed or references undefined partials.
+          Catch block SHOULD log the template content to identify the invalid syntax.
+          Validate template rendering locally with Handlebars.js before deploying
+          to SES. Note: a valid template may still fail at send time if TemplateData
+          is missing required variables.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: UpdateTemplateCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Updates an existing SES email template's content (subject, HTML body, text body).
+      Used in deployment scripts to update transactional email templates. Fails if
+      the template does not exist. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateTemplate.html
+      # Error types confirmed from dist-types/commands/UpdateTemplateCommand.d.ts
+      - id: ses-update-template-not-found
+        condition: >-
+          sesClient.send(new UpdateTemplateCommand(...)) called with a TemplateName
+          that does not exist in the SES account
+        throws: TemplateDoesNotExistException
+        required_handling: >
+          MUST wrap in try-catch. TemplateDoesNotExistException is thrown when the
+          template to update does not exist. In idempotent deployment scripts,
+          catch this and switch to CreateTemplateCommand instead.
+          Pattern: try { update } catch(TemplateDoesNotExistException) { create instead }.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-update-template-invalid-syntax
+        condition: >-
+          sesClient.send(new UpdateTemplateCommand(...)) called with a template
+          whose updated content contains invalid Handlebars syntax
+        throws: InvalidTemplateException
+        required_handling: >
+          MUST wrap in try-catch. InvalidTemplateException is thrown when the new
+          template content is syntactically invalid. Previous template content
+          is preserved — the update is atomic and does not partially apply.
+          Validate template content locally with Handlebars.js before updating.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
 
 tags:
   - aws

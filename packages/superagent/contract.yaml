@@ -1,10 +1,15 @@
 package: superagent
 semver: ">=3.7.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.91
+
+detection:
+  factory_methods:
+    - agent
 
 functions:
   - name: get
@@ -27,6 +32,42 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: lib/request-base.js line 690-716 — _timeoutError() sets err.timeout and err.code
+      # deadline timeout: err.code='ETIME', response timeout: err.code='ETIMEDOUT'
+      # https://forwardemail.github.io/superagent/#timeouts
+      - id: timeout-error-identifiable
+        condition: "request exceeds deadline (.timeout(ms)) or response timeout (.timeout({response:ms}))"
+        throws: "Error with err.timeout=<number> and err.code='ETIME' (deadline) or 'ETIMEDOUT' (response timeout)"
+        required_handling: "Check err.timeout in catch block to distinguish timeout from network errors; retry with backoff if appropriate"
+        sources:
+          - "https://forwardemail.github.io/superagent/#timeouts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: lib/node/index.js lines 1067-1080 — ETOOLARGE error when response exceeds maxResponseSize
+      # Default limit: 200,000,000 bytes (200MB). Can be lowered with .maxResponseSize(n).
+      # Error: new Error('Maximum response size reached') with .code='ETOOLARGE'
+      - id: max-response-size-exceeded
+        condition: "response body exceeds maxResponseSize limit (default 200MB for buffered responses)"
+        throws: "Error with code='ETOOLARGE' and message='Maximum response size reached'"
+        required_handling: "Handle in catch block; check err.code === 'ETOOLARGE' for specific handling; use streaming .pipe() for large responses instead of buffering"
+        sources:
+          - "https://forwardemail.github.io/superagent/#response-body"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
   - name: post
     import_path: "superagent"
     description: "Makes HTTP POST request"
@@ -46,6 +87,22 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: lib/request-base.js line 690-716 — same timeout error behavior as get()
+      - id: timeout-error-identifiable
+        condition: "request exceeds deadline or response timeout"
+        throws: "Error with err.timeout=<number> and err.code='ETIME' (deadline) or 'ETIMEDOUT' (response timeout)"
+        required_handling: "Check err.timeout in catch to distinguish timeout from auth/rate-limit errors; POST requests are not idempotent so do not auto-retry without deduplication"
+        sources:
+          - "https://forwardemail.github.io/superagent/#timeouts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
   - name: put
     import_path: "superagent"
@@ -135,4 +192,54 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: agent
+    import_path: "superagent"
+    description: >
+      Creates a stateful SuperAgent Agent instance that persists cookies, auth headers,
+      and TLS settings across multiple requests. The agent's HTTP methods (agent.get(),
+      agent.post(), agent.put(), agent.patch(), agent.delete(), agent.head()) are
+      async-callable and have identical error profiles to top-level superagent methods.
+      Commonly used for authenticated API sessions and cookie-based auth.
+    postconditions:
+      # Evidence: @types/superagent/lib/node/agent.d.ts — Agent extends AgentBase with all HTTP methods
+      # Evidence: lib/node/index.js — all requests route through same callback/error path
+      # Evidence: https://forwardemail.github.io/superagent/#agents-for-global-state
+      - id: agent-request-network-error
+        condition: "network failure, DNS error, connection refused, or HTTP 4xx/5xx on agent.get/post/put/patch/delete/head()"
+        throws: "Error with err.status (HTTP errors) or no err.status (network errors), plus err.response for HTTP errors"
+        required_handling: "Wrap agent HTTP method calls in try-catch; agent persists cookies so session errors (401, 403) may indicate expired auth that must be re-established"
+        sources:
+          - "https://forwardemail.github.io/superagent/#agents-for-global-state"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: lib/request-base.js lines 166, 207-208 — retry error codes include ECONNABORTED
+      # Agent instances share retry config set via agent.retry(n)
+      # https://forwardemail.github.io/superagent/#retrying-requests
+      - id: agent-session-auth-failure
+        condition: "401 Unauthorized or 403 Forbidden response when agent session/cookie has expired"
+        throws: "Error with err.status=401 or err.status=403 and err.response containing the response body"
+        required_handling: >
+          Catch 401/403 specifically and re-authenticate: check err.status === 401 to detect
+          session expiry. Agents carry cookies across requests — a 401 mid-session means the
+          cookie/token expired and must be refreshed before retrying. Do not silently swallow
+          these errors or the agent will continue sending expired credentials.
+        sources:
+          - "https://forwardemail.github.io/superagent/#agents-for-global-state"
+          - "https://forwardemail.github.io/superagent/#error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: authentication_failure
           incident_cost_range: medium
