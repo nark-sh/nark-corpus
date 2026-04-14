@@ -1,10 +1,11 @@
 package: passport
 semver: ">=0.7.0 <1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-13"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.71
 
 detection:
   type_names:
@@ -48,6 +49,399 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: logIn
+    import_path: "passport"
+    description: >
+      Establishes a login session for the authenticated user, saving the session
+      via the registered SessionManager. Called automatically by authenticate()
+      on success (when session:true), and can be called manually after custom
+      authentication logic (e.g., after user signup). The callback receives an
+      error if session persistence fails.
+    postconditions:
+      # Evidence: https://www.passportjs.org/concepts/authentication/login/
+      # Source confirmed: lib/http/request.js, lib/sessionmanager.js
+      - id: login-missing-session-middleware
+        condition: >
+          req.logIn() is called but no session middleware (express-session) has been
+          configured, so req.session is undefined.
+        throws: >
+          Error('Login sessions require session support. Did you forget to use
+          `express-session` middleware?') passed to done callback
+        required_handling: >
+          Caller MUST pass a done callback and check the err argument. If err is
+          present, forward to next(err). Also ensure express-session (or equivalent)
+          is mounted before passport.initialize().
+        sources:
+          - "https://www.passportjs.org/concepts/authentication/login/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/sessionmanager.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: login-session-save-error
+        condition: >
+          Session persistence fails during req.logIn() — typically because the
+          session store (Redis, Postgres, etc.) is unavailable when session.save()
+          is called. Also occurs if the session.regenerate() call fails.
+        throws: >
+          Error from session store propagated to done callback — commonly a
+          connection error from the underlying session store (e.g., ioredis
+          disconnection, Postgres connection timeout).
+        required_handling: >
+          Caller MUST provide a done callback. If err is truthy, the user is NOT
+          logged in (req.user is set to null). Caller MUST call next(err) or
+          respond with 500 — silently ignoring this error leaves the user
+          appearing logged in on the client but not in the server session.
+        sources:
+          - "https://www.passportjs.org/concepts/authentication/login/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/sessionmanager.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: login-serialize-error
+        condition: >
+          The registered serializeUser function calls done(err) with an error, or
+          throws synchronously. This causes login session establishment to fail.
+        throws: >
+          Error propagated from serializeUser's done(err) call to the logIn callback
+        required_handling: >
+          Caller MUST check err in the logIn callback. Common causes: database
+          unavailability when looking up user ID, or serializer logic bug. Always
+          forward to next(err) for centralized error handling.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: login-missing-callback
+        condition: >
+          req.logIn() is called with session:true (default) but no callback
+          function is provided.
+        throws: Error('req#login requires a callback function') — thrown synchronously
+        required_handling: >
+          Always provide a callback to req.logIn() when session:true (the default).
+          Use { session: false } only for stateless API authentication.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/http/request.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: logout
+    import_path: "passport"
+    description: >
+      Terminates the login session for the current request. Removes req.user and
+      clears the session data. Must be called with a callback because session.save()
+      is asynchronous. Using GET requests for logout endpoints is discouraged due to
+      CSRF vulnerability — use POST or DELETE.
+    postconditions:
+      # Evidence: https://www.passportjs.org/concepts/authentication/logout/
+      # Source confirmed: lib/http/request.js, lib/sessionmanager.js
+      - id: logout-missing-callback
+        condition: >
+          req.logout() is called but no callback function is provided. In passport
+          >= 0.6.0, a callback is required because session.save() is async.
+        throws: Error('req#logout requires a callback function') — thrown synchronously
+        required_handling: >
+          Always provide a callback: req.logout(function(err) { if (err) { return next(err); } ... }).
+          Calling req.logout() without a callback was valid in passport < 0.6 but
+          now throws synchronously, crashing the request.
+        sources:
+          - "https://www.passportjs.org/concepts/authentication/logout/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/http/request.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: logout-session-save-error
+        condition: >
+          Session persistence fails during req.logout() — session.save() errors
+          when the session store (Redis, Postgres, memcached) is unavailable,
+          or session.regenerate() fails during the secure logout flow.
+        throws: >
+          Error from session store propagated to done callback
+        required_handling: >
+          Caller MUST check err in the callback and forward to next(err). If silently
+          ignored, the session may not be destroyed in the store — the user appears
+          logged out on the client but their session remains valid server-side,
+          creating a security vulnerability.
+        sources:
+          - "https://www.passportjs.org/concepts/authentication/logout/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/sessionmanager.js"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+      - id: logout-missing-session-middleware
+        condition: >
+          req.logout() is called but no session middleware is mounted — req.session
+          is undefined.
+        throws: >
+          Error('Login sessions require session support. Did you forget to use
+          `express-session` middleware?') passed to callback
+        required_handling: >
+          Ensure express-session (or equivalent) is mounted before passport middleware.
+          Always check err in the callback.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/sessionmanager.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: session
+    import_path: "passport"
+    description: >
+      Middleware that restores authentication state from the session on each request.
+      Calls deserializeUser() to reconstruct the full user object from the session-stored
+      identifier. When deserializeUser calls done(err), the error propagates to the
+      Express error handler. When done(null, false) is called (user no longer exists),
+      the session user data is cleared silently and the request continues unauthenticated.
+      Must be mounted after express-session.
+    postconditions:
+      # Evidence: source confirmed from lib/strategies/session.js, lib/middleware/authenticate.js
+      # https://www.passportjs.org/concepts/authentication/middleware/
+      - id: session-missing-session-middleware
+        condition: >
+          passport.session() runs but express-session middleware has not been mounted,
+          so req.session is undefined.
+        throws: >
+          Error('Login sessions require session support. Did you forget to use
+          `express-session` middleware?') — propagated via next(err) to Express
+          error handler
+        required_handling: >
+          Mount express-session (or compatible session middleware) before passport.initialize()
+          and passport.session() in the middleware stack. If session middleware is
+          missing, all requests hit the error handler.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/strategies/session.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: session-deserialize-error
+        condition: >
+          The registered deserializeUser function calls done(err) with an error —
+          typically a database query failure when looking up the user by ID from
+          the session. This triggers on every authenticated request, not just at
+          login time.
+        throws: >
+          Error propagated via next(err) to the Express error handler on every
+          request where a login session exists
+        required_handling: >
+          The deserializeUser callback MUST distinguish between "user not found"
+          (call done(null, false)) and "database error" (call done(err)). A database
+          error causes every session-backed request to fail with 500. Implement
+          retry or fallback behavior in the deserializer. Also mount an Express
+          error handler to prevent unhandled crash.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/strategies/session.js"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: session-failed-deserialize-chain
+        condition: >
+          No registered deserializeUser function can handle the session data —
+          the internal chain exhausts all registered deserializers without finding
+          a match.
+        throws: >
+          Error('Failed to deserialize user out of session') — propagated via
+          next(err) to Express error handler
+        required_handling: >
+          Ensure at least one deserializeUser function handles the stored session
+          format. This error commonly occurs after a data migration changes the
+          user ID type or format. Add a migration deserializer that handles both
+          old and new formats.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: authorize
+    import_path: "passport"
+    description: >
+      Middleware that authorizes a third-party service connection for an already-
+      authenticated user. Identical to authenticate() internally but sets req.account
+      (not req.user) with the third-party account info, leaving the existing login
+      session unmodified. Used for OAuth account linking flows.
+    postconditions:
+      # Evidence: https://www.passportjs.org/docs/authorize/
+      # Source confirmed: lib/middleware/authenticate.js (assignProperty option)
+      - id: authorize-strategy-error
+        condition: >
+          The OAuth strategy encounters an error during the authorization flow —
+          network failure reaching the provider's token endpoint, invalid OAuth
+          tokens, or provider returning an error response.
+        throws: >
+          Error propagated to the callback (if provided) as first argument, or
+          forwarded via next(err) to Express error handler if no callback
+        required_handling: >
+          Caller MUST provide a callback or mount an Express error handler.
+          Without a callback, strategy errors go to next(err). With a callback,
+          check err as first argument before inspecting req.account.
+        sources:
+          - "https://www.passportjs.org/docs/authorize/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/authenticate.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+      - id: authorize-failure-without-redirect
+        condition: >
+          Authorization fails (strategy calls fail()) and no failureRedirect is
+          configured and no callback is provided.
+        throws: >
+          AuthenticationError with HTTP 401 status — if failWithError:true is set.
+          Otherwise, a 401 HTTP response is sent directly with WWW-Authenticate headers.
+        required_handling: >
+          Always provide a failureRedirect or a callback when using authorize().
+          Without either, failed authorization sends a raw 401 response which may
+          not align with the application's error handling or UI expectations.
+        sources:
+          - "https://www.passportjs.org/docs/authorize/"
+          - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/authenticate.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+  - name: serializeUser
+    import_path: "passport"
+    description: >
+      Registers a function that converts a user object to a session-storable identifier
+      (typically user ID). Called during req.logIn() to persist the user to the session.
+      The function receives (user, done) or (req, user, done). If done(err) is called,
+      the login session fails. If done(null, id) is called, the id is stored in the session.
+    postconditions:
+      # Evidence: Source confirmed from lib/authenticator.js serializeUser chain
+      # https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js
+      - id: serialize-chain-failure
+        condition: >
+          No registered serializeUser function calls done with a non-falsy id —
+          the chain exhausts without serializing a user identifier.
+        throws: >
+          Error('Failed to serialize user into session') — propagated to the
+          req.logIn() callback
+        required_handling: >
+          Ensure at least one serializeUser function calls done(null, someId) for
+          every user object type your application produces. This error blocks all
+          login attempts.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: deserializeUser
+    import_path: "passport"
+    description: >
+      Registers a function that reconstructs a user object from the session-stored
+      identifier on each request. Called by passport.session() middleware on every
+      request with an active session. The function receives (id, done) or (req, id, done).
+      Errors propagate to every subsequent authenticated request, not just once.
+    postconditions:
+      # Evidence: Source confirmed from lib/authenticator.js, lib/strategies/session.js
+      # https://github.com/jaredhanson/passport/blob/master/lib/strategies/session.js
+      - id: deserialize-database-error
+        condition: >
+          The deserializeUser function calls done(err) due to a database failure
+          when looking up the user by the stored ID. Because passport.session()
+          runs on every request, this error fires on every authenticated request
+          until the database recovers.
+        throws: >
+          Error propagated via next(err) on every authenticated request
+        required_handling: >
+          Implement defensive error handling in the deserializer. If the database
+          is temporarily unavailable, consider returning done(null, false) to treat
+          the user as unauthenticated rather than crashing every request. Distinguish
+          "user not found" (false) from "database error" (err). Add database
+          retry logic or circuit breakers to the deserializer.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/strategies/session.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: deserialize-chain-failure
+        condition: >
+          No registered deserializeUser function can reconstruct a user from the
+          stored session identifier — the chain exhausts without calling done with
+          a user.
+        throws: >
+          Error('Failed to deserialize user out of session') — propagated on
+          every request where a session exists
+        required_handling: >
+          Ensure deserializeUser handles all possible session identifier formats.
+          After user data migrations, add a compatibility handler for old-format IDs.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 edge_cases:
   - id: custom-strategy-errors
     description: "Custom strategies must properly call done(err) or done(null, false, info) to propagate errors - uncaught errors in strategy crash application"
@@ -61,6 +455,40 @@ edge_cases:
       user_experience: service_unavailable
       incident_cost_range: medium
 
+  - id: authenticate-failwith-error
+    description: >
+      When failWithError: true is set on authenticate() options, failed authentication
+      (all strategies exhausted) throws AuthenticationError (from passport internals)
+      via next(err) instead of sending a 401 response. Applications using failWithError
+      must have an Express error handler that checks err.status === 401 to differentiate
+      authentication failures from internal server errors.
+    sources:
+      - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/authenticate.js"
+    severity: warning
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: authentication_failure
+      incident_cost_range: low
+
+  - id: session-regeneration-csrf-protection
+    description: >
+      passport.session() (and req.logIn()) calls req.session.regenerate() before
+      saving login state, which generates a new session ID. This is intentional
+      CSRF/session-fixation protection. Any data stored on the old session before
+      logIn is called will NOT be available after login unless explicitly copied
+      using keepSessionInfo: true option.
+    sources:
+      - "https://github.com/jaredhanson/passport/blob/master/lib/sessionmanager.js"
+    severity: info
+    business_impact:
+      incident_label: DATA_LOSS
+      production_behavior: silent_failure
+      visibility: silent
+      user_experience: lost_data
+      incident_cost_range: low
+
 # Category: authentication
 # Latest version: 0.7.0
-# Generated: 2026-02-26
+# Deepened: 2026-04-13 by deepen-stream-1
