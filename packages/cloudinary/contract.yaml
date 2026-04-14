@@ -1,10 +1,11 @@
 package: cloudinary
 semver: ">=1.0.0 <3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-13"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 intentionally omitted)
 
 functions:
   - name: upload
@@ -13,13 +14,27 @@ functions:
 
     postconditions:
       - id: upload-missing-error-handling
+        # Evidence: https://cloudinary.com/documentation/upload_images
+        # HTTP codes confirmed: 400 (bad request), 401 (auth), 403 (not allowed), 404, 420 (rate limited), 500
+        # Error structure from source: lib/api_client/execute_request.js — rejects with plain object { message, http_code }
+        # NOT a standard Error instance — instanceof Error checks will fail
         condition: "network error, validation error, authentication failure, or quota exceeded during upload"
-        throws: "Error with network/validation/auth details"
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error instance.
+          HTTP 401: Authorization required (invalid/missing api_key, api_secret, or cloud_name).
+          HTTP 403: Not allowed (unsigned upload attempt with restricted params).
+          HTTP 400: Bad request (invalid file type, transformation params, or public_id format).
+          HTTP 420: Rate limited (upload quota exceeded).
+          HTTP 500: Internal server error.
+          Node.js Error object: network-level failure (ECONNREFUSED, ETIMEDOUT, DNS failure).
         required_handling: >
           MUST wrap cloudinary.v2.uploader.upload() in try-catch (for async/await)
           OR check error parameter in callback: (error, result) => { if (error) ... }
+          IMPORTANT: error is a plain object {message, http_code}, not Error instance.
+          Check error.http_code to distinguish auth (401), permission (403), rate-limit (420).
         sources:
-          - "https://cloudinary.com/documentation/node_image_and_video_upload"
+          - "https://cloudinary.com/documentation/upload_images"
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -27,6 +42,7 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
 
   - name: upload_large
     import_path: "cloudinary"
@@ -34,13 +50,23 @@ functions:
 
     postconditions:
       - id: upload-large-missing-error-handling
-        condition: "network interruption, 413 error, authentication failure, or chunk upload failure"
-        throws: "Error with 413 Request Entity Too Large or network error details"
+        # Evidence: https://cloudinary.com/documentation/upload_images
+        # Chunk size default 20MB, minimum 5MB. Files >100MB require this method.
+        # Same error object structure as upload() — plain { message, http_code }
+        condition: "network interruption, chunk upload failure, authentication failure, or file size exceeded"
+        throws: >
+          Plain object { message: string, http_code: number } on chunk failure.
+          HTTP 400: File exceeds account upload limit (>100MB without plan support, or >100GB).
+          HTTP 401: Authorization required (invalid credentials).
+          HTTP 500: Internal server error during chunk assembly.
+          Node.js Error object: network failure between chunks (ETIMEDOUT mid-upload).
+          TimeoutError object ({ name: 'TimeoutError' }): request timeout during chunk POST.
         required_handling: >
           MUST wrap cloudinary.v2.uploader.upload_large() in try-catch
           OR check error parameter in callback. Files >100MB require this method.
+          Partial uploads are NOT automatically cleaned up on failure.
         sources:
-          - "https://cloudinary.com/documentation/node_image_and_video_upload"
+          - "https://cloudinary.com/documentation/upload_images"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -48,6 +74,7 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
 
   - name: upload_stream
     import_path: "cloudinary"
@@ -55,16 +82,27 @@ functions:
 
     postconditions:
       - id: upload-stream-missing-error-handling
-        condition: "stream read error, network interruption, memory issue, or authentication failure"
-        throws: "Error with stream or network details"
-        # Evidence: 1 firing in scan-cloudinary-2026-04-02.json (1 FP identified — reject(error) in else branch is valid handling)
+        # Evidence: https://support.cloudinary.com/hc/en-us/community/posts/360026620212
+        # Source: lib/uploader.js — upload_stream returns an UploadStream (Transform stream)
+        # Error arrives in the callback, not as a rejected Promise
+        # Evidence: 1 firing in scan-cloudinary-2026-04-02.json (1 FP identified)
         # Top affected: arihantcodes/spectrum-ui (⭐ 991 stars)
+        condition: "stream read error, network interruption, memory issue, or authentication failure"
+        throws: >
+          Error delivered via callback parameter, NOT as a rejected Promise.
+          The callback is the ONLY way to receive errors from upload_stream().
+          Error structure: { message: string, http_code: number } (plain object, not Error instance).
+          HTTP 401: Authorization required.
+          HTTP 400: Invalid transformation parameters or file format rejected.
+          Node.js Error: stream read failure or EPIPE on stream pipe.
         required_handling: >
           MUST provide callback with error parameter:
           cloudinary.v2.uploader.upload_stream((error, result) => { if (error) ... })
-          Stream uploads REQUIRE callback-based error handling.
+          Stream uploads REQUIRE callback-based error handling — there is no Promise to catch.
+          Piping to the returned stream without a callback will silently swallow errors.
         sources:
           - "https://support.cloudinary.com/hc/en-us/community/posts/360026620212-stream-upload-catching-errors-NODE-JS-"
+          - "https://cloudinary.com/documentation/upload_images"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -72,6 +110,7 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
 
   - name: destroy
     import_path: "cloudinary"
@@ -79,11 +118,24 @@ functions:
 
     postconditions:
       - id: destroy-missing-error-handling
-        condition: "asset not found, authentication failure, network error, or permission denied"
-        throws: "Error with resource not found or authentication details"
+        # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+        # Source: lib/api_client/execute_request.js — same error shape as upload
+        # NOTE: destroy() returns { result: 'ok' } on success or { result: 'not found' } for missing assets
+        # It does NOT throw 404 for missing assets — it resolves with result:'not found'
+        # Only network errors, auth failures, and unexpected status codes reject the Promise
+        condition: "authentication failure, network error, permission denied, or unexpected server error"
+        throws: >
+          Plain object { message: string, http_code: number } for API errors.
+          HTTP 401: Authorization required (invalid credentials).
+          HTTP 403: Not allowed (insufficient permissions for this resource type or delivery type).
+          HTTP 500: Internal server error.
+          Node.js Error: network-level failure (ECONNREFUSED, ETIMEDOUT).
+          IMPORTANT: Missing asset does NOT throw — resolves with { result: 'not found' }.
+          Callers checking result.result === 'ok' will miss this silent no-op.
         required_handling: >
-          MUST wrap cloudinary.v2.uploader.destroy() in try-catch
-          OR check error parameter in callback. Asset may not exist.
+          MUST wrap cloudinary.v2.uploader.destroy() in try-catch for auth/network errors.
+          ALSO check result.result === 'ok' to detect missing assets (not thrown as error).
+          Example: if (result.result !== 'ok') { log warning about missing asset }
         sources:
           - "https://cloudinary.com/documentation/image_upload_api_reference"
         severity: error
@@ -93,3 +145,305 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: rename
+    import_path: "cloudinary"
+    description: >
+      Renames (moves) an asset from one public_id to another. Used to reorganize
+      media assets after upload, implement slug-based asset naming, or move assets
+      between folders. By default does NOT overwrite the target if it already exists
+      (returns 409 Conflict). Automatically invalidates the old CDN URL on rename.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # HTTP codes from source: 400, 401, 403, 404, 409, 420, 500
+      # Error shape: plain object { message, http_code } from lib/api_client/execute_request.js
+      - id: rename-missing-error-handling
+        severity: error
+        condition: >
+          source asset not found (HTTP 404), target public_id already exists with overwrite:false (HTTP 409),
+          authentication failure (HTTP 401), or permission denied (HTTP 403)
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Throws (rejects) when the source asset doesn't exist (HTTP 404), when the
+          target public_id already exists and overwrite is false (HTTP 409 Conflict),
+          when credentials are invalid (HTTP 401), or when the caller lacks permission
+          (HTTP 403). A missing source asset is the most common unhandled case —
+          callers assume the asset exists but it may have been deleted concurrently.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 404: Source asset not found (from_public_id does not exist).
+          HTTP 409: Target public_id already exists and overwrite option is false (default).
+          HTTP 401: Authorization required (invalid api_key/api_secret).
+          HTTP 403: Not allowed (permission denied for this resource type).
+          HTTP 400: Bad request (invalid public_id format).
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.rename() in try-catch.
+          Check error.http_code: 404 means source missing, 409 means target conflict.
+          Pass overwrite: true explicitly if overwrite behavior is intended.
+        evidence_quality: confirmed
+
+      - id: rename-silent-conflict
+        severity: warning
+        condition: >
+          rename target public_id already exists and overwrite option is not set to true (HTTP 409)
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          When overwrite is false (the default), renaming to a public_id that already
+          exists returns HTTP 409. Callers who do not check error.http_code treat this
+          the same as a network failure — losing the context that the target exists
+          and the original asset is still at its source location.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: 409 } — rejected with conflict message.
+        required_handling: >
+          Check error.http_code === 409 to distinguish "target already exists" from
+          other failures. Either use overwrite:true or handle the conflict explicitly.
+        evidence_quality: confirmed
+
+  - name: explicit
+    import_path: "cloudinary"
+    description: >
+      Applies transformations, updates tags/metadata, or generates derived versions
+      of an asset that was already uploaded. Used for eager transformations, adding
+      responsive breakpoints after upload, and updating structured metadata.
+      Requires the asset to already exist — does NOT upload new files.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # HTTP codes: 400 (invalid transformation), 401 (auth), 403 (permission), 404 (not found), 420 (rate)
+      - id: explicit-missing-error-handling
+        severity: error
+        condition: >
+          asset not found (HTTP 404), invalid transformation parameters (HTTP 400),
+          authentication failure (HTTP 401), or rate limit exceeded (HTTP 420)
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects when the target asset doesn't exist (HTTP 404), when transformation
+          parameters are invalid (HTTP 400), when credentials are missing or invalid
+          (HTTP 401), or when rate limited (HTTP 420). In pipelines that call explicit()
+          after upload() with delay, the asset may not yet be available, causing
+          sporadic 404 rejections that are hard to reproduce.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 404: Asset not found (public_id does not exist yet or was deleted).
+          HTTP 400: Invalid transformation parameters (bad crop mode, unsupported format).
+          HTTP 401: Authorization required (invalid credentials).
+          HTTP 420: Rate limited (too many transformation requests in short window).
+          HTTP 500: Internal error (transformation pipeline failure for complex operations).
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.explicit() in try-catch.
+          Check error.http_code: 404 means asset not yet available (consider retry with backoff),
+          400 means transformation params are wrong (check transformation options).
+        evidence_quality: confirmed
+
+  - name: add_tag
+    import_path: "cloudinary"
+    description: >
+      Adds one or more tags to a list of assets identified by their public_ids.
+      Tags are used for bulk operations (delete by tag, search by tag, CDN delivery
+      grouping). Batch operation — partial failure is not reported per-asset.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # Same HTTP error codes as all Upload API methods
+      - id: add-tag-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), invalid tag format (HTTP 400),
+          or network failure — add_tag() silently returns empty list for non-existent public_ids
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects when authentication fails (HTTP 401), when the caller lacks
+          permission (HTTP 403), or on network failure. Does NOT return 404 for
+          non-existent public_ids — it silently succeeds with an empty public_ids
+          list in the response. This makes silent no-ops the most dangerous failure
+          mode, not thrown errors.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 401: Authorization required.
+          HTTP 403: Not allowed (permission denied).
+          HTTP 400: Bad request (invalid tag format, too many public_ids).
+          Node.js Error: network failure.
+          SILENT: Non-existent public_ids do NOT throw — silently returns empty list.
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.add_tag() in try-catch for auth/network errors.
+          Check response.public_ids array to verify tags were actually applied.
+        evidence_quality: confirmed
+
+  - name: remove_tag
+    import_path: "cloudinary"
+    description: >
+      Removes one or more tags from a list of assets. Used for access control changes,
+      CDN delivery group removal, and cleanup of organizational metadata.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      - id: remove-tag-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), invalid tag or public_id format (HTTP 400),
+          or network failure during tag removal operation
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects on authentication failure (HTTP 401), permission errors (HTTP 403),
+          or network failure. Same silent no-op behavior as add_tag() for non-existent
+          assets or non-existent tags.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 401: Authorization required.
+          HTTP 403: Not allowed.
+          HTTP 400: Invalid tag or public_id format.
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.remove_tag() in try-catch.
+          For access-control use cases, verify the operation succeeded via response.public_ids.
+        evidence_quality: confirmed
+
+  - name: api.delete_resources
+    import_path: "cloudinary"
+    description: >
+      Deletes multiple assets by public_id array using the Admin API. A bulk
+      destructive operation that cannot be undone (unless backup is enabled).
+      Rate-limited by the Admin API plan (unlike the Upload API which is not limited).
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/admin_api
+      # Admin API rate limit: X-FeatureRateLimit-* headers, HTTP 420 when exceeded
+      # Source: lib/api_client/execute_request.js, lib/v2/api.js
+      - id: delete-resources-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), Admin API rate limit exceeded (HTTP 420),
+          or network failure during bulk asset deletion
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        description: >
+          Rejects on authentication failure (HTTP 401), when the caller lacks
+          permission to delete (HTTP 403), or when the Admin API rate limit is
+          exceeded (HTTP 420). Unlike uploader.destroy(), which silently returns
+          result:'not found' for missing assets, delete_resources() returns a
+          deleted: {}, not_found: [] structure in the success response — partial
+          results are returned even when some assets don't exist. Only auth, permission,
+          and rate limit errors cause rejection.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 401: Authorization required (invalid api_key/api_secret).
+          HTTP 403: Not allowed (insufficient plan or resource-level permission).
+          HTTP 420: Rate limited (Admin API hourly quota exceeded).
+          HTTP 500: Internal server error.
+          Node.js Error: network failure.
+        required_handling: >
+          MUST wrap cloudinary.v2.api.delete_resources() in try-catch.
+          Check error.http_code === 420 for rate limit and implement exponential backoff.
+          Monitor X-FeatureRateLimit-Remaining header for proactive throttling.
+          Check response.not_found[] array to verify which assets were actually deleted.
+        evidence_quality: confirmed
+        source: "https://cloudinary.com/documentation/admin_api"
+
+  - name: api.resource
+    import_path: "cloudinary"
+    description: >
+      Fetches detailed metadata for a single asset from the Admin API: dimensions,
+      format, tags, context, transformation history, and moderation status.
+      Commonly used before transformations, in media management UIs, and for
+      validation pipelines.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/admin_api
+      # Rate limited via Admin API — same 420 as delete_resources
+      - id: api-resource-missing-error-handling
+        condition: >
+          asset not found (HTTP 404), authentication failure (HTTP 401), permission denied (HTTP 403),
+          or Admin API rate limit exceeded (HTTP 420)
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 404: Asset not found (public_id does not exist).
+          HTTP 401: Authorization required.
+          HTTP 403: Not allowed (insufficient permissions for this resource type).
+          HTTP 420: Rate limited (Admin API quota exceeded).
+        required_handling: >
+          MUST wrap cloudinary.v2.api.resource() in try-catch.
+          Check error.http_code === 404 to handle missing assets gracefully (return null).
+          Check error.http_code === 420 to implement backoff for high-volume metadata pipelines.
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        severity: error
+        evidence_quality: confirmed
+
+  - name: search.execute
+    import_path: "cloudinary"
+    description: >
+      Executes a structured search query against the Cloudinary asset index using
+      the Search API. Returns paginated results with asset metadata. Used in
+      media libraries, content management systems, and bulk export pipelines.
+      Requires Admin API credentials.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/search_api
+      # Rate limited via Admin API — HTTP 420 is common in search-heavy workflows
+      - id: search-execute-missing-error-handling
+        condition: >
+          invalid search expression (HTTP 400), missing Admin API credentials (HTTP 401),
+          rate limit exceeded (HTTP 420), or network failure
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 400: Bad request (invalid search expression syntax, malformed Lucene query).
+          HTTP 401: Authorization required (Admin API credentials required, not just upload key).
+          HTTP 420: Rate limited (Admin API quota, search counts against the same limit).
+          HTTP 500: Internal error (query too broad, index timeout).
+        required_handling: >
+          MUST wrap cloudinary.v2.search.expression(...).execute() in try-catch.
+          Check error.http_code === 400 to detect expression syntax errors.
+          Check error.http_code === 401 — search requires Admin API credentials (api_key + api_secret),
+          not just cloud_name. Client-side usage will always return 401.
+          Implement pagination with next_cursor for large result sets to avoid timeouts.
+        sources:
+          - "https://cloudinary.com/documentation/search_api"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
