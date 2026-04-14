@@ -2,7 +2,8 @@ package: socket.io-client
 semver: ">=4.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-13"
+coverage_score: 0.80  # 4 contracted functions / 5 meaningful async-callable functions
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
 
@@ -173,6 +174,175 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         note: "Not using timeout causes poor UX but not crashes"
+
+  - name: emitWithAck
+    import_path: "socket.io-client"
+    description: >
+      Promise-based method for emitting events and waiting for server acknowledgement.
+      Returns a Promise that resolves with the server's response. Added in v4.6.0.
+      Used for request-response patterns where callers await the server reply.
+
+    postconditions:
+      # Evidence: socket.io-client/build/esm/socket.js:294 — exact error: new Error("operation has timed out")
+      # Evidence: socket.io/docs/v4/client-api/#socketemitwithackeventname-args
+      - id: emit-with-ack-timeout-error
+        condition: "server does not acknowledge within timeout set via .timeout(ms)"
+        throws: "Promise rejects with Error('operation has timed out')"
+        required_handling: |
+          Caller MUST wrap socket.timeout(ms).emitWithAck() in try-catch.
+
+          Without timeout error handling:
+          - Unhandled Promise rejection crashes Node.js (v15+)
+          - Silent hang in browser applications
+          - Loading spinners never resolve
+          - UI state left in permanent "pending" state
+
+          The exact error message from source is "operation has timed out".
+          Note: emitWithAck() without .timeout() returns a Promise that NEVER
+          rejects on timeout — the callback is simply never called. Always use
+          .timeout() with emitWithAck() to get a rejecting Promise.
+
+          Usage:
+            try {
+              const response = await socket.timeout(5000).emitWithAck('get-data', { id: 123 });
+            } catch (err) {
+              if (err.message === 'operation has timed out') {
+                // server did not respond within 5 seconds
+              }
+            }
+        sources:
+          - "https://socket.io/docs/v4/client-api/#socketemitwithackeventname-args"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: |
+          Available since v4.6.0. The error message is exactly "operation has timed out"
+          (confirmed from source: socket.js line 294). No custom error class — just a plain Error instance.
+
+      # Evidence: socket.io-client/build/esm/socket.js:467 — exact error: new Error("socket has been disconnected")
+      - id: emit-with-ack-disconnect-error
+        condition: "socket disconnects while waiting for server acknowledgement"
+        throws: "Promise rejects with Error('socket has been disconnected')"
+        required_handling: |
+          Caller MUST handle the case where the socket disconnects while awaiting
+          an acknowledgement. This happens when:
+          - Network drops between emit and acknowledgement
+          - Server crashes before responding
+          - Socket manually disconnected while request is in-flight
+
+          Without disconnect error handling:
+          - Unhandled Promise rejection
+          - Data may have been sent to server (partial operation)
+          - Client has no way to know if server processed the request
+
+          Idempotent operations: Safe to retry on reconnection.
+          Non-idempotent operations: MUST check server state before retrying
+          to avoid duplicate processing (e.g., creating duplicate records).
+
+          Usage:
+            try {
+              const response = await socket.timeout(5000).emitWithAck('create-order', data);
+            } catch (err) {
+              if (err.message === 'socket has been disconnected') {
+                // check if order was created before retrying
+              }
+            }
+        sources:
+          - "https://socket.io/docs/v4/client-api/#socketemitwithackeventname-args"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        note: |
+          The error message is exactly "socket has been disconnected" (confirmed from source: socket.js line 467).
+          This is distinct from the timeout error and requires different handling:
+          timeout = server didn't respond, disconnect = connection was lost entirely.
+          For non-idempotent ops (create/delete/update), callers MUST implement
+          idempotency keys or server-side deduplication.
+
+      # Evidence: socket.io-client/build/esm/socket.js:241 — throw new Error('"' + ev + '" is a reserved event name')
+      - id: emit-with-ack-reserved-event-name
+        condition: "event name matches a reserved Socket.IO event (connect, connect_error, disconnect, disconnecting)"
+        throws: "throws synchronously with Error('\"<name>\" is a reserved event name')"
+        required_handling: |
+          Caller MUST NOT emit events named: connect, connect_error, disconnect,
+          disconnecting, newListener, removeListener.
+
+          This throws synchronously (not as a rejected Promise), so it bypasses
+          try-catch around the await expression. The throw happens during the emit
+          call itself, before the Promise is created.
+
+          This is a programming error, not a runtime condition — it indicates the
+          event name must be changed at design time.
+        sources:
+          - "https://socket.io/docs/v4/client-api/#event-connect"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        note: |
+          Synchronous throw — not a Promise rejection. Caught by a regular try-catch
+          block but NOT by .catch() chained on the emitWithAck Promise since the error
+          throws before the Promise is returned.
+
+  - name: socket.io.reconnect_failed
+    import_path: "socket.io-client"
+    description: >
+      The Manager emits 'reconnect_failed' when all reconnection attempts are exhausted
+      (when reconnectionAttempts option is set to a finite number). This is the final
+      failure event — the socket will not attempt to reconnect again after this point.
+      Accessed via socket.io.on('reconnect_failed', handler).
+
+    postconditions:
+      # Evidence: socket.io-client/build/esm/manager.js:324 — emitReserved("reconnect_failed")
+      # Evidence: https://socket.io/docs/v4/client-api/#event-reconnect_failed
+      - id: reconnect-failed-event
+        condition: "all reconnection attempts exhausted (reconnectionAttempts limit reached)"
+        throws: "emits 'reconnect_failed' event on socket.io (the Manager)"
+        required_handling: |
+          Caller SHOULD listen for socket.io.on('reconnect_failed', handler) when
+          using a finite reconnectionAttempts value.
+
+          Without reconnect_failed handling:
+          - Application silently stops working
+          - No user-visible indication of permanent disconnection
+          - UI remains in "reconnecting" state forever
+          - Background jobs that depend on the socket queue without limit
+
+          Default behavior: reconnectionAttempts = Infinity, so reconnect_failed
+          never fires by default. Only fires when reconnectionAttempts is a finite number.
+
+          Usage:
+            const socket = io('http://localhost:3000', {
+              reconnectionAttempts: 5
+            });
+            socket.io.on('reconnect_failed', () => {
+              // All 5 attempts failed — show error, switch to fallback
+              showPermanentDisconnectionError();
+            });
+        sources:
+          - "https://socket.io/docs/v4/client-api/#event-reconnect_failed"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        note: |
+          Only relevant when reconnectionAttempts is set to a finite number.
+          With default Infinity setting, this event never fires.
+          Event is on socket.io (Manager), not on the socket itself.
 
 # ANALYZER LIMITATIONS:
 # Current analyzer detects try-catch patterns but NOT event listener patterns:

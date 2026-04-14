@@ -2,9 +2,10 @@ package: twilio
 semver: ">=3.0.0 <6.0.0"
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: 2026-04-03
+last_verified: 2026-04-14
 status: production
 evidence_quality: confirmed
+coverage_score: 0.64
 functions:
   - name: create
     import_path: twilio
@@ -179,3 +180,163 @@ functions:
         source: https://www.twilio.com/docs/usage/webhooks/webhooks-security
         sources:
           - https://www.twilio.com/docs/usage/webhooks/webhooks-security
+  - name: create
+    import_path: twilio
+    namespace: verificationCheck
+    description: >
+      Validates a verification code submitted by the user during 2FA. This is the
+      second half of the Twilio Verify flow — after verifications.create() sends the
+      code, verificationCheck.create() confirms the user entered it correctly.
+      Returns a VerificationCheckInstance with status 'approved' or 'pending'.
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/verify/api/verification-check
+      # Evidence: https://www.twilio.com/docs/errors/60202 (max check attempts, HTTP 429)
+      # Evidence: https://www.twilio.com/docs/errors/60200 (invalid parameter, HTTP 400)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (authentication error, HTTP 401)
+      # Error types confirmed from twilio-node source: RestException with .code and .status
+      - id: verification-check-no-try-catch
+        condition: verificationCheck.create() called without try-catch or .catch() handler
+        throws: RestException with error.code, error.status, and error.message
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: |
+          verify.services().verificationCheck.create() is called without try-catch.
+          This function makes HTTP requests to Twilio and can fail with: authentication
+          errors (20003), max check attempts (60202 — HTTP 429 after 5 wrong codes),
+          expired/already-approved verification returning 404, or invalid parameters
+          (60200). Unhandled promise rejections crash the app and expose 2FA errors
+          to users without a recovery path.
+        detector: |
+          If client.verify.v2.services().verificationCheck.create() is called in an
+          async context without try-catch wrapping the await, or without .catch() in
+          promise chain
+        required_handling: |
+          MUST wrap await verificationCheck.create() in try-catch. Handle error.code
+          60202 (max attempts — tell user to request a new code), 404 status (code
+          expired — prompt re-send), and error.code 20003 (auth failure — alert ops).
+        source: https://www.twilio.com/docs/verify/api/verification-check
+        sources:
+          - https://www.twilio.com/docs/verify/api/verification-check
+          - https://www.twilio.com/docs/errors/60202
+      - id: verification-check-expired-not-handled
+        condition: verificationCheck.create() does not handle 404 for expired verifications
+        throws: RestException with status 404
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: |
+          Twilio deletes the verification SID once it expires (after 10 minutes),
+          is approved, or max check attempts are reached. A subsequent
+          verificationCheck.create() call returns RestException with HTTP 404 status.
+          If not caught, this crashes the app and prevents the user from retrying
+          the 2FA flow.
+        detector: |
+          If try-catch around verificationCheck.create() does not check
+          error.status === 404 to handle expired/used verification tokens
+        required_handling: |
+          SHOULD check error.status === 404 in the catch block and direct the user
+          to request a new verification code via verifications.create().
+        source: https://www.twilio.com/docs/verify/api/verification-check
+        sources:
+          - https://www.twilio.com/docs/verify/api/verification-check
+      - id: verification-check-max-attempts-not-handled
+        condition: verificationCheck.create() does not handle error code 60202 (max check attempts)
+        throws: RestException with error.code 60202
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: |
+          Error 60202 occurs when the user has submitted 5 incorrect verification codes
+          for a single verification (HTTP 429). The verification is permanently locked
+          and a new one must be issued. Without specific handling, users see a generic
+          error and have no way to recover through the UI.
+        detector: |
+          If catch block around verificationCheck.create() does not check
+          error.code === 60202 (max check attempts reached)
+        required_handling: |
+          SHOULD check error.code === 60202 and show a user-friendly message explaining
+          that the code has expired and they must request a new verification code.
+          Automatically trigger verifications.create() to send a fresh code.
+        source: https://www.twilio.com/docs/errors/60202
+        sources:
+          - https://www.twilio.com/docs/errors/60202
+          - https://www.twilio.com/docs/verify/api/verification-check
+  - name: fetch
+    import_path: twilio
+    namespace: lookups.v2.phoneNumbers
+    description: >
+      Validates a phone number and retrieves carrier/line type intelligence from
+      Twilio Lookups v2. Used by SaaS apps to validate phone numbers before
+      sending SMS, detect VoIP lines, or check for number portability.
+      Called as: client.lookups.v2.phoneNumbers(number).fetch({ fields: 'line_type_intelligence' })
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/lookup/api (fetched 2026-04-14)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (authentication, HTTP 401)
+      # Evidence: https://www.twilio.com/docs/errors/21421 (invalid phone number)
+      # Error types confirmed from twilio-node source: RestException with .code and .status
+      - id: lookups-fetch-no-try-catch
+        condition: lookups.v2.phoneNumbers().fetch() called without try-catch
+        throws: RestException with error.code, error.status, and error.message
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          client.lookups.v2.phoneNumbers(number).fetch() is called without try-catch.
+          This function makes HTTP requests to Twilio Lookups API and can throw
+          RestException for: invalid phone number format (21421, HTTP 400),
+          authentication failure (20003, HTTP 401), or rate limiting (20429, HTTP 429).
+          Unhandled promise rejections crash the application.
+        detector: |
+          If client.lookups.v2.phoneNumbers() .fetch() is called in an async context
+          without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await phoneNumbers(number).fetch() in try-catch. For user-submitted
+          numbers, handle 21421 (invalid format) with a user-facing validation message.
+          Handle 20003 (auth failure) with ops alerting.
+        source: https://www.twilio.com/docs/lookup/api
+        sources:
+          - https://www.twilio.com/docs/lookup/api
+          - https://www.twilio.com/docs/errors/21421
+      - id: lookups-invalid-number-result-not-checked
+        condition: lookups.v2.phoneNumbers().fetch() result valid field not checked
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          The Lookups v2 API returns HTTP 200 for invalid/unrecognized phone numbers
+          but sets valid: false in the response body with a validation_errors array
+          (e.g., "TOO_LONG", "TOO_SHORT", "INVALID_COUNTRY_CODE"). If the caller
+          does not check phoneNumber.valid before using the result, they proceed
+          with an invalid number and subsequent messages.create() or calls.create()
+          will fail with error 21211 or 21421.
+        detector: |
+          If phoneNumbers(number).fetch() result is used without checking
+          result.valid === true or result.valid before proceeding to send SMS
+        required_handling: |
+          SHOULD check phoneNumber.valid === true after fetch(). If false, inspect
+          phoneNumber.validationErrors array and return appropriate user feedback
+          before attempting to send SMS or make calls.
+        source: https://www.twilio.com/docs/lookup/api
+        sources:
+          - https://www.twilio.com/docs/lookup/api
