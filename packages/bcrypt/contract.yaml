@@ -2,9 +2,10 @@ package: bcrypt
 semver: '>=5.0.0 <6.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-02'
+last_verified: '2026-04-13'
 status: production
 evidence_quality: confirmed
+coverage_score: 0.57
 functions:
   - name: hash
     import_path: bcrypt
@@ -33,6 +34,8 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
     postconditions:
+      # Evidence: seen in 13 primary firings across 8 repos in scan-bcrypt-2026-04-14.json
+      # Top affected: spacebarchat/server (⭐ 2k+), curveball/a12n-server, afteracademy/nodejs-backend-architecture-typescript
       - id: invalid-args
         condition: data or salt is null/undefined, or data is not a string/Buffer, or salt is not a string or number
         throws: >-
@@ -132,6 +135,8 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
     postconditions:
+      # Evidence: seen in 16 primary firings across 10 repos in scan-bcrypt-2026-04-14.json
+      # Top affected: spacebarchat/server (⭐ 2k+), amruthpillai/reactive-resume (⭐ 35k+), NarHakobyan/awesome-nest-boilerplate
       - id: invalid-args
         condition: data or hash is null/undefined, or data is not a string/Buffer, or hash is not a string
         throws: >-
@@ -259,6 +264,191 @@ functions:
         sources:
           - https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
         severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+  - name: hashSync
+    import_path: bcrypt
+    description: >-
+      Synchronously hashes a password or data string using bcrypt. Blocks the Node.js event loop
+      during hashing — recommended only for scripts and CLI tools, not web server request handlers.
+      If salt is a number, genSaltSync() is called internally.
+    postconditions:
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
+      # Error messages confirmed from source: 'data and salt arguments required' / type-mismatch message
+      - id: hash-sync-invalid-args
+        condition: data or salt is null/undefined, or data is not a string/Buffer, or salt is not a string or number
+        throws: >-
+          Error('data and salt arguments required') if either arg is null/undefined;
+          Error('data must be a string or Buffer and salt must either be a salt string or a number of rounds')
+          for type mismatches. Throws synchronously — not a rejected Promise.
+        required_handling: >
+          Caller MUST validate inputs before calling bcrypt.hashSync(). Wrap in try-catch since this is a
+          synchronous throw (not a rejected Promise). A missing try-catch will propagate the exception up
+          the call stack — in Express, this crashes the request handler unless a global error boundary catches it.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: hash-sync-event-loop-block
+        condition: Called in a web server request handler with saltRounds >= 10
+        throws: Does not throw — but blocks the Node.js event loop for 100ms–1s+ per call
+        required_handling: >
+          DO NOT call bcrypt.hashSync() inside Express/Fastify/Next.js route handlers or any code
+          on the request/response hot path. Use the async bcrypt.hash() instead. Blocking the event loop
+          during password hashing causes ALL concurrent HTTP requests to queue, leading to cascading latency
+          under load. This is a behavioral correctness issue, not just a performance concern.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: high
+    edge_cases:
+      - id: hash-sync-truncation-at-72-bytes
+        description: >-
+          bcrypt silently truncates input at 72 bytes. Passwords longer than 72 bytes that share the same
+          first 72 bytes hash to the same value. This is the same behavior as bcrypt.hash().
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+  - name: compareSync
+    import_path: bcrypt
+    description: >-
+      Synchronously compares plain-text data against a bcrypt hash. Returns a boolean.
+      Blocks the Node.js event loop during comparison — use bcrypt.compare() in request handlers.
+    postconditions:
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
+      # Error messages confirmed from source: 'data and hash arguments required' / type-mismatch
+      - id: compare-sync-invalid-args
+        condition: data or hash is null/undefined, or data is not a string/Buffer, or hash is not a string
+        throws: >-
+          Error('data and hash arguments required') if either arg is null/undefined;
+          Error('data must be a string or Buffer and hash must be a string') for type mismatches.
+          Throws synchronously.
+        required_handling: >
+          Caller MUST validate inputs before calling bcrypt.compareSync(). Wrap in try-catch.
+          A malformed hash string (e.g., not a valid bcrypt hash) will cause this function to throw —
+          it does NOT return false for an invalid hash format.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: compare-sync-event-loop-block
+        condition: Called in a web server request handler
+        throws: Does not throw — but blocks the Node.js event loop for 100ms–1s+ per call
+        required_handling: >
+          DO NOT call bcrypt.compareSync() inside Express/Fastify/Next.js route handlers.
+          Use bcrypt.compare() (async) instead. During login endpoints under load, using compareSync
+          serializes all auth checks — each login queues behind the previous one, causing login latency
+          to multiply linearly with concurrent users.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: high
+  - name: genSaltSync
+    import_path: bcrypt
+    description: >-
+      Synchronously generates a bcrypt salt with the specified number of rounds.
+      Blocks the event loop. Defaults to 10 rounds if rounds is falsy.
+    postconditions:
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Error messages confirmed from source
+      - id: gen-salt-sync-invalid-rounds
+        condition: rounds parameter is provided but is not a number (e.g., a string)
+        throws: Error('rounds must be a number'). Throws synchronously.
+        required_handling: >
+          Caller MUST ensure rounds is a number when provided. Wrap in try-catch.
+          Note: falsy values (0, null, undefined) are silently coerced to the default 10 rounds —
+          only non-number, truthy values throw.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: gen-salt-sync-invalid-minor
+        condition: minor parameter is provided but is not 'a' or 'b'
+        throws: Error('minor must be either "a" or "b"'). Throws synchronously.
+        required_handling: >
+          Only pass 'a' or 'b' as the minor version. Omit the parameter to use the default 'b'.
+          Passing any other string causes an immediate synchronous throw.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+  - name: getRounds
+    import_path: bcrypt
+    description: >-
+      Extracts the number of salt rounds embedded in a bcrypt hash string.
+      Synchronous utility function — does not perform hashing.
+      Used for validating whether stored hashes meet current security requirements.
+    postconditions:
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Error messages confirmed from source
+      - id: get-rounds-missing-hash
+        condition: hash argument is null or undefined
+        throws: Error('hash argument required'). Throws synchronously.
+        required_handling: >
+          Caller MUST check that the hash argument exists before calling getRounds(). Wrap in try-catch.
+          Common failure pattern: calling getRounds() during hash migration/audit over DB rows where
+          some rows have null password fields.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: get-rounds-invalid-type
+        condition: hash argument is not a string (e.g., a Buffer or number)
+        throws: Error('hash must be a string'). Throws synchronously.
+        required_handling: >
+          Caller MUST ensure the hash is a string. Wrap in try-catch.
+          Common failure pattern: passing a Buffer or TypeScript typed value that hasn't been
+          .toString()'d before passing to getRounds().
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
