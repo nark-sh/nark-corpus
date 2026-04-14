@@ -1,10 +1,11 @@
 package: "@aws-sdk/s3-request-presigner"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-13"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 functions:
   - name: getSignedUrl
@@ -12,7 +13,8 @@ functions:
     description: >
       Generates a pre-signed URL for an S3 command (GetObject, PutObject, DeleteObject, etc.).
       Resolves credentials and signs the request. Returns Promise<string>.
-      Throws on credential resolution failure, invalid credentials, or network errors.
+      Throws on credential resolution failure, invalid credentials, expiresIn exceeding 7 days,
+      or an invalid HTTP request object.
 
     postconditions:
       # Evidence: seen in 17 primary firings across 8 repos in scan-aws-sdk-s3-request-presigner-2026-04-11.json
@@ -49,38 +51,216 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
-  - name: createPresignedPost
-    import_path: "@aws-sdk/s3-request-presigner"
-    description: >
-      Creates a presigned POST policy for browser-based file uploads to S3.
-      Same credential resolution process as getSignedUrl. Returns Promise<PresignedPost>.
-
-    postconditions:
-      - id: presigner-post-credential-error
+      # Evidence: @smithy/signature-v4 dist-cjs/index.js — if (expiresIn > MAX_PRESIGNED_TTL) Promise.reject(...)
+      # MAX_PRESIGNED_TTL = 60 * 60 * 24 * 7 = 604800 seconds (7 days)
+      # Source: https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html
+      - id: presigner-expires-in-too-large
         condition: >
-          Credential resolution fails: same conditions as getSignedUrl
+          options.expiresIn is set to a value greater than 604800 (7 days in seconds).
+          This is a common mistake when developers confuse milliseconds with seconds,
+          pass Date.now() directly, or attempt to create "permanent" links.
         throws: >
-          CredentialsProviderError or generic Error. Same error surface as getSignedUrl.
+          Promise.reject() with the string message: "Signature version 4 presigned URLs
+          must have an expiration date less than one week in the future". This is a
+          string rejection (not an Error instance) from @smithy/signature-v4.
         required_handling: >
-          Caller MUST wrap createPresignedPost() in try-catch. Missing credentials
-          in serverless deployments cause unhandled rejections.
+          Caller MUST wrap getSignedUrl() in try-catch and validate expiresIn is <= 604800.
+          Note: if using temporary credentials (IAM role, STS), the URL will expire earlier
+          than expiresIn — at the point the underlying STS token expires.
+
+          Safe maximum:
+            const url = await getSignedUrl(s3Client, command, {
+              expiresIn: 3600, // 1 hour — well within the 7-day maximum
+            });
         sources:
-          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-s3-request-presigner/"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html"
+          - "https://github.com/smithy-lang/smithy-typescript/blob/main/packages/signature-v4/src/SignatureV4.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: @smithy/signature-v4 SignatureV4Base.js — throw new Error("Resolved credential object is not valid")
+      # Triggered when credentialProvider() returns an object missing accessKeyId or secretAccessKey fields
+      - id: presigner-invalid-credential-object
+        condition: >
+          The AWS credentials object returned by the credential provider is malformed:
+          missing accessKeyId, missing secretAccessKey, or either field is not a string.
+          Common when a custom credential provider returns a partial object, or when
+          environment variables are set to empty strings rather than being absent.
+        throws: >
+          Error("Resolved credential object is not valid") from @smithy/signature-v4.
+          This is distinct from CredentialsProviderError — the provider resolved
+          successfully but returned an unusable object.
+        required_handling: >
+          Caller MUST wrap getSignedUrl() in try-catch. Validate that AWS credentials
+          have both accessKeyId and secretAccessKey before calling. Check for empty
+          string values in addition to undefined.
+        sources:
+          - "https://github.com/smithy-lang/smithy-typescript/blob/main/packages/signature-v4/src/SignatureV4Base.ts"
         severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # S3RequestPresigner is the lower-level class underlying getSignedUrl.
+  # Used directly in frameworks, middleware, and advanced signing scenarios.
+  # Both methods delegate to @aws-sdk/signature-v4-multi-region for SigV4/SigV4a signing.
+  - name: S3RequestPresigner.presign
+    import_path: "@aws-sdk/s3-request-presigner"
+    description: >
+      Low-level presigning method on the S3RequestPresigner class. Takes a raw IHttpRequest
+      and signs it. Returns Promise<IHttpRequest>. Used internally by getSignedUrl and
+      directly by frameworks implementing custom presigning pipelines.
+      Default expiresIn is 900 seconds (15 minutes) unless overridden in options.
+
+    postconditions:
+      # Evidence: @smithy/signature-v4 dist-cjs/index.js — MAX_PRESIGNED_TTL check
+      # Evidence: @aws-sdk/signature-v4-multi-region dist-cjs/index.js — presign multi-region handling
+      - id: presigner-class-presign-expires-error
+        condition: >
+          options.expiresIn exceeds 604800 seconds (7 days). Same limit as getSignedUrl.
+          Since the default is 900s, this only triggers with explicit large values.
+        throws: >
+          Promise.reject() with string "Signature version 4 presigned URLs must have
+          an expiration date less than one week in the future". String rejection, not Error instance.
+        required_handling: >
+          Wrap in try-catch. Ensure expiresIn <= 604800 when passed explicitly.
+        sources:
+          - "https://github.com/smithy-lang/smithy-typescript/blob/main/packages/signature-v4/src/SignatureV4.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: @aws-sdk/signature-v4-multi-region dist-cjs/index.js —
+      # throw new Error(`presign with signingRegion '*' is only supported when using the CRT dependency...`)
+      - id: presigner-class-presign-sigv4a-missing-crt
+        condition: >
+          The S3 bucket uses S3 Multi-Region Access Points (MRAPs) requiring SigV4a signing
+          (signingRegion = '*'). The @aws-sdk/signature-v4-crt or @aws-sdk/signature-v4a
+          package is not installed/registered. This occurs when using MRAPs in serverless
+          environments where native addons are unavailable.
+        throws: >
+          Error: "presign with signingRegion '*' is only supported when using the CRT
+          dependency @aws-sdk/signature-v4-crt. Please check whether you have installed
+          the '@aws-sdk/signature-v4-crt' package explicitly."
+        required_handling: >
+          Wrap in try-catch. If using S3 Multi-Region Access Points, install and register
+          @aws-sdk/signature-v4-crt (native module, Node.js only) or @aws-sdk/signature-v4a
+          (pure JS). Cannot be used in browser or edge runtimes without the JS implementation.
+        sources:
+          - "https://github.com/aws/aws-sdk-js-v3/tree/main/packages/signature-v4-multi-region"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiRegionAccessPoints.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: @smithy/signature-v4 SignatureV4Base.js
+      - id: presigner-class-presign-invalid-credentials
+        condition: >
+          The credential object passed to the signer is malformed (missing accessKeyId
+          or secretAccessKey). Same as presigner-invalid-credential-object for getSignedUrl.
+        throws: >
+          Error("Resolved credential object is not valid")
+        required_handling: >
+          Wrap in try-catch. Validate credentials object before constructing S3RequestPresigner.
+        sources:
+          - "https://github.com/smithy-lang/smithy-typescript/blob/main/packages/signature-v4/src/SignatureV4Base.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: S3RequestPresigner.presignWithCredentials
+    import_path: "@aws-sdk/s3-request-presigner"
+    description: >
+      Variant of presign that accepts an explicit AwsCredentialIdentity object instead of
+      resolving credentials from the signer's credential provider. Useful for generating
+      presigned URLs on behalf of a different user's credentials (e.g., STS AssumeRole).
+      NOT supported when signingRegion is '*' (S3 Multi-Region Access Points).
+
+    postconditions:
+      # Evidence: @aws-sdk/signature-v4-multi-region dist-cjs/index.js —
+      # throw new Error("Method presignWithCredentials is not supported for [signingRegion=*].")
+      - id: presigner-presign-with-credentials-mrap-unsupported
+        condition: >
+          options.signingRegion is '*' (required for S3 Multi-Region Access Points).
+          presignWithCredentials explicitly does not support MRAP / SigV4a signing.
+          This is a hard limitation distinct from the CRT availability check — even with
+          CRT installed, this method throws.
+        throws: >
+          Error("Method presignWithCredentials is not supported for [signingRegion=*].")
+          Thrown synchronously within the returned Promise.
+        required_handling: >
+          Wrap in try-catch. For MRAP buckets, use S3RequestPresigner.presign() instead,
+          which does support SigV4a via CRT. Do not use presignWithCredentials with MRAPs.
+        sources:
+          - "https://github.com/aws/aws-sdk-js-v3/tree/main/packages/signature-v4-multi-region"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiRegionAccessPoints.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: @smithy/signature-v4 dist-cjs — MAX_PRESIGNED_TTL validation applies to all presign paths
+      - id: presigner-presign-with-credentials-expires-error
+        condition: >
+          options.expiresIn exceeds 604800 seconds (7 days). Same MAX_PRESIGNED_TTL limit
+          applies to all presigning paths including presignWithCredentials.
+        throws: >
+          Promise.reject() with string "Signature version 4 presigned URLs must have
+          an expiration date less than one week in the future".
+        required_handling: >
+          Wrap in try-catch. Validate expiresIn <= 604800.
+        sources:
+          - "https://github.com/smithy-lang/smithy-typescript/blob/main/packages/signature-v4/src/SignatureV4.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
 
 notes:
   - "Scan 2026-04-11: 15 repos scanned, 8 affected (53%), 17 violations. Only getSignedUrl triggered (not createPresignedPost — less commonly used). FP check: 0/20 repos. evidence_quality upgraded to confirmed."
   - "getSignedUrl is a standalone function, not a method — import { getSignedUrl } from '@aws-sdk/s3-request-presigner'"
-  - "Both functions make synchronous credential resolution (no network call in most cases when using env var credentials)"
-  - "createPresignedPost is less common than getSignedUrl but has the same error surface"
+  - "createPresignedPost is NOT exported by this package — it is in @aws-sdk/s3-presigned-post (a separate package). Previous contract entry was incorrect."
+  - "S3RequestPresigner.presign is the internal implementation called by getSignedUrl; used directly in framework middleware."
+  - "MAX_PRESIGNED_TTL = 604800 seconds (7 days) — enforced by @smithy/signature-v4; applies to all presign methods."
+  - "expiresIn defaults: getSignedUrl passes through options (default 3600 if not set), S3RequestPresigner.presign defaults to 900s (15 min)."
+  - "SigV4a (multi-region signing, signingRegion='*') requires @aws-sdk/signature-v4-crt (native/Node.js) or @aws-sdk/signature-v4a (pure JS browser-compatible)."
+  - "presignWithCredentials does NOT support MRAP (signingRegion='*') even with CRT installed — hard limitation."
   - "AWS SDK v3 only — this package does not exist in v2"
   - "S3Client must be initialized with region or it will throw a NoRegionError"
+  - "Deepen pass 21 (deepen-stream-2, 2026-04-13): Added S3RequestPresigner.presign and S3RequestPresigner.presignWithCredentials entries. Added expiresIn and invalid-credential-object postconditions to getSignedUrl. Removed incorrect createPresignedPost (wrong package). Coverage: 1/2 (50%) -> 3/3 (100%)."
 
 tags:
   - aws
@@ -96,3 +276,4 @@ related_packages:
   - "@aws-sdk/client-s3"
   - "@aws-sdk/client-s3-control"
   - "@aws-sdk/lib-storage"
+  - "@aws-sdk/s3-presigned-post"
