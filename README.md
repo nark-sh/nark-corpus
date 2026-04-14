@@ -1,12 +1,12 @@
 # nark-corpus
 
-**Behavioral contracts for npm packages — YAML definitions of error handling requirements.**
+**Contract library for nark — YAML definitions of error handling requirements for 169+ npm packages.**
 
 This is the contract library used by [nark](https://github.com/nark-sh/nark), the contract coverage scanner. It contains 169+ contracts that describe how npm packages fail at runtime and what error handling callers must provide.
 
-## What's a Behavioral Contract?
+## What's a Contract?
 
-A behavioral contract is a YAML file that describes:
+A contract is a YAML file that describes:
 - Which functions/methods in a package can fail
 - How they fail (thrown errors, rejected promises, error events)
 - What callers must do to handle those failures
@@ -80,20 +80,20 @@ nark-corpus/
 ### With nark (recommended)
 
 ```bash
-# nark bundles nark-corpus automatically
+npm install nark nark-corpus
 npx nark --tsconfig ./tsconfig.json
 ```
 
 ### Programmatic access
 
 ```javascript
-import { getCorpusPath, listPackages } from 'nark-corpus';
+import { getCorpusPath, getSchemaPath, getCorpusInfo } from 'nark-corpus';
 
-// Get the path to the corpus directory
+// Get the path to the packages directory
 const corpusPath = getCorpusPath();
 
-// List all available packages
-const packages = listPackages();
+// Get version and path info
+const info = getCorpusInfo();
 ```
 
 ### Validate contracts
