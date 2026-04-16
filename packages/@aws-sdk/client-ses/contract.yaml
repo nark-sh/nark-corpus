@@ -1,25 +1,28 @@
 package: "@aws-sdk/client-ses"
 semver: "^3.0.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71
-# coverage_score = 17 contracted / 24 total relevant API functions (17 contracted + 7 intentionally omitted)
+coverage_score: 0.77
+# coverage_score = 24 contracted / 31 total relevant API functions (24 contracted + 7 intentionally omitted)
 # Previously contracted (7): send, SendTemplatedEmailCommand, SendBulkTemplatedEmailCommand,
 #   SendRawEmailCommand, SendCustomVerificationEmailCommand, CreateTemplateCommand, UpdateTemplateCommand
 # Previously contracted pass 2 (6): SendEmailCommand, TestRenderTemplateCommand,
 #   CreateConfigurationSetCommand, CreateConfigurationSetEventDestinationCommand,
 #   CreateCustomVerificationEmailTemplateCommand, UpdateCustomVerificationEmailTemplateCommand
-# Newly contracted this pass (4): SendBounceCommand, UpdateConfigurationSetEventDestinationCommand,
+# Previously contracted pass 3 (4): SendBounceCommand, UpdateConfigurationSetEventDestinationCommand,
 #   PutConfigurationSetDeliveryOptionsCommand, DeleteConfigurationSetCommand
-# (PutIdentityPolicyCommand covered via send() generic postcondition - InvalidPolicy maps to SESServiceException)
-# Intentionally omitted (3): VerifyEmailIdentityCommand, VerifyDomainIdentityCommand,
+# Newly contracted this pass (7): CreateReceiptRuleSetCommand, CreateReceiptRuleCommand,
+#   SetActiveReceiptRuleSetCommand, CreateConfigurationSetTrackingOptionsCommand,
+#   UpdateConfigurationSetSendingEnabledCommand, PutIdentityPolicyCommand,
+#   DeleteConfigurationSetEventDestinationCommand
+# Intentionally omitted (7): VerifyEmailIdentityCommand (setup only, generic error),
+#   VerifyDomainIdentityCommand (setup only, generic error),
 #   DeleteTemplateCommand (only SESServiceException generic), GetTemplateCommand,
 #   ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
-# All omitted functions are either read-only GETs, idempotent deletes, or have no distinct errors
-#   beyond generic SESServiceException already covered by the generic send() postcondition.
+#   — all are setup/read-only with no distinct error contracts beyond generic SESServiceException
 # Note: The full SDK has 72 commands; the above counts only those relevant for SaaS app runtime code.
 
 functions:
@@ -1200,6 +1203,445 @@ functions:
         sources:
           - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetCommand/"
           - "https://docs.aws.amazon.com/ses/latest/APIReference/API_DeleteConfigurationSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateReceiptRuleSetCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates an empty receipt rule set. A receipt rule set is a collection of
+      receipt rules that define how Amazon SES handles inbound email for your
+      domain. After creating a rule set, you must add receipt rules and then
+      call SetActiveReceiptRuleSetCommand to activate it. Used during application
+      setup to configure inbound email processing pipelines (support tickets,
+      inbound webhook emails, verification callbacks). Rate-limited to 1 call
+      per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleSetCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRuleSet.html
+      # Error types confirmed from dist-types/commands/CreateReceiptRuleSetCommand.d.ts:
+      # AlreadyExistsException, LimitExceededException
+      - id: ses-create-receipt-rule-set-already-exists
+        condition: >-
+          sesClient.send(new CreateReceiptRuleSetCommand({ RuleSetName: name }))
+          called with a RuleSetName that already exists in the SES account
+        throws: AlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. AlreadyExistsException is thrown when a receipt
+          rule set with the same name already exists. In idempotent deployment
+          scripts, catch this and skip (rule set already exists — this is recoverable).
+          Do NOT let this exception fail a CI/CD deployment pipeline.
+          Pattern: try { create } catch(AlreadyExistsException) { skip or verify rules }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRuleSet.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-receipt-rule-set-limit-exceeded
+        condition: >-
+          sesClient.send(new CreateReceiptRuleSetCommand(...)) called when the
+          AWS account has reached the maximum number of receipt rule sets
+        throws: LimitExceededException
+        required_handling: >-
+          MUST wrap in try-catch. LimitExceededException is thrown when the
+          account's receipt rule set quota is exhausted. Catch block SHOULD log
+          the error and alert operators to review and remove unused rule sets.
+          This limit blocks deployment automation and prevents inbound email
+          routing from being configured in new environments.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRuleSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateReceiptRuleCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates a receipt rule within an existing receipt rule set. Receipt rules
+      define what SES does when an email is received for a matching recipient
+      address — save to S3, invoke a Lambda function, forward to SNS, or bounce.
+      Most commonly used to build inbound email processing pipelines: support
+      ticket ingestion, webhook callbacks, user-generated email parsing.
+      The Lambda, S3, and SNS actions require IAM permissions for SES to invoke
+      them. Misconfigured actions throw distinct exceptions at rule-creation time
+      rather than at email-receipt time. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRule.html
+      # Error types confirmed from dist-types/commands/CreateReceiptRuleCommand.d.ts:
+      # AlreadyExistsException, InvalidLambdaFunctionException, InvalidS3ConfigurationException,
+      # InvalidSnsTopicException, LimitExceededException, RuleDoesNotExistException,
+      # RuleSetDoesNotExistException
+      - id: ses-create-receipt-rule-invalid-action-config
+        condition: >-
+          sesClient.send(new CreateReceiptRuleCommand({ ..., Rule: { Actions: [{
+          LambdaAction: { FunctionArn: invalidArn }, S3Action: { BucketName: badBucket },
+          or SNSAction: { TopicArn: invalidTopic } }] } })) where any action target
+          is invalid, does not exist, or lacks the required IAM permissions for SES
+        throws: >-
+          InvalidLambdaFunctionException — Lambda ARN is invalid, function does not exist,
+          or SES lacks invoke permissions on the function;
+          InvalidS3ConfigurationException — S3 bucket does not exist, is in a different
+          region, lacks a bucket policy granting SES PutObject permission, or the KMS
+          key is invalid;
+          InvalidSnsTopicException — SNS topic ARN is invalid, topic does not exist,
+          or SES lacks Publish permission on the topic.
+        required_handling: >-
+          MUST wrap in try-catch. These exceptions are thrown at rule-creation time,
+          not at email-receipt time — a misconfigured action is rejected before the rule
+          takes effect. This is an early-detection safety mechanism.
+          Catch block SHOULD log the specific exception type to identify which action
+          target (Lambda/S3/SNS) has the configuration problem, and fix IAM permissions
+          before retrying. These errors commonly occur when deploying to a new AWS
+          account or region where SES resource-based policies have not been set up.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRule.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-create-receipt-rule-ruleset-not-found
+        condition: >-
+          sesClient.send(new CreateReceiptRuleCommand({ RuleSetName: name, ... }))
+          where name references a receipt rule set that does not exist
+        throws: RuleSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. RuleSetDoesNotExistException is thrown when
+          the specified RuleSetName does not exist. Deployment scripts that add
+          rules to a rule set must ensure the rule set was created first
+          (via CreateReceiptRuleSetCommand). Catch block SHOULD attempt to create
+          the rule set first, then retry adding the rule.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptRule.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-receipt-rule-already-exists
+        condition: >-
+          sesClient.send(new CreateReceiptRuleCommand({ ..., Rule: { Name: ruleName } }))
+          called with a Rule.Name that already exists in the specified rule set
+        throws: AlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. AlreadyExistsException is thrown when a rule
+          with the same name already exists in the rule set. In idempotent deployment
+          scripts, catch this and skip or switch to UpdateReceiptRuleCommand to
+          update the existing rule. Do NOT fail the deployment — the rule already exists.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptRuleCommand/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: SetActiveReceiptRuleSetCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Activates a specified receipt rule set to make it the active set for inbound
+      email processing. Only one receipt rule set can be active at a time. Calling
+      with RuleSetName: null disables all inbound email processing entirely. Used
+      in deployment pipelines when switching between rule sets (e.g., blue/green
+      inbound email routing) or when initially enabling inbound email processing
+      after setup. If this call fails, inbound emails are processed by the previously
+      active rule set (or not processed if no set was active). Rate-limited to 1
+      call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SetActiveReceiptRuleSetCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SetActiveReceiptRuleSet.html
+      # Error type confirmed from dist-types/commands/SetActiveReceiptRuleSetCommand.d.ts:
+      # RuleSetDoesNotExistException
+      - id: ses-set-active-receipt-rule-set-not-found
+        condition: >-
+          sesClient.send(new SetActiveReceiptRuleSetCommand({ RuleSetName: name }))
+          where name references a receipt rule set that does not exist in the account
+        throws: RuleSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. RuleSetDoesNotExistException is thrown when the
+          specified RuleSetName does not exist. Deployment scripts that activate a
+          rule set after creating it must handle this in case the creation step failed
+          or the name is misspelled. When this exception is thrown, the previously
+          active rule set remains active — inbound email routing is NOT disrupted,
+          but the intended new routing is not applied.
+          Catch block SHOULD log the missing rule set name and alert operators.
+          Never silently swallow this error — it means inbound email routing was
+          NOT switched as intended.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SetActiveReceiptRuleSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SetActiveReceiptRuleSet.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: CreateConfigurationSetTrackingOptionsCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Adds open and click tracking options to an existing SES configuration set.
+      Tracking options configure a custom redirect domain for tracking links (clicks
+      and opens are recorded by SES redirecting through a tracking endpoint). Used
+      in email marketing and engagement analytics pipelines. The custom redirect
+      domain must be verified in SES before it can be used. Rate-limited to 1 call
+      per second. Each configuration set can have only one TrackingOptions object.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetTrackingOptionsCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetTrackingOptions.html
+      # Error types confirmed from dist-types/commands/CreateConfigurationSetTrackingOptionsCommand.d.ts:
+      # ConfigurationSetDoesNotExistException, InvalidTrackingOptionsException,
+      # TrackingOptionsAlreadyExistsException
+      - id: ses-create-tracking-options-invalid-domain
+        condition: >-
+          sesClient.send(new CreateConfigurationSetTrackingOptionsCommand({
+          ConfigurationSetName: name, TrackingOptions: { CustomRedirectDomain: domain } }))
+          where domain is not verified in SES or is not a valid domain/subdomain
+        throws: InvalidTrackingOptionsException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidTrackingOptionsException is thrown when
+          the CustomRedirectDomain is not a verified SES identity or is not a valid
+          domain format. This error is distinct from the configuration set not existing.
+          Catch block SHOULD log the invalid domain and alert operators to verify it
+          in SES first (via VerifyDomainIdentityCommand). Email opens and clicks will
+          NOT be tracked until tracking options are correctly configured.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetTrackingOptionsCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetTrackingOptions.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-tracking-options-already-exists
+        condition: >-
+          sesClient.send(new CreateConfigurationSetTrackingOptionsCommand(...))
+          called on a configuration set that already has a TrackingOptions object
+        throws: TrackingOptionsAlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. TrackingOptionsAlreadyExistsException is thrown
+          when a TrackingOptions object already exists on the specified configuration
+          set — only one is allowed per set. In idempotent deployment scripts, catch
+          this and either skip or switch to UpdateConfigurationSetTrackingOptionsCommand
+          to modify the existing tracking domain.
+          Pattern: try { create } catch(TrackingOptionsAlreadyExistsException) { update instead }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetTrackingOptionsCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetTrackingOptions.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-tracking-options-config-set-not-found
+        condition: >-
+          sesClient.send(new CreateConfigurationSetTrackingOptionsCommand({
+          ConfigurationSetName: name, ... })) where name does not exist
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. Deployment scripts that add tracking options
+          to a configuration set must ensure the configuration set was created first.
+          Catch block SHOULD create the configuration set, then retry.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetTrackingOptionsCommand/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: UpdateConfigurationSetSendingEnabledCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Enables or disables email sending for all messages sent using a specific
+      configuration set. Used to temporarily pause sending in response to elevated
+      bounce or complaint rates (typically triggered by CloudWatch alarms on SES
+      reputation metrics). Disabling sending on a configuration set is the primary
+      automated reputation protection mechanism — when bounce rate exceeds ~5% or
+      complaint rate exceeds ~0.1%, SES may suspend the account unless sending is
+      paused. Critical for automated reputation management workflows.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetSendingEnabledCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateConfigurationSetSendingEnabled.html
+      # Error type confirmed from dist-types/commands/UpdateConfigurationSetSendingEnabledCommand.d.ts:
+      # ConfigurationSetDoesNotExistException
+      - id: ses-update-config-set-sending-enabled-not-found
+        condition: >-
+          sesClient.send(new UpdateConfigurationSetSendingEnabledCommand({
+          ConfigurationSetName: name, Enabled: false })) where name does not exist,
+          typically in an automated CloudWatch → Lambda → SES reputation protection
+          pipeline that references a hardcoded or environment-variable-sourced config set name
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown
+          when the named configuration set does not exist. This is critical in
+          automated reputation management pipelines — if the exception is unhandled,
+          the Lambda function crashes without pausing email sending, allowing bounce
+          and complaint rates to continue accumulating and potentially triggering
+          an AWS account-level sending suspension.
+          Catch block MUST alert on-call — failed reputation protection is a SEV-1
+          incident risk. Log the configuration set name and verify it exists in
+          the target AWS account/region.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetSendingEnabledCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateConfigurationSetSendingEnabled.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: PutIdentityPolicyCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Adds or updates a sending authorization policy for a verified SES identity
+      (email address or domain). Sending authorization policies enable the identity
+      owner to authorize other AWS accounts or IAM principals to send email from
+      the identity. Used in multi-tenant SaaS applications where customers send
+      email via the platform's verified SES identity, and in cross-account email
+      architectures. Policy must be valid JSON conforming to SES authorization
+      policy syntax and cannot exceed 4 KB. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/PutIdentityPolicyCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_PutIdentityPolicy.html
+      # Error type confirmed from dist-types/commands/PutIdentityPolicyCommand.d.ts:
+      # InvalidPolicyException
+      - id: ses-put-identity-policy-invalid
+        condition: >-
+          sesClient.send(new PutIdentityPolicyCommand({ Identity: identity,
+          PolicyName: name, Policy: policyJson })) where policyJson is malformed
+          JSON, exceeds 4 KB, has invalid IAM principals or actions, or does not
+          conform to SES authorization policy syntax
+        throws: InvalidPolicyException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidPolicyException is thrown when the policy
+          document is syntactically invalid, structurally invalid, or exceeds the
+          4 KB size limit. The policy is NOT applied — the previous policy (if any)
+          is preserved. In multi-tenant SaaS applications where customers configure
+          sending authorization policies, an unhandled InvalidPolicyException will
+          crash the provisioning endpoint, leaving the customer unable to send email
+          through the platform.
+          Catch block SHOULD extract the specific policy error from the exception
+          message (AWS includes details about what is invalid) and return a meaningful
+          error to the caller. Validate policy JSON structure and size before calling.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/PutIdentityPolicyCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_PutIdentityPolicy.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: DeleteConfigurationSetEventDestinationCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Deletes an event destination from an existing SES configuration set. Event
+      destinations route sending events (bounces, complaints, deliveries) to
+      CloudWatch, Kinesis Firehose, or SNS. Called during infrastructure cleanup,
+      when rotating monitoring backends, or when removing redundant event destinations.
+      Unlike deleting the configuration set itself, this operation removes only one
+      destination while preserving others. Not idempotent — deleting a non-existent
+      destination throws an exception. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetEventDestinationCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_DeleteConfigurationSetEventDestination.html
+      # Error types confirmed from dist-types/commands/DeleteConfigurationSetEventDestinationCommand.d.ts:
+      # ConfigurationSetDoesNotExistException, EventDestinationDoesNotExistException
+      - id: ses-delete-event-dest-not-found
+        condition: >-
+          sesClient.send(new DeleteConfigurationSetEventDestinationCommand({
+          ConfigurationSetName: csName, EventDestinationName: destName }))
+          where destName does not exist in the specified configuration set
+        throws: EventDestinationDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. EventDestinationDoesNotExistException is thrown
+          when the destination name does not exist in the configuration set.
+          Unlike S3 object deletion, SES event destination deletion is NOT idempotent
+          — calling it twice throws on the second call. Cleanup scripts and test
+          teardown code that unconditionally delete event destinations will throw
+          on re-runs.
+          Catch block SHOULD either check existence first with DescribeConfigurationSet,
+          or catch EventDestinationDoesNotExistException and treat as success (already
+          deleted). Log the missing destination name for audit purposes.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_DeleteConfigurationSetEventDestination.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-delete-event-dest-config-set-not-found
+        condition: >-
+          sesClient.send(new DeleteConfigurationSetEventDestinationCommand({
+          ConfigurationSetName: csName, ... })) where csName does not exist
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown
+          when the parent configuration set does not exist. Cleanup scripts that
+          tear down an entire SES configuration (config set + event destinations)
+          must handle both the case where the config set is already gone and where
+          only specific destinations are missing.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetEventDestinationCommand/"
         severity: error
         business_impact:
           incident_label: DOWNTIME

@@ -34,6 +34,17 @@
  *   - PutConfigurationSetDeliveryOptionsCommand  postconditions: ses-put-delivery-options-config-set-not-found,
  *       ses-put-delivery-options-invalid
  *   - DeleteConfigurationSetCommand  postconditions: ses-delete-config-set-not-found
+ *   - CreateReceiptRuleSetCommand  postconditions: ses-create-receipt-rule-set-already-exists,
+ *       ses-create-receipt-rule-set-limit-exceeded
+ *   - CreateReceiptRuleCommand  postconditions: ses-create-receipt-rule-invalid-action-config,
+ *       ses-create-receipt-rule-ruleset-not-found, ses-create-receipt-rule-already-exists
+ *   - SetActiveReceiptRuleSetCommand  postcondition: ses-set-active-receipt-rule-set-not-found
+ *   - CreateConfigurationSetTrackingOptionsCommand  postconditions: ses-create-tracking-options-invalid-domain,
+ *       ses-create-tracking-options-already-exists, ses-create-tracking-options-config-set-not-found
+ *   - UpdateConfigurationSetSendingEnabledCommand  postcondition: ses-update-config-set-sending-enabled-not-found
+ *   - PutIdentityPolicyCommand  postcondition: ses-put-identity-policy-invalid
+ *   - DeleteConfigurationSetEventDestinationCommand  postconditions: ses-delete-event-dest-not-found,
+ *       ses-delete-event-dest-config-set-not-found
  *
  * Detection pattern:
  *   - SESClient is imported from @aws-sdk/client-ses
@@ -60,6 +71,13 @@ import {
   UpdateConfigurationSetEventDestinationCommand,
   PutConfigurationSetDeliveryOptionsCommand,
   DeleteConfigurationSetCommand,
+  CreateReceiptRuleSetCommand,
+  CreateReceiptRuleCommand,
+  SetActiveReceiptRuleSetCommand,
+  CreateConfigurationSetTrackingOptionsCommand,
+  UpdateConfigurationSetSendingEnabledCommand,
+  PutIdentityPolicyCommand,
+  DeleteConfigurationSetEventDestinationCommand,
 } from '@aws-sdk/client-ses';
 
 const sesClient = new SESClient({ region: 'us-east-1' });
@@ -735,6 +753,272 @@ export async function deleteConfigurationSetIdempotent(configSetName: string) {
     if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
       // Already deleted — treat as success
       console.log('Configuration set already deleted:', configSetName);
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. CreateReceiptRuleSetCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-receipt-rule-set-already-exists
+// @expect-violation: ses-create-receipt-rule-set-limit-exceeded
+export async function createReceiptRuleSetNoCatch(ruleSetName: string) {
+  // SHOULD_FIRE: ses-create-receipt-rule-set-* — CreateReceiptRuleSetCommand throws
+  //   AlreadyExistsException or LimitExceededException, no try-catch
+  await sesClient.send(new CreateReceiptRuleSetCommand({
+    RuleSetName: ruleSetName,
+  }));
+}
+
+// @expect-clean
+export async function createReceiptRuleSetIdempotent(ruleSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateReceiptRuleSetCommand inside try-catch with AlreadyExists handling
+    await sesClient.send(new CreateReceiptRuleSetCommand({
+      RuleSetName: ruleSetName,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AlreadyExistsException') {
+      // Rule set already exists — idempotent deployment success
+      console.log('Receipt rule set already exists, skipping:', ruleSetName);
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. CreateReceiptRuleCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-receipt-rule-invalid-action-config
+// @expect-violation: ses-create-receipt-rule-ruleset-not-found
+// @expect-violation: ses-create-receipt-rule-already-exists
+export async function createReceiptRuleNoCatch(ruleSetName: string, lambdaArn: string) {
+  // SHOULD_FIRE: ses-create-receipt-rule-* — CreateReceiptRuleCommand throws InvalidLambdaFunctionException,
+  //   RuleSetDoesNotExistException, AlreadyExistsException, no try-catch
+  await sesClient.send(new CreateReceiptRuleCommand({
+    RuleSetName: ruleSetName,
+    Rule: {
+      Name: 'ProcessInboundEmails',
+      Enabled: true,
+      Actions: [{
+        LambdaAction: {
+          FunctionArn: lambdaArn,
+          InvocationType: 'Event',
+        },
+      }],
+      ScanEnabled: true,
+    },
+  }));
+}
+
+// @expect-clean
+export async function createReceiptRuleWithCatch(ruleSetName: string, lambdaArn: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateReceiptRuleCommand inside try-catch with action-config error handling
+    await sesClient.send(new CreateReceiptRuleCommand({
+      RuleSetName: ruleSetName,
+      Rule: {
+        Name: 'ProcessInboundEmails',
+        Enabled: true,
+        Actions: [{
+          LambdaAction: {
+            FunctionArn: lambdaArn,
+            InvocationType: 'Event',
+          },
+        }],
+        ScanEnabled: true,
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'InvalidLambdaFunctionException') {
+      console.error('SES cannot invoke Lambda — check IAM permissions and ARN:', lambdaArn, err.message);
+      throw err;
+    } else if (err instanceof Error && err.name === 'RuleSetDoesNotExistException') {
+      console.error('Receipt rule set does not exist:', ruleSetName);
+      throw err;
+    } else if (err instanceof Error && err.name === 'AlreadyExistsException') {
+      console.log('Receipt rule already exists, skipping');
+      return;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. SetActiveReceiptRuleSetCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-set-active-receipt-rule-set-not-found
+export async function setActiveReceiptRuleSetNoCatch(ruleSetName: string) {
+  // SHOULD_FIRE: ses-set-active-receipt-rule-set-not-found — SetActiveReceiptRuleSetCommand throws
+  //   RuleSetDoesNotExistException, no try-catch. Silent failure: inbound routing not switched.
+  await sesClient.send(new SetActiveReceiptRuleSetCommand({
+    RuleSetName: ruleSetName,
+  }));
+}
+
+// @expect-clean
+export async function setActiveReceiptRuleSetWithCatch(ruleSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: SetActiveReceiptRuleSetCommand inside try-catch
+    await sesClient.send(new SetActiveReceiptRuleSetCommand({
+      RuleSetName: ruleSetName,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'RuleSetDoesNotExistException') {
+      // Rule set does not exist — inbound routing was NOT switched
+      console.error('Receipt rule set does not exist — inbound email routing unchanged:', ruleSetName);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. CreateConfigurationSetTrackingOptionsCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-tracking-options-invalid-domain
+// @expect-violation: ses-create-tracking-options-already-exists
+// @expect-violation: ses-create-tracking-options-config-set-not-found
+export async function createTrackingOptionsNoCatch(configSetName: string, domain: string) {
+  // SHOULD_FIRE: ses-create-tracking-options-* — CreateConfigurationSetTrackingOptionsCommand throws
+  //   InvalidTrackingOptionsException, TrackingOptionsAlreadyExistsException,
+  //   ConfigurationSetDoesNotExistException, no try-catch
+  await sesClient.send(new CreateConfigurationSetTrackingOptionsCommand({
+    ConfigurationSetName: configSetName,
+    TrackingOptions: { CustomRedirectDomain: domain },
+  }));
+}
+
+// @expect-clean
+export async function createTrackingOptionsIdempotent(configSetName: string, domain: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateConfigurationSetTrackingOptionsCommand inside try-catch
+    await sesClient.send(new CreateConfigurationSetTrackingOptionsCommand({
+      ConfigurationSetName: configSetName,
+      TrackingOptions: { CustomRedirectDomain: domain },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TrackingOptionsAlreadyExistsException') {
+      // Already configured — idempotent deployment success
+      console.log('Tracking options already exist for config set, skipping:', configSetName);
+      return;
+    } else if (err instanceof Error && err.name === 'InvalidTrackingOptionsException') {
+      console.error('Custom redirect domain is not verified in SES:', domain);
+      throw err;
+    } else if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      console.error('Configuration set does not exist:', configSetName);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. UpdateConfigurationSetSendingEnabledCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-update-config-set-sending-enabled-not-found
+export async function pauseEmailSendingNoCatch(configSetName: string) {
+  // SHOULD_FIRE: ses-update-config-set-sending-enabled-not-found — UpdateConfigurationSetSendingEnabledCommand
+  //   throws ConfigurationSetDoesNotExistException, no try-catch.
+  //   Critical: reputation management pipeline crashes, bounces continue accumulating.
+  await sesClient.send(new UpdateConfigurationSetSendingEnabledCommand({
+    ConfigurationSetName: configSetName,
+    Enabled: false,
+  }));
+}
+
+// @expect-clean
+export async function pauseEmailSendingWithCatch(configSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateConfigurationSetSendingEnabledCommand inside try-catch
+    await sesClient.send(new UpdateConfigurationSetSendingEnabledCommand({
+      ConfigurationSetName: configSetName,
+      Enabled: false,
+    }));
+    console.log('Email sending paused for config set:', configSetName);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      // CRITICAL: could not pause sending — escalate immediately
+      console.error('CRITICAL: Failed to pause email sending — config set does not exist:', configSetName);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. PutIdentityPolicyCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-put-identity-policy-invalid
+export async function putIdentityPolicyNoCatch(identity: string, policyName: string, policy: string) {
+  // SHOULD_FIRE: ses-put-identity-policy-invalid — PutIdentityPolicyCommand throws
+  //   InvalidPolicyException when policy is malformed or > 4KB, no try-catch
+  await sesClient.send(new PutIdentityPolicyCommand({
+    Identity: identity,
+    PolicyName: policyName,
+    Policy: policy,
+  }));
+}
+
+// @expect-clean
+export async function putIdentityPolicyWithCatch(identity: string, policyName: string, policy: string) {
+  try {
+    // SHOULD_NOT_FIRE: PutIdentityPolicyCommand inside try-catch with InvalidPolicy handling
+    await sesClient.send(new PutIdentityPolicyCommand({
+      Identity: identity,
+      PolicyName: policyName,
+      Policy: policy,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'InvalidPolicyException') {
+      console.error('SES policy is invalid — check JSON syntax and 4KB limit:', policyName, err.message);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. DeleteConfigurationSetEventDestinationCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-delete-event-dest-not-found
+// @expect-violation: ses-delete-event-dest-config-set-not-found
+export async function deleteEventDestinationNoCatch(configSetName: string, destName: string) {
+  // SHOULD_FIRE: ses-delete-event-dest-* — DeleteConfigurationSetEventDestinationCommand throws
+  //   EventDestinationDoesNotExistException (not idempotent) and ConfigurationSetDoesNotExistException,
+  //   no try-catch
+  await sesClient.send(new DeleteConfigurationSetEventDestinationCommand({
+    ConfigurationSetName: configSetName,
+    EventDestinationName: destName,
+  }));
+}
+
+// @expect-clean
+export async function deleteEventDestinationIdempotent(configSetName: string, destName: string) {
+  try {
+    // SHOULD_NOT_FIRE: DeleteConfigurationSetEventDestinationCommand inside try-catch
+    await sesClient.send(new DeleteConfigurationSetEventDestinationCommand({
+      ConfigurationSetName: configSetName,
+      EventDestinationName: destName,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'EventDestinationDoesNotExistException') {
+      // Already deleted — treat as idempotent success
+      console.log('Event destination already deleted, skipping:', destName);
+    } else if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      // Parent config set also gone — full teardown already complete
+      console.log('Configuration set already deleted, skipping teardown:', configSetName);
     } else {
       throw err;
     }
