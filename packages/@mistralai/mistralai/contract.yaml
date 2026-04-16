@@ -38,7 +38,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.52
+coverage_score: 0.61
 
 detection:
   class_names:
@@ -924,6 +924,188 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: create
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates a new fine-tuning job queued for processing. Called as
+      client.fineTuning.jobs.create({ model, trainingFiles, hyperparameters }).
+      Accepts training file IDs returned from client.files.upload(). When autoStart=false
+      (default), the job starts in QUEUED/VALIDATING state and requires a separate
+      client.fine_tuning.jobs.start() call. Makes an HTTPS POST to
+      api.mistral.ai/v1/fine_tuning/jobs. Throws on invalid training file IDs,
+      invalid model, auth failure, quota exceeded, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/fineTuningJobsCreate.ts
+      # Error codes: errorCodes: ["4XX", "5XX"], retryCodes: ["429", "500", "502", "503", "504"]
+      # Job statuses: QUEUED, STARTED, VALIDATING, VALIDATED, RUNNING, FAILED_VALIDATION,
+      #   FAILED, SUCCESS, CANCELLED, CANCELLATION_REQUESTED
+      # Note: No HTTPValidationError on this endpoint (unlike most others) — uses generic MistralError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/fineTuningJobsCreate.ts
+      - id: fine-tuning-jobs-create-no-error-handling
+        condition: >
+          client.fine_tuning.jobs.create() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when any training file ID in trainingFiles
+          does not exist or was deleted.
+          MistralError (.statusCode=422) when model is not fine-tuneable, hyperparameters
+          are invalid, or invalidSampleSkipPercentage is out of range.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when request object fails schema validation before sending.
+          Note: A successful response returns a job object with status QUEUED — this does
+          NOT mean training has started. Job must be explicitly started when autoStart=false.
+        required_handling: >
+          Caller MUST wrap await client.fineTuning.jobs.create() in try-catch or chain .catch().
+          SaaS platforms automating fine-tuning pipelines call this after files.upload() — an
+          invalid file ID (404, e.g. file expired before job creation) crashes the pipeline
+          silently if uncaught. When autoStart=false, the caller must also call
+          fineTuning.jobs.start() after validation completes.
+
+          try {
+            const job = await client.fineTuning.jobs.create({
+              model: 'open-mistral-7b',
+              trainingFiles: [{ fileId: uploadedFileId }],
+              hyperparameters: { trainingSteps: 10, learningRate: 0.0001 },
+            });
+            console.log(`Fine-tuning job created: ${job.id}, status: ${job.status}`);
+            return job.id;
+          } catch (error) {
+            console.error('Fine-tuning job creation error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/fine-tuning/operation/jobs_api_routes_fine_tuning_create_fine_tuning_job"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/fineTuningJobsCreate.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: start
+    import_path: "@mistralai/mistralai"
+    description: >
+      Explicitly starts a validated fine-tuning job. Called as
+      client.fineTuning.jobs.start({ jobId }). Required when the job was created with
+      autoStart=false and has reached VALIDATED status. Throws on invalid job ID (404),
+      job in wrong status (422 — must be VALIDATED to start), auth failure, or network error.
+      Makes an HTTPS POST to api.mistral.ai/v1/fine_tuning/jobs/{jobId}/start.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/fineTuningJobsStart.ts
+      # Error codes: errorCodes: ["4XX", "5XX"], retryCodes: ["429", "500", "502", "503", "504"]
+      # Status precondition: job must be in VALIDATED state to be startable
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/fineTuningJobsStart.ts
+      - id: fine-tuning-jobs-start-no-error-handling
+        condition: >
+          client.fine_tuning.jobs.start() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when jobId does not exist or has been deleted.
+          MistralError (.statusCode=422) when job is not in VALIDATED state — calling
+          start() on a job that is still VALIDATING or FAILED_VALIDATION returns 422.
+          MistralError (.statusCode=401) when API key is invalid.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when request object fails schema validation.
+        required_handling: >
+          Caller MUST wrap await client.fineTuning.jobs.start() in try-catch or chain .catch().
+          SaaS pipelines that poll job status before calling start() still need error handling
+          — a race condition where the job moves to FAILED_VALIDATION between status check
+          and start() call throws 422. Always handle the 422 case with a clear error message.
+
+          try {
+            const job = await client.fineTuning.jobs.start({
+              jobId: fineTuningJobId,
+            });
+            console.log(`Fine-tuning job started: ${job.id}, status: ${job.status}`);
+            return job.id;
+          } catch (error) {
+            if (error instanceof MistralError && error.statusCode === 422) {
+              throw new Error('Job is not in VALIDATED state — cannot start yet');
+            }
+            console.error('Fine-tuning job start error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/fine-tuning/operation/jobs_api_routes_fine_tuning_start_fine_tuning_job"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/fineTuningJobsStart.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: callTool
+    import_path: "@mistralai/mistralai"
+    description: >
+      Executes a tool on a registered MCP (Model Context Protocol) connector. Called as
+      client.beta.connectors.callTool({ connectorIdOrName, toolName, credentialsName,
+      connectorCallToolRequest }). MCP connectors are integrations with external services
+      (databases, APIs, file systems) that Mistral agents can invoke at runtime. Returns
+      a ConnectorToolCallResponse with content array (text, image, audio, resources).
+      Makes an HTTPS POST to api.mistral.ai/v1/connectors/{connectorIdOrName}/tools/{toolName}.
+      Throws on invalid connector ID, unknown tool name, auth failure, validation errors,
+      or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/betaConnectorsCallTool.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retryCodes: ["429", "500", "502", "503", "504"]
+      # 422 uses HTTPValidationError (distinct from generic MistralError)
+      # Response: ConnectorToolCallResponse { content[], metadata? } — metadata has isError field
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/betaConnectorsCallTool.ts
+      - id: connectors-call-tool-no-error-handling
+        condition: >
+          client.beta.connectors.callTool() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when connectorIdOrName does not exist or the
+          toolName is not registered on that connector.
+          HTTPValidationError (.statusCode=422, .detail[] array) when
+          connectorCallToolRequest parameters fail validation for the given tool schema.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError when the MCP connector's underlying service is unreachable.
+          RequestTimeoutError when the tool execution exceeds the configured timeout.
+        required_handling: >
+          Caller MUST wrap await client.beta.connectors.callTool() in try-catch or chain .catch().
+          Agent pipelines that call external tools (database queries, API calls) via MCP
+          connectors throw on connector unavailability or tool schema mismatches — uncaught
+          errors crash the entire agent step, aborting the agentic workflow.
+          Note: A successful response may still contain tool errors via response.metadata.isError
+          — always check metadata in addition to catching thrown errors.
+
+          try {
+            const result = await client.beta.connectors.callTool({
+              connectorIdOrName: process.env.MISTRAL_CONNECTOR_ID,
+              toolName: 'query_database',
+              connectorCallToolRequest: {
+                arguments: { query: 'SELECT * FROM users LIMIT 10' },
+              },
+            });
+            // Check for tool-level errors in metadata
+            if (result.metadata?.isError) {
+              throw new Error(`Tool execution failed: ${result.content[0]?.text}`);
+            }
+            return result.content;
+          } catch (error) {
+            console.error('MCP connector tool call error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/beta/operation/connector_call_tool_v1_connectors__connector_id__tools__tool_name__post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaConnectorsCallTool.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: medium
 
 notes:

@@ -21,6 +21,9 @@
  *   libraries-create-no-error-handling      (added pass 2)
  *   libraries-documents-upload-no-error-handling (added pass 2)
  *   classifiers-classify-no-error-handling  (added pass 2)
+ *   fine-tuning-jobs-create-no-error-handling (added pass 3)
+ *   fine-tuning-jobs-start-no-error-handling  (added pass 3)
+ *   connectors-call-tool-no-error-handling    (added pass 3)
  */
 import { Mistral } from '@mistralai/mistralai';
 
@@ -453,5 +456,96 @@ async function gt_classifiers_classify_with_try_catch(modelId: string, userText:
   } catch (error) {
     console.error('Classifier error:', error);
     return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 14. fine_tuning.jobs.create — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 3 (2026-04-16, deepen-stream-2 pass 5)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: fine-tuning-jobs-create-no-error-handling
+async function gt_fine_tuning_jobs_create_missing(uploadedFileId: string) {
+  // SHOULD_FIRE: fine-tuning-jobs-create-no-error-handling — no try-catch
+  const job = await client.fineTuning.jobs.create({
+    model: 'open-mistral-7b',
+    trainingFiles: [{ fileId: uploadedFileId }],
+    hyperparameters: { trainingSteps: 10, learningRate: 0.0001 },
+  });
+  return job.id;
+}
+
+// 14. fine_tuning.jobs.create — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_fine_tuning_jobs_create_with_try_catch(uploadedFileId: string) {
+  try {
+    // SHOULD_NOT_FIRE: fine_tuning.jobs.create has try-catch
+    const job = await client.fineTuning.jobs.create({
+      model: 'open-mistral-7b',
+      trainingFiles: [{ fileId: uploadedFileId }],
+      hyperparameters: { trainingSteps: 10, learningRate: 0.0001 },
+    });
+    return job.id;
+  } catch (error) {
+    console.error('Fine-tuning job creation error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 15. fine_tuning.jobs.start — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 3 (2026-04-16, deepen-stream-2 pass 5)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: fine-tuning-jobs-start-no-error-handling
+async function gt_fine_tuning_jobs_start_missing(jobId: string) {
+  // SHOULD_FIRE: fine-tuning-jobs-start-no-error-handling — no try-catch
+  const job = await client.fineTuning.jobs.start({ jobId });
+  return job.status;
+}
+
+// 15. fine_tuning.jobs.start — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_fine_tuning_jobs_start_with_try_catch(jobId: string) {
+  try {
+    // SHOULD_NOT_FIRE: fine_tuning.jobs.start has try-catch
+    const job = await client.fineTuning.jobs.start({ jobId });
+    return job.status;
+  } catch (error) {
+    console.error('Fine-tuning job start error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 16. beta.connectors.callTool — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 3 (2026-04-16, deepen-stream-2 pass 5)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: connectors-call-tool-no-error-handling
+async function gt_connectors_call_tool_missing(connectorId: string, query: string) {
+  // SHOULD_FIRE: connectors-call-tool-no-error-handling — no try-catch
+  const result = await client.beta.connectors.callTool({
+    connectorIdOrName: connectorId,
+    toolName: 'query_database',
+    connectorCallToolRequest: { arguments: { query } },
+  });
+  return result.content;
+}
+
+// 16. beta.connectors.callTool — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_connectors_call_tool_with_try_catch(connectorId: string, query: string) {
+  try {
+    // SHOULD_NOT_FIRE: beta.connectors.callTool has try-catch
+    const result = await client.beta.connectors.callTool({
+      connectorIdOrName: connectorId,
+      toolName: 'query_database',
+      connectorCallToolRequest: { arguments: { query } },
+    });
+    return result.content;
+  } catch (error) {
+    console.error('MCP connector tool call error:', error);
+    throw error;
   }
 }
