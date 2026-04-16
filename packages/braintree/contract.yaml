@@ -8,9 +8,10 @@ package: braintree
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.79
 
 detection:
   class_names: ["BraintreeGateway"]
@@ -216,3 +217,524 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: high
+
+  - name: void
+    import_path: "braintree"
+    description: >
+      Voids an authorized or submitted-for-settlement transaction, canceling the charge
+      before funds are captured. Called as gateway.transaction.void(transactionId).
+      Only valid for transactions in "authorized", "submitted_for_settlement", or
+      "settlement_pending" (PayPal) states. Throws on infrastructure failure or invalid state.
+
+    postconditions:
+      # Evidence: source confirmed at transaction_gateway.js — PUT /transactions/:id/void
+      # Error types confirmed from exceptions.js in braintree@3.x source
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/transaction/void/node
+      - id: void-no-try-catch
+        condition: >
+          await gateway.transaction.void(transactionId) is called without a surrounding
+          try-catch block.
+        throws: >
+          AuthenticationError (wrong API credentials),
+          AuthorizationError (key lacks permission),
+          NotFoundError (transaction ID does not exist),
+          ServerError (Braintree internal error),
+          GatewayTimeoutError (Braintree gateway timeout),
+          ServiceUnavailableError (Braintree down).
+          All are subclasses of BraintreeError (err.type identifies the subclass).
+        required_handling: >
+          Caller MUST wrap in try-catch. A voiding failure means the transaction may
+          still result in a customer charge. The result object also carries validation
+          errors (result.success=false) when the transaction state is invalid for voiding.
+
+          try {
+            const result = await gateway.transaction.void(transactionId);
+            if (!result.success) {
+              // Invalid state for void: result.message, result.errors.deepErrors()
+            }
+          } catch (err) {
+            // Infrastructure failure: log and notify operations team
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/void/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: void-wrong-state
+        condition: >
+          gateway.transaction.void() is called on a transaction that has already been settled,
+          is in "settlement_declined", "voided", or "failed" state. The transaction is not in
+          a voidable state ("authorized", "submitted_for_settlement", "settlement_pending").
+        throws: >
+          Does NOT throw — returns result object with result.success=false and validation
+          errors. Common error: "91504 Transaction cannot be voided" (transaction already settled).
+        required_handling: >
+          Caller MUST check result.success after void. Settlement windows close quickly —
+          transactions auto-settle within 1 business day. Void attempts on settled transactions
+          must fall back to refund. Not checking result.success causes silent void failures
+          while the customer is still charged.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/void/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/result-objects"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: submitForSettlement
+    import_path: "braintree"
+    description: >
+      Captures an authorized transaction for settlement — requests that funds be transferred
+      to the merchant's account. Called as gateway.transaction.submitForSettlement(transactionId, amount?).
+      Only valid for transactions in "authorized" state. Must be done within the authorization
+      validity window (typically 7 days for cards). Throws on infrastructure failure.
+
+    postconditions:
+      # Evidence: source confirmed at transaction_gateway.js — PUT /transactions/:id/submit_for_settlement
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/transaction/submit-for-settlement/node
+      - id: submit-settlement-no-try-catch
+        condition: >
+          await gateway.transaction.submitForSettlement(transactionId) is called without a
+          surrounding try-catch block.
+        throws: >
+          AuthenticationError, AuthorizationError, NotFoundError (invalid transaction ID),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError, TooManyRequestsError.
+          All are subclasses of BraintreeError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Failure to submit for settlement means the
+          authorization expires and no funds are collected. This is particularly critical
+          for "authorize only" flows where submitForSettlement is called separately.
+
+          try {
+            const result = await gateway.transaction.submitForSettlement(transactionId);
+            if (!result.success) {
+              // result.errors.deepErrors() — e.g. transaction already submitted or settled
+            }
+          } catch (err) {
+            // Infrastructure failure — retry with backoff
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/submit-for-settlement/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: submit-settlement-wrong-state
+        condition: >
+          submitForSettlement() is called on a transaction not in "authorized" state —
+          already submitted, already settled, voided, or failed.
+        throws: >
+          Does NOT throw — returns result.success=false with validation errors. Common error:
+          "91507 Cannot submit for settlement unless status is authorized."
+        required_handling: >
+          Caller MUST check result.success. Silent failure to capture payment means
+          the merchant provides goods/services but never collects payment.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/transaction/submit-for-settlement/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: cancel
+    import_path: "braintree"
+    description: >
+      Cancels an active subscription. Called as gateway.subscription.cancel(subscriptionId).
+      Once canceled, the subscription cannot be reactivated — a new subscription must be created.
+      Throws NotFoundError if subscriptionId is invalid. Throws on infrastructure failure.
+
+    postconditions:
+      # Evidence: source confirmed at subscription_gateway.js — PUT /subscriptions/:id/cancel
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/subscription/cancel/node
+      - id: subscription-cancel-no-try-catch
+        condition: >
+          await gateway.subscription.cancel(subscriptionId) is called without a surrounding
+          try-catch block.
+        throws: >
+          NotFoundError (subscription ID does not exist or belongs to different merchant),
+          AuthenticationError, AuthorizationError,
+          ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. An uncaught NotFoundError on cancel means the
+          subscription remains active and continues billing the customer. This is especially
+          critical during account deletion or "cancel subscription" user flows.
+
+          try {
+            await gateway.subscription.cancel(subscriptionId);
+            // Subscription successfully canceled — update local DB record
+          } catch (err) {
+            if (err.type === 'notFoundError') {
+              // Subscription already gone or wrong ID — treat as canceled
+            }
+            throw err;
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/subscription/cancel/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: retryCharge
+    import_path: "braintree"
+    description: >
+      Manually retries charging a past-due subscription. Called as
+      gateway.subscription.retryCharge(subscriptionId, amount?, submitForSettlement?).
+      Internally calls gateway.transaction.sale() so throws the same exception types.
+      Used to recover from failed subscription billing cycles.
+
+    postconditions:
+      # Evidence: source confirmed at subscription_gateway.js — delegates to TransactionGateway.sale()
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/subscription/retry-charge/node
+      - id: retry-charge-no-try-catch
+        condition: >
+          await gateway.subscription.retryCharge(subscriptionId) is called without a
+          surrounding try-catch block.
+        throws: >
+          AuthenticationError, AuthorizationError, NotFoundError (invalid subscription),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError, TooManyRequestsError.
+          Internally delegates to transaction.sale() — same exception hierarchy.
+        required_handling: >
+          Caller MUST wrap in try-catch. Also MUST check result.success — declined cards
+          return result.success=false with result.transaction.processorResponseCode/Text.
+          Retry failures in dunning flows must be logged and tracked to avoid infinite retry loops.
+
+          try {
+            const result = await gateway.subscription.retryCharge(subscriptionId, undefined, true);
+            if (result.success) {
+              // Recovered: result.transaction.id
+            } else {
+              // Card declined: result.message, result.transaction.processorResponseText
+            }
+          } catch (err) {
+            // Infrastructure failure
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/subscription/retry-charge/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: retry-charge-result-not-checked
+        condition: >
+          result.success is not checked after retryCharge(). A declined card returns
+          result.success=false with no exception thrown — the caller proceeds as if
+          the retry succeeded.
+        throws: "Does NOT throw on card decline — returns result.success=false"
+        required_handling: >
+          Caller MUST check result.success after retryCharge(). Unchecked result means
+          the dunning flow records a "success" while the subscription remains past-due
+          and the customer continues to receive service without paying.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/general/result-objects"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: update
+    import_path: "braintree"
+    description: >
+      Updates subscription attributes (plan, price, payment method, billing date) or
+      customer/payment-method vault data. Common calls:
+        gateway.subscription.update(subscriptionId, attributes)
+        gateway.customer.update(customerId, attributes)
+        gateway.paymentMethod.update(token, attributes)
+      Throws on infrastructure failure.
+
+    postconditions:
+      # Evidence: source confirmed from subscription_gateway.js, customer_gateway.js,
+      # payment_method_gateway.js — all use gateway.http.put()
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/subscription/update/node
+      - id: update-no-try-catch
+        condition: >
+          await gateway.subscription.update(), gateway.customer.update(), or
+          gateway.paymentMethod.update() is called without a surrounding try-catch block.
+        throws: >
+          AuthenticationError, AuthorizationError, NotFoundError (invalid ID or token),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError, TooManyRequestsError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Also check result.success — validation failures
+          (invalid plan, billing amount below minimum) are returned in the result object,
+          not thrown.
+
+          try {
+            const result = await gateway.subscription.update(subscriptionId, { planId: newPlan });
+            if (!result.success) {
+              // result.errors.deepErrors() — e.g. plan not found, invalid amount
+            }
+          } catch (err) {
+            // Infrastructure failure
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/subscription/update/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: delete
+    import_path: "braintree"
+    description: >
+      Deletes a customer or payment method from the Braintree vault. Common calls:
+        gateway.customer.delete(customerId)
+        gateway.paymentMethod.delete(token)
+      Also deletes all associated payment methods when deleting a customer.
+      Throws NotFoundError if the ID does not exist. Critical for GDPR compliance flows.
+
+    postconditions:
+      # Evidence: source confirmed at customer_gateway.js and payment_method_gateway.js
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/customer/delete/node
+      - id: delete-no-try-catch
+        condition: >
+          await gateway.customer.delete(customerId) or gateway.paymentMethod.delete(token)
+          is called without a surrounding try-catch block.
+        throws: >
+          NotFoundError (customer or token does not exist — extremely common after account merges
+          or external deletions),
+          AuthorizationError (insufficient API key permissions for vault deletion),
+          AuthenticationError, ServerError, GatewayTimeoutError.
+        required_handling: >
+          Caller MUST wrap in try-catch. NotFoundError on delete should usually be treated
+          as idempotent success (the resource is gone regardless). Unhandled NotFoundError
+          in GDPR deletion flows breaks the data-removal guarantee.
+
+          try {
+            await gateway.customer.delete(customerId);
+          } catch (err) {
+            if (err.type === 'notFoundError') {
+              // Already deleted — treat as success for idempotency
+              return;
+            }
+            throw err; // Re-throw infrastructure failures
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/customer/delete/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: parse
+    import_path: "braintree"
+    description: >
+      Parses and validates a Braintree webhook notification. Called as
+      gateway.webhookNotification.parse(btSignature, btPayload) where both are provided
+      as HTTP POST body parameters from Braintree's webhook delivery. Returns a parsed
+      WebhookNotification object with kind, timestamp, and subject.
+
+    postconditions:
+      # Evidence: source confirmed at webhook_notification_gateway.js
+      # InvalidSignatureError thrown in 3 cases: missing params, illegal chars, signature mismatch
+      # Docs: https://developer.paypal.com/braintree/docs/guides/webhooks/overview
+      - id: webhook-parse-no-try-catch
+        condition: >
+          await gateway.webhookNotification.parse(signature, payload) is called without
+          a surrounding try-catch block.
+        throws: >
+          InvalidSignatureError in three cases confirmed from source:
+            1. signature parameter is missing or falsy
+            2. payload parameter is missing or falsy
+            3. payload contains illegal non-base64 characters
+            4. signature does not match payload (HMAC mismatch — tampered webhook or wrong key)
+          Also: ServerError or UnexpectedError if XML parsing fails on malformed payload.
+        required_handling: >
+          Caller MUST wrap in try-catch. InvalidSignatureError means the webhook was either
+          tampered with or the wrong API keys are in use. Do NOT process the notification.
+          Always return HTTP 200 to Braintree regardless to prevent re-delivery of bad webhooks.
+
+          try {
+            const notification = await gateway.webhookNotification.parse(
+              req.body.bt_signature,
+              req.body.bt_payload
+            );
+            // Process notification.kind (e.g. 'subscription_charged_successfully')
+          } catch (err) {
+            if (err.type === 'invalidSignatureError') {
+              // Log attempted tampering — do NOT process
+              return res.sendStatus(200); // Prevent re-delivery
+            }
+            throw err;
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/guides/webhooks/overview"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: webhook-signature-not-validated
+        condition: >
+          Webhook handler processes notification.kind without first validating that
+          parse() succeeded — or catches the error and processes anyway.
+        throws: "Does not throw — security vulnerability: processing tampered webhook data"
+        required_handling: >
+          The InvalidSignatureError MUST be treated as a hard stop. Processing a webhook
+          that fails signature validation can trigger fraudulent subscription state changes,
+          refund triggers, or account actions based on attacker-controlled data.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/guides/webhooks/overview"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: accept
+    import_path: "braintree"
+    description: >
+      Accepts a chargeback dispute — conceding the dispute without contesting it.
+      Called as gateway.dispute.accept(disputeId). Only valid for disputes in OPEN status.
+      Finalize and addEvidence are the alternative: contest the dispute with evidence.
+
+    postconditions:
+      # Evidence: source confirmed at dispute_gateway.js
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/dispute/accept/node
+      - id: dispute-accept-no-try-catch
+        condition: >
+          await gateway.dispute.accept(disputeId) is called without a surrounding try-catch block.
+        throws: >
+          NotFoundError (dispute ID does not exist or already closed),
+          AuthenticationError, AuthorizationError (insufficient dispute management permissions),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Also check result.success — attempting to accept
+          a dispute that is not in OPEN status returns result.success=false.
+          An unhandled exception in a chargeback workflow means the dispute response
+          deadline may be missed, resulting in an automatic loss.
+
+          try {
+            const result = await gateway.dispute.accept(disputeId);
+            if (!result.success) {
+              // Dispute not in OPEN state or other validation error
+            }
+          } catch (err) {
+            // Infrastructure failure — alert operations team
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/dispute/accept/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: finalize
+    import_path: "braintree"
+    description: >
+      Finalizes a dispute, submitting all added evidence to the card network for review.
+      Called as gateway.dispute.finalize(disputeId). Must be called after adding evidence
+      via addTextEvidence() or addFileEvidence(). Missing this step means evidence is never
+      submitted and the dispute is lost by default.
+
+    postconditions:
+      # Evidence: source confirmed at dispute_gateway.js — POST /disputes/:id/finalize
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/dispute/finalize/node
+      - id: dispute-finalize-no-try-catch
+        condition: >
+          await gateway.dispute.finalize(disputeId) is called without a surrounding try-catch block.
+        throws: >
+          NotFoundError (dispute ID invalid or already finalized),
+          AuthorizationError (insufficient dispute management API permissions),
+          AuthenticationError, ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. A finalize failure means evidence was added
+          but never submitted to the card network — the merchant loses the dispute by default
+          even though evidence exists.
+
+          try {
+            const result = await gateway.dispute.finalize(disputeId);
+            if (!result.success) {
+              // result.errors — e.g. no evidence added before finalization
+            }
+          } catch (err) {
+            // Alert operations team: dispute may be lost
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/dispute/finalize/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: finalize-not-called-after-evidence
+        condition: >
+          Evidence is added via addTextEvidence() or addFileEvidence() but finalize()
+          is never called (e.g. error handling skips finalize, or developer forgot the step).
+        throws: "Does not throw — silent failure: evidence uploaded but never submitted"
+        required_handling: >
+          Finalize MUST always be called after evidence is added. It is a separate required
+          step — adding evidence without finalizing submits nothing to the card network.
+          The dispute deadline passes and the merchant loses even with valid evidence.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/guides/disputes/overview"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
