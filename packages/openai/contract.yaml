@@ -2,7 +2,7 @@ package: openai
 semver: ">=4.0.0 <7.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # deepen-stream-1 pass 8
+last_verified: "2026-04-16"  # deepen-stream-1 pass 9
 status: production
 evidence_quality: confirmed
 # Depth pass 2026-04-16 (deepen-stream-2 pass 3):
@@ -29,7 +29,24 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.71  # 29 contracted / 41 total async-callable functions (20 intentionally omitted)
+coverage_score: 0.73  # 32 contracted / 44 total async-callable functions (20 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-1 pass 9):
+# Expanded coverage from 29→32 contracted functions (+3 this pass).
+# API surface updated: 41→44 (added files.waitForProcessing, beta.chatkit.sessions.create,
+#   beta.chatkit.sessions.cancel to enumeration).
+# Contracted this pass: files.waitForProcessing (2 postconditions),
+#   files.delete (1 postcondition), beta.chatkit.sessions.create (2 postconditions)
+# Key insights:
+#   files.waitForProcessing() has a SILENT failure mode: file.status='error' is a terminal
+#   state that exits the polling loop without throwing — callers must check status manually.
+#   files.delete() is NOT idempotent (unlike S3 DeleteObject) — throws NotFoundError (404)
+#   when re-deleting an already-deleted file; cleanup flows must catch this explicitly.
+#   beta.chatkit.sessions.create() introduces a short-lived client_secret pattern identical
+#   to realtime.sessions.create() — caching the secret is a silent auth failure vector.
+# Evidence:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 # Depth pass 2026-04-16 (deepen-stream-1 pass 8):
 # Expanded coverage from 27→29 contracted functions (+2 this pass).
 # API surface total unchanged: 41 async-callable functions.
@@ -2417,4 +2434,242 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # files.waitForProcessing()  (via openai.files.waitForProcessing())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Polls openai.files.retrieve() until file.status reaches a terminal state:
+  #   'processed', 'error', or 'deleted'. Throws APIConnectionTimeoutError after
+  #   30 minutes (default) if no terminal state is reached. File status 'error'
+  #   does NOT throw — callers must check the returned FileObject.status field.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: files.waitForProcessing
+    import_path: "openai"
+    description: >
+      Polls a file until it reaches a terminal processing state. Called as
+      openai.files.waitForProcessing(fileId). Internally calls retrieve() in a loop
+      every 5 seconds until file.status is 'processed', 'error', or 'deleted'.
+      Used in RAG pipelines after uploading a file to a vector store to wait for
+      indexing to complete before querying. CRITICAL: a file.status of 'error'
+      is NOT thrown as an exception — callers must check the returned object's
+      status and error fields after awaiting.
+
+    postconditions:
+      # Evidence: APIConnectionTimeoutError confirmed in files.ts waitForProcessing():
+      #   throw new APIConnectionTimeoutError({
+      #     message: `Giving up on waiting for file ${id} to finish processing after ${maxWait} milliseconds.`
+      #   })
+      # Thrown when file.status does not reach 'processed'/'error'/'deleted' within maxWait (default 30min).
+      - id: files-wait-for-processing-timeout
+        condition: >
+          openai.files.waitForProcessing() called but the file does not reach a
+          terminal status within the maxWait duration (default: 30 minutes /
+          1,800,000 ms). Each iteration sleeps pollInterval ms (default: 5 seconds)
+          then calls retrieve(). Large file uploads or heavily loaded OpenAI
+          infrastructure can exceed the 30-minute window.
+        throws: "APIConnectionTimeoutError('Giving up on waiting for file <id> to finish processing after <maxWait> milliseconds.')"
+        required_handling: >
+          Caller MUST wrap waitForProcessing() in try-catch and catch
+          APIConnectionTimeoutError (or its base APIConnectionError) distinctly.
+          On timeout, the caller must decide: (a) resume polling with a fresh call
+          to waitForProcessing() using a custom maxWait, (b) fall back to
+          asynchronous notification, or (c) surface a user-facing error.
+          Do NOT silently ignore the timeout — the file may still be processing
+          and vector store operations that depend on it will fail with NotFoundError
+          or return empty results if the file is not yet indexed.
+          Pass a custom maxWait for large files (>100 MB): maxWait: 2 * 60 * 60 * 1000
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: confirmed from files.ts TERMINAL_STATES = new Set(['processed', 'error', 'deleted'])
+      # file.status === 'error' causes the while-loop to EXIT (it IS a terminal state),
+      # returning the FileObject with status='error' and file.error populated.
+      # The caller receives a FileObject, not an exception.
+      - id: files-wait-for-processing-error-status-unchecked
+        condition: >
+          openai.files.waitForProcessing() returns (does NOT throw) when the file
+          status reaches 'error'. The returned FileObject has status='error' and
+          a populated error field. Callers that do not check the returned object's
+          status field silently proceed with an errored, unprocessed file — causing
+          downstream vector store queries to return empty or partial results.
+        throws: "none — returns FileObject with status='error' and populated error.message"
+        required_handling: >
+          Caller MUST check the returned FileObject.status after awaiting:
+            const file = await openai.files.waitForProcessing(fileId);
+            if (file.status === 'error') {
+              throw new Error(`File processing failed: ${file.error?.message}`);
+            }
+          The error field (if present) contains a machine-readable code and
+          human-readable message from the OpenAI platform about why processing failed.
+          Common causes: unsupported file format, file too large for the model,
+          corrupted binary content. Do NOT use the file for vector store queries
+          if status !== 'processed'.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # files.delete()  (via openai.files.delete())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # DELETE /files/{file_id}. Returns FileDeleted object. Throws NotFoundError (404)
+  # if the file ID is invalid, already deleted, or belongs to a different organization.
+  # NOT idempotent — re-deleting a file throws rather than succeeding.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: files.delete
+    import_path: "openai"
+    description: >
+      Deletes a file from OpenAI storage. Called as openai.files.delete(fileId).
+      Used in RAG pipeline cleanup flows to remove outdated documents from
+      vector stores, and in multi-step upload flows that abort after partial upload.
+      Returns a FileDeleted confirmation object. NOT idempotent — deleting a
+      file that no longer exists throws NotFoundError (404). Deleting a file
+      that is still attached to a vector store may also produce an error.
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) confirmed from error.ts status→class mapping:
+      #   NotFoundError extends APIError (status 404)
+      # Thrown when the fileID does not exist, is already deleted, or belongs to
+      # a different organization/project.
+      - id: files-delete-not-found
+        condition: >
+          openai.files.delete(fileId) called with a fileId that does not exist,
+          has already been deleted, or belongs to a different project/organization.
+          This is the most common failure in cleanup flows where file IDs are
+          cached and the file was already removed by another process or expired.
+          Also thrown if the fileId references a file from a previous API key or org.
+        throws: "NotFoundError (HTTP 404)"
+        required_handling: >
+          Caller MUST wrap files.delete() in try-catch.
+          In idempotent cleanup flows, catch NotFoundError and treat it as success:
+            try {
+              await openai.files.delete(fileId);
+            } catch (err) {
+              if (err instanceof OpenAI.NotFoundError) {
+                // Already deleted — acceptable in cleanup flows
+                return;
+              }
+              throw err;
+            }
+          Do NOT silently swallow all errors — only NotFoundError is acceptable
+          to ignore in cleanup. Re-throw AuthenticationError, RateLimitError, and
+          InternalServerError without swallowing.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # beta.chatkit.sessions.create()  (via openai.beta.chatkit.sessions.create())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # POST /chatkit/sessions with header 'OpenAI-Beta: chatkit_beta=v1'.
+  # Creates a ChatKit session linking a user to a workflow. Returns a ChatSession
+  # containing a client_secret for frontend use. Throws on auth failure,
+  # missing beta access, invalid workflow, or rate limit.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: beta.chatkit.sessions.create
+    import_path: "openai"
+    description: >
+      Creates a ChatKit session via openai.beta.chatkit.sessions.create().
+      Links an end user to a configured workflow and returns a ChatSession with
+      a client_secret for the frontend to use directly. Sessions expire after
+      10 minutes by default (configurable via expires_after). Used in server-side
+      session initialization flows for AI-powered user interfaces backed by OpenAI
+      workflow infrastructure.
+
+    postconditions:
+      # Evidence: AuthenticationError (401) and PermissionDeniedError (403) confirmed from
+      # error.ts HTTP status→class mapping. Beta API endpoints commonly return 403 when
+      # the organization has not been granted access to the beta feature.
+      - id: chatkit-sessions-create-no-error-handling
+        condition: >
+          openai.beta.chatkit.sessions.create() called without try-catch.
+          The ChatKit API is a beta endpoint requiring special access. Throws on:
+          (1) AuthenticationError (401) — invalid or revoked API key;
+          (2) PermissionDeniedError (403) — organization not enabled for ChatKit beta
+              or insufficient permissions for the specified workflow;
+          (3) NotFoundError (404) — the workflow.id does not exist or is archived;
+          (4) UnprocessableEntityError (422) — invalid user string or malformed params;
+          (5) RateLimitError (429) — per-minute session creation rate limit exceeded.
+        throws: "AuthenticationError | PermissionDeniedError | NotFoundError | UnprocessableEntityError | RateLimitError"
+        required_handling: >
+          Caller MUST wrap beta.chatkit.sessions.create() in try-catch.
+          This is typically a server-side API route handler — errors must be caught
+          and returned as HTTP error responses rather than crashing the handler.
+          Distinguish PermissionDeniedError (403) — which indicates beta access is
+          not granted and requires contacting OpenAI — from NotFoundError (404)
+          which indicates a misconfigured workflow ID (fix in application config).
+          The returned client_secret MUST be treated as a short-lived credential:
+          do not cache or reuse it across requests; create a new session per user
+          interaction. The session expires after expires_after seconds (default: 600).
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: The client_secret returned by sessions.create() is a short-lived credential
+      # confirmed from sessions.ts: "Cancelling prevents new requests from using the issued client secret."
+      # This is the same pattern as realtime.sessions.create() — sessions expire and the
+      # secret must be used immediately, not cached.
+      - id: chatkit-sessions-create-secret-expired
+        condition: >
+          The ChatSession.client_secret is cached and reused across requests after the
+          session expires (default: 10 minutes). Expired sessions cause the frontend
+          to receive authentication failures when attempting to use the client_secret.
+          This is a silent failure pattern: the backend route succeeds (200 OK) because
+          it returns a cached session, but the frontend immediately fails when using it.
+        throws: "none — client_secret silently fails on frontend; no exception thrown server-side"
+        required_handling: >
+          Server-side session creation routes MUST create a fresh session per user
+          request — do NOT cache client_secret values. Each call to
+          beta.chatkit.sessions.create() must happen immediately before the secret is
+          sent to the frontend. Do NOT store client_secret in a database or cache.
+          Set an appropriate expires_after value based on your UI's expected response
+          time: if users may take >10 minutes to act after receiving the secret,
+          increase expires_after or implement session refresh logic.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
         evidence_quality: confirmed

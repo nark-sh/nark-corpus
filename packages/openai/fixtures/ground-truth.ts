@@ -1061,3 +1061,90 @@ export async function chatCompletionsRunToolsWithCatch(userMessage: string) {
     throw err;
   }
 }
+
+// ─── files.waitForProcessing ──────────────────────────────────────────────────
+
+// @expect-violation: files-wait-for-processing-timeout
+// @expect-violation: files-wait-for-processing-error-status-unchecked
+async function filesWaitForProcessingMissingErrorHandling(fileId: string) {
+  // SHOULD_FIRE: no try-catch (timeout not handled) AND status not checked
+  const file = await openai.files.waitForProcessing(fileId);
+  return file; // status not checked — silent failure if status==='error'
+}
+
+// @expect-clean
+async function filesWaitForProcessingWithErrorHandling(fileId: string) {
+  // SHOULD_NOT_FIRE: try-catch for timeout + status check for error state
+  try {
+    const file = await openai.files.waitForProcessing(fileId, {
+      maxWait: 2 * 60 * 60 * 1000, // 2 hours for large files
+    });
+    if (file.status === 'error') {
+      throw new Error(`File processing failed: ${file.error?.message ?? 'unknown error'}`);
+    }
+    return file;
+  } catch (err) {
+    if (err instanceof OpenAI.APIConnectionTimeoutError) {
+      throw new Error(`File processing timed out for ${fileId} — retry or check file size`);
+    }
+    throw err;
+  }
+}
+
+// ─── files.delete ─────────────────────────────────────────────────────────────
+
+// @expect-violation: files-delete-not-found
+async function filesDeleteMissingErrorHandling(fileId: string) {
+  // SHOULD_FIRE: no try-catch — NotFoundError not handled
+  await openai.files.delete(fileId);
+}
+
+// @expect-clean
+async function filesDeleteWithIdempotentHandling(fileId: string) {
+  // SHOULD_NOT_FIRE: NotFoundError treated as success (idempotent cleanup)
+  try {
+    await openai.files.delete(fileId);
+  } catch (err) {
+    if (err instanceof OpenAI.NotFoundError) {
+      return; // Already deleted — acceptable in cleanup flows
+    }
+    throw err; // Re-throw AuthenticationError, RateLimitError, etc.
+  }
+}
+
+// ─── beta.chatkit.sessions.create ─────────────────────────────────────────────
+
+// @expect-violation: chatkit-sessions-create-no-error-handling
+async function chatkitSessionsCreateMissingErrorHandling(userId: string, workflowId: string) {
+  // SHOULD_FIRE: no try-catch — AuthenticationError, PermissionDeniedError, NotFoundError not handled
+  const session = await openai.beta.chatkit.sessions.create({
+    user: userId,
+    workflow: { id: workflowId },
+  });
+  return session.client_secret;
+}
+
+// @expect-clean
+async function chatkitSessionsCreateWithErrorHandling(userId: string, workflowId: string) {
+  // SHOULD_NOT_FIRE: try-catch handles all error types; fresh session per request
+  try {
+    const session = await openai.beta.chatkit.sessions.create({
+      user: userId,
+      workflow: { id: workflowId },
+      expires_after: { anchor: 'created_at', minutes: 10 },
+    });
+    // client_secret is short-lived — return immediately, never cache
+    return session.client_secret;
+  } catch (err) {
+    if (err instanceof OpenAI.PermissionDeniedError) {
+      throw new Error('ChatKit beta access not enabled for this organization');
+    }
+    if (err instanceof OpenAI.NotFoundError) {
+      throw new Error(`Workflow ${workflowId} not found — check configuration`);
+    }
+    if (err instanceof OpenAI.RateLimitError) {
+      throw new Error('Session creation rate limit exceeded — retry after backoff');
+    }
+    throw err;
+  }
+}
