@@ -1,10 +1,16 @@
 package: express-rate-limit
-semver: '>=6.0.0 <8.0.0'
-contract_version: 1.0.0
+semver: '>=6.0.0'
+contract_version: 1.3.0
 maintainer: corpus-team
-last_verified: '2026-04-13'
+last_verified: '2026-04-15'
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
+# Deepen pass 2026-04-15 (deepen-stream-1 + deepen-stream-2): added getKey, resetKey, invalid-ip, x-forwarded-for,
+# double-count, created-in-request-handler, rate-limit-invalid-store, async-callback-error-routes-to-handler
+# API surface: 5 distinct callable behaviors (rateLimit factory + 2 instance methods + 2 async/construction patterns)
+# Omitted: ipKeyGenerator (sync pure utility, no error contract), MemoryStore direct (pure memory, no I/O errors)
+# coverage_score: 0.14 → 1.0 (+12 postconditions across 4 function entries this combined pass)
 functions:
   - name: rateLimit
     import_path: express-rate-limit
@@ -103,6 +109,150 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         required_handling: No action required — use the returned value as needed.
+      # Evidence: https://express-rate-limit.mintlify.app/reference/error-codes
+      - id: invalid-ip-address
+        condition: >
+          request.ip contains an invalid IPv4/IPv6 format or includes a port number (e.g. '127.0.0.1:3000').
+          Triggered by ERR_ERL_INVALID_IP_ADDRESS validation check.
+        throws: >
+          Logs ERR_ERL_INVALID_IP_ADDRESS warning to console. The request is processed with the invalid key, which
+          can cause bypass vulnerabilities — clients using port-mangled IPs are counted separately from normal IPs.
+        required_handling: >
+          When deploying behind a proxy, ensure trust proxy is set correctly so Express normalizes request.ip.
+          If using a custom keyGenerator, return ipKeyGenerator(req.ip) rather than raw req.ip to normalize the value.
+          Invalid IP addresses can create bypass vulnerabilities that are invisible until exploited.
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/error-codes
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+      - id: x-forwarded-for-without-trust-proxy
+        condition: >
+          X-Forwarded-For header is present in the request but Express trust proxy is not configured
+          (default: false). Triggered by ERR_ERL_UNEXPECTED_X_FORWARDED_FOR validation check.
+        throws: >
+          Logs ERR_ERL_UNEXPECTED_X_FORWARDED_FOR warning. Rate limiting uses the wrong IP — typically the
+          load balancer's IP — causing all users to share a single rate limit bucket, effectively making the
+          middleware a global limiter instead of a per-client limiter.
+        required_handling: >
+          If deploying behind a load balancer or reverse proxy that sets X-Forwarded-For, caller MUST configure
+          app.set('trust proxy', N) where N is the number of trusted proxies in the chain. Without this, all
+          clients appear to share the same IP, hitting the rate limit simultaneously.
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/error-codes
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: double-count
+        condition: >
+          The same request increments the rate limit counter more than once. Triggered by ERR_ERL_DOUBLE_COUNT
+          validation — typically caused by duplicate rate limiter middleware instances applied to the same route,
+          or by sharing a store instance without a unique prefix across multiple limiters.
+        throws: >
+          Logs ERR_ERL_DOUBLE_COUNT warning. Clients hit their rate limit at half the configured threshold,
+          causing legitimate users to be blocked unexpectedly.
+        required_handling: >
+          Review route registration to ensure each rate limiter is applied exactly once per request path.
+          If sharing an external store across multiple limiter instances, set a unique prefix per instance
+          (e.g., store: new RedisStore({ prefix: 'api-limiter:' })).
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/error-codes
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+      - id: created-in-request-handler
+        condition: >
+          rateLimit() is called inside a request handler function (e.g., inside app.get() callback)
+          rather than at application initialization time. Triggered by ERR_ERL_CREATED_IN_REQUEST_HANDLER.
+        throws: >
+          Logs ERR_ERL_CREATED_IN_REQUEST_HANDLER warning at runtime. A new MemoryStore is created on each
+          request, meaning hit counts are never accumulated — the rate limiter never actually limits anything.
+        required_handling: >
+          Always call rateLimit() at module/app initialization, not inside request handlers. The returned
+          middleware instance should be created once and reused across requests. Example:
+          const limiter = rateLimit({ ... }); app.use(limiter);  // correct
+          app.get('/route', (req, res) => { const limiter = rateLimit({ ... }); ... }); // wrong
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/error-codes
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+      # Evidence: dist/index.cjs line 821-824 (source confirmed, v8.3.2)
+      # throw new TypeError("An invalid store was passed. Please ensure that the store is a
+      # class that implements the `Store` interface.")
+      - id: rate-limit-invalid-store
+        condition: >
+          A store option is provided but is missing required interface methods: increment(),
+          decrement(), or resetKey(). Also triggers if optional resetAll or init are present
+          but are not functions.
+        throws: >
+          TypeError("An invalid store was passed. Please ensure that the store is a class that
+          implements the `Store` interface.") — thrown synchronously during rateLimit() call at startup
+        required_handling: >
+          Caller MUST ensure custom stores implement the full Store interface. Validate in integration
+          tests. This throws synchronously at startup — the process crashes before any requests are served.
+        severity: error
+        description: >
+          express-rate-limit validates the store interface synchronously when rateLimit() is called.
+          Custom store implementations missing increment, decrement, or resetKey crash the app at startup.
+          This is distinct from runtime store errors: this error prevents the app from starting at all.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/express-rate-limit/express-rate-limit/blob/main/source/rate-limit.ts
+          - https://express-rate-limit.mintlify.app/guides/creating-a-store
+      # Evidence: dist/index.cjs line 828-834 (source confirmed, v8.3.2)
+      # var handleAsyncErrors = (fn) => async (request, response, next) => {
+      #   try { await Promise.resolve(fn(request, response, next)).catch(next); }
+      #   catch (error) { next(error); } };
+      - id: async-callback-error-routes-to-handler
+        condition: >
+          An async configuration callback (keyGenerator, skip, requestWasSuccessful, limit function,
+          message function, or identifier function) throws or returns a rejected Promise during processing.
+        throws: >
+          Error forwarded to Express error handler via next(error). The middleware does NOT send an HTTP
+          response — it calls next(error), routing to the nearest 4-argument Express error handler.
+        required_handling: >
+          Applications MUST register a global Express error handler. Callback implementations should
+          handle expected failures internally. Without a global error handler, Express sends a plain 500.
+          Note: callback errors bypass passOnStoreError — they always route to next(error).
+        severity: error
+        description: >
+          All middleware execution is wrapped by handleAsyncErrors(). A failed DB lookup in keyGenerator,
+          an error in skip (allowlisting), or a crash in requestWasSuccessful invokes the Express error
+          handler rather than propagating to the callback author. This is surprising: callback authors
+          expect their error to propagate up the call stack, but it routes to the global error handler.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/express-rate-limit/express-rate-limit/blob/main/source/rate-limit.ts
+          - https://express-rate-limit.mintlify.app/reference/configuration
     edge_cases:
       - id: memory-store-not-for-clusters
         description: >-
@@ -143,3 +293,110 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+  - name: getKey
+    import_path: express-rate-limit
+    description: >
+      Async method on the RateLimitRequestHandler returned by rateLimit(). Retrieves a client's current hit
+      count and reset time by key (the same key the keyGenerator produces for a given client). Returns
+      undefined if the client has not yet made a request in the current window. Note: this method is only
+      available if the backing store implements the optional get() method — not all external store adapters
+      do.
+    postconditions:
+      # Evidence: TypeScript declaration index.d.ts — getKey: (key: string) => Promise<ClientRateLimitInfo | undefined>
+      # Evidence: https://express-rate-limit.mintlify.app/guides/creating-a-store (store interface, get() is optional)
+      - id: get-key-store-unsupported
+        condition: >
+          The backing store does not implement the optional get() method. Many external store adapters
+          (Redis, Memcached, PostgreSQL) do not implement get() by default.
+        throws: >
+          Throws an Error: "The store does not support the 'get' method" (or equivalent from the adapter).
+          Unhandled, this causes an unhandled promise rejection that crashes Node.js worker threads in
+          production.
+        required_handling: >
+          Callers of limiter.getKey() MUST wrap the call in a try-catch (or .catch()) to handle stores
+          that do not implement get(). Since store support varies by adapter, defensive error handling is
+          required regardless of which store adapter is in use. If the store doesn't support get(), fall
+          back to allowing the request through or return a graceful degraded response.
+        sources:
+          - https://express-rate-limit.mintlify.app/guides/creating-a-store
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: get-key-store-error
+        condition: >
+          The backing store's get() method throws an error (e.g., Redis connection lost, database timeout)
+          while limiter.getKey() is awaited without error handling.
+        throws: >
+          Store error propagates as an unhandled promise rejection. Unlike the middleware itself (which has
+          passOnStoreError for fail-open behavior), getKey() has no built-in error isolation — the raw store
+          error is thrown directly to the caller.
+        required_handling: >
+          Wrap getKey() in try-catch. On store error, implement a fail-open fallback (return default quota
+          info or skip the pre-check) rather than blocking the request. Example:
+          try { info = await limiter.getKey(key); } catch { info = undefined; }
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/configuration
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+  - name: resetKey
+    import_path: express-rate-limit
+    description: >
+      Synchronous method on the RateLimitRequestHandler returned by rateLimit(). Resets a specific client's
+      hit counter to zero, identified by the key the keyGenerator produces for that client. Commonly used
+      in admin endpoints (e.g., "unlock this user's account") or after a successful CAPTCHA challenge.
+      This method is synchronous but may dispatch async work to the store internally.
+    postconditions:
+      # Evidence: TypeScript declaration — resetKey: (key: string) => void
+      # Evidence: https://express-rate-limit.mintlify.app/reference/error-codes (no specific error documented)
+      - id: reset-key-unprotected-endpoint
+        condition: >
+          The reset endpoint itself is subject to the same rate limiter it is trying to reset. A client
+          that is already rate-limited (HTTP 429) cannot reach the reset handler — the rate limit middleware
+          blocks the request before resetKey() is ever called.
+        throws: >
+          No error is thrown — the issue is architectural. resetKey() is never reached because the rate
+          limiter blocks the request first. The unlock operation silently fails from the client's perspective.
+        required_handling: >
+          Any endpoint that calls resetKey() MUST be exempt from the same rate limiter. Use the skip option:
+          skip: (req) => req.path === '/admin/reset-limit'
+          Or apply the rate limiter only to specific routes rather than globally.
+        sources:
+          - https://express-rate-limit.mintlify.app/reference/configuration
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+      - id: reset-key-wrong-key-format
+        condition: >
+          resetKey() is called with a raw IP address string when the rate limiter was configured with a
+          custom keyGenerator that produces a different key format (e.g., user ID, API key, or
+          ipKeyGenerator() with IPv6 subnet masking). The key does not match any stored entry.
+        throws: >
+          No error is thrown — the operation silently no-ops. The client's hit count is not reset. This is
+          a silent failure that is particularly dangerous in account unlock flows.
+        required_handling: >
+          Always call resetKey() with the same key format that keyGenerator produces. If using IP-based
+          limiting, call ipKeyGenerator(req.ip) to normalize before passing to resetKey(). If using
+          user-ID-based limiting, pass the user ID. Verify the key format matches by testing with getKey()
+          after calling resetKey() to confirm the counter was actually cleared.
+        sources:
+          - https://express-rate-limit.mintlify.app/guides/creating-a-store
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: low

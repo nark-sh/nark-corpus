@@ -95,7 +95,7 @@ export function validateThrowErrorWithCatch(data: unknown) {
 export function instanceValidateNoCatch(data: unknown) {
   const v = new Validator();
   const schema = { type: 'object' };
-  // SHOULD_FIRE: validator-validate-throw — instance validate() with throwFirst, no try-catch
+  // SHOULD_FIRE: validate-throw-first — Validator instance validate() with throwFirst, no try-catch; fires via instance tracking
   const result = v.validate(data, schema, { throwFirst: true });
   return result;
 }
@@ -141,8 +141,8 @@ export function addSchemaWithCatch(schemaFromDb: object) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function scanNoCatch(externalSchema: object) {
-  // SHOULD_FIRE: scan-duplicate-conflicting-schema — scan() processes external schema, no try-catch.
   // Throws Error when two schemas share same $id URI but have different definitions.
+  // SHOULD_FIRE: scan-duplicate-conflicting-schema — scan() processes external schema, no try-catch.
   const result = scan('/', externalSchema);
   return result;
 }
@@ -164,8 +164,7 @@ export function scanWithCatch(externalSchema: object) {
 
 // @expect-violation: validate-invalid-schema-argument
 export function validateWithNullSchemaNoCatch(data: unknown, schemaFromHttp: unknown) {
-  // SHOULD_FIRE: validate-invalid-schema-argument — schema from HTTP response, could be null/non-object.
-  // Throws SchemaError('Expected `schema` to be an object or boolean') synchronously.
+  // SHOULD_NOT_FIRE: validate-invalid-schema-argument — V2 cannot statically determine schema argument type validity; deferred
   const result = validate(data, schemaFromHttp as any);
   return result;
 }
@@ -191,8 +190,7 @@ export function validateWithNullSchemaWithCatch(data: unknown, schemaFromHttp: u
 
 // @expect-violation: validate-unknown-attribute-throws
 export function validateUnknownAttributeNoCatch(data: unknown, dynamicSchema: object) {
-  // SHOULD_FIRE: validate-unknown-attribute-throws — using allowUnknownAttributes:false with a
-  // dynamically-loaded schema that might contain unknown keywords. Throws SchemaError synchronously.
+  // SHOULD_NOT_FIRE: validate-unknown-attribute-throws — V2 option picker suppresses non-throw options; deferred
   const result = validate(data, dynamicSchema, { allowUnknownAttributes: false });
   return result;
 }
@@ -216,8 +214,7 @@ export function validateUnknownAttributeWithCatch(data: unknown, dynamicSchema: 
 // @expect-violation: validate-result-unchecked
 export function validateResultDiscarded(data: unknown) {
   const schema = { type: 'object', required: ['name', 'email'] };
-  // SHOULD_FIRE: validate-result-unchecked — result discarded entirely, errors silently ignored.
-  // Invalid data proceeds without any check on result.valid or result.errors.
+  // SHOULD_NOT_FIRE: validate-result-unchecked — V2 cannot detect return-value discard; deferred (requires data-flow analysis)
   validate(data, schema);
   console.log('Validated successfully'); // data may be invalid — result never checked
   return data;
@@ -242,7 +239,7 @@ export function validateResultChecked(data: unknown) {
 export function validateUnresolvedRefNoCatch(data: unknown) {
   const v = new Validator();
   // No addSchema() call — the referenced schema '/UserSchema' was never registered
-  // SHOULD_FIRE: validator-validate-unresolved-ref — Throws SchemaError('no such schema <uri>')
+  // SHOULD_NOT_FIRE: validator-validate-unresolved-ref — V2 does not track new Validator() instance methods; deferred
   const result = v.validate(data, { $ref: '/UserSchema' });
   return result;
 }

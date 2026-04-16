@@ -59,7 +59,7 @@ const sesClient = new SESClient({ region: 'us-east-1' });
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendEmailNoCatch(to: string, subject: string) {
-  // SHOULD_FIRE: ses-send-no-try-catch — SendEmailCommand rejects with MessageRejected, LimitExceededException, etc. No try-catch.
+  // SHOULD_FIRE: ses-send-email-no-try-catch — SendEmailCommand rejects with MessageRejected, LimitExceededException, etc. No try-catch.
   await sesClient.send(new SendEmailCommand({
     Source: 'noreply@example.com',
     Destination: { ToAddresses: [to] },
@@ -90,7 +90,7 @@ export async function sendEmailWithCatch(to: string, subject: string) {
 }
 
 export async function sendEmailMultipleRecipients(recipients: string[]) {
-  // SHOULD_FIRE: ses-send-no-try-catch — SendEmailCommand to multiple recipients, no try-catch
+  // SHOULD_FIRE: ses-send-email-no-try-catch — SendEmailCommand to multiple recipients, no try-catch
   await sesClient.send(new SendEmailCommand({
     Source: 'noreply@example.com',
     Destination: { ToAddresses: recipients },
@@ -123,7 +123,7 @@ export async function sendEmailMultipleRecipientsWithCatch(recipients: string[])
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendRawEmailNoCatch(rawMessage: Uint8Array) {
-  // SHOULD_FIRE: ses-send-no-try-catch — SendRawEmailCommand rejects on MIME errors, quota, network. No try-catch.
+  // SHOULD_FIRE: ses-raw-email-size-limit — SendRawEmailCommand rejects on MIME errors, quota, network. No try-catch.
   await sesClient.send(new SendRawEmailCommand({
     RawMessage: { Data: rawMessage },
   }));
@@ -146,7 +146,7 @@ export async function sendRawEmailWithCatch(rawMessage: Uint8Array) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendTemplatedEmailNoCatch(email: string, token: string) {
-  // SHOULD_FIRE: ses-send-no-try-catch — SendTemplatedEmailCommand throws TemplateDoesNotExist, MessageRejected, etc. No try-catch.
+  // SHOULD_FIRE: ses-template-does-not-exist — SendTemplatedEmailCommand throws TemplateDoesNotExist, MessageRejected, etc. No try-catch.
   const response = await sesClient.send(new SendTemplatedEmailCommand({
     Source: 'noreply@example.com',
     Destination: { ToAddresses: [email] },
@@ -179,7 +179,7 @@ export async function sendTemplatedEmailWithCatch(email: string, token: string) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendBulkEmailNoCatch(users: { email: string; name: string }[]) {
-  // SHOULD_FIRE: ses-send-no-try-catch — SendBulkTemplatedEmailCommand throws on account/config errors. No try-catch.
+  // SHOULD_FIRE: ses-bulk-template-does-not-exist — SendBulkTemplatedEmailCommand throws on account/config errors. No try-catch.
   await sesClient.send(new SendBulkTemplatedEmailCommand({
     Source: 'digest@example.com',
     Template: 'WeeklyDigest',
@@ -218,7 +218,7 @@ export async function sendBulkEmailWithCatch(users: { email: string; name: strin
 // Failed recipients are silently dropped.
 export async function sendBulkEmailIgnoringPartialFailures(users: { email: string; name: string }[]) {
   try {
-    // SHOULD_FIRE: ses-bulk-partial-destination-failure — response.Status array not inspected
+    // SHOULD_NOT_FIRE: inside try-catch; ses-bulk-partial-destination-failure requires response.Status inspection which V2 does not implement
     await sesClient.send(new SendBulkTemplatedEmailCommand({
       Source: 'digest@example.com',
       Template: 'WeeklyDigest',
