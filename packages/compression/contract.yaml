@@ -1,10 +1,16 @@
 package: compression
 semver: '>=1.7.0 <2.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-02'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
+# Deepen pass 2026-04-16 (deepen-stream-1):
+# API surface: compression() factory (1), compression.filter() static (1) = 2 callable exports
+# Contracted: compression() fully, compression.filter() intentionally omitted (pure sync bool, no error contract)
+# New postconditions added: zlib-stream-unhandled-error, sse-missing-flush
+# coverage_score: 0.5 → 1.0 (compression.filter intentionally omitted; both remaining meaningful entries contracted)
+coverage_score: 1.0
 functions:
   - name: compression
     import_path: compression
@@ -81,6 +87,59 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         required_handling: No action required — use the returned value as needed.
+
+      # Evidence: expressjs/compression/blob/master/index.js — stream has stream.on('data') and stream.on('end')
+      # but NO stream.on('error') handler. Node.js docs: unhandled 'error' on EventEmitter throws and crashes process.
+      # Confirmed via source inspection 2026-04-16 and nodejs.org/api/errors.html EventEmitter error behavior.
+      - id: zlib-stream-unhandled-error
+        condition: >
+          The internal zlib compression stream emits an 'error' event (e.g., memory allocation failure,
+          invalid zlib parameters, or a rare compression fault)
+        throws: >
+          Uncaught exception — the zlib stream error is emitted with no .on('error') listener attached
+          by compression middleware, causing the Node.js process to throw an uncaught exception (or
+          unhandledRejection) and potentially crash.
+        required_handling: >
+          Callers using compression() middleware SHOULD attach an Express error handler (app.use with
+          4-argument signature) and/or a global process.on('uncaughtException') handler. The middleware
+          does not protect against internal zlib stream errors. For production use, a process supervisor
+          (pm2, systemd) must restart the process after such a crash.
+        sources:
+          - https://github.com/expressjs/compression/blob/master/index.js
+          - https://nodejs.org/api/errors.html#class-error
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: expressjs/compression/blob/master/README.md — Server-Sent Events section explicitly documents
+      # that res.flush() must be called after each write to ensure data reaches the client through the zlib buffer.
+      # Without flush, zlib holds chunks until the buffer is full, causing SSE clients to see no events.
+      - id: sse-missing-flush
+        condition: >
+          Server-Sent Events (SSE) or any streaming response uses compression() middleware and writes
+          data with res.write() but does NOT call res.flush() after each write
+        returns: >
+          Compressed data is buffered in the zlib stream and NOT immediately delivered to the client.
+          SSE clients receive no events (or very delayed batched events) until the zlib buffer fills.
+        required_handling: >
+          Any SSE or streaming endpoint using compression() MUST call res.flush() after each
+          res.write() call to force zlib to flush its buffer and deliver the compressed chunk immediately.
+          Alternative: set Cache-Control: no-transform to bypass compression for SSE endpoints.
+        sources:
+          - https://github.com/expressjs/compression/blob/master/README.md
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
     edge_cases:
       - id: no-content-length-assumed
         description: >-
@@ -134,3 +193,23 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # compression.filter is an exported static function: compression.filter(req, res) → boolean
+  # It is the default filter function used internally by the middleware to determine if a response is compressible.
+  # It is exported so users can compose custom filters that fall back to the default.
+  # The function is SYNCHRONOUS and returns a boolean — it has no async behavior and no documented error throws.
+  # Evidence: @types/compression/index.d.ts line 51: "function filter(req: express.Request, res: express.Response): boolean"
+  # Evidence: expressjs/compression/blob/master/index.js — shouldCompress() reads Content-Type header via compressible module
+  # INTENTIONALLY OMITTED from postconditions: pure synchronous boolean utility, no error contract needed.
+  - name: compression.filter
+    import_path: compression
+    description: >
+      Static default filter function exported as compression.filter(req, res). Returns true if the
+      response Content-Type is compressible (per the compressible npm module), false otherwise.
+      Used to build custom filter functions that extend the default behavior. Synchronous.
+    postconditions: []
+    coverage: intentionally-omitted
+    omission_reason: >
+      Pure synchronous boolean utility. Returns true/false based on Content-Type header via the
+      compressible module. No throws, no async, no error contract needed. Omitting per ICP filter:
+      no behavioral contract value for runtime safety.
