@@ -842,3 +842,101 @@ export async function webhookVerifyWithCatch(payload: string, headers: Record<st
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. responses.stream — missing finalResponse() error handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: responses-stream-premature-termination-error
+// @expect-violation: responses-stream-authentication-error
+export async function responsesStreamNoCatch(prompt: string) {
+  // SHOULD_FIRE: responses.stream() — callers must await stream.finalResponse() in try-catch.
+  // If the stream terminates prematurely (network drop, server error), finalResponse()
+  // throws OpenAIError. Callers who only iterate events miss this entirely.
+  const stream = openai.responses.stream({
+    model: 'gpt-4o',
+    input: prompt,
+  });
+  // No try-catch around finalResponse — misses premature termination errors
+  const response = await stream.finalResponse();
+  return response;
+}
+
+// @expect-clean
+export async function responsesStreamWithCatch(prompt: string) {
+  try {
+    // SHOULD_NOT_FIRE: responses.stream() with proper error handling
+    const stream = openai.responses.stream({
+      model: 'gpt-4o',
+      input: prompt,
+    });
+    const response = await stream.finalResponse();
+    return response;
+  } catch (err) {
+    if (err instanceof OpenAI.APIUserAbortError) {
+      throw new Error('Stream was cancelled');
+    }
+    if (err instanceof OpenAI.AuthenticationError) {
+      throw new Error('Invalid API key for streaming');
+    }
+    if (err instanceof OpenAI.OpenAIError) {
+      // Covers premature stream termination
+      throw new Error(`Stream failed: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// @expect-violation: responses-stream-premature-termination-error
+export async function responsesStreamForAwaitNoCatch(prompt: string) {
+  // SHOULD_FIRE: iterating events but not awaiting finalResponse() — misses termination errors
+  const stream = openai.responses.stream({
+    model: 'gpt-4o',
+    input: prompt,
+  });
+  const events = [];
+  for await (const event of stream) {
+    events.push(event);
+  }
+  // Missing: await stream.finalResponse() — stream may have terminated without full response
+  return events;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. conversations.items.create — missing error handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: conversations-items-not-found-error
+// @expect-violation: conversations-items-rate-limit-error
+export async function conversationsItemsCreateNoCatch(conversationId: string, userMessage: string) {
+  // SHOULD_FIRE: conversations.items.create() throws NotFoundError when conversation
+  // has expired or been deleted — common in agent frameworks that cache conversation IDs.
+  const items = await openai.conversations.items.create(conversationId, {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: userMessage }],
+  } as any);
+  return items;
+}
+
+// @expect-clean
+export async function conversationsItemsCreateWithCatch(conversationId: string, userMessage: string) {
+  try {
+    // SHOULD_NOT_FIRE: proper error handling for conversations.items.create()
+    const items = await openai.conversations.items.create(conversationId, {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: userMessage }],
+    } as any);
+    return items;
+  } catch (err) {
+    if (err instanceof OpenAI.NotFoundError) {
+      // Conversation expired or deleted — recreate and rebuild
+      throw new Error(`Conversation ${conversationId} not found — recreate conversation`);
+    }
+    if (err instanceof OpenAI.RateLimitError) {
+      throw new Error('Rate limit exceeded adding conversation items');
+    }
+    throw err;
+  }
+}

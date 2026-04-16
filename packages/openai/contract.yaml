@@ -2,7 +2,7 @@ package: openai
 semver: ">=4.0.0 <7.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-16"  # deepen-stream-1 pass 7
 status: production
 evidence_quality: confirmed
 # Depth pass 2026-04-16 (deepen-stream-2 pass 3):
@@ -29,7 +29,22 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.61  # 25 contracted / 41 total async-callable functions (20 intentionally omitted)
+coverage_score: 0.66  # 27 contracted / 41 total async-callable functions (20 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-1 pass 7):
+# Expanded coverage from 25→27 contracted functions (+2 this pass).
+# API surface total unchanged: 41 async-callable functions.
+# Contracted this pass: responses.stream (3 postconditions), conversations.items.create (3 postconditions)
+# key insights:
+#   responses.stream() has distinct error: OpenAIError('stream ended without producing a ChatCompletion')
+#   — callers who only use 'for await' on events miss this; must await stream.finalResponse() in try-catch.
+#   APIUserAbortError (extends OpenAIError, NOT APIError) is thrown on stream.abort() — distinct catch needed.
+#   conversations.items.create() is a runtime hot-path op in agent frameworks;
+#   NotFoundError 404 on expired conversation IDs is the critical failure mode.
+# Evidence:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/responses/ResponseStream.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/EventStream.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 # Depth pass 2026-04-16 (deepen-stream-1 pass 6):
 # Expanded coverage from 23→25 contracted functions (+2 this pass).
 # API surface total updated: 36→41 (discovered 5 more in openai@6.34.0:
@@ -1905,4 +1920,219 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # responses.stream()  (via openai.responses.stream())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/responses/ResponseStream.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/EventStream.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Streaming helper for the Responses API. Wraps create() or retrieve() in an
+  # event-driven stream. Returns ResponseStream<ParsedT> — callers MUST call
+  # stream.finalResponse() or await stream.done() to detect errors.
+  # Supports two modes:
+  #   (1) New response: stream body params same as responses.create()
+  #   (2) Continue existing: { response_id, starting_after?, tools? }
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: responses.stream
+    import_path: "openai"
+    description: >
+      Streaming helper for the OpenAI Responses API via openai.responses.stream().
+      Returns a ResponseStream<ParsedT> that emits server-sent events. Unlike
+      responses.create({ stream: true }), this method returns a helper that tracks
+      accumulated state and exposes .finalResponse() to get the completed response.
+      Also supports streaming an existing response by response_id for resumable
+      agent workflows. Callers MUST await stream.finalResponse() or stream.done()
+      to handle errors — the stream itself does not throw synchronously.
+
+    postconditions:
+      # Evidence: OpenAIError confirmed in ResponseStream.ts finalResponse():
+      #   if (!response) throw new OpenAIError('stream ended without producing a ChatCompletion');
+      # Occurs when: network drops mid-stream, server closes connection early,
+      # or stream receives invalid event sequence.
+      - id: responses-stream-premature-termination-error
+        condition: >
+          The stream terminates before producing a complete response. Causes: network
+          interruption mid-stream, server closing the SSE connection early, or
+          invalid event sequence (e.g., first event is not 'response.created').
+          This error only surfaces when .finalResponse() or .done() is awaited —
+          the stream object itself does not throw at creation time.
+        throws: "OpenAIError('stream ended without producing a ChatCompletion')"
+        required_handling: >
+          Caller MUST await stream.finalResponse() inside a try-catch block.
+          If only iterating over stream events via 'for await', the loop may
+          complete without error even when the response is incomplete — always
+          follow iteration with await stream.finalResponse().
+          Implement retry logic for transient network errors: create a new stream
+          using response_id to resume from where the stream ended.
+          Pattern:
+            try {
+              const response = await stream.finalResponse();
+            } catch (err) {
+              if (err instanceof OpenAI.OpenAIError) { /* handle */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/responses/ResponseStream.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/EventStream.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: APIUserAbortError confirmed in EventStream.ts _handleError():
+      #   new APIUserAbortError() emitted on 'abort' event when stream.abort() called
+      # Common pattern: server-side timeout that calls stream.abort()
+      - id: responses-stream-abort-error
+        condition: >
+          The stream is aborted by calling stream.abort() — either explicitly by the
+          caller (e.g., request timeout, user cancellation) or via the AbortController
+          passed to the options parameter. Aborted streams do not produce a final response.
+        throws: "APIUserAbortError"
+        required_handling: >
+          Caller MUST handle APIUserAbortError distinctly from other OpenAIError subtypes.
+          After aborting, do NOT call finalResponse() as it will throw.
+          Common pattern in server-side code: wrap stream in a timeout that calls
+          stream.abort() — ensure the abort is caught and surfaced as a user-facing error.
+          APIUserAbortError does NOT extend APIError — it extends OpenAIError.
+          Pattern:
+            stream.on('abort', (err) => { /* handle abort */ });
+            // or in try-catch around finalResponse():
+            } catch (err) {
+              if (err instanceof OpenAI.APIUserAbortError) { /* user cancelled */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/EventStream.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: AuthenticationError (HTTP 401) confirmed in error.ts
+      # HTTP errors from the underlying create/retrieve call bubble up through EventStream
+      - id: responses-stream-authentication-error
+        condition: >
+          The API key is invalid, missing, or revoked (HTTP 401). The error occurs during
+          the initial HTTP request that opens the SSE stream — before any events are emitted.
+          Surfaces via the EventStream 'error' event and rejects stream.done() / stream.finalResponse().
+        throws: "AuthenticationError with status 401 (wrapped in OpenAIError by EventStream)"
+        required_handling: >
+          Caller MUST catch AuthenticationError when awaiting stream.finalResponse().
+          Auth errors from streaming calls fail immediately, not after partial data.
+          This is a configuration error — alert operations, do NOT retry with same key.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # conversations.items.create()  (via openai.conversations.items.create())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Runtime operation for managed conversation workflows (agent frameworks,
+  # persistent multi-turn agents). Adds up to 20 items to an existing conversation.
+  # Distinct from conversations.create() (admin/lifecycle op) — this is called
+  # in the hot path of agent frameworks that maintain conversation state.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: conversations.items.create
+    import_path: "openai"
+    description: >
+      Adds items to an existing managed conversation via openai.conversations.items.create().
+      Used in agent frameworks that maintain persistent multi-turn conversation state
+      between model calls. Accepts up to 20 items per request. Returns ConversationItemList.
+      Runtime-critical for agent workflows that persist tool call results, user messages,
+      and model outputs in a server-side conversation store.
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) confirmed in error.ts
+      # Thrown when conversationID is invalid, deleted, or expired
+      - id: conversations-items-not-found-error
+        condition: >
+          The conversationID does not correspond to an existing conversation — either
+          it was never created, has been deleted, or belongs to a different project/org.
+          Also thrown if the conversation has expired (managed conversations have TTLs).
+        throws: "NotFoundError with status 404"
+        required_handling: >
+          Caller MUST catch NotFoundError to detect stale or invalid conversation IDs.
+          In agent frameworks that cache conversation IDs across requests, the conversation
+          may be deleted server-side (TTL expiry, explicit delete, or cleanup job).
+          On 404: create a new conversation via openai.conversations.create() and
+          rebuild conversation history from local state before continuing.
+          Do NOT silently swallow — the agent's conversation context is lost.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: RateLimitError (HTTP 429) confirmed in error.ts
+      # Agent frameworks that add items on every model turn can hit rate limits
+      - id: conversations-items-rate-limit-error
+        condition: >
+          The rate limit for conversation item creation is exceeded (HTTP 429).
+          Agent frameworks that call conversations.items.create() on every turn
+          — to persist tool results and model outputs — generate high request
+          volumes that can exceed per-minute limits during traffic spikes.
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff for RateLimitError.
+          SDK auto-retries 2 times with backoff, but high-frequency agent loops
+          may exhaust retries. Consider batching multiple items into a single call
+          (up to 20 items per request) to reduce API calls per agent turn.
+          Rate limit here is distinct from the model inference rate limits.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: BadRequestError (HTTP 400) confirmed in error.ts
+      # Thrown when items exceed 20-per-request limit or have invalid structure
+      - id: conversations-items-invalid-request-error
+        condition: >
+          The request body contains invalid item data — more than 20 items in a single
+          request, items with invalid types, or items that reference non-existent
+          tool call IDs (e.g., a tool result item referencing a call_id not in history).
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST NOT retry without fixing the request structure.
+          Split batches exceeding 20 items into multiple calls.
+          Ensure tool result items reference valid call_ids from the model's prior output.
+          Do NOT retry bad request errors — they are structural, not transient.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
         evidence_quality: confirmed
