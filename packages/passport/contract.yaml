@@ -2,10 +2,10 @@ package: passport
 semver: ">=0.7.0 <1.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71
+coverage_score: 0.91
 
 detection:
   type_names:
@@ -41,6 +41,30 @@ functions:
         required_handling: "Caller MUST handle strategy errors in callback or Express error handler. Check if (err) in custom callback and forward to next(err) for centralized error handling."
         sources:
           - "https://www.passportjs.org/docs/authenticate/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: authenticate-unknown-strategy
+        condition: >
+          passport.authenticate() is called with a strategy name that has not been
+          registered via passport.use(). The strategy lookup returns undefined.
+        throws: >
+          Error('Unknown authentication strategy "<name>"') — forwarded via next(err)
+          to the Express error handler. Confirmed from lib/middleware/authenticate.js:
+          'if (!prototype) { return next(new Error("Unknown authentication strategy \"" + layer + "\"")); }'
+        required_handling: >
+          Always register strategies with passport.use() before calling
+          passport.authenticate(). Typos in strategy names, missing passport-strategy
+          packages, or conditional registration (only registering strategies in some
+          environments) all cause this error at request time, not at startup. Use
+          a centralized Express error handler to catch this gracefully.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/authenticate.js"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -442,6 +466,165 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: use
+    import_path: "passport"
+    description: >
+      Registers an authentication strategy by name. The strategy name is used later
+      in passport.authenticate('name'). If no name argument is passed, the strategy's
+      own .name property is used. Throws synchronously if neither the argument nor
+      the strategy object provides a name.
+    postconditions:
+      # Evidence: lib/authenticator.js line 62 — confirmed from source
+      # 'if (!name) { throw new Error("Authentication strategies must have a name"); }'
+      - id: use-strategy-no-name
+        condition: >
+          passport.use(strategy) is called where the strategy object has no .name
+          property and no name argument is provided. The name variable resolves to
+          undefined/null/empty string.
+        throws: >
+          Error('Authentication strategies must have a name') — thrown synchronously
+          during app startup (not at request time).
+        required_handling: >
+          Always ensure strategies have a name. Either pass an explicit name:
+          passport.use('local', new LocalStrategy(...)), or verify the strategy
+          package exports a .name property. Custom strategies defined as anonymous
+          objects must be passed with an explicit name argument. This error surfaces
+          during app initialization, crashing startup.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: initialize
+    import_path: "passport"
+    description: >
+      Returns Express/Connect middleware that prepares the request for Passport
+      authentication. Attaches req.logIn, req.logOut, req.isAuthenticated,
+      req.isUnauthenticated, and req._sessionManager to each request. Must be
+      mounted before passport.session() and before any passport.authenticate() calls.
+      As of v0.6.x, initialize() is optional for strategies that do not depend on
+      passport@0.4.x compatibility, but omitting it can break older strategy packages.
+    postconditions:
+      # Evidence: lib/middleware/initialize.js — confirmed from source
+      # lib/middleware/authenticate.js — strategies relying on req._passport will fail
+      # https://www.passportjs.org/concepts/authentication/middleware/
+      - id: initialize-order-violation
+        condition: >
+          passport.initialize() middleware is mounted AFTER passport.session() or
+          passport.authenticate() routes in the Express middleware stack. Because
+          initialize() attaches req._sessionManager and compatibility shims, strategies
+          that run before initialize() will fail with 'req.logIn is not a function'
+          or similar TypeError when attempting session operations.
+        throws: >
+          TypeError: req.logIn is not a function — or similar, because the req
+          methods were not yet attached by initialize(). Also: req._passport.instance
+          not set causes failures in passport@0.4.x-dependent strategies.
+        required_handling: >
+          Mount passport.initialize() BEFORE passport.session() and before any
+          routes that use passport.authenticate(). Correct order:
+          app.use(session(...))  →  app.use(passport.initialize())  →
+          app.use(passport.session())  →  routes.
+          Incorrect middleware order is the most common passport setup bug.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/initialize.js"
+          - "https://www.passportjs.org/concepts/authentication/middleware/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: initialize-missing-in-compat-mode
+        condition: >
+          passport.initialize() is omitted entirely and a strategy package was built
+          against passport@0.4.x or earlier. Those strategies read req._passport.instance
+          to access the Passport instance. When initialize() is not called, req._passport
+          is undefined, causing those strategies to throw a TypeError on every request.
+        throws: >
+          TypeError: Cannot read properties of undefined (reading 'instance') —
+          thrown inside the strategy's authenticate() method when it tries to access
+          req._passport.instance.
+        required_handling: >
+          Always use passport.initialize() when using strategies that may depend on
+          passport@0.4.x internals (e.g., passport-azure-ad, passport-saml, older
+          OAuth strategies). Check the strategy's peer dependency on passport to
+          determine if compat mode is required. When in doubt, always mount initialize().
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/middleware/initialize.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transformAuthInfo
+    import_path: "passport"
+    description: >
+      Registers a function to transform auth info objects supplied by strategies before
+      they are set on req.authInfo. Used in OAuth flows to enrich bearer token info with
+      client details (e.g., loading a full Client record from DB using info.clientID).
+      The transform function receives (info, done) or (req, info, done). If done(err) is
+      called or the transformer throws, the error propagates to the Express error handler.
+      If no transformers are registered, info is passed through unchanged.
+    postconditions:
+      # Evidence: lib/authenticator.js transformAuthInfo implementation — confirmed from source
+      # Async error handling via try/catch wrapping: 'catch(e) { return done(e); }'
+      - id: transform-auth-info-database-error
+        condition: >
+          A registered transformAuthInfo function calls done(err) due to a database
+          failure — for example, when loading a Client record from the database using
+          info.clientID fails because the database is unavailable or the ID is invalid.
+        throws: >
+          Error from done(err) propagated via next(err) to Express error handler.
+          The original info object is NOT set on req.authInfo when a transformer errors.
+        required_handling: >
+          The transform function MUST call done(err) on failure, not silently swallow
+          errors. The Express error handler will receive the error. For database-backed
+          transforms, implement circuit breakers or fallback behavior. If client info
+          enrichment fails non-critically, consider calling done(null, info) to pass
+          the original info through rather than failing the entire request.
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+      - id: transform-auth-info-chain-failure
+        condition: >
+          A registered transformAuthInfo function throws synchronously. Passport
+          wraps the transformer call in a try/catch block and forwards the error
+          to done(), which propagates to next(err).
+        throws: >
+          Error from the thrown exception, propagated via catch(e) → done(e) →
+          next(err) to the Express error handler.
+        required_handling: >
+          Transformer functions must not throw synchronously. Wrap async operations
+          in try/catch and call done(err). Synchronous throws are caught but still
+          fail the request by forwarding to the Express error handler. Ensure all
+          code paths in the transformer either call done(err) or done(null, transformedInfo).
+        sources:
+          - "https://github.com/jaredhanson/passport/blob/master/lib/authenticator.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
 edge_cases:
   - id: custom-strategy-errors
     description: "Custom strategies must properly call done(err) or done(null, false, info) to propagate errors - uncaught errors in strategy crash application"
@@ -492,3 +675,4 @@ edge_cases:
 # Category: authentication
 # Latest version: 0.7.0
 # Deepened: 2026-04-13 by deepen-stream-1
+# Deepened: 2026-04-16 by deepen-stream-2 — added use(), initialize(), transformAuthInfo(), authenticate-unknown-strategy

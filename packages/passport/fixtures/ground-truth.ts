@@ -170,4 +170,98 @@ app.get('/oauth/callback/twitter',
   }
 );
 
+// ─── passport.use() fixtures — deepen pass 2026-04-16 ────────────────────────
+
+// @expect-violation: use-strategy-no-name
+// Using an anonymous strategy object with no .name property and no name argument
+function registerAnonymousStrategy() {
+  // ❌ Strategy has no .name — throws Error('Authentication strategies must have a name')
+  const anonymousStrategy = {
+    authenticate: function(this: any) { this.success(null, {}); }
+  } as any;
+  passport.use(anonymousStrategy);
+}
+
+// @expect-clean
+// Correct passport.use() with explicit name override
+function registerNamedStrategy() {
+  const customStrategy = {
+    name: 'custom',
+    authenticate: function(this: any) { this.success(null, {}); }
+  } as any;
+  passport.use('custom', customStrategy);
+}
+
+// ─── passport.initialize() order fixtures — deepen pass 2026-04-16 ─────────
+
+// @expect-violation: initialize-order-violation
+// passport.session() mounted before passport.initialize() — req._sessionManager will be undefined
+function setupMiddlewareWrongOrder() {
+  const wrongApp = express();
+  // ❌ Wrong order: session() before initialize() — req._sessionManager not attached
+  wrongApp.use(passport.session());
+  wrongApp.use(passport.initialize());
+}
+
+// @expect-clean
+// Correct middleware order: session → initialize → passport.session
+function setupMiddlewareCorrectOrder() {
+  const correctApp = express();
+  const session = require('express-session');
+  correctApp.use(session({ secret: 'keyboard cat', resave: false, saveUninitialized: false }));
+  correctApp.use(passport.initialize());
+  correctApp.use(passport.session());
+}
+
+// ─── authenticate with unknown strategy — deepen pass 2026-04-16 ─────────
+
+// @expect-violation: authenticate-unknown-strategy
+// Using a strategy name that has not been registered with passport.use()
+app.get('/login/typo',
+  passport.authenticate('lcal'),  // ❌ Typo: 'lcal' instead of 'local' — not registered
+  function(req, res) {
+    res.redirect('/dashboard');
+  }
+);
+
+// @expect-clean
+// Using a properly registered strategy name
+function loginWithRegisteredStrategy() {
+  const LocalStrategy = require('passport-local').Strategy;
+  passport.use('local', new LocalStrategy(function(username: string, password: string, done: Function) {
+    done(null, { username });
+  }));
+  return passport.authenticate('local', { successRedirect: '/', failureRedirect: '/login' });
+}
+
+// ─── transformAuthInfo fixtures — deepen pass 2026-04-16 ────────────────────
+
+// @expect-violation: transform-auth-info-database-error
+// transformAuthInfo that swallows database errors silently
+passport.transformAuthInfo(function(info: any, done: (err: any, transformedInfo?: any) => void) {
+  // ❌ Database error swallowed — info is passed through as-is without client enrichment
+  try {
+    // simulate DB lookup by clientID
+    const client = null; // lookup failed but error swallowed
+    done(null, { ...info, client }); // silently passes null client
+  } catch (err) {
+    done(null, info); // ❌ swallows the error — never calls done(err)
+  }
+});
+
+// @expect-clean
+// Correct transformAuthInfo — propagates database errors
+passport.transformAuthInfo(function(info: any, done: (err: any, transformedInfo?: any) => void) {
+  try {
+    if (!info.clientID) {
+      return done(null, info); // no clientID to look up — pass through
+    }
+    // simulate DB call
+    const client = { id: info.clientID, name: 'test-client' };
+    done(null, { ...info, client });
+  } catch (err) {
+    done(err); // ✅ propagate DB errors to error handler
+  }
+});
+
 export { app };
