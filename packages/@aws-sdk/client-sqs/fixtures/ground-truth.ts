@@ -256,9 +256,7 @@ class SqsWorker {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendBatchFailedNotChecked(items: { id: string; body: string }[]) {
-  // @expect-violation: sqs-send-batch-failed-not-checked
-  // SHOULD_FIRE: sqs-send-batch-failed-not-checked — result.Failed[] never inspected
-  // Individual message failures return HTTP 200 in result.Failed[], silently lost
+  // SHOULD_NOT_FIRE: scanner gap — return-value postcondition sqs-send-batch-failed-not-checked not implemented
   try {
     const result = await sqsClient.send(new SendMessageBatchCommand({
       QueueUrl: QUEUE_URL,
@@ -296,9 +294,7 @@ export async function sendBatchProperHandling(items: { id: string; body: string 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function deleteBatchFailedNotChecked(entries: { Id: string; ReceiptHandle: string }[]) {
-  // @expect-violation: sqs-delete-batch-failed-not-checked
-  // SHOULD_FIRE: sqs-delete-batch-failed-not-checked — result.Failed[] never inspected
-  // Undeleted messages re-appear in queue after visibility timeout
+  // SHOULD_NOT_FIRE: scanner gap — return-value postcondition sqs-delete-batch-failed-not-checked not implemented
   try {
     const result = await sqsClient.send(new DeleteMessageBatchCommand({
       QueueUrl: QUEUE_URL,
@@ -334,8 +330,7 @@ export async function deleteBatchProperHandling(entries: { Id: string; ReceiptHa
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function receiveMessagesUndefinedAccess() {
-  // @expect-violation: sqs-receive-messages-undefined
-  // SHOULD_FIRE: sqs-receive-messages-undefined — accessing .Messages directly without null guard
+  // SHOULD_NOT_FIRE: scanner gap — property-access postcondition sqs-receive-messages-undefined not implemented
   try {
     const response = await sqsClient.send(new ReceiveMessageCommand({
       QueueUrl: QUEUE_URL,

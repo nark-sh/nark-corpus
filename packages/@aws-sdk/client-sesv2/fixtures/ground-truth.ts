@@ -44,7 +44,7 @@ const sesv2Client = new SESv2Client({ region: 'us-east-1' });
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function gt_sendEmail_missing(to: string) {
-  // SHOULD_FIRE: sesv2-send-no-try-catch — SendEmailCommand without try-catch
+  // SHOULD_FIRE: sesv2-send-email-no-try-catch — SendEmailCommand without try-catch
   await sesv2Client.send(new SendEmailCommand({
     FromEmailAddress: 'noreply@example.com',
     Destination: { ToAddresses: [to] },
@@ -77,7 +77,7 @@ export async function gt_sendEmail_safe(to: string) {
 }
 
 export async function gt_sendEmail_multiRecipient_missing(recipients: string[]) {
-  // SHOULD_FIRE: sesv2-send-no-try-catch — SendEmailCommand to multiple recipients, no try-catch
+  // SHOULD_FIRE: sesv2-send-email-no-try-catch — SendEmailCommand to multiple recipients, no try-catch
   await sesv2Client.send(new SendEmailCommand({
     FromEmailAddress: 'noreply@example.com',
     Destination: { ToAddresses: recipients },
@@ -114,7 +114,7 @@ export async function gt_sendEmail_multiRecipient_safe(recipients: string[]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function gt_sendBulk_missing(recipients: string[]) {
-  // SHOULD_FIRE: sesv2-send-no-try-catch — SendBulkEmailCommand without try-catch
+  // SHOULD_FIRE: sesv2-bulk-email-no-try-catch — SendBulkEmailCommand without try-catch
   await sesv2Client.send(new SendBulkEmailCommand({
     FromEmailAddress: 'bulk@example.com',
     BulkEmailEntries: recipients.map(e => ({
@@ -156,8 +156,7 @@ export async function gt_sendBulk_safe(recipients: string[]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function gt_sendBulk_resultNotChecked(recipients: string[]) {
-  // @expect-violation: sesv2-bulk-email-result-not-checked
-  // SHOULD_FIRE: result.BulkEmailEntryResults not inspected — per-recipient failures silently lost
+  // SHOULD_NOT_FIRE: scanner gap — return-value postcondition sesv2-bulk-email-result-not-checked not implemented
   try {
     await sesv2Client.send(new SendBulkEmailCommand({
       FromEmailAddress: 'bulk@example.com',

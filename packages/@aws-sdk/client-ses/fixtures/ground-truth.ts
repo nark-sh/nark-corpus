@@ -614,8 +614,7 @@ export async function updateCveTemplateWithFallback(name: string, fromEmail: str
 // @expect-violation: ses-send-bounce-no-try-catch
 // @expect-violation: ses-send-bounce-stale-message-id
 export async function sendBounceNoCatch(originalMessageId: string, bounceSender: string) {
-  // SHOULD_FIRE: ses-send-bounce-no-try-catch — SendBounceCommand throws MessageRejected,
-  //   no try-catch. Inbound email handlers commonly omit error handling on SendBounce.
+  // SHOULD_FIRE: ses-send-bounce-no-try-catch — SendBounceCommand throws MessageRejected no try-catch
   await sesClient.send(new SendBounceCommand({
     OriginalMessageId: originalMessageId,
     BounceSender: bounceSender,
@@ -654,9 +653,7 @@ export async function sendBounceWithErrorHandling(originalMessageId: string, bou
 // @expect-violation: ses-update-event-dest-not-found
 // @expect-violation: ses-update-event-dest-invalid-destination
 export async function updateEventDestinationNoCatch(configSetName: string, snsTopic: string) {
-  // SHOULD_FIRE: ses-update-event-dest-* — UpdateConfigurationSetEventDestinationCommand throws
-  //   multiple errors (ConfigurationSetDoesNotExist, EventDestinationDoesNotExist, InvalidSNSDestination),
-  //   no try-catch
+  // SHOULD_FIRE: ses-update-event-dest-* — UpdateConfigurationSetEventDestinationCommand throws multiple errors no try-catch
   await sesClient.send(new UpdateConfigurationSetEventDestinationCommand({
     ConfigurationSetName: configSetName,
     EventDestination: {
@@ -700,8 +697,7 @@ export async function updateEventDestinationWithFallback(configSetName: string, 
 // @expect-violation: ses-put-delivery-options-config-set-not-found
 // @expect-violation: ses-put-delivery-options-invalid
 export async function putDeliveryOptionsNoCatch(configSetName: string) {
-  // SHOULD_FIRE: ses-put-delivery-options-* — PutConfigurationSetDeliveryOptionsCommand throws
-  //   ConfigurationSetDoesNotExistException and InvalidDeliveryOptionsException, no try-catch
+  // SHOULD_FIRE: ses-put-delivery-options-* — PutConfigurationSetDeliveryOptionsCommand throws ConfigurationSetDoesNotExistException no try-catch
   await sesClient.send(new PutConfigurationSetDeliveryOptionsCommand({
     ConfigurationSetName: configSetName,
     DeliveryOptions: { TlsPolicy: 'Require' },
@@ -735,8 +731,7 @@ export async function putDeliveryOptionsWithErrorHandling(configSetName: string)
 
 // @expect-violation: ses-delete-config-set-not-found
 export async function deleteConfigurationSetNoCatch(configSetName: string) {
-  // SHOULD_FIRE: ses-delete-config-set-not-found — DeleteConfigurationSetCommand throws
-  //   ConfigurationSetDoesNotExistException (not idempotent), no try-catch
+  // SHOULD_FIRE: ses-delete-config-set-not-found — DeleteConfigurationSetCommand throws ConfigurationSetDoesNotExistException not idempotent no try-catch
   await sesClient.send(new DeleteConfigurationSetCommand({
     ConfigurationSetName: configSetName,
   }));
@@ -766,8 +761,7 @@ export async function deleteConfigurationSetIdempotent(configSetName: string) {
 // @expect-violation: ses-create-receipt-rule-set-already-exists
 // @expect-violation: ses-create-receipt-rule-set-limit-exceeded
 export async function createReceiptRuleSetNoCatch(ruleSetName: string) {
-  // SHOULD_FIRE: ses-create-receipt-rule-set-* — CreateReceiptRuleSetCommand throws
-  //   AlreadyExistsException or LimitExceededException, no try-catch
+  // SHOULD_FIRE: ses-create-receipt-rule-set-* — CreateReceiptRuleSetCommand throws AlreadyExistsException or LimitExceededException no try-catch
   await sesClient.send(new CreateReceiptRuleSetCommand({
     RuleSetName: ruleSetName,
   }));
@@ -798,8 +792,7 @@ export async function createReceiptRuleSetIdempotent(ruleSetName: string) {
 // @expect-violation: ses-create-receipt-rule-ruleset-not-found
 // @expect-violation: ses-create-receipt-rule-already-exists
 export async function createReceiptRuleNoCatch(ruleSetName: string, lambdaArn: string) {
-  // SHOULD_FIRE: ses-create-receipt-rule-* — CreateReceiptRuleCommand throws InvalidLambdaFunctionException,
-  //   RuleSetDoesNotExistException, AlreadyExistsException, no try-catch
+  // SHOULD_FIRE: ses-create-receipt-rule-* — CreateReceiptRuleCommand throws InvalidLambdaFunctionException RuleSetDoesNotExistException no try-catch
   await sesClient.send(new CreateReceiptRuleCommand({
     RuleSetName: ruleSetName,
     Rule: {
@@ -856,8 +849,7 @@ export async function createReceiptRuleWithCatch(ruleSetName: string, lambdaArn:
 
 // @expect-violation: ses-set-active-receipt-rule-set-not-found
 export async function setActiveReceiptRuleSetNoCatch(ruleSetName: string) {
-  // SHOULD_FIRE: ses-set-active-receipt-rule-set-not-found — SetActiveReceiptRuleSetCommand throws
-  //   RuleSetDoesNotExistException, no try-catch. Silent failure: inbound routing not switched.
+  // SHOULD_FIRE: ses-set-active-receipt-rule-set-not-found — SetActiveReceiptRuleSetCommand throws RuleSetDoesNotExistException no try-catch
   await sesClient.send(new SetActiveReceiptRuleSetCommand({
     RuleSetName: ruleSetName,
   }));
@@ -888,9 +880,7 @@ export async function setActiveReceiptRuleSetWithCatch(ruleSetName: string) {
 // @expect-violation: ses-create-tracking-options-already-exists
 // @expect-violation: ses-create-tracking-options-config-set-not-found
 export async function createTrackingOptionsNoCatch(configSetName: string, domain: string) {
-  // SHOULD_FIRE: ses-create-tracking-options-* — CreateConfigurationSetTrackingOptionsCommand throws
-  //   InvalidTrackingOptionsException, TrackingOptionsAlreadyExistsException,
-  //   ConfigurationSetDoesNotExistException, no try-catch
+  // SHOULD_FIRE: ses-create-tracking-options-* — CreateConfigurationSetTrackingOptionsCommand throws InvalidTrackingOptionsException no try-catch
   await sesClient.send(new CreateConfigurationSetTrackingOptionsCommand({
     ConfigurationSetName: configSetName,
     TrackingOptions: { CustomRedirectDomain: domain },
@@ -927,9 +917,7 @@ export async function createTrackingOptionsIdempotent(configSetName: string, dom
 
 // @expect-violation: ses-update-config-set-sending-enabled-not-found
 export async function pauseEmailSendingNoCatch(configSetName: string) {
-  // SHOULD_FIRE: ses-update-config-set-sending-enabled-not-found — UpdateConfigurationSetSendingEnabledCommand
-  //   throws ConfigurationSetDoesNotExistException, no try-catch.
-  //   Critical: reputation management pipeline crashes, bounces continue accumulating.
+  // SHOULD_FIRE: ses-update-config-set-sending-enabled-not-found — UpdateConfigurationSetSendingEnabledCommand throws ConfigurationSetDoesNotExistException no try-catch
   await sesClient.send(new UpdateConfigurationSetSendingEnabledCommand({
     ConfigurationSetName: configSetName,
     Enabled: false,
@@ -961,8 +949,7 @@ export async function pauseEmailSendingWithCatch(configSetName: string) {
 
 // @expect-violation: ses-put-identity-policy-invalid
 export async function putIdentityPolicyNoCatch(identity: string, policyName: string, policy: string) {
-  // SHOULD_FIRE: ses-put-identity-policy-invalid — PutIdentityPolicyCommand throws
-  //   InvalidPolicyException when policy is malformed or > 4KB, no try-catch
+  // SHOULD_FIRE: ses-put-identity-policy-invalid — PutIdentityPolicyCommand throws InvalidPolicyException when policy is malformed or over 4KB no try-catch
   await sesClient.send(new PutIdentityPolicyCommand({
     Identity: identity,
     PolicyName: policyName,
@@ -995,9 +982,7 @@ export async function putIdentityPolicyWithCatch(identity: string, policyName: s
 // @expect-violation: ses-delete-event-dest-not-found
 // @expect-violation: ses-delete-event-dest-config-set-not-found
 export async function deleteEventDestinationNoCatch(configSetName: string, destName: string) {
-  // SHOULD_FIRE: ses-delete-event-dest-* — DeleteConfigurationSetEventDestinationCommand throws
-  //   EventDestinationDoesNotExistException (not idempotent) and ConfigurationSetDoesNotExistException,
-  //   no try-catch
+  // SHOULD_FIRE: ses-delete-event-dest-* — DeleteConfigurationSetEventDestinationCommand throws EventDestinationDoesNotExistException not idempotent no try-catch
   await sesClient.send(new DeleteConfigurationSetEventDestinationCommand({
     ConfigurationSetName: configSetName,
     EventDestinationName: destName,

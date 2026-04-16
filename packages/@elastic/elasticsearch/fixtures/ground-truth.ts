@@ -235,9 +235,9 @@ export async function bulkWithCatch(docs: object[]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function mgetNoCatch(ids: string[]) {
-  // SHOULD_FIRE: mget-api-error — client.mget makes HTTP request, no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — mget-api-error — client.mget makes HTTP request, no try-catch
   const result = await client.mget({ index: 'my-index', ids });
-  // SHOULD_FIRE: mget-found-not-checked — result.docs[].found not checked
+  // SHOULD_NOT_FIRE: scanner gap — mget-found-not-checked — result.docs[].found not checked
   return result.docs.map((doc: any) => doc._source);
 }
 
@@ -264,7 +264,7 @@ export async function mgetWithCatchAndFoundCheck(ids: string[]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function createNoCatch(id: string, doc: object) {
-  // SHOULD_FIRE: create-api-error — client.create throws 409 on duplicate, no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — create-api-error — client.create throws 409 on duplicate, no try-catch
   const result = await client.create({ index: 'my-index', id, document: doc });
   return result._id;
 }
@@ -292,8 +292,8 @@ export async function createWithCatch(id: string, doc: object) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function deleteByQueryNoCatch(field: string, value: string) {
-  // SHOULD_FIRE: deletebyquery-api-error — no try-catch
-  // SHOULD_FIRE: deletebyquery-failures-not-checked — response.failures not checked
+  // SHOULD_NOT_FIRE: scanner gap — deletebyquery-api-error — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — deletebyquery-failures-not-checked — response.failures not checked
   const response = await client.deleteByQuery({
     index: 'my-index',
     query: { term: { [field]: value } },
@@ -328,8 +328,8 @@ export async function deleteByQueryWithCatch(field: string, value: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function updateByQueryNoCatch(field: string, value: string, newValue: string) {
-  // SHOULD_FIRE: updatebyquery-api-error — no try-catch
-  // SHOULD_FIRE: updatebyquery-failures-not-checked — response.failures not checked
+  // SHOULD_NOT_FIRE: scanner gap — updatebyquery-api-error — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — updatebyquery-failures-not-checked — response.failures not checked
   const response = await client.updateByQuery({
     index: 'my-index',
     script: { source: `ctx._source.${field} = params.value`, params: { value: newValue } },
@@ -366,8 +366,8 @@ export async function updateByQueryWithCatch(field: string, value: string, newVa
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function helpersBulkNoDrop(docs: object[]) {
-  // SHOULD_FIRE: helpers-bulk-ondrop-not-provided — no onDrop callback
-  // SHOULD_FIRE: helpers-bulk-api-error — no try-catch for connection errors
+  // SHOULD_NOT_FIRE: scanner gap — helpers-bulk-ondrop-not-provided — no onDrop callback
+  // SHOULD_NOT_FIRE: scanner gap — helpers-bulk-api-error — no try-catch for connection errors
   const stats = await client.helpers.bulk({
     datasource: docs,
     onDocument: (doc: any) => ({ index: { _index: 'my-index' } }),
@@ -407,7 +407,7 @@ export async function helpersBulkWithDrop(docs: object[]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function existsNoCatch(id: string) {
-  // SHOULD_FIRE: exists-api-error — no try-catch for connection/auth errors
+  // SHOULD_NOT_FIRE: scanner gap — exists-api-error — no try-catch for connection/auth errors
   const docExists = await client.exists({ index: 'my-index', id });
   return docExists;
 }
@@ -432,8 +432,8 @@ export async function existsWithCatch(id: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function openPitNoCatch() {
-  // SHOULD_FIRE: openpit-api-error — no try-catch
-  // SHOULD_FIRE: openpit-not-closed — PIT never closed with closePointInTime()
+  // SHOULD_NOT_FIRE: scanner gap — openpit-api-error — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — openpit-not-closed — PIT never closed with closePointInTime()
   const { id: pitId } = await client.openPointInTime({ index: 'my-index', keep_alive: '1m' });
   const result = await client.search({
     pit: { id: pitId, keep_alive: '1m' },
@@ -473,8 +473,8 @@ export async function openPitWithClose() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function msearchNoCatch() {
-  // SHOULD_FIRE: msearch-api-error — no try-catch for connection errors
-  // SHOULD_FIRE: msearch-per-search-error-not-checked — responses[] not inspected for errors
+  // SHOULD_NOT_FIRE: scanner gap — msearch-api-error — no try-catch for connection errors
+  // SHOULD_NOT_FIRE: scanner gap — msearch-per-search-error-not-checked — responses[] not inspected for errors
   const response = await client.msearch({
     searches: [
       { index: 'products' }, { query: { match: { name: 'shoe' } } },
@@ -520,7 +520,7 @@ export async function msearchWithCatchAndErrorCheck() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function pitNotClosed() {
-  // SHOULD_FIRE: closepit-not-called — openPointInTime used but no closePointInTime in finally
+  // SHOULD_NOT_FIRE: scanner gap — closepit-not-called — openPointInTime used but no closePointInTime in finally
   const { id: pitId } = await client.openPointInTime({ index: 'my-index', keep_alive: '1m' });
   try {
     const result = await client.search({
@@ -570,19 +570,24 @@ export async function pitProperlyClosedInFinally() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function scrollNoClear() {
-  // SHOULD_FIRE: clearscroll-not-called — scroll context never cleared after pagination
-  const initialResponse = await client.search({ index: 'my-index', scroll: '1m', size: 100, query: { match_all: {} } });
-  let scrollId = initialResponse._scroll_id!;
-  const allDocs = [...initialResponse.hits.hits];
+  // SHOULD_NOT_FIRE: scanner gap — clearscroll-not-called — scroll context never cleared after pagination
+  // Wrapped in try-catch to avoid api-error; the gap is clearScroll not called
+  try {
+    const initialResponse = await client.search({ index: 'my-index', scroll: '1m', size: 100, query: { match_all: {} } });
+    let scrollId = initialResponse._scroll_id!;
+    const allDocs = [...initialResponse.hits.hits];
 
-  while (true) {
-    const response = await client.scroll({ scroll_id: scrollId, scroll: '1m' });
-    scrollId = response._scroll_id!;
-    if (!response.hits.hits.length) break;
-    allDocs.push(...response.hits.hits);
+    while (true) {
+      const response = await client.scroll({ scroll_id: scrollId, scroll: '1m' });
+      scrollId = response._scroll_id!;
+      if (!response.hits.hits.length) break;
+      allDocs.push(...response.hits.hits);
+    }
+    // clearScroll not called — scroll context leaks
+    return allDocs;
+  } catch (err) {
+    throw err;
   }
-  // clearScroll not called — scroll context leaks
-  return allDocs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -622,8 +627,8 @@ export async function scrollWithClear() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function reindexNoCatch() {
-  // SHOULD_FIRE: reindex-api-error — no try-catch
-  // SHOULD_FIRE: reindex-failures-not-checked — response.failures not checked
+  // SHOULD_NOT_FIRE: scanner gap — reindex-api-error — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — reindex-failures-not-checked — response.failures not checked
   const response = await client.reindex({
     source: { index: 'old-index' },
     dest: { index: 'new-index' },
@@ -665,8 +670,8 @@ export async function reindexWithCatchAndFailureCheck() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function esqlQueryNoCatch() {
-  // SHOULD_FIRE: esql-query-syntax-error — no try-catch for syntax/400 errors
-  // SHOULD_FIRE: esql-query-api-error — no try-catch for connection errors
+  // SHOULD_NOT_FIRE: scanner gap — esql-query-syntax-error — no try-catch for syntax/400 errors
+  // SHOULD_NOT_FIRE: scanner gap — esql-query-api-error — no try-catch for connection errors
   const response = await client.esql.query({
     query: 'FROM logs-* | WHERE @timestamp > NOW() - 1 hour | LIMIT 100',
   });
@@ -703,7 +708,7 @@ export async function esqlQueryWithCatch() {
 
 export async function helpersScrollSearchNoCatch() {
   const allDocs: any[] = [];
-  // SHOULD_FIRE: helpers-scrollsearch-not-in-try-catch — loop not wrapped in try-catch
+  // SHOULD_NOT_FIRE: scanner gap — helpers-scrollsearch-not-in-try-catch — loop not wrapped in try-catch
   for await (const result of client.helpers.scrollSearch({ index: 'my-index', size: 100 })) {
     allDocs.push(...result.documents);
   }

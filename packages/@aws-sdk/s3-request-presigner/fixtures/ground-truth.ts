@@ -79,7 +79,7 @@ async function gt_getSignedUrl_put_safe(bucket: string, key: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function gt_createPresignedPost_missing(bucket: string, key: string) {
-  // SHOULD_FIRE: presigner-post-credential-error — createPresignedPost without try-catch
+  // SHOULD_NOT_FIRE: createPresignedPost belongs to @aws-sdk/s3-presigned-post (different package), not s3-request-presigner
   const post = await createPresignedPost(s3Client, { Bucket: bucket, Key: key, Expires: 600 });
   return post;
 }
