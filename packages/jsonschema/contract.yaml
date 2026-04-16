@@ -1,15 +1,20 @@
 package: jsonschema
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 1.0
 
 functions:
   - name: validate
     import_path: "jsonschema"
-    description: "Validates data against a JSON Schema. Throws when throwFirst, throwAll, or throwError options are set."
+    description: >
+      Validates data against a JSON Schema. Throws synchronously when throwFirst, throwAll, or throwError
+      options are set. Also throws SchemaError when the schema argument is not a valid object/boolean, or
+      when allowUnknownAttributes:false is set and an unknown keyword is encountered. Without throw options,
+      returns a ValidatorResult — caller MUST check result.valid or errors may be silently ignored.
 
     postconditions:
       # Evidence: 5 primary firings across 1 repo in scan-jsonschema-2026-04-02.json
@@ -66,9 +71,89 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: validator.js:107-109 — confirmed from package source
+      # Source: node_modules/jsonschema/lib/validator.js lines 107-109
+      # if((typeof schema !== 'boolean' && typeof schema !== 'object') || schema === null){
+      #   throw new SchemaError('Expected `schema` to be an object or boolean');
+      # }
+      - id: validate-invalid-schema-argument
+        condition: "schema argument is null, undefined, a string, number, or other non-object/non-boolean type"
+        throws: "SchemaError('Expected `schema` to be an object or boolean')"
+        required_handling: >
+          Caller MUST ensure the schema argument is a valid object or boolean before calling validate().
+          Passing null, undefined, a string, or any other primitive throws SchemaError synchronously.
+          This commonly occurs when schemas are loaded from external sources (databases, HTTP APIs, config files)
+          without validation of the loaded value. The call site MUST have try-catch or pre-validate the schema.
+        sources:
+          - "https://github.com/tdegrunt/jsonschema/blob/master/lib/validator.js"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: validator.js:207-210 — confirmed from package source
+      # Source: node_modules/jsonschema/lib/validator.js lines 207-210
+      # } else if (options.allowUnknownAttributes === false) {
+      #   throw new SchemaError("Unsupported attribute: " + key, schema);
+      # }
+      - id: validate-unknown-attribute-throws
+        condition: "options.allowUnknownAttributes is false and schema contains an unrecognized keyword"
+        throws: "SchemaError('Unsupported attribute: <key>')"
+        required_handling: >
+          When using allowUnknownAttributes:false with externally-provided or dynamic schemas,
+          caller MUST wrap in try-catch. Unknown JSON Schema keywords (custom or future draft keywords
+          not implemented by this library version) cause SchemaError to be thrown synchronously.
+          This is a strict-mode option — callers who set it accept stricter schema validation but must
+          handle the resulting throws.
+        sources:
+          - "https://github.com/tdegrunt/jsonschema/blob/master/lib/validator.js"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: helpers.js:79-81 — ValidatorResult.valid computed property
+      # Source: node_modules/jsonschema/lib/helpers.js lines 79-81
+      # Object.defineProperty(ValidatorResult.prototype, "valid", { get: function() {
+      #   return !this.errors.length;
+      # }});
+      - id: validate-result-unchecked
+        condition: "validate() is called without throw options and the return value's .valid property or .errors array is never inspected"
+        throws: "nothing — silent data accepted as valid"
+        required_handling: >
+          When validate() is called without throwFirst/throwAll/throwError options, it returns a ValidatorResult
+          object. Callers MUST check result.valid (or result.errors.length) before proceeding.
+          If the result is discarded or only used for its instance value without checking validity,
+          invalid data silently passes validation. This is the most common misuse pattern:
+          calling validate() for its side-effects while assuming success.
+          Pattern to avoid: validate(data, schema); // result discarded — data used regardless
+        sources:
+          - "https://github.com/tdegrunt/jsonschema/blob/master/lib/helpers.js"
+          - "https://github.com/tdegrunt/jsonschema/blob/master/README.md"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
   - name: "Validator.validate"
     import_path: "jsonschema"
-    description: "Instance method that validates data against a JSON Schema. Same throwing behavior as standalone validate()."
+    description: >
+      Instance method on the Validator class. Validates data against a schema. Shares all throw behaviors
+      of the standalone validate() function: throwFirst/throwAll/throwError options, SchemaError on invalid
+      schema argument, SchemaError with allowUnknownAttributes:false. The instance form additionally
+      resolves $ref schemas registered via addSchema().
 
     postconditions:
       - id: validator-validate-throw
@@ -80,6 +165,29 @@ functions:
         sources:
           - "https://github.com/tdegrunt/jsonschema/blob/master/README.md"
         severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: validator.js:266-272 — $ref resolution throws SchemaError
+      # Source: node_modules/jsonschema/lib/validator.js lines 256-273
+      # Validator.prototype.resolve throws SchemaError when $ref URI cannot be resolved
+      - id: validator-validate-unresolved-ref
+        condition: "schema uses $ref URI that was not pre-registered with addSchema()"
+        throws: "SchemaError('no such schema <uri>')"
+        required_handling: >
+          When Validator.validate() encounters a $ref in the schema, it resolves the URI against schemas
+          registered with addSchema(). If the referenced schema was never registered, it throws SchemaError
+          synchronously. This occurs in multi-schema setups (OpenAPI/JSON Schema $ref compositions) when
+          a dependent schema is missing. Caller MUST ensure all referenced schemas are registered before
+          calling validate(), and MUST wrap in try-catch when schemas come from external or dynamic sources.
+        sources:
+          - "https://github.com/tdegrunt/jsonschema/blob/master/lib/validator.js"
+        severity: error
+        evidence_quality: confirmed
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -114,6 +222,44 @@ functions:
         sources:
           - "https://github.com/tdegrunt/jsonschema/issues/60"
         severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: scan
+    import_path: "jsonschema"
+    description: >
+      Traverses a JSON Schema recursively and indexes all sub-schemas by their $id/id URI.
+      Used internally by Validator but also exported for advanced use cases such as pre-validating
+      schema registries or building schema dependency graphs. Throws when two schemas share the same
+      URI but have conflicting definitions.
+
+    postconditions:
+      # Evidence: scan.js:33-37 — confirmed from package source
+      # Source: node_modules/jsonschema/lib/scan.js lines 32-37
+      # if(found[ourBase]){
+      #   if(!helpers.deepCompareStrict(found[ourBase], schema)){
+      #     throw new Error('Schema <'+ourBase+'> already exists with different definition');
+      #   }
+      # }
+      - id: scan-duplicate-conflicting-schema
+        condition: >
+          Two schemas share the same $id or id URI but have different structure/definitions.
+          This occurs when dynamically assembling schema registries from multiple sources (config,
+          database, HTTP) where the same schema ID appears with different content.
+        throws: "Error('Schema <uri> already exists with different definition')"
+        required_handling: >
+          Caller MUST wrap scan() in try-catch when processing schemas from external or dynamic sources.
+          The error is thrown as a generic Error (not SchemaError), making it easy to miss in
+          catch(err) blocks that check instanceof SchemaError. Callers should deduplicate schemas
+          before scanning or use a try-catch that catches all Error types.
+        sources:
+          - "https://github.com/tdegrunt/jsonschema/blob/master/lib/scan.js"
+        severity: error
+        evidence_quality: confirmed
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
