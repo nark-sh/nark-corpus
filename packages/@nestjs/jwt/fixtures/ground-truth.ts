@@ -58,8 +58,7 @@ export function verifySyncWithCatch(token: string) {
 // ─── 5. sign() sync — no try-catch ───────────────────────────────────────────
 
 export function signWithoutCatch(payload: object) {
-  // SHOULD_FIRE: sign-sync-wrong-secret-provider — sign() throws WrongSecretProviderError
-  // when configured with async secretOrKeyProvider
+  // SHOULD_FIRE: sign-sync-wrong-secret-provider — sign() throws WrongSecretProviderError when configured with async secretOrKeyProvider
   return jwtService.sign(payload);
 }
 

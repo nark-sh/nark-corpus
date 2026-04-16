@@ -113,8 +113,7 @@ export async function thumbnailWithCatch(inputPath: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getImageDimensionsNoCatch(inputPath: string) {
-  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — metadata() rejects on
-  // missing file, corrupt header, or unsupported format. No try-catch.
+  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — metadata() rejects on missing file, corrupt header, or unsupported format. No try-catch.
   const meta = await sharp(inputPath).metadata();
   return { width: meta.width, height: meta.height };
 }
@@ -131,8 +130,7 @@ export async function getImageDimensionsWithCatch(inputPath: string) {
 }
 
 export async function validateUploadedImageNoCatch(inputBuffer: Buffer) {
-  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — user-provided buffer
-  // may be corrupt or not an image at all. No try-catch.
+  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — user-provided buffer may be corrupt or not an image at all. No try-catch.
   const meta = await sharp(inputBuffer).metadata();
   return meta.format;
 }
@@ -152,8 +150,7 @@ export async function validateUploadedImageWithCatch(inputBuffer: Buffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getImageStatsNoCatch(inputPath: string) {
-  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — stats() decodes all pixels
-  // and rejects on corrupt data, missing file, or unsupported format. No try-catch.
+  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — stats() decodes all pixels and rejects on corrupt data, missing file, or unsupported format. No try-catch.
   const s = await sharp(inputPath).stats();
   return s.entropy;
 }
@@ -170,8 +167,7 @@ export async function getImageStatsWithCatch(inputPath: string) {
 }
 
 export async function detectBlurryImageNoCatch(inputBuffer: Buffer) {
-  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — blur detection pipeline
-  // fails silently if corrupt buffer provided. No try-catch.
+  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — blur detection pipeline fails silently if corrupt buffer provided. No try-catch.
   const { sharpness } = await sharp(inputBuffer).stats();
   return sharpness < 10;
 }
