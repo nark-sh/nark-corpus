@@ -6,15 +6,29 @@
  *   - verify-no-try-catch (on function: jwtVerify)
  *   - sign-no-try-catch (on function: SignJWT.sign)
  *   - import-jwk-no-try-catch (on function: importJWK)
- *
- * Key rules:
- *   - jwtVerify() without try-catch → SHOULD_FIRE (verify-no-try-catch)
- *   - jwtVerify() inside try-catch → SHOULD_NOT_FIRE
- *   - new SignJWT().sign() without try-catch → SHOULD_FIRE (sign-no-try-catch)
- *   - importJWK() without try-catch → SHOULD_FIRE (import-jwk-no-try-catch)
+ *   - jwt-decrypt-no-try-catch (on function: jwtDecrypt) [ADDED 2026-04-16]
+ *   - compact-decrypt-no-try-catch (on function: compactDecrypt) [ADDED 2026-04-16]
+ *   - encrypt-jwt-no-try-catch (on function: EncryptJWT.encrypt) [ADDED 2026-04-16]
+ *   - import-spki-no-try-catch (on function: importSPKI) [ADDED 2026-04-16]
+ *   - import-pkcs8-no-try-catch (on function: importPKCS8) [ADDED 2026-04-16]
+ *   - import-x509-no-try-catch (on function: importX509) [ADDED 2026-04-16]
+ *   - generate-key-pair-no-try-catch (on function: generateKeyPair) [ADDED 2026-04-16]
+ *   - compact-verify-no-try-catch (on function: compactVerify) [ADDED 2026-04-16]
  */
 
-import { jwtVerify, SignJWT, importJWK } from 'jose';
+import {
+  jwtVerify,
+  jwtDecrypt,
+  SignJWT,
+  EncryptJWT,
+  compactDecrypt,
+  compactVerify,
+  importJWK,
+  importSPKI,
+  importPKCS8,
+  importX509,
+  generateKeyPair,
+} from 'jose';
 
 const key = new TextEncoder().encode('secret-key-that-is-at-least-32-bytes-long!!');
 
@@ -97,6 +111,140 @@ export async function importJWKSafely(jwk: Record<string, string>) {
   try {
     // SHOULD_NOT_FIRE: importJWK() inside try-catch
     return await importJWK(jwk, 'RS256');
+  } catch (e) {
+    throw e;
+  }
+}
+
+// ─── 9. jwtDecrypt() without try-catch ────────────────────────────────────────
+// @expect-violation: jwt-decrypt-no-try-catch
+
+export async function bareDecryptJwt(token: string, privateKey: Uint8Array) {
+  // SHOULD_FIRE: jwt-decrypt-no-try-catch — jwtDecrypt() without try-catch
+  // Throws JWEDecryptionFailed on wrong key, JWTExpired on expired token
+  const { payload } = await jwtDecrypt(token, privateKey);
+  return payload;
+}
+
+// ─── 10. jwtDecrypt() with try-catch ──────────────────────────────────────────
+// @expect-clean
+
+export async function decryptJwtSafely(token: string, privateKey: Uint8Array) {
+  try {
+    // SHOULD_NOT_FIRE: jwtDecrypt() inside try-catch — JWEDecryptionFailed handled
+    const { payload } = await jwtDecrypt(token, privateKey);
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// ─── 11. compactDecrypt() without try-catch ───────────────────────────────────
+// @expect-violation: compact-decrypt-no-try-catch
+
+export async function bareCompactDecrypt(jwe: string, key: Uint8Array) {
+  // SHOULD_FIRE: compact-decrypt-no-try-catch — compactDecrypt() without try-catch
+  // Throws JWEDecryptionFailed on authentication tag failure, JWEInvalid on format error
+  const { plaintext } = await compactDecrypt(jwe, key);
+  return plaintext;
+}
+
+// ─── 12. compactDecrypt() with try-catch ─────────────────────────────────────
+// @expect-clean
+
+export async function compactDecryptSafely(jwe: string, key: Uint8Array) {
+  try {
+    // SHOULD_NOT_FIRE: compactDecrypt() inside try-catch
+    const { plaintext } = await compactDecrypt(jwe, key);
+    return plaintext;
+  } catch (e) {
+    throw e;
+  }
+}
+
+// ─── 13. importSPKI() without try-catch ───────────────────────────────────────
+// @expect-violation: import-spki-no-try-catch
+
+export async function bareImportSPKI(pem: string) {
+  // SHOULD_FIRE: import-spki-no-try-catch — importSPKI() without try-catch
+  // Throws TypeError when PEM is malformed or missing -----BEGIN PUBLIC KEY----- header
+  return await importSPKI(pem, 'RS256');
+}
+
+// ─── 14. importSPKI() with try-catch ──────────────────────────────────────────
+// @expect-clean
+
+export async function importSPKISafely(pem: string) {
+  try {
+    // SHOULD_NOT_FIRE: importSPKI() inside try-catch
+    return await importSPKI(pem, 'RS256');
+  } catch (e) {
+    throw e;
+  }
+}
+
+// ─── 15. importPKCS8() without try-catch ──────────────────────────────────────
+// @expect-violation: import-pkcs8-no-try-catch
+
+export async function bareImportPKCS8(pem: string) {
+  // SHOULD_FIRE: import-pkcs8-no-try-catch — importPKCS8() without try-catch
+  // Throws TypeError when PEM is malformed or missing -----BEGIN PRIVATE KEY----- header
+  return await importPKCS8(pem, 'RS256');
+}
+
+// ─── 16. importPKCS8() with try-catch ─────────────────────────────────────────
+// @expect-clean
+
+export async function importPKCS8Safely(pem: string) {
+  try {
+    // SHOULD_NOT_FIRE: importPKCS8() inside try-catch
+    return await importPKCS8(pem, 'RS256');
+  } catch (e) {
+    throw e;
+  }
+}
+
+// ─── 17. compactVerify() without try-catch ────────────────────────────────────
+// @expect-violation: compact-verify-no-try-catch
+
+export async function bareCompactVerify(jws: string, key: Uint8Array) {
+  // SHOULD_FIRE: compact-verify-no-try-catch — compactVerify() without try-catch
+  // Throws JWSSignatureVerificationFailed on tampered token, JWSInvalid on format error
+  const { payload } = await compactVerify(jws, key);
+  return payload;
+}
+
+// ─── 18. compactVerify() with try-catch ───────────────────────────────────────
+// @expect-clean
+
+export async function compactVerifySafely(jws: string, key: Uint8Array) {
+  try {
+    // SHOULD_NOT_FIRE: compactVerify() inside try-catch
+    const { payload } = await compactVerify(jws, key);
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ─── 19. generateKeyPair() without try-catch ──────────────────────────────────
+// @expect-violation: generate-key-pair-no-try-catch
+
+export async function bareGenerateKeyPair() {
+  // SHOULD_FIRE: generate-key-pair-no-try-catch — generateKeyPair() without try-catch
+  // Throws JOSENotSupported for unsupported algorithm or invalid modulusLength
+  const { privateKey, publicKey } = await generateKeyPair('RS256');
+  return { privateKey, publicKey };
+}
+
+// ─── 20. generateKeyPair() with try-catch ─────────────────────────────────────
+// @expect-clean
+
+export async function generateKeyPairSafely() {
+  try {
+    // SHOULD_NOT_FIRE: generateKeyPair() inside try-catch
+    const { privateKey, publicKey } = await generateKeyPair('RS256');
+    return { privateKey, publicKey };
   } catch (e) {
     throw e;
   }
