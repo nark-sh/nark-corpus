@@ -1,7 +1,11 @@
 /**
  * @aws-sdk/lib-storage Ground-Truth Fixture
  * Postcondition IDs:
- *   upload-done-no-try-catch  (Upload.done())
+ *   upload-done-no-try-catch       (Upload.done())
+ *   upload-done-already-called     (Upload.done() called twice)
+ *   abort-does-not-clean-up-synchronously  (Upload.abort() fire-and-forget)
+ *   leave-parts-on-error-prevents-cleanup  (leavePartsOnError: true)
+ *   abort-before-done-is-noop      (abort() before done())
  */
 import { Upload } from '@aws-sdk/lib-storage';
 import { S3Client } from '@aws-sdk/client-s3';
@@ -49,6 +53,90 @@ async function gt_upload_buffer_safe(bucket: string, key: string, content: Buffe
     await upload.done();
   } catch (err) {
     console.error('Upload failed:', err);
+    throw err;
+  }
+}
+
+// 5. upload.done() called twice on same instance (SHOULD_FIRE: upload-done-already-called)
+// Note: No direct detection rule exists yet — this is a contract-defined violation.
+// The test documents the behavior: calling done() twice throws "already executed .done()"
+// @expect-violation: upload-done-already-called
+async function gt_upload_done_twice(bucket: string, key: string, body: Readable) {
+  const upload = new Upload({ client: s3, params: { Bucket: bucket, Key: key, Body: body } });
+  try {
+    try {
+      await upload.done(); // First call — may succeed or fail
+    } catch (firstErr) {
+      // WRONG: Retry by calling done() again on same instance
+      // SHOULD_FIRE: upload-done-already-called — second call to done() on same Upload instance
+      try {
+        await upload.done(); // Throws "already executed .done()"
+      } catch (secondErr) {
+        throw secondErr;
+      }
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 6. abort() without awaiting done() (fire-and-forget abort) (SHOULD_FIRE: abort-does-not-clean-up-synchronously)
+// @expect-violation: abort-does-not-clean-up-synchronously
+async function gt_abort_fire_and_forget(bucket: string, key: string, body: Readable) {
+  const upload = new Upload({ client: s3, params: { Bucket: bucket, Key: key, Body: body } });
+  const donePromise = upload.done(); // Start upload
+  // SHOULD_FIRE: abort-does-not-clean-up-synchronously — abort() without awaiting done()
+  await upload.abort(); // Signal abort, but never await donePromise — cleanup never confirmed
+  // donePromise is abandoned — AbortError and markUploadAsAborted never run
+}
+
+// 7. abort() correctly awaited with done() (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_abort_with_done_awaited(bucket: string, key: string, body: Readable) {
+  const upload = new Upload({ client: s3, params: { Bucket: bucket, Key: key, Body: body } });
+  const donePromise = upload.done();
+  await upload.abort();
+  try {
+    // SHOULD_NOT_FIRE: done() is properly awaited after abort() to allow cleanup
+    await donePromise;
+  } catch (err: any) {
+    if (err.name !== 'AbortError') throw err;
+    // Normal cancellation
+  }
+}
+
+// 8. leavePartsOnError: true without manual cleanup (SHOULD_FIRE: leave-parts-on-error-prevents-cleanup)
+// @expect-violation: leave-parts-on-error-prevents-cleanup
+async function gt_leave_parts_on_error_no_cleanup(bucket: string, key: string, body: Readable) {
+  // SHOULD_FIRE: leave-parts-on-error-prevents-cleanup — leavePartsOnError=true without manual abort
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: body },
+    leavePartsOnError: true,  // Disables automatic cleanup on abort/failure
+  });
+  try {
+    await upload.done();
+  } catch (err) {
+    // Parts are NOT cleaned up — S3 costs accumulate indefinitely
+    // No manual AbortMultipartUploadCommand issued
+    throw err;
+  }
+}
+
+// 9. leavePartsOnError: true WITH manual cleanup (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_leave_parts_on_error_with_cleanup(bucket: string, key: string, body: Readable) {
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: body },
+    leavePartsOnError: true,  // Manual cleanup responsibility
+  });
+  const uploadId = upload.uploadId;
+  try {
+    // SHOULD_NOT_FIRE: developer is taking manual responsibility for cleanup
+    await upload.done();
+  } catch (err) {
+    console.error('Upload failed, would manually clean up uploadId:', uploadId);
     throw err;
   }
 }

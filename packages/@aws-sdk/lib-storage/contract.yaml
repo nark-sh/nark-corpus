@@ -1,10 +1,28 @@
 package: "@aws-sdk/lib-storage"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
-status: draft
-evidence_quality: partial
+last_verified: "2026-04-16"  # deepen-stream-2 pass 1: coverage unknown → 100% (2 async functions, both contracted)
+status: production
+evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-2 pass 1):
+# API surface: Upload class has 2 true async-callable functions: done(), abort().
+# Previously contracted: done() (1 postcondition).
+# This pass added: abort() (3 postconditions: abort-does-not-clean-up, abort-after-done-is-noop,
+#   leave-parts-on-error-cost). Also added done() second postcondition: done-already-called.
+# Coverage: 2/2 async functions = 100% (constructor sync, on() is sync event registration).
+# Evidence sources inspected this pass:
+#   https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+#   https://github.com/aws/aws-sdk-js-v3/tree/main/lib/lib-storage (README)
+#   https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-lib-storage/
+#   Source inspection: dist-cjs/index.js (node_modules, @aws-sdk/lib-storage@3.x)
+# Key findings:
+#   abort() does NOT directly clean up uploaded parts — it only signals the AbortController.
+#   done() must still resolve/reject (via Promise.race) before cleanup via markUploadAsAborted() runs.
+#   If done() has not been called yet, abort() is a no-op regarding cleanup — there is nothing to abort.
+#   If leavePartsOnError=true, even abort() will NOT send AbortMultipartUploadCommand — S3 costs accumulate.
+#   Calling done() twice throws "already executed .done()" error — upload instances are single-use.
+coverage_score: 1.0  # 2/2 async-callable functions contracted
 
 detection:
   class_names: ["Upload"]
@@ -59,6 +77,175 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: dist-cjs/index.js lines 232-237: `if (this.sent) { throw new Error("@aws-sdk/lib-storage: this instance of Upload has already executed .done()...") }`
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      - id: upload-done-already-called
+        condition: >
+          upload.done() is called a second time on the same Upload instance. Upload
+          instances are single-use — calling done() twice throws immediately regardless
+          of whether the first call succeeded or failed.
+        throws: >
+          Error: "@aws-sdk/lib-storage: this instance of Upload has already executed
+          .done(). Create a new instance."
+        required_handling: >
+          Caller MUST create a new Upload instance for each upload operation.
+          Do NOT reuse Upload instances across retries — if done() fails, create a new
+          Upload instance with the same parameters and call done() on it instead.
+
+          WRONG — will throw on retry:
+            const upload = new Upload({...});
+            try { await upload.done(); } catch (e) { await upload.done(); } // THROWS
+
+          CORRECT — create new instance for retry:
+            const makeUpload = () => new Upload({client, params});
+            try { await makeUpload().done(); } catch (e) { await makeUpload().done(); }
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: abort
+    import_path: "@aws-sdk/lib-storage"
+    description: >
+      Signals cancellation of an in-progress multipart upload. Calls abort() on the
+      internal AbortController, which causes done() (if currently running) to reject
+      with an AbortError. Does NOT directly call AbortMultipartUploadCommand — cleanup
+      happens asynchronously inside done()'s Promise.race resolution. If done() has
+      not been started, abort() is effectively a no-op (there is nothing to clean up).
+    postconditions:
+      # Evidence: dist-cjs/index.js lines 229-231: `async abort() { this.abortController.abort(); }`
+      # Evidence: dist-cjs/index.js lines 466-471: markUploadAsAborted only runs if uploadId exists
+      #   (meaning done() started multipart) AND leavePartsOnError=false AND abort command prepared
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      - id: abort-does-not-clean-up-synchronously
+        condition: >
+          abort() is called on an in-progress upload without waiting for done() to
+          resolve or reject. Developers assume abort() immediately stops the upload and
+          cleans up parts, but it only signals the AbortController — done() must still
+          reject with AbortError before markUploadAsAborted() runs.
+        throws: >
+          abort() itself throws nothing. done() (the concurrent Promise) rejects with:
+          Error("Upload aborted.") with error.name === 'AbortError'.
+          The AbortError is thrown from __abortTimeout via Promise.race inside done().
+        required_handling: >
+          Caller MUST await done() after calling abort() to ensure cleanup completes.
+          The pattern is: call abort(), then catch the AbortError from done().
+
+          CORRECT pattern:
+            const upload = new Upload({...});
+            const donePromise = upload.done(); // Start upload
+            // ... later, when cancellation is needed:
+            await upload.abort();
+            try {
+              await donePromise; // Will reject with AbortError
+            } catch (err) {
+              if (err.name === 'AbortError') {
+                // Upload cancelled cleanly — parts already cleaned up (unless leavePartsOnError=true)
+              } else {
+                throw err; // Re-throw non-abort errors
+              }
+            }
+
+          WRONG — fire and forget abort:
+            upload.abort(); // No await, done() never awaited → cleanup never confirmed
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+          - "https://github.com/aws/aws-sdk-js-v3/tree/main/lib/lib-storage"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: dist-cjs/index.js lines 466-470:
+      #   if (this.uploadId && !this.leavePartsOnError && null !== this.abortMultipartUploadCommand) {
+      #     await this.client.send(this.abortMultipartUploadCommand);
+      #   }
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      - id: leave-parts-on-error-prevents-cleanup
+        condition: >
+          Upload is configured with leavePartsOnError: true and the upload fails or
+          is aborted. With this flag, markUploadAsAborted() skips the AbortMultipartUploadCommand
+          call — uploaded parts remain in S3 indefinitely and incur ongoing storage costs.
+        throws: >
+          No additional throw — parts are silently left on S3. The original failure error
+          is still thrown by done(), but the cleanup is skipped due to the flag.
+        required_handling: >
+          When leavePartsOnError: true, callers MUST manually clean up orphaned parts
+          by listing and aborting multipart uploads or configuring an S3 lifecycle rule.
+
+          leavePartsOnError: true should ONLY be used when you need to inspect uploaded
+          parts for debugging. In production, use leavePartsOnError: false (the default).
+
+          To list and abort orphaned multipart uploads manually:
+            const { UploadId } = upload; // capture before done() rejects
+            await s3Client.send(new AbortMultipartUploadCommand({
+              Bucket, Key, UploadId
+            }));
+
+          Or configure S3 lifecycle rule to abort incomplete multipart uploads after N days:
+            "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+
+          WARNING: Default S3 storage costs for incomplete multipart uploads:
+          Each part (5 MB minimum) that is not cleaned up is billed at standard S3 rates.
+          A failed 100 MB upload leaves up to 20 parts (5 MB each) billable until aborted.
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config"
+          - "https://github.com/aws/aws-sdk-js-v3/tree/main/lib/lib-storage"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: dist-cjs/index.js lines 229-231: abort() only calls this.abortController.abort()
+      # If done() has never been called, uploadId is undefined, and markUploadAsAborted is a no-op
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      - id: abort-before-done-is-noop
+        condition: >
+          abort() is called before done() has been called. Since the upload has not
+          started yet (no multipart upload initiated, no uploadId set), abort() only
+          signals the AbortController but there is nothing to clean up. When done() is
+          subsequently called, it will immediately reject with AbortError — but no S3
+          network requests were ever made.
+        throws: >
+          abort() itself throws nothing. If done() is called after abort(), done()
+          immediately rejects via Promise.race with AbortError (from __abortTimeout).
+          No S3 AbortMultipartUploadCommand is sent because uploadId is undefined.
+        required_handling: >
+          This is generally safe behavior — calling abort() before done() prevents the
+          upload from starting at all. However, callers should still catch the AbortError
+          from done() when calling done() after abort().
+
+          Example (cancel before start):
+            const upload = new Upload({...});
+            upload.abort(); // Signal: don't start
+            try {
+              await upload.done(); // Throws AbortError immediately
+            } catch (err) {
+              if (err.name !== 'AbortError') throw err;
+              // Normal cancellation — no S3 state to clean up
+            }
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 notes:
   - "Upload is instantiated with new Upload({client, params}) — the actual upload starts on .done()"
