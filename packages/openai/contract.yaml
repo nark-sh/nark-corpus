@@ -1,10 +1,12 @@
 package: openai
 semver: ">=4.0.0 <7.0.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-2 pass 3):
+# Expanded coverage from 20→23 contracted functions (+3 this pass).
 # Depth pass 2026-04-16 (deepen-stream-1 pass 2):
 # Expanded coverage from 16→20 contracted functions (+4 this pass).
 # API surface total: 31 async-callable (updated from 27 — discovered 4 missed in prior pass:
@@ -27,7 +29,19 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.65  # 20 contracted / 31 total async-callable functions (11 intentionally omitted)
+coverage_score: 0.64  # 23 contracted / 36 total async-callable functions (15 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-2 pass 3):
+# Expanded coverage from 20→23 contracted functions (+3 this pass).
+# API surface total updated: 31→36 (discovered 5 more: responses.compact, responses.inputTokens.count,
+#   realtime.calls.accept, realtime.calls.hangup, realtime.calls.refer/reject)
+# Contracted this pass: responses.compact, vector_stores.search (previously omitted), responses.inputTokens.count
+# Omitted this pass: realtime.calls.* (SIP telephony — niche adoption in SaaS apps)
+# Note: vector_stores.search moved from omitted→contracted (prior omission was too aggressive for a RAG-core op)
+# Evidence from openai-node@6.x source:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/input-tokens.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 
 functions:
   - name: create
@@ -1468,3 +1482,234 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # responses.compact()  (via openai.responses.compact())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Compacts a multi-turn conversation thread to reduce context window size and
+  # token costs in long-running agent/chat sessions. Produces a CompactedResponse
+  # with encrypted summary replacing older context. Used in production RAG and
+  # agent flows to manage token budget over many turns.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: responses.compact
+    import_path: "openai"
+    description: >
+      Compacts a multi-turn Responses API conversation by summarising older context
+      into a single compaction item (object type 'response.compaction'). Accepts
+      previous_response_id to identify the conversation chain to compact.
+      Returns a CompactedResponse with output[] (user messages + compaction item)
+      and usage token accounting. Used in long-running agent and RAG flows to stay
+      within the model's context window and reduce per-request token costs.
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) confirmed in error.ts
+      # previous_response_id refers to a server-side response object that can be
+      # deleted, expired, or invalid — callers must guard against stale IDs
+      - id: responses-compact-not-found-error
+        condition: "previous_response_id references a non-existent or expired response (404)"
+        throws: "NotFoundError with status 404"
+        required_handling: >
+          Caller MUST catch NotFoundError and handle the missing conversation gracefully.
+          DO NOT silently discard the error — the compaction did not occur.
+          Options: (1) restart the conversation from scratch, (2) fall back to passing
+          full conversation history in the next responses.create() call.
+          Log the failed previous_response_id for debugging.
+          Agent and chatbot flows that rely on compaction to stay within context limits
+          will silently lose the entire conversation history if this error is not caught.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: RateLimitError (HTTP 429) from error.ts — compact() calls the model
+      # to generate the compaction summary, consuming tokens and hitting rate limits
+      - id: responses-compact-rate-limit-error
+        condition: "Rate limit exceeded during compaction model call (429)"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller MUST catch RateLimitError and implement exponential backoff.
+          Compaction consumes tokens (model generates the summary), so it counts
+          against the same rate limits as responses.create(). High-frequency agent
+          loops that compact every few turns may hit rate limits unexpectedly.
+          If compaction fails: fall back to including the full history or reduce
+          compaction frequency.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: BadRequestError (HTTP 400) confirmed in error.ts
+      # The model field is required and must be a supported model ID
+      - id: responses-compact-bad-request-error
+        condition: "Invalid model ID or unsupported model for compaction (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST specify a valid model in ResponseCompactParams.model.
+          Use the same model that generated the original conversation to ensure
+          consistent token counting. BadRequestError is not retryable — fix the
+          model ID before retrying.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # vector_stores.search()  (via openai.vectorStores.search())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Performs semantic search against a vector store. Core operation in production
+  # RAG pipelines built on OpenAI file search. Returns paginated chunks ordered
+  # by relevance. Uses the OpenAI-Beta: assistants=v2 header.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: vector_stores.search
+    import_path: "openai"
+    description: >
+      Searches a vector store for relevant content chunks matching a query string,
+      with optional attribute filters. Returns a paginated Page<VectorStoreSearchResponse>
+      with semantic similarity results. Core production operation in RAG applications
+      that use OpenAI file search as the retrieval layer. Sends POST to
+      /vector_stores/{id}/search with the OpenAI-Beta: assistants=v2 header.
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) from error.ts
+      # Vector stores can be deleted externally or IDs can be stale across environments
+      - id: vector-stores-search-not-found-error
+        condition: "vectorStoreID references a deleted or non-existent vector store (404)"
+        throws: "NotFoundError with status 404"
+        required_handling: >
+          Caller MUST catch NotFoundError and handle gracefully in the RAG pipeline.
+          A missing vector store means search will return no results AND an exception —
+          do not assume empty results on error.
+          Options: (1) re-create the vector store and re-index documents,
+          (2) return a graceful "knowledge base unavailable" response to the user.
+          Log the invalid vectorStoreID to detect environment/config drift (dev vs prod stores).
+          Production RAG apps often have different vector store IDs per environment —
+          a misconfigured env var causes this to fail on every query.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: RateLimitError (HTTP 429) from error.ts
+      # Vector store search runs ML inference — rate limits apply
+      - id: vector-stores-search-rate-limit-error
+        condition: "Search rate limit exceeded (429) — common in high-frequency RAG loops"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller MUST catch RateLimitError and implement exponential backoff.
+          RAG pipelines that search on every user message are especially vulnerable
+          to sustained rate limiting during traffic spikes.
+          Consider caching frequent queries and implementing request queuing.
+          Rate limit errors from vector store search are distinct from chat completion
+          rate limits — they may have different limits and windows.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # responses.inputTokens.count()  (via openai.responses.inputTokens.count())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/input-tokens.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Dry-run token counter for Responses API requests. Returns InputTokenCountResponse
+  # with input_tokens field. Used as a pre-flight check before expensive model calls
+  # to validate that the input fits within the model's context window.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: responses.inputTokens.count
+    import_path: "openai"
+    description: >
+      Counts the input tokens for a Responses API request without generating a response.
+      Sends POST to /responses/input_tokens. Returns InputTokenCountResponse with
+      input_tokens (number) and object: 'response.input_tokens'.
+      Used as a pre-flight check to validate that assembled context (conversation
+      history, system prompt, tool definitions) fits within the model's context window
+      before committing to a responses.create() call that may fail or incur large costs.
+
+    postconditions:
+      # Evidence: BadRequestError (HTTP 400) confirmed in error.ts
+      # When truncation is 'disabled' (default) and input exceeds context window,
+      # API returns 400 — the count itself fails rather than returning a result
+      - id: responses-input-tokens-context-overflow-error
+        condition: >
+          Input exceeds the model's context window with truncation set to 'disabled'
+          (the default). The count call fails with BadRequestError (400) rather than
+          returning the token count.
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST catch BadRequestError when using this as a pre-flight check.
+          The count failing means the subsequent responses.create() would also fail
+          with the same error — take corrective action before attempting the real call.
+          Options: (1) truncate or summarize input, (2) use truncation: 'auto' in
+          the count call to get the count after truncation, (3) compact the conversation
+          using responses.compact() first.
+          Do NOT treat BadRequestError from count() as a transient error — it indicates
+          the input is too large for the model, not a service issue.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/input-tokens.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: AuthenticationError (HTTP 401) from error.ts
+      # Token counting still requires a valid API key — used in server-side pre-checks
+      - id: responses-input-tokens-authentication-error
+        condition: "Invalid or missing API key (401) — token counting requires authentication"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST catch AuthenticationError when using token count as a pre-flight check.
+          A missing API key means ALL subsequent API calls will also fail.
+          Surface to operations team immediately — this is a configuration error.
+          Token count calls in background jobs (e.g., pre-processing pipelines) may
+          fail silently if this error is swallowed.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed

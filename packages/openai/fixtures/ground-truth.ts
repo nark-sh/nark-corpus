@@ -681,3 +681,105 @@ export async function realtimeSessionsCreateWithCatch() {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// responses.compact — missing try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: responses-compact-not-found-error
+// @expect-violation: responses-compact-rate-limit-error
+export async function responsesCompactNoCatch(previousResponseId: string) {
+  // SHOULD_FIRE: responses.compact with no try-catch — NotFoundError if stale ID, RateLimitError from model call
+  const compacted = await openai.responses.compact({
+    model: 'gpt-4o',
+    previous_response_id: previousResponseId,
+  });
+  return compacted;
+}
+
+// @expect-clean
+export async function responsesCompactWithCatch(previousResponseId: string) {
+  try {
+    // SHOULD_NOT_FIRE: responses.compact inside try-catch with NotFoundError handling
+    const compacted = await openai.responses.compact({
+      model: 'gpt-4o',
+      previous_response_id: previousResponseId,
+    });
+    return compacted;
+  } catch (error) {
+    if (error instanceof OpenAI.NotFoundError) {
+      // Conversation chain broken — restart from scratch
+      throw new Error('Conversation history not found — starting fresh session');
+    }
+    if (error instanceof OpenAI.RateLimitError) {
+      throw new Error('Rate limit during compaction — retry with backoff');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vector_stores.search — missing try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: vector-stores-search-not-found-error
+// @expect-violation: vector-stores-search-rate-limit-error
+export async function vectorStoresSearchNoCatch(vectorStoreId: string, query: string) {
+  // SHOULD_FIRE: vector_stores.search with no try-catch — NotFoundError for invalid store, RateLimitError
+  const results = await openai.vectorStores.search(vectorStoreId, { query });
+  return results;
+}
+
+// @expect-clean
+export async function vectorStoresSearchWithCatch(vectorStoreId: string, query: string) {
+  try {
+    // SHOULD_NOT_FIRE: vector_stores.search inside try-catch with proper error handling
+    const results = await openai.vectorStores.search(vectorStoreId, { query });
+    return results;
+  } catch (error) {
+    if (error instanceof OpenAI.NotFoundError) {
+      // Vector store deleted or env mismatch — return empty results rather than crashing RAG pipeline
+      return { data: [], object: 'list' };
+    }
+    if (error instanceof OpenAI.RateLimitError) {
+      throw new Error('Vector store search rate limited — retry with backoff');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// responses.inputTokens.count — missing try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: responses-input-tokens-context-overflow-error
+// @expect-violation: responses-input-tokens-authentication-error
+export async function responsesInputTokensCountNoCatch(input: string) {
+  // SHOULD_FIRE: inputTokens.count with no try-catch — BadRequestError on overflow, AuthenticationError
+  const count = await openai.responses.inputTokens.count({
+    model: 'gpt-4o',
+    input,
+  });
+  return count.input_tokens;
+}
+
+// @expect-clean
+export async function responsesInputTokensCountWithCatch(input: string) {
+  try {
+    // SHOULD_NOT_FIRE: inputTokens.count inside try-catch with context overflow handling
+    const count = await openai.responses.inputTokens.count({
+      model: 'gpt-4o',
+      input,
+    });
+    return count.input_tokens;
+  } catch (error) {
+    if (error instanceof OpenAI.BadRequestError) {
+      // Input too large for model — caller must truncate before responses.create()
+      throw new Error('Input exceeds model context window — reduce input size before generating response');
+    }
+    if (error instanceof OpenAI.AuthenticationError) {
+      throw new Error('OpenAI authentication failed');
+    }
+    throw error;
+  }
+}
