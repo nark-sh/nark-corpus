@@ -1,10 +1,20 @@
 package: "@aws-sdk/client-sesv2"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.75
+# coverage_score = 6 contracted / 8 total relevant API functions (6 contracted + 2 intentionally omitted)
+# Previously contracted (1): send (generic)
+# Newly contracted this pass (5): SendEmailCommand, SendBulkEmailCommand,
+#   CreateEmailIdentityCommand, SendCustomVerificationEmailCommand,
+#   CreateEmailTemplateCommand+UpdateEmailTemplateCommand (combined), CreateImportJobCommand
+# Intentionally omitted (2):
+#   TestRenderEmailTemplateCommand (dev/preview utility, not production code path)
+#   CreateConfigurationSetCommand (infrastructure management, not SaaS app runtime)
+# Admin/read-only omitted (not counted): Get*, List*, Delete* commands
 
 functions:
   - name: send
@@ -55,6 +65,369 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: SendEmailCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Sends a transactional email via Amazon SES v2. Supports Simple (plain text/HTML),
+      Raw (MIME), and Templated message types. Returns SendEmailResponse with MessageId
+      on success. Throws on all service errors — the MessageId is NOT a delivery confirmation,
+      only an acceptance receipt.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html
+      # Error types confirmed from @aws-sdk/client-sesv2 TypeScript declarations (dist-types/commands/SendEmailCommand.d.ts)
+      - id: sesv2-send-email-no-try-catch
+        condition: >
+          Any service error or network failure: account suspended permanently
+          (AccountSuspendedException), sending paused (SendingPausedException),
+          sending domain not verified (MailFromDomainNotVerifiedException),
+          message rejected for invalid content (MessageRejected),
+          configuration set / template not found (NotFoundException),
+          invalid parameters (BadRequestException), quota exceeded (LimitExceededException),
+          throttling (TooManyRequestsException), or network failure.
+        throws: >
+          SESv2ServiceException subclass. error.name identifies the specific error code:
+          AccountSuspendedException (account permanently blocked — not retryable),
+          SendingPausedException (account sending disabled — check SES console),
+          MailFromDomainNotVerifiedException (DKIM/DMARC setup incomplete),
+          MessageRejected (virus scan failed — do not retry same content),
+          NotFoundException (configuration set or template name does not exist),
+          BadRequestException (malformed input — not retryable),
+          LimitExceededException (hourly/daily send quota exceeded),
+          TooManyRequestsException (API rate limit — retry with backoff).
+        required_handling: >
+          Caller MUST wrap client.send(new SendEmailCommand(...)) in try-catch.
+          SendingPausedException and AccountSuspendedException require manual
+          intervention via SES console — not retryable by code. LimitExceededException
+          and TooManyRequestsException should queue for delayed retry.
+
+          Minimum handling:
+            try {
+              const result = await sesv2Client.send(new SendEmailCommand({ ... }));
+              // result.MessageId is an acceptance receipt, NOT delivery confirmation
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                // AccountSuspendedException / SendingPausedException: alert ops team
+                // MailFromDomainNotVerifiedException: check domain DKIM/DMARC setup
+                // LimitExceededException / TooManyRequestsException: queue for retry
+                console.error(`SES v2 SendEmail [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: SendBulkEmailCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Sends templated email to multiple recipients in one API call. Returns HTTP 200
+      with BulkEmailEntryResults array even when individual recipients FAIL.
+      Each entry has a Status field that MUST be checked — failures are NOT thrown
+      as exceptions. This is the most dangerous SESv2 silent failure pattern.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendBulkEmail.html
+      # BulkEmailEntryResult type confirmed from dist-types/models/models_0.d.ts (lines 720-800)
+      # AWS docs explicitly state: "Check each response object and retry any messages with a failure status"
+      - id: sesv2-bulk-email-result-not-checked
+        condition: >
+          SendBulkEmailCommand returns HTTP 200 with BulkEmailEntryResults array.
+          Each entry has Status field that can be SUCCESS, ACCOUNT_SUSPENDED,
+          ACCOUNT_THROTTLED, ACCOUNT_DAILY_QUOTA_EXCEEDED, MESSAGE_REJECTED,
+          MAIL_FROM_DOMAIN_NOT_VERIFIED, CONFIGURATION_SET_DOES_NOT_EXIST,
+          TEMPLATE_DOES_NOT_EXIST, ACCOUNT_SENDING_PAUSED,
+          CONFIGURATION_SET_SENDING_PAUSED, INVALID_PARAMETER, TRANSIENT_FAILURE,
+          or FAILED. Non-SUCCESS statuses are NOT thrown as exceptions.
+        throws: >
+          Nothing thrown for per-recipient failures. The HTTP 200 response contains
+          BulkEmailEntryResults[n].Status and BulkEmailEntryResults[n].Error.
+          Account-level errors (AccountSuspendedException, TooManyRequestsException,
+          LimitExceededException) ARE thrown and terminate the entire request.
+        required_handling: >
+          Caller MUST iterate over response.BulkEmailEntryResults and check each
+          entry's Status. Recipients with non-SUCCESS status must be tracked and
+          retried. AWS documentation explicitly states: "Check each response object
+          and retry any messages with a failure status."
+
+          Minimum handling:
+            const response = await sesv2Client.send(new SendBulkEmailCommand({ ... }));
+            const failed = response.BulkEmailEntryResults?.filter(
+              r => r.Status !== 'SUCCESS'
+            ) ?? [];
+            if (failed.length > 0) {
+              // Log and queue for retry
+              failed.forEach(r => console.error(`Bulk email failed: ${r.Status} - ${r.Error}`));
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendBulkEmail.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: sesv2-bulk-email-no-try-catch
+        condition: >
+          Account-level errors for SendBulkEmailCommand ARE thrown as exceptions:
+          AccountSuspendedException, SendingPausedException, TooManyRequestsException,
+          LimitExceededException, MailFromDomainNotVerifiedException, BadRequestException.
+          These terminate the entire bulk send operation (no entries processed).
+        throws: >
+          SESv2ServiceException subclass. Same error hierarchy as SendEmailCommand.
+          AccountSuspendedException and SendingPausedException are not retryable.
+        required_handling: >
+          Caller MUST also wrap client.send(new SendBulkEmailCommand(...)) in try-catch
+          for account-level failures, in addition to checking per-entry BulkEmailEntryResults.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendBulkEmail.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: CreateEmailIdentityCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Registers an email address or domain as a sending identity in SES v2. Must be called
+      before that identity can be used as a From address. Returns DKIM tokens for DNS setup.
+      Often called during onboarding flows or multi-tenant domain registration.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateEmailIdentity.html
+      # Error types confirmed from dist-types/commands/CreateEmailIdentityCommand.d.ts
+      - id: sesv2-create-identity-no-try-catch
+        condition: >
+          CreateEmailIdentityCommand can fail with:
+          AlreadyExistsException (identity already registered — common in idempotent flows),
+          LimitExceededException (AWS account identity quota reached — requires AWS support),
+          ConcurrentModificationException (server-side conflict during concurrent identity creation),
+          NotFoundException (invalid domain or parent resource — rare),
+          BadRequestException (invalid email address or domain format),
+          TooManyRequestsException (rate limit exceeded).
+        throws: >
+          SESv2ServiceException subclass. AlreadyExistsException (HTTP 400) is the most
+          common: attempting to re-register an identity that already exists. This must be
+          handled in multi-tenant flows where multiple users may register the same domain.
+          LimitExceededException requires AWS quota increase — cannot be resolved in code.
+          ConcurrentModificationException is a server fault (HTTP 500) — retry with backoff.
+        required_handling: >
+          Caller MUST wrap in try-catch. AlreadyExistsException should typically be treated
+          as success (idempotent) in registration flows. LimitExceededException requires
+          alerting ops team — no programmatic solution.
+
+          Minimum handling:
+            try {
+              const result = await sesv2Client.send(new CreateEmailIdentityCommand({ EmailIdentity: domain }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'AlreadyExistsException') {
+                  // Identity already exists — treat as success in idempotent flows
+                  return;
+                }
+                if (err.name === 'LimitExceededException') {
+                  // AWS identity quota reached — alert ops team
+                }
+                throw err;
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateEmailIdentity.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: SendCustomVerificationEmailCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Sends a custom verification email to a recipient using a pre-created verification
+      template. Used in customer-facing email verification flows. Throws NotFoundException
+      when the template name does not exist — a configuration error that causes silent
+      onboarding failures if the template has been deleted or misnamed.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendCustomVerificationEmail.html
+      # Error types confirmed from dist-types/commands/SendCustomVerificationEmailCommand.d.ts
+      - id: sesv2-custom-verification-no-try-catch
+        condition: >
+          SendCustomVerificationEmailCommand can fail with:
+          NotFoundException (template name does not exist — template deleted or misspelled),
+          MailFromDomainNotVerifiedException (sending domain unverified),
+          MessageRejected (message content rejected — virus scan),
+          SendingPausedException (account sending disabled),
+          LimitExceededException (rate limit),
+          TooManyRequestsException (API throttle),
+          BadRequestException (invalid email address format).
+        throws: >
+          SESv2ServiceException subclass. NotFoundException is the most insidious error:
+          if the custom verification template is deleted from SES while the application
+          still references it by name, all verification emails silently fail. The error
+          name is 'NotFoundException' with HTTP 404.
+        required_handling: >
+          Caller MUST wrap in try-catch. NotFoundException for a missing template is a
+          configuration error that should trigger an immediate alert — it means no
+          verification emails can be sent until the template is recreated.
+
+          Minimum handling:
+            try {
+              await sesv2Client.send(new SendCustomVerificationEmailCommand({
+                EmailAddress: userEmail,
+                TemplateName: 'MyVerificationTemplate',
+              }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'NotFoundException') {
+                  // Verification template deleted — alert ops, no verification emails can be sent
+                }
+                console.error(`Custom verification email failed [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendCustomVerificationEmail.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: CreateEmailTemplateCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Creates a new email template for use with SendEmailCommand (templated) and
+      SendBulkEmailCommand. Template names must be unique. Called during application
+      setup, deployment, or when dynamically creating templates per tenant.
+      UpdateEmailTemplateCommand follows the same pattern with NotFoundException
+      instead of AlreadyExistsException.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateEmailTemplate.html
+      # Error types confirmed from dist-types/commands/CreateEmailTemplateCommand.d.ts
+      # UpdateEmailTemplateCommand has same pattern: NotFoundException replaces AlreadyExistsException
+      - id: sesv2-create-template-no-try-catch
+        condition: >
+          CreateEmailTemplateCommand can fail with:
+          AlreadyExistsException (template with this name already exists — not idempotent),
+          LimitExceededException (template quota exceeded — AWS default is 20,000 templates),
+          BadRequestException (invalid template syntax — Handlebars-style variables malformed),
+          TooManyRequestsException (API rate limit: max 1 request/second for template operations).
+          UpdateEmailTemplateCommand similarly throws NotFoundException when template does not exist.
+        throws: >
+          SESv2ServiceException subclass. AlreadyExistsException (HTTP 400) means a template
+          with that exact name already exists. Unlike CreateEmailIdentityCommand, template
+          creation is NOT idempotent — AlreadyExistsException means a conflict must be resolved.
+          BadRequestException for Handlebars syntax errors in the template body.
+        required_handling: >
+          Caller MUST wrap in try-catch. AlreadyExistsException must be handled explicitly —
+          either use a unique name, check existence first, or use UpdateEmailTemplateCommand
+          for existing templates. TooManyRequestsException requires throttling template
+          operations to at most 1/second.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateEmailTemplate.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: CreateImportJobCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Creates an asynchronous import job to bulk-import contacts into a SES v2 contact list
+      or suppression list from an S3 CSV/JSON source. Returns a JobId immediately — the actual
+      import runs asynchronously. The API call succeeding does NOT mean import succeeded.
+      Job status must be polled via GetImportJobCommand.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateImportJob.html
+      # Error types confirmed from dist-types/commands/CreateImportJobCommand.d.ts
+      - id: sesv2-import-job-result-not-polled
+        condition: >
+          CreateImportJobCommand returns a JobId immediately with HTTP 200. The import
+          job then runs asynchronously. If the caller does not poll GetImportJobCommand
+          for job completion/failure, it will never know whether contacts were actually
+          imported. A failed import job silently drops all contacts.
+        throws: >
+          Nothing thrown for job execution failures. The API only throws for request-level
+          errors: BadRequestException (invalid S3 path, malformed destination),
+          LimitExceededException (concurrent import job limit exceeded),
+          TooManyRequestsException (API rate limit).
+        required_handling: >
+          Caller MUST poll GetImportJobCommand until JobStatus is COMPLETE or FAILED.
+          A FAILED status with FailedRecordsS3Url indicates partial failures.
+
+          Minimum handling:
+            const { JobId } = await sesv2Client.send(new CreateImportJobCommand({ ... }));
+            // Poll for job completion
+            let status = 'CREATED';
+            while (status !== 'COMPLETED' && status !== 'FAILED') {
+              await new Promise(r => setTimeout(r, 5000)); // 5s poll interval
+              const job = await sesv2Client.send(new GetImportJobCommand({ JobId }));
+              status = job.JobStatus;
+            }
+            if (status === 'FAILED') {
+              // Check job.FailedRecordsS3Url for details
+              throw new Error(`SES import job ${JobId} failed`);
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateImportJob.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: sesv2-import-job-no-try-catch
+        condition: >
+          CreateImportJobCommand throws on request-level failures:
+          LimitExceededException (concurrent import job limit),
+          BadRequestException (invalid ImportDataSource S3 path or invalid ImportDestination),
+          TooManyRequestsException (rate limit).
+        throws: >
+          SESv2ServiceException subclass. LimitExceededException means too many concurrent
+          import jobs are running — wait for existing jobs to complete before starting new ones.
+        required_handling: >
+          Caller MUST wrap in try-catch in addition to polling job status.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateImportJob.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 tags:
   - aws
   - email
@@ -67,12 +440,14 @@ tags:
 
 notes:
   - "Scan 2026-04-11: scan encountered errors (0 repos scanned due to scanner failure on only available repo). FP check: 0/20 repos. evidence_quality upgraded to confirmed based on FP check passing and existing evidence."
+  - "Depth pass 2026-04-16: 5 new command-specific function entries added (SendEmailCommand, SendBulkEmailCommand, CreateEmailIdentityCommand, SendCustomVerificationEmailCommand, CreateEmailTemplateCommand, CreateImportJobCommand)."
   - "SESv2 uses different parameters than SES v1: FromEmailAddress (not Source), Content.Simple (not Message)"
   - "SESv2Client is a separate class from SESClient — different import paths"
   - "Error class is SESv2ServiceException, not SESServiceException"
   - "Sandbox mode: only verified email addresses can receive emails by default"
   - "TooManyRequestsException: implement exponential backoff for high-volume sending"
-  - "Creating/verifying email identities with CreateEmailIdentityCommand can also fail"
+  - "SendBulkEmailCommand: CRITICAL silent failure — HTTP 200 with per-recipient status in BulkEmailEntryResults"
+  - "CreateImportJobCommand: async job pattern — always poll GetImportJobCommand for COMPLETED/FAILED status"
 
 related_packages:
   - "@aws-sdk/client-ses"
