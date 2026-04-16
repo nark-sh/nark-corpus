@@ -2,10 +2,10 @@ package: moment
 semver: ">=2.29.0 <3.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.73
+coverage_score: 0.83
 
 functions:
   - name: moment
@@ -304,10 +304,152 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: add
+    import_path: "moment"
+    description: "Mutates the original moment by adding time (years, months, weeks, days, hours, minutes, seconds, milliseconds)"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/manipulating/add/
+      # Source confirmed: docs explicitly list "invalid.add(unit, value)" as producing an invalid moment.
+      # The NaN-like propagation means add() on an invalid moment silently returns another invalid moment
+      # rather than throwing — callers have no indication the operation failed.
+      - id: add-invalid-moment-propagation
+        condition: "add() is called on a moment object that is already invalid (isValid() === false)"
+        returns: "Invalid moment object — NaN propagates through all subsequent operations"
+        required_handling: >
+          Caller MUST check isValid() on the source moment BEFORE calling add().
+          When add() is called on an invalid moment, it silently returns another invalid moment.
+          This is particularly dangerous when the moment comes from a parsed user input or API
+          response: the subsequent add() call succeeds without error, but every downstream
+          operation (format(), diff(), toISOString()) continues silently returning "Invalid date" / null / NaN.
+          Pattern: const m = moment(input); if (!m.isValid()) { throw new Error('invalid date'); } m.add(1, 'day');
+        sources:
+          - "https://momentjs.com/docs/#/manipulating/add/"
+          - "https://momentjs.com/docs/#/parsing/is-valid/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: subtract
+    import_path: "moment"
+    description: "Mutates the original moment by subtracting time (years, months, weeks, days, hours, minutes, seconds, milliseconds)"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/manipulating/subtract/
+      # Source confirmed: docs explicitly list "invalid.subtract(unit, value)" as producing an invalid moment.
+      # Same NaN-like propagation as add().
+      - id: subtract-invalid-moment-propagation
+        condition: "subtract() is called on a moment object that is already invalid (isValid() === false)"
+        returns: "Invalid moment object — NaN propagates through all subsequent operations"
+        required_handling: >
+          Caller MUST check isValid() on the source moment BEFORE calling subtract().
+          When subtract() is called on an invalid moment, it silently returns another invalid moment.
+          Common dangerous pattern: computing expiry dates (moment(createdAt).subtract(30, 'days'))
+          where createdAt may be null/undefined from a DB column — the invalid moment silently
+          propagates, producing incorrect expiry timestamps that get stored in the database.
+          Pattern: const m = moment(input); if (!m.isValid()) { throw new Error('invalid date'); } m.subtract(30, 'days');
+        sources:
+          - "https://momentjs.com/docs/#/manipulating/subtract/"
+          - "https://momentjs.com/docs/#/parsing/is-valid/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: min
+    import_path: "moment"
+    description: "Returns the minimum (earliest) of the provided moment objects"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/get-set/min/
+      # Source confirmed: "From version 2.10.5, if an invalid moment is one of the arguments,
+      # the result is an invalid moment." The pickBy() implementation in moment source confirms:
+      # if any element passes isMoment check but isValid()===false, min/max propagates invalidity.
+      - id: min-invalid-moment-propagation
+        condition: "any argument to moment.min() is an invalid moment (isValid() === false)"
+        returns: "Invalid moment object, regardless of the validity of other arguments"
+        required_handling: >
+          Caller MUST ensure all moments passed to moment.min() are valid before calling.
+          Even if only one of many moments is invalid, the entire min() result is invalid.
+          This is counterintuitive — developers often expect min() to return the best valid
+          value, but instead it propagates invalidity from any single bad argument.
+          Common dangerous pattern: moment.min(userInputDates.map(d => moment(d))) where any
+          one unparseable date in the array causes the entire result to be invalid.
+          Pattern: const validDates = dates.map(d => moment(d)).filter(m => m.isValid()); moment.min(validDates);
+        sources:
+          - "https://momentjs.com/docs/#/get-set/min/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: max
+    import_path: "moment"
+    description: "Returns the maximum (latest) of the provided moment objects"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/get-set/max/
+      # Source confirmed: "From version 2.10.5, if an invalid moment is one of the arguments,
+      # the result is an invalid moment." Symmetric with moment.min().
+      - id: max-invalid-moment-propagation
+        condition: "any argument to moment.max() is an invalid moment (isValid() === false)"
+        returns: "Invalid moment object, regardless of the validity of other arguments"
+        required_handling: >
+          Caller MUST ensure all moments passed to moment.max() are valid before calling.
+          Even if only one of many moments is invalid, the entire max() result is invalid.
+          This is the same counterintuitive propagation as moment.min().
+          Common dangerous pattern: moment.max(events.map(e => moment(e.endAt))) where any
+          one null/missing endAt in the dataset causes the maximum to be invalid — leading
+          to "Invalid date" being stored as the computed deadline or expiry date.
+          Pattern: const validDates = dates.map(d => moment(d)).filter(m => m.isValid()); moment.max(validDates);
+        sources:
+          - "https://momentjs.com/docs/#/get-set/max/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: fromNow
+    import_path: "moment"
+    description: "Returns a human-readable string representing the time relative to now (e.g., '2 hours ago', 'in 3 days')"
+    postconditions:
+      # Evidence: https://momentjs.com/docs/#/displaying/fromnow/
+      # Source confirmed: docs state "invalid.fromNow(suffix)" returns "a localized version of 'InvalidDate'"
+      # This is a silent string failure — the string "Invalid date" gets rendered in UI instead of a relative time.
+      - id: fromnow-invalid-date-string
+        condition: "moment object is invalid (isValid() === false)"
+        returns: "The localized string 'Invalid date' instead of a relative time string"
+        required_handling: >
+          Caller MUST check isValid() before calling fromNow(). The string "Invalid date"
+          is silently returned and easily gets displayed to users in UI components like
+          "Posted Invalid date ago" or "Expires Invalid date". This is a common UX bug in
+          production React/Next.js apps that use moment for relative timestamps.
+          Use pattern: const m = moment(input); return m.isValid() ? m.fromNow() : 'Unknown date';
+        sources:
+          - "https://momentjs.com/docs/#/displaying/fromnow/"
+          - "https://momentjs.com/docs/#/parsing/is-valid/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 # Category: utilities
 
 # npm: https://www.npmjs.com/package/moment
 # Repository: https://github.com/moment/moment
 # Note: Moment.js is in maintenance mode (no new features), but still widely used
 # Security: CVE-2022-24785 (path traversal), CVE-2022-31129 (ReDoS)
-# coverage_score: 0.73  # 8 contracted out of 11 meaningful api functions (3 omitted: diff/toDate/valueOf — NaN propagation covered by format/toISOString contracts)
+# coverage_score: 0.83  # 15 contracted out of 18 meaningful api functions (3 omitted: diff/toDate/valueOf — NaN propagation covered by format/toISOString contracts)
+# pass-4 additions: add, subtract, min, max, fromNow (+5 functions, was 10 → now 15)

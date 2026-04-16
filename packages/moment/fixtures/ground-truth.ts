@@ -299,7 +299,7 @@ export function subtractWithIsValid(input: string): string {
 
 export function minNoValidation(dates: string[]): string {
   const moments = dates.map(d => moment(d));
-  // SHOULD_NOT_FIRE: scanner gap — min-invalid-moment-propagation — invalid moment in array makes result invalid
+  // SHOULD_FIRE: min-invalid-moment-propagation — moment.min() called without filtering invalid moments first
   const earliest = moment.min(moments);
   return earliest.format('YYYY-MM-DD');
 }
@@ -320,7 +320,7 @@ export function minWithFilterValidation(dates: string[]): string {
 
 export function maxNoValidation(dates: string[]): string {
   const moments = dates.map(d => moment(d));
-  // SHOULD_NOT_FIRE: scanner gap — max-invalid-moment-propagation — invalid moment in array makes result invalid
+  // SHOULD_FIRE: max-invalid-moment-propagation — moment.max() called without filtering invalid moments first
   const latest = moment.max(moments);
   return latest.format('YYYY-MM-DD');
 }

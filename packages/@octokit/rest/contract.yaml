@@ -1189,10 +1189,437 @@ functions:
         sources:
           - https://github.com/octokit/plugin-paginate-rest.js
 
+  - name: pulls.createReview
+    import_path: "@octokit/rest"
+    description: >
+      Creates a review on a pull request. Can create a pending review (PENDING event),
+      approve (APPROVE), request changes (REQUEST_CHANGES), or comment (COMMENT).
+      Fundamental to code review automation, GitHub Apps that auto-review PRs, and
+      security scanning tools that post review comments. Requires pull-requests:write scope.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/reviews — confirmed 403, 422 status codes
+      # RequestError class from @octokit/request-error — status field contains HTTP code
+      - id: pulls-create-review-no-try-catch
+        condition: >
+          octokit.pulls.createReview() called without try-catch when the PR is not found,
+          the review body violates spam detection, or permission is insufficient
+        throws: >
+          RequestError with status 403 (Forbidden — insufficient permissions or non-collaborator
+          attempting to review), 404 (Not Found — PR or repo not found), 422 (Validation
+          Failed — invalid event type, comment body violates spam detection, or endpoint
+          has been spammed too rapidly).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Automated review posting fails silently without error handling. A 422 is common
+          when the review body is too long, uses disallowed patterns, or when multiple
+          automated reviews are posted too rapidly (spam detection). A 403 occurs when
+          the token lacks pull-requests:write permission. Without try-catch, CI pipelines
+          that create reviews crash and leave PRs without required review status.
+        detector: >
+          If octokit.pulls.createReview() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (check token has pull-requests:write scope),
+          404 (verify PR number and repo owner/name), 422 (invalid event type — only
+          PENDING/APPROVE/REQUEST_CHANGES/COMMENT are valid; backoff if spam detection hit).
+        source: https://docs.github.com/en/rest/pulls/reviews
+        sources:
+          - https://docs.github.com/en/rest/pulls/reviews
+
+  - name: pulls.submitReview
+    import_path: "@octokit/rest"
+    description: >
+      Submits a pending pull request review that was created with the PENDING event.
+      Converts a draft review to an official APPROVE, REQUEST_CHANGES, or COMMENT review.
+      Used in multi-step review automation where comments are staged before submission.
+      Requires the review to be in PENDING state — submitting a non-pending review fails.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/reviews — confirmed 422 on wrong state, 404 missing review
+      - id: pulls-submit-review-wrong-state
+        condition: >
+          octokit.pulls.submitReview() called without try-catch when the review is not
+          in PENDING state, the review ID is invalid, or event parameter is missing
+        throws: >
+          RequestError with status 422 (Validation Failed — review is not PENDING, event
+          parameter is blank/invalid, or endpoint has been spammed), 404 (Not Found —
+          review_id or pull_number not found in repository).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Attempting to submit a review that was already submitted (APPROVED/CHANGES_REQUESTED
+          state instead of PENDING) throws 422. This happens in automation where the review
+          lifecycle is not tracked — the code creates a review and then tries to submit it
+          again on retry. The event parameter (APPROVE/REQUEST_CHANGES/COMMENT) is required;
+          omitting it causes 422. Without try-catch, the entire review pipeline crashes.
+        detector: >
+          If octokit.pulls.submitReview() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (verify review is in PENDING state before
+          submitting — use pulls.getReview() to check; ensure event parameter is provided).
+          Handle 404 (verify review_id and pull_number exist). Track review state to
+          avoid double-submit on retry.
+        source: https://docs.github.com/en/rest/pulls/reviews
+        sources:
+          - https://docs.github.com/en/rest/pulls/reviews
+
+  - name: repos.uploadReleaseAsset
+    import_path: "@octokit/rest"
+    description: >
+      Uploads a binary asset (file) to a GitHub Release. Used in release automation
+      pipelines to attach build artifacts, binaries, checksums, and release packages.
+      Returns the uploaded asset object with browser_download_url. The upload_url
+      is obtained from repos.createRelease() response. Unique among GitHub API calls
+      in that it sends raw binary data, not JSON.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/releases/assets — 422 on duplicate filename confirmed
+      - id: release-asset-duplicate-filename
+        condition: >
+          octokit.repos.uploadReleaseAsset() called without try-catch when an asset
+          with the same filename already exists on the release
+        throws: >
+          RequestError with status 422 (Unprocessable Entity) when a file with the
+          same name is already attached to the release. GitHub does not overwrite —
+          the duplicate upload fails. Must delete the existing asset first.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Release CI pipelines that re-run on failure will attempt to re-upload assets
+          that were already uploaded in the first run. GitHub returns 422 instead of
+          overwriting. Without error handling, the re-run crashes and the release is
+          left with partial assets. The fix is to check for existing assets and delete
+          them before re-uploading.
+        detector: >
+          If octokit.repos.uploadReleaseAsset() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (check if asset already exists with
+          repos.listReleaseAssets(), delete it with repos.deleteReleaseAsset() before
+          re-uploading). Handle 404 (verify release_id from createRelease response).
+          Note: filename must match the Content-Type header; GitHub renames files with
+          special characters automatically.
+        source: https://docs.github.com/en/rest/releases/assets
+        sources:
+          - https://docs.github.com/en/rest/releases/assets
+
+  - name: repos.addCollaborator
+    import_path: "@octokit/rest"
+    description: >
+      Adds a user as a collaborator to a repository with a specified permission level.
+      Returns 201 (invitation created) for new collaborators, 204 (already a collaborator)
+      for existing ones. Used in team management automation, onboarding flows, and
+      GitHub Apps that provision repository access. Requires admin access to the repo.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/collaborators/collaborators — 422, 403 confirmed
+      - id: add-collaborator-emu-account
+        condition: >
+          octokit.repos.addCollaborator() called without try-catch when the target user
+          is an Enterprise Managed User (EMU) being added to a non-enterprise repository,
+          or validation fails due to invalid permission level
+        throws: >
+          RequestError with status 422 (Validation Failed) when an EMU account is invited
+          to a repository in an enterprise with personal user accounts, or when the assigned
+          permission level is below the organization's base permission. Status 403 (Forbidden)
+          when the authenticated user lacks admin access to the repository.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Collaborator invitation flows in GitHub Apps fail when organizations mix EMU and
+          personal accounts. The 422 error on EMU accounts is non-obvious from the error
+          message alone. Additionally, assigning a permission role lower than the org's
+          base permission fails with 422. Without error handling, provisioning automation
+          crashes silently.
+        detector: >
+          If octokit.repos.addCollaborator() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (check for EMU constraints if your org uses
+          GitHub Enterprise; verify permission level is not below org base permission).
+          Handle 403 (verify authenticated user has admin role on the repository).
+          Note: 201 means invitation sent; 204 means user was already a collaborator.
+          Check the response status to distinguish.
+        source: https://docs.github.com/en/rest/collaborators/collaborators
+        sources:
+          - https://docs.github.com/en/rest/collaborators/collaborators
+
+  - name: repos.createWebhook
+    import_path: "@octokit/rest"
+    description: >
+      Creates a webhook on a repository to receive HTTP POST callbacks for specified events.
+      Used by GitHub Apps to register event subscriptions for push, pull_request, issues,
+      and other events. Requires admin access to the repository. The webhook config
+      includes the payload URL, content type, and secret for HMAC verification.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/repos/webhooks — 403, 404, 422 confirmed
+      - id: create-webhook-invalid-config
+        condition: >
+          octokit.repos.createWebhook() called without try-catch when the webhook URL
+          is unreachable/malformed, or the repository does not exist
+        throws: >
+          RequestError with status 422 (Validation Failed) when the webhook URL is
+          malformed, uses a disallowed scheme, or points to a GitHub-internal address.
+          Status 403 (Forbidden) when the authenticated user lacks admin access to
+          the repository. Status 404 (Not Found) when the repository doesn't exist.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GitHub App installation flows that register webhooks crash without error handling.
+          The 422 occurs when the URL scheme is not https, when it points to localhost/
+          internal addresses (not allowed in production), or when the content_type is
+          invalid. The 403 is common when the GitHub App installation token lacks the
+          admin:repo_hook permission scope. Without try-catch, the entire installation
+          flow fails.
+        detector: >
+          If octokit.repos.createWebhook() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (validate URL is publicly reachable HTTPS
+          endpoint; check for localhost/private IP disqualifiers). Handle 403 (verify token
+          has admin:repo_hook scope or the GitHub App has the Webhooks read-write permission).
+          Handle 404 (verify repo owner and name before attempting webhook creation).
+        source: https://docs.github.com/en/rest/repos/webhooks
+        sources:
+          - https://docs.github.com/en/rest/repos/webhooks
+
+  - name: repos.createFork
+    import_path: "@octokit/rest"
+    description: >
+      Creates a fork of a repository. Returns immediately (202) but the fork is created
+      asynchronously — git objects may not be available for several seconds after the
+      response. Used in fork-based contribution workflows, template instantiation,
+      and automated repository provisioning. The fork is always created under the
+      authenticated user's account unless an organization is specified.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/repos/forks — 202 async, 400, 403, 422 confirmed
+      - id: create-fork-async-not-awaited
+        condition: >
+          octokit.repos.createFork() response is used immediately after the call without
+          waiting for the async fork process to complete
+        throws: >
+          Does not throw, but the fork's git objects are not immediately available.
+          Subsequent git operations on the fork (clone, push) within seconds of the
+          202 response may fail. For forks taking > 5 minutes, GitHub Support must
+          be contacted.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          A 202 response means the fork was accepted, not completed. Automation that
+          immediately tries to use the fork (push a branch, add collaborators) fails
+          because git objects are not yet available. This is a silent failure pattern —
+          the createFork() call succeeds but subsequent operations fail with confusing
+          errors. Must implement a polling/retry mechanism after fork creation.
+        detector: >
+          If octokit.repos.createFork() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (permission denied or forking disabled for org),
+          422 (fork already exists for this user — check if target fork already exists),
+          400 (invalid parameters). After successful 202, wait before using the fork:
+          implement exponential backoff polling of repos.get() on the fork to confirm
+          availability before proceeding.
+        source: https://docs.github.com/en/rest/repos/forks
+        sources:
+          - https://docs.github.com/en/rest/repos/forks
+
+  - name: git.createTag
+    import_path: "@octokit/rest"
+    description: >
+      Creates a tag object in the git database. Note: this creates the git tag object
+      (annotated tag), NOT the reference — a separate git.createRef() call is needed
+      to make the tag visible. Used in release automation pipelines to create annotated
+      tags with messages, GPG signatures, and tagger metadata. Distinct from
+      lightweight tags (created with git.createRef alone).
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/tags — 409, 422 confirmed
+      - id: git-create-tag-without-create-ref
+        condition: >
+          octokit.git.createTag() called without a subsequent git.createRef() call to
+          make the tag reference visible, or called without try-catch
+        throws: >
+          RequestError with status 422 (Validation Failed) when the SHA of the tagged
+          object is invalid or references a non-existent object. Status 409 (Conflict)
+          for concurrency issues during tag creation.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          git.createTag() creates the tag OBJECT but does NOT make it visible in the
+          repository. A separate git.createRef('refs/tags/<name>', sha) call is required.
+          Omitting this second call results in an orphaned tag object that exists in the
+          git database but is invisible to users (doesn't appear in 'git tag' output,
+          not shown in GitHub UI). This is a two-step operation that is frequently
+          implemented with only the first step.
+        detector: >
+          If octokit.git.createTag() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (invalid SHA — verify the object SHA exists
+          in the repo before tagging), 409 (retry with backoff for concurrency conflicts).
+          IMPORTANT: Always follow createTag() with git.createRef('refs/tags/<name>',
+          sha) using the sha from the createTag response to make the tag visible.
+        source: https://docs.github.com/en/rest/git/tags
+        sources:
+          - https://docs.github.com/en/rest/git/tags
+
+  - name: git.deleteRef
+    import_path: "@octokit/rest"
+    description: >
+      Deletes a git reference (branch or tag). Used in branch cleanup automation,
+      post-merge branch deletion, and release management. The ref format must be
+      'heads/<branch>' for branches and 'tags/<name>' for tags. Attempting to delete
+      the repository's default branch fails with 422.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/refs — 422 on default branch, 409 conflict confirmed
+      - id: git-delete-ref-default-branch
+        condition: >
+          octokit.git.deleteRef() called without try-catch when the ref is the default
+          branch, the ref format is invalid, or concurrency conflict occurs
+        throws: >
+          RequestError with status 422 (Validation Failed) when attempting to delete the
+          repository's default branch (GitHub blocks this), when the ref format is wrong
+          (must be 'heads/<name>' not 'refs/heads/<name>'), or spam detection triggers.
+          Status 409 (Conflict) for concurrent deletion attempts.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Post-merge branch cleanup automation crashes without error handling when the
+          branch happens to be the default branch (e.g., a renamed default branch), or
+          when the ref format is wrong. The ref parameter must use 'heads/<branch>'
+          NOT 'refs/heads/<branch>' — the full ref path causes 422 validation failure.
+          Branch cleanup on merged PRs should check if the branch is the default before
+          deleting.
+        detector: >
+          If octokit.git.deleteRef() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (check ref is not default branch — compare
+          with repos.get().default_branch before deleting; ensure ref format is
+          'heads/<name>' not 'refs/heads/<name>'). Handle 409 (retry with backoff).
+          Note: 404 is NOT returned for missing refs — use git.getRef() first to
+          verify existence if needed.
+        source: https://docs.github.com/en/rest/git/refs
+        sources:
+          - https://docs.github.com/en/rest/git/refs
+
+  - name: actions.cancelWorkflowRun
+    import_path: "@octokit/rest"
+    description: >
+      Cancels a workflow run that is in a cancellable state (queued or in_progress).
+      Returns 202 (Accepted) — the cancellation is asynchronous. Used in CI management
+      tools, automated cost controls, and workflow orchestration. Cannot cancel runs
+      in terminal states (completed, cancelled, failed, skipped, timed_out).
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/actions/workflow-runs — 409 on terminal state confirmed
+      - id: cancel-workflow-run-terminal-state
+        condition: >
+          octokit.actions.cancelWorkflowRun() called without try-catch when the workflow
+          run is already in a terminal state (completed, cancelled, failed, timed_out)
+        throws: >
+          RequestError with status 409 (Conflict) when the workflow run cannot be
+          cancelled because it has already reached a terminal state. The 202 success
+          response means cancellation was ACCEPTED, not that it has completed.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Workflow cancellation in automated CI tools fails when the workflow completes
+          between the trigger check and the cancel call (race condition). Without error
+          handling, CI orchestration tools crash with 409 when trying to cancel already-
+          finished runs. The 202 response means accepted-for-cancellation, not cancelled —
+          subsequent status checks are needed to confirm the run reached cancelled state.
+        detector: >
+          If octokit.actions.cancelWorkflowRun() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 409 (workflow is already in a terminal state —
+          check run status with actions.getWorkflowRun() before cancelling; treat 409
+          as success if the goal is to ensure the run is not running). Handle 404
+          (run_id not found — verify run exists). Poll actions.getWorkflowRun() after
+          202 to confirm cancellation completes.
+        source: https://docs.github.com/en/rest/actions/workflow-runs
+        sources:
+          - https://docs.github.com/en/rest/actions/workflow-runs
+
+  - name: pulls.update
+    import_path: "@octokit/rest"
+    description: >
+      Updates a pull request's title, body, base branch, or state (open/closed).
+      Used in automation to update PR descriptions with generated content, retarget
+      PRs to different base branches, or close stale PRs programmatically. Changing
+      the base branch can cause merge conflicts. Closing a merged PR has no effect.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/pulls — 403, 422 confirmed for state/base updates
+      - id: pulls-update-invalid-base
+        condition: >
+          octokit.pulls.update() called without try-catch when setting the base to a
+          non-existent branch, updating a merged PR's state, or lacking write permissions
+        throws: >
+          RequestError with status 422 (Validation Failed) when the new base branch does
+          not exist in the repository, when attempting to reopen a merged PR (merged PRs
+          cannot be reopened), or when validation fails on the body/title parameters.
+          Status 403 (Forbidden) when the token lacks pull-requests:write permission.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Automated PR management tools fail silently without error handling. Attempting
+          to reopen a merged PR returns 422 (not 422 — actually GitHub silently ignores
+          state:open on merged PRs). Changing the base branch to a deleted branch fails
+          with 422. Bulk PR update automations that close PRs by branch name can hit
+          this when operating on already-merged PRs.
+        detector: >
+          If octokit.pulls.update() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (verify base branch exists before retargeting;
+          check PR is not in merged state before changing state). Handle 403 (verify
+          token has pull-requests:write scope). Handle 404 (verify PR number and repo).
+        source: https://docs.github.com/en/rest/pulls/pulls
+        sources:
+          - https://docs.github.com/en/rest/pulls/pulls
+
 metadata:
   last_verified: "2026-04-16"
   evidence_quality: confirmed
-  coverage_score: 0.62
+  coverage_score: 0.80
 
 tags:
   - github
