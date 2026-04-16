@@ -5,7 +5,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71
+coverage_score: 0.78
 
 functions:
   - name: send
@@ -286,6 +286,144 @@ functions:
         sources:
           - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteStatement.html"
           - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ql-reference.insert.html"
+
+  - name: ExecuteTransactionCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Executes a batch of PartiQL statements transactionally. Unlike ExecuteStatementCommand
+      (single statement) and BatchExecuteStatementCommand (non-transactional batch), this command
+      guarantees all-or-nothing atomicity. Throws TransactionCanceledException with
+      CancellationReasons when any statement fails. Unique to this command: throws
+      IdempotentParameterMismatchException when the same ClientRequestToken is reused
+      with different statements, and TransactionInProgressException when a prior transaction
+      with the same token is still in flight.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteTransaction.html
+      # Confirmed from AWS SDK v3 type declarations: ExecuteTransactionCommand throws list
+      - id: execute-transaction-cancellation-reasons-not-inspected
+        severity: error
+        condition: >
+          ExecuteTransactionCommand throws TransactionCanceledException and caller catches
+          it but does not inspect CancellationReasons array to distinguish ConditionalCheckFailed
+          (business conflict, NOT retryable) from ProvisionedThroughputExceeded or
+          TransactionConflict (infrastructure failures, retryable).
+        description: >
+          ExecuteTransactionCommand throws TransactionCanceledException when any PartiQL
+          statement in the batch fails a condition check or encounters a conflict. The
+          exception carries a CancellationReasons array ordered by statement position.
+          Each entry has a Code field: "ConditionalCheckFailed", "TransactionConflict",
+          "ItemCollectionSizeLimitExceeded", "ProvisionedThroughputExceeded",
+          "ThrottlingError", "ValidationError", or "None" (success).
+
+          Callers who catch TransactionCanceledException without iterating CancellationReasons
+          cannot distinguish business-logic conflicts (must NOT be retried) from infrastructure
+          failures (SHOULD be retried with exponential backoff).
+
+          This command is often used for atomic checkout flows, inventory reservation, and
+          financial operations — precisely the contexts where silent failure is most costly.
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST catch TransactionCanceledException and inspect CancellationReasons
+          to distinguish ConditionalCheckFailed (not retryable — business conflict)
+          from TransactionConflict and ProvisionedThroughputExceeded (retryable).
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteTransaction.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html"
+
+      - id: execute-transaction-idempotent-parameter-mismatch
+        severity: error
+        condition: >
+          Caller retries ExecuteTransactionCommand with the same ClientRequestToken but
+          different PartiQL statements, causing IdempotentParameterMismatchException.
+          This occurs when retry logic reuses tokens without matching the original payload.
+        description: >
+          ExecuteTransactionCommand throws IdempotentParameterMismatchException (HTTP 400)
+          when a ClientRequestToken that was already used for a successful call is reused
+          with different statements. The token guarantees at-most-once execution for the
+          exact same payload — not for different payloads.
+
+          This error is unique to ExecuteTransactionCommand (and TransactWriteItemsCommand).
+          It commonly occurs when: (a) error-recovery code constructs a new transaction
+          with a previously-used idempotency token, or (b) the same token is accidentally
+          shared across different code paths.
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Generate a unique ClientRequestToken per logical transaction attempt. Never reuse
+          a token with a different statement set. Use a UUID v4 per call. Do not retry
+          with the same token if the error is IdempotentParameterMismatchException.
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteTransaction.html"
+
+  - name: BatchExecuteStatementCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Executes a batch of PartiQL statements (SELECT, INSERT, UPDATE, DELETE) in a single
+      non-transactional call. Supports up to 25 statements. CRITICAL: Uses HTTP 200 for
+      PARTIAL FAILURES — individual statement failures are NOT thrown as exceptions. Failed
+      statements are reported in response.Responses[].Error. Callers who do not iterate
+      Responses and check each entry's Error field silently miss failures. This is a DIFFERENT
+      failure pattern from BatchWriteItemCommand/BatchGetItemCommand (which use UnprocessedItems)
+      — per-item errors here include DuplicateItem and ConditionalCheckFailed, not just throughput.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchExecuteStatement.html
+      # AWS docs: "A HTTP 200 response does not mean that all statements in the BatchExecuteStatement
+      #  succeeded. Error details for individual statements can be found under the Error field of
+      #  the BatchStatementResponse for each statement."
+      # BatchStatementError.Code valid values confirmed from:
+      # https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchStatementError.html
+      - id: batch-execute-statement-response-errors-not-checked
+        severity: error
+        condition: >
+          BatchExecuteStatementCommand succeeds (no throw) but one or more entries in
+          response.Responses have a non-null Error field indicating that statement failed.
+          Caller does not iterate response.Responses and check each entry's Error field.
+        description: >
+          BatchExecuteStatementCommand returns HTTP 200 even when individual PartiQL
+          statements FAIL. Each statement's result is in response.Responses[], ordered
+          by statement position. A failed statement has a non-null Error field containing:
+          - Code: one of "ConditionalCheckFailed", "DuplicateItem", "AccessDenied",
+            "ResourceNotFound", "ValidationError", "ProvisionedThroughputExceeded",
+            "TransactionConflict", "ThrottlingError", "InternalServerError",
+            "ItemCollectionSizeLimitExceeded", "RequestLimitExceeded"
+          - Message: human-readable description
+
+          This failure pattern differs fundamentally from BatchWriteItemCommand:
+          - BatchWriteItemCommand: failed items go to response.UnprocessedItems (can retry same items)
+          - BatchExecuteStatementCommand: failed statements go to response.Responses[].Error
+            (must check each entry individually; no automatic retry list provided)
+
+          PartiQL INSERT failures (DuplicateItem) and conditional write failures
+          (ConditionalCheckFailed) are especially common and silently swallowed
+          when the caller ignores per-item errors.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST iterate response.Responses after every BatchExecuteStatement call
+          and check each entry's Error field. For throughput errors (ProvisionedThroughputExceeded,
+          ThrottlingError), retry the failed statements with exponential backoff. For
+          DuplicateItem and ConditionalCheckFailed, treat as business-logic errors (not retryable).
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchExecuteStatement.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchStatementError.html"
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All DynamoDB operations use the same send() entry point."

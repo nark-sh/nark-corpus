@@ -23,6 +23,8 @@ import {
   BatchGetItemCommand,
   TransactWriteItemsCommand,
   ExecuteStatementCommand,
+  ExecuteTransactionCommand,
+  BatchExecuteStatementCommand,
 } from '@aws-sdk/client-dynamodb';
 
 const dynamoClient = new DynamoDBClient({ region: 'us-east-1' });
@@ -481,6 +483,161 @@ export async function executeInsertWithDuplicateCheck(userId: string, email: str
       // ✅ Handle duplicate as expected business case
       throw new Error(`User with email ${email} already exists`);
     }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — execute-transaction-cancellation-reasons-not-inspected
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: execute-transaction-cancellation-reasons-not-inspected
+// ExecuteTransactionCommand catches TransactionCanceledException but does not inspect
+// CancellationReasons — cannot distinguish ConditionalCheckFailed from infrastructure failures
+export async function executeTransactionWithoutCancellationCheck(userId: string, orderId: string) {
+  try {
+    await dynamoClient.send(new ExecuteTransactionCommand({
+      TransactStatements: [
+        {
+          Statement: `UPDATE Users SET balance = balance - 10 WHERE userId = ?`,
+          Parameters: [{ S: userId }],
+        },
+        {
+          Statement: `INSERT INTO Orders VALUE {'orderId': ?, 'userId': ?, 'amount': 10}`,
+          Parameters: [{ S: orderId }, { S: userId }],
+        },
+      ],
+    }));
+  } catch (error: unknown) {
+    // ❌ Catches TransactionCanceledException but does not inspect CancellationReasons
+    // Cannot distinguish ConditionalCheckFailed (business conflict) from ProvisionedThroughputExceeded (retryable)
+    if (error instanceof Error && error.name === 'TransactionCanceledException') {
+      console.error('Transaction cancelled:', error.message);
+      throw new Error('Transaction failed');
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: execute-transaction-idempotent-parameter-mismatch
+// ExecuteTransactionCommand without try-catch — TransactionCanceledException and
+// IdempotentParameterMismatchException both crash without handling
+export async function executeTransactionNoCatch(userId: string, orderId: string) {
+  // ❌ No try-catch — TransactionCanceledException, IdempotentParameterMismatchException crash
+  await dynamoClient.send(new ExecuteTransactionCommand({
+    TransactStatements: [
+      {
+        Statement: `UPDATE Users SET balance = balance - 10 WHERE userId = ?`,
+        Parameters: [{ S: userId }],
+      },
+    ],
+    ClientRequestToken: 'reused-token-123',
+  }));
+}
+
+// @expect-clean
+// ExecuteTransactionCommand with proper CancellationReasons inspection
+export async function executeTransactionWithCancellationCheck(userId: string, orderId: string) {
+  try {
+    await dynamoClient.send(new ExecuteTransactionCommand({
+      TransactStatements: [
+        {
+          Statement: `UPDATE Users SET balance = balance - 10 WHERE userId = ?`,
+          Parameters: [{ S: userId }],
+        },
+        {
+          Statement: `INSERT INTO Orders VALUE {'orderId': ?, 'userId': ?, 'amount': 10}`,
+          Parameters: [{ S: orderId }, { S: userId }],
+        },
+      ],
+    }));
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      if (error.name === 'TransactionCanceledException') {
+        const cancelledError = error as Error & {
+          CancellationReasons?: Array<{ Code?: string; Message?: string }>;
+        };
+        // ✅ Inspect CancellationReasons to distinguish conflict types
+        for (const reason of cancelledError.CancellationReasons ?? []) {
+          if (reason.Code === 'ConditionalCheckFailed') {
+            throw new Error(`Business conflict: ${reason.Message}`);
+          } else if (reason.Code === 'DuplicateItem') {
+            throw new Error(`Duplicate order: ${reason.Message}`);
+          }
+        }
+        throw new Error(`Transaction infrastructure failure: ${error.message}`);
+      }
+      if (error.name === 'IdempotentParameterMismatchException') {
+        // ✅ Different payload with same token — programming error
+        throw new Error('Token reuse with different payload: use a new unique token');
+      }
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — batch-execute-statement-response-errors-not-checked
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: batch-execute-statement-response-errors-not-checked
+// BatchExecuteStatementCommand called without iterating Responses for per-item errors
+// HTTP 200 is returned even when individual statements fail — silent data loss
+export async function batchExecuteIgnoresResponseErrors(
+  userIds: string[],
+  emails: string[],
+) {
+  try {
+    const result = await dynamoClient.send(new BatchExecuteStatementCommand({
+      Statements: userIds.map((userId, i) => ({
+        Statement: `INSERT INTO Users VALUE {'userId': ?, 'email': ?}`,
+        Parameters: [{ S: userId }, { S: emails[i] }],
+      })),
+    }));
+    // ❌ Returns result without checking Responses[].Error
+    // DuplicateItem or ConditionalCheckFailed silently swallowed for individual statements
+    return result.Responses?.length ?? 0;
+  } catch (error) {
+    console.error('BatchExecuteStatement failed:', error);
+    throw error;
+  }
+}
+
+// @expect-clean
+// BatchExecuteStatementCommand with proper per-item error checking
+export async function batchExecuteChecksResponseErrors(
+  userIds: string[],
+  emails: string[],
+) {
+  try {
+    const result = await dynamoClient.send(new BatchExecuteStatementCommand({
+      Statements: userIds.map((userId, i) => ({
+        Statement: `INSERT INTO Users VALUE {'userId': ?, 'email': ?}`,
+        Parameters: [{ S: userId }, { S: emails[i] }],
+      })),
+    }));
+    // ✅ Check each response for per-item errors
+    const failures: string[] = [];
+    for (const [i, response] of (result.Responses ?? []).entries()) {
+      if (response.Error) {
+        const code = response.Error.Code;
+        if (code === 'DuplicateItem') {
+          failures.push(`Statement ${i}: duplicate item — ${response.Error.Message}`);
+        } else if (code === 'ConditionalCheckFailed') {
+          failures.push(`Statement ${i}: condition check failed`);
+        } else if (code === 'ProvisionedThroughputExceeded' || code === 'ThrottlingError') {
+          failures.push(`Statement ${i}: throttled — retry with exponential backoff`);
+        } else {
+          failures.push(`Statement ${i}: ${code} — ${response.Error.Message}`);
+        }
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`BatchExecuteStatement partial failure:\n${failures.join('\n')}`);
+    }
+    return result.Responses?.length ?? 0;
+  } catch (error) {
+    console.error('BatchExecuteStatement failed:', error);
     throw error;
   }
 }
