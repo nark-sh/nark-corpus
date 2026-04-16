@@ -1,11 +1,11 @@
 package: jszip
 semver: ">=3.8.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75  # 3 contracted functions / 4 total async-callable functions (1 omitted: JSZipStreamHelper.accumulate - covered by JSZipObject.async contract)
+coverage_score: 0.80  # 4 contracted functions / 5 total async-callable functions (1 omitted: JSZipStreamHelper.accumulate - covered by JSZipObject.async contract)
 
 detection:
   type_names:
@@ -121,6 +121,87 @@ functions:
           - "https://stuk.github.io/jszip/documentation/api_zipobject/async.html"
           - "https://github.com/Stuk/jszip/blob/master/lib/utils.js"
         severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: generateNodeStream
+    import_path: "jszip"
+    description: >
+      Generates the complete zip file as a Node.js Streams3 Readable stream.
+      Returns a ReadableStream that emits Buffer chunks as zip data is compressed.
+      Used for streaming large zip files to HTTP responses or file system writers
+      without buffering the entire archive in memory. Only supports 'nodebuffer'
+      output type. Internally delegates to generateInternalStream().toNodejsStream().
+    patterns:
+      - '.generateNodeStream('
+      - 'generateNodeStream({'
+    postconditions:
+      # Evidence: NodejsStreamOutputAdapter.js line 29 — errors from DEFLATE compression
+      # are forwarded via self.emit('error', e). Source:
+      # https://github.com/Stuk/jszip/blob/master/lib/nodejs/NodejsStreamOutputAdapter.js
+      # https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js
+      # Official docs: https://stuk.github.io/jszip/documentation/api_jszip/generate_node_stream.html
+      - id: generate-node-stream-no-error-listener
+        condition: >
+          zip.generateNodeStream() called without registering an 'error' event listener
+          on the returned ReadableStream, and/or without calling .pipe() to a writable
+          stream that handles errors. DEFLATE compression of individual zip entries can
+          fail mid-stream, emitting an 'error' event on the readable stream. Per Node.js
+          EventEmitter semantics, an unhandled 'error' event causes an uncaught exception
+          that crashes the process.
+        throws: >
+          Error emitted via stream 'error' event (not thrown — does NOT reject a Promise).
+          Error message describes the compression failure. If no 'error' listener is
+          registered on the returned stream, Node.js throws an unhandled exception:
+          "Error: [compression error message]" and terminates the process.
+        required_handling: >
+          Caller MUST register an 'error' event listener on the stream returned by
+          generateNodeStream() before piping. When piping, also handle errors on the
+          writable stream. The common pattern:
+            zip.generateNodeStream({streamFiles:true})
+              .on('error', (err) => console.error('Zip error:', err))
+              .pipe(outputStream)
+              .on('finish', () => console.log('Done'));
+          Note: using .pipe() does NOT automatically propagate stream errors. Both the
+          readable and writable streams must have separate error handlers.
+        sources:
+          - "https://github.com/Stuk/jszip/blob/master/lib/nodejs/NodejsStreamOutputAdapter.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+          - "https://stuk.github.io/jszip/documentation/api_jszip/generate_node_stream.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: generate-node-stream-unsupported-env
+        condition: >
+          zip.generateNodeStream() called in a browser environment or in a Node.js
+          environment where the 'readable-stream' package is unavailable. The internal
+          checkSupport('nodestream') check fails synchronously before the stream is created.
+          Also throws if the 'type' option is set to anything other than 'nodebuffer'
+          (e.g., 'blob', 'uint8array') — these types are explicitly rejected by
+          toNodejsStream() with "is not supported by this method".
+        throws: >
+          Error thrown synchronously (not via stream): 'nodestream is not supported by
+          this platform' when the environment lacks readable-stream support.
+          Error thrown synchronously: '<type> is not supported by this method' when
+          a non-nodebuffer type is passed via options.type.
+        required_handling: >
+          Use generateNodeStream() only in Node.js server environments. Always use the
+          default type ('nodebuffer'). In environments where browser/Node.js compatibility
+          is uncertain, use generateAsync() instead which works in both environments.
+          Wrap in try-catch if called with dynamic options to catch the synchronous throw.
+        sources:
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/support.js"
+        severity: error
         business_impact:
           incident_label: SILENT_FAILURE
           production_behavior: immediate_exception

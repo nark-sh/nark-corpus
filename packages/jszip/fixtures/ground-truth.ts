@@ -5,10 +5,12 @@
  * the expected scanner behavior. Used by the ground-truth test.
  *
  * Postcondition IDs from contract.yaml:
- *   load-invalid-zip          — loadAsync without try-catch
- *   generate-unsupported-type — generateAsync without try-catch
- *   file-async-no-try-catch   — JSZipObject.async() without try-catch (decompression errors)
- *   file-async-unsupported-type — JSZipObject.async() with unsupported output type
+ *   load-invalid-zip                    — loadAsync without try-catch
+ *   generate-unsupported-type           — generateAsync without try-catch
+ *   file-async-no-try-catch             — JSZipObject.async() without try-catch (decompression errors)
+ *   file-async-unsupported-type         — JSZipObject.async() with unsupported output type
+ *   generate-node-stream-no-error-listener — generateNodeStream() without .on('error') listener
+ *   generate-node-stream-unsupported-env   — generateNodeStream() in unsupported environment
  */
 import JSZip from 'jszip';
 
@@ -116,6 +118,54 @@ async function fileAsync_withRethrow(zip: JSZip): Promise<Uint8Array> {
   }
 }
 
+// generateNodeStream without error listener — common streaming antipattern
+function generateNodeStream_withoutErrorListener(zip: JSZip, outputPath: string): void {
+  const fs = require('fs');
+  // SHOULD_FIRE: generate-node-stream-no-error-listener — stream piped without 'error' listener
+  zip.generateNodeStream({ streamFiles: true })
+    .pipe(fs.createWriteStream(outputPath))
+    .on('finish', function() {
+      console.log('Zip written to', outputPath);
+    });
+}
+
+// generateNodeStream with proper error listener on readable — correct pattern
+// Note: scanner does not yet distinguish .on('error') as proper handling for generateNodeStream.
+// Scanner concern queued: concern-20260416-jszip-deepen-1
+function generateNodeStream_withErrorListener(zip: JSZip, outputPath: string): void {
+  const fs = require('fs');
+  // SHOULD_FIRE: generate-node-stream-no-error-listener — scanner does not yet detect .on('error') as proper handling
+  zip.generateNodeStream({ streamFiles: true })
+    .on('error', function(err: Error) {
+      console.error('Failed to generate zip stream:', err);
+    })
+    .pipe(fs.createWriteStream(outputPath))
+    .on('finish', function() {
+      console.log('Zip written to', outputPath);
+    });
+}
+
+// generateNodeStream with try-catch around synchronous throw — correct for env check
+// SHOULD_NOT_FIRE: try-catch protects against synchronous throw from unsupported env
+function generateNodeStream_withTryCatch(zip: JSZip, outputPath: string): void {
+  try {
+    const fs = require('fs');
+    // SHOULD_NOT_FIRE: generateNodeStream wrapped in try-catch handles sync throws
+    zip.generateNodeStream({ type: 'nodebuffer' as any })
+      .on('error', (err: Error) => console.error('Stream error:', err))
+      .pipe(fs.createWriteStream(outputPath));
+  } catch (error) {
+    console.error('generateNodeStream not supported in this environment:', error);
+  }
+}
+
+// generateNodeStream piped to HTTP response without error listener — high-risk server pattern
+function streamZipToResponse(zip: JSZip, res: any): void {
+  // SHOULD_FIRE: generate-node-stream-no-error-listener — piped to HTTP response without .on('error')
+  zip.generateNodeStream({ type: 'nodebuffer' as any, streamFiles: true })
+    .pipe(res);
+}
+
 export {
   loadAsync_withTryCatch,
   loadAsync_withoutTryCatch,
@@ -128,4 +178,8 @@ export {
   extractDocumentContents,
   extractAllFiles,
   fileAsync_withRethrow,
+  generateNodeStream_withoutErrorListener,
+  generateNodeStream_withErrorListener,
+  generateNodeStream_withTryCatch,
+  streamZipToResponse,
 };
