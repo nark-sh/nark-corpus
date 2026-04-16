@@ -1,10 +1,11 @@
 package: '@azure/storage-blob'
 semver: '>=12.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-11'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
+coverage_score: 0.76
 # Evidence: 0 violations across 5 repos scanned in scan-azure-storage-blob-2026-04-11.json
 # Repos: remotely-save/remotely-save (⭐ 7025), erxes/erxes (⭐ 3918), unjs/unstorage (⭐ 2536),
 #         Scale3-Labs/langtrace (⭐ 1187), zetaloop/desktop (⭐ 743)
@@ -461,3 +462,563 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-delete
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+  # Error types confirmed: RestError (from @azure/core-rest-pipeline, re-exported by @azure/storage-blob)
+  - name: deleteBlob
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Marks the specified blob for deletion. The blob is later deleted during
+      garbage collection. BlobClient.delete() is the primary blob-deletion API
+      called on an individual BlobClient instance. Note: if the blob has snapshots,
+      deletion fails unless deleteSnapshots option is provided.
+    postconditions:
+      - id: blob-delete-snapshots-present
+        condition: >
+          blob has one or more snapshots and deleteSnapshots option was not set —
+          throws RestError with statusCode 409 and errorCode SnapshotsPresent.
+          A very common silent bug: code that successfully deletes blobs in development
+          (no snapshots) fails in production after versioning or backup jobs create snapshots.
+        throws: 'RestError with statusCode 409 and errorCode: SnapshotsPresent'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-delete
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST either pass { deleteSnapshots: 'include' } to delete blob and all
+          snapshots together, or catch RestError with statusCode 409 and errorCode
+          SnapshotsPresent to handle the conflict.
+
+      - id: blob-delete-not-found
+        condition: >
+          blob does not exist — throws RestError with statusCode 404 and errorCode BlobNotFound.
+          Common in cleanup flows where the blob was already deleted by another process.
+        throws: 'RestError with statusCode 404 and errorCode: BlobNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-delete
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST catch RestError and check error.statusCode === 404 to handle
+          already-deleted blobs gracefully. Or use deleteIfExists() which returns
+          { succeeded: false } instead of throwing.
+
+      - id: blob-delete-lease-conflict
+        condition: >
+          blob has an active lease but no lease ID was provided — throws RestError
+          with statusCode 412 and errorCode LeaseIdMissing or LeaseIdMismatchWithBlobOperation.
+        throws: 'RestError with statusCode 412 and errorCode: LeaseIdMissing or LeaseIdMismatchWithBlobOperation'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-delete
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST provide the active lease ID via options.conditions.leaseId when
+          deleting leased blobs. Catch RestError with statusCode 412 to detect lease
+          conflicts.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blockblobclient#@azure-storage-blob-blockblobclient-uploadstream
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+  - name: uploadStream
+    import_path: '@azure/storage-blob.BlockBlobClient'
+    description: >
+      Uploads a Node.js Readable stream to Azure Blob Storage using block-by-block
+      staging and commit. Unlike upload() (which requires the full body upfront),
+      uploadStream() is the correct method for large files, live video streams, and
+      any case where the content length is unknown. Internally calls stageBlock for
+      each buffer chunk and commitBlockList at the end. bufferSize defaults to 8MB,
+      maxConcurrency defaults to 5 concurrent block uploads.
+    postconditions:
+      - id: uploadstream-no-try-catch
+        condition: >
+          any network failure, auth error, or storage service error during block staging
+          or commit — throws RestError. Because uploadStream() makes multiple HTTP requests
+          (one stageBlock per bufferSize chunk), any intermediate failure throws and the
+          partial upload is left uncommitted.
+        throws: 'RestError (from @azure/core-rest-pipeline) with statusCode reflecting the HTTP failure'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blockblobclient#@azure-storage-blob-blockblobclient-uploadstream
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        required_handling: >
+          Caller MUST wrap uploadStream in try-catch. On error, the partially staged
+          blocks are automatically cleaned up by Azure after 7 days, but the upload
+          must be retried from the beginning.
+
+      - id: uploadstream-container-not-found
+        condition: >
+          the target container does not exist — throws RestError with statusCode 404
+          and errorCode ContainerNotFound. Common in multi-tenant apps where containers
+          are provisioned lazily and creation fails silently.
+        throws: 'RestError with statusCode 404 and errorCode: ContainerNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blockblobclient#@azure-storage-blob-blockblobclient-uploadstream
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST ensure container exists before calling uploadStream. Catch
+          RestError with statusCode 404 and errorCode ContainerNotFound to detect
+          missing containers and provision them via containerClient.createIfNotExists().
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-uploadblockblob
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+  - name: uploadBlockBlob
+    import_path: '@azure/storage-blob.ContainerClient'
+    description: >
+      Convenience method on ContainerClient that creates a BlockBlobClient for
+      the given blob name and calls upload() internally. Returns both the
+      BlockBlobUploadResponse and the BlockBlobClient for the newly created blob.
+      The most common pattern in Next.js API routes and Express handlers that
+      upload user files directly without creating a separate BlockBlobClient.
+    postconditions:
+      - id: uploadblockblob-no-try-catch
+        condition: >
+          any network failure, auth error, or service error — throws RestError.
+          Same error profile as BlockBlobClient.upload() since it delegates to that method.
+          Commonly called in API route handlers without try-catch because callers assume
+          the container already exists.
+        throws: 'RestError (from @azure/core-rest-pipeline) on any service or network failure'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-uploadblockblob
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap in try-catch. The returned blockBlobClient can be used
+          to retry the upload after creating the container if needed.
+
+      - id: uploadblockblob-container-not-found
+        condition: >
+          the container encoded in the ContainerClient URL does not exist — throws
+          RestError with statusCode 404 and errorCode ContainerNotFound. Every blob
+          upload to the container fails until the container is created.
+        throws: 'RestError with statusCode 404 and errorCode: ContainerNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-uploadblockblob
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        required_handling: >
+          Caller MUST ensure container exists. Use containerClient.createIfNotExists()
+          before the first upload to a new container.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-deleteblob
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+  - name: deleteBlob
+    import_path: '@azure/storage-blob.ContainerClient'
+    description: >
+      Convenience method on ContainerClient that marks a named blob for deletion.
+      Internally creates a BlobClient and calls delete(). Commonly used in content
+      management systems, file cleanup jobs, and admin endpoints that know the
+      container but not the specific BlobClient instance.
+    postconditions:
+      - id: container-deleteblob-snapshots-present
+        condition: >
+          blob has snapshots and deleteSnapshots option is not set — throws RestError
+          with statusCode 409 and errorCode SnapshotsPresent. Same behavior as
+          BlobClient.delete(). Affects blobs that have been snapshotted by Azure Backup
+          or versioning policies.
+        throws: 'RestError with statusCode 409 and errorCode: SnapshotsPresent'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-deleteblob
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST pass { deleteSnapshots: 'include' } option or handle the 409
+          RestError with errorCode SnapshotsPresent to detect snapshot conflicts.
+
+      - id: container-deleteblob-not-found
+        condition: >
+          the named blob does not exist — throws RestError with statusCode 404 and
+          errorCode BlobNotFound. Common in eventual-consistency scenarios where
+          the blob was deleted between a list operation and the delete call.
+        throws: 'RestError with statusCode 404 and errorCode: BlobNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-deleteblob
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST catch RestError with statusCode 404 to handle already-deleted
+          blobs, or create a BlobClient and use deleteIfExists() instead for idempotent deletion.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-begincopyurl
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
+  - name: beginCopyFromURL
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Starts an asynchronous copy operation from a source URL to this blob.
+      Returns a PollerLike that must be polled to completion. The copy runs
+      server-side and does not transfer data through the client. Used for
+      blob-to-blob copies within Azure (or cross-account), archiving, and
+      content replication. The source URL must be accessible by the storage
+      service, not just the client.
+    postconditions:
+      - id: begincopy-poll-not-awaited
+        condition: >
+          caller does not await poller.pollUntilDone() after beginCopyFromURL() —
+          the destination blob remains in 'pending' state while code proceeds as if
+          the copy completed. No exception is thrown; the result is a silently incomplete blob.
+        throws: >
+          Does NOT throw at copy initiation. The copy runs asynchronously server-side.
+          Only pollUntilDone() throws if the copy fails. Using the destination blob
+          before pollUntilDone() completes results in reading partial or empty content.
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-begincopyurl
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        required_handling: >
+          Caller MUST await poller.pollUntilDone() after beginCopyFromURL(). Pattern:
+          const poller = await blobClient.beginCopyFromURL(sourceUrl);
+          const result = await poller.pollUntilDone();
+          Then check result.copyStatus === 'success' before using destination blob.
+
+      - id: begincopy-source-not-accessible
+        condition: >
+          source URL is inaccessible to the storage service — throws RestError with
+          statusCode 400 or 403. Causes: source blob requires SAS token not provided,
+          source is in a different account without cross-account SAS, or SAS token expired.
+        throws: 'RestError with statusCode 400 or 403 from the storage service'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-begincopyurl
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST catch RestError on both beginCopyFromURL() and pollUntilDone()
+          calls. For cross-account copies, source URL must include a valid SAS token
+          with read permissions.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-synccopyurl
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
+  - name: syncCopyFromURL
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Performs a synchronous copy from a source URL to this blob. Unlike
+      beginCopyFromURL(), this completes in a single HTTP request (no polling
+      required). Limited to blobs smaller than 256MB and source URLs that the
+      Azure service can access. Used for copying public CDN content, external
+      URLs, or small blobs within the same storage account.
+    postconditions:
+      - id: synccopy-no-try-catch
+        condition: >
+          any network failure, source access error, or service error — throws RestError.
+          Unlike beginCopyFromURL(), syncCopyFromURL() blocks until the copy completes
+          so the await must be wrapped in try-catch.
+        throws: 'RestError (from @azure/core-rest-pipeline) on any service or network failure'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-synccopyurl
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap syncCopyFromURL in try-catch. For large blobs (>256MB)
+          or when size is unknown, use beginCopyFromURL() instead.
+
+      - id: synccopy-source-inaccessible
+        condition: >
+          source URL requires authentication the storage service cannot provide — throws
+          RestError with statusCode 403. Also throws for source blob size > 256 MiB limit.
+          Developers testing with public URLs succeed but production with private blobs fails.
+        throws: 'RestError with statusCode 403 (auth) or 400 (size limit exceeded)'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-synccopyurl
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST ensure source URL includes appropriate SAS token for private
+          Azure blobs, and validate source blob size is within 256 MiB limit.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtobuffer
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
+  - name: downloadToBuffer
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Downloads the blob content into a Node.js Buffer in parallel using multiple
+      range requests. Suitable for medium-sized blobs that must be processed
+      entirely in memory. Not available in browser environments. The parallelism
+      is controlled by options.concurrency (default 5). Each parallel request
+      downloads blockSize bytes (default 4MB).
+    postconditions:
+      - id: downloadtobuffer-no-try-catch
+        condition: >
+          any network failure, auth error, or service error during parallel range downloads —
+          throws RestError. If one parallel range request fails mid-download, the entire
+          operation throws and partial data is discarded.
+        throws: 'RestError (from @azure/core-rest-pipeline) on any service or network failure'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtobuffer
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap downloadToBuffer in try-catch. For very large blobs, use
+          download() with streaming instead to avoid loading the entire file into memory.
+
+      - id: downloadtobuffer-blob-not-found
+        condition: >
+          blob does not exist — throws RestError with statusCode 404 and errorCode BlobNotFound.
+          Common in file processing queues where the blob was deleted between enqueue and processing.
+        throws: 'RestError with statusCode 404 and errorCode: BlobNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtobuffer
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST catch RestError with statusCode 404 to distinguish missing blobs
+          from transient network errors. Missing blobs should not be retried.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtofile
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
+  - name: downloadToFile
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Downloads the blob content to a local file path in Node.js. Internally
+      calls download() and pipes the readable stream to a file write stream.
+      Node.js only — not available in browser environments. Commonly used in
+      data processing workflows, ETL jobs, and worker processes that need to
+      work with the file locally before processing it.
+    postconditions:
+      - id: downloadtofile-no-try-catch
+        condition: >
+          network failure, storage service error, or filesystem error during download —
+          throws RestError (storage errors) or Node.js filesystem Error with code ENOENT,
+          EACCES, or ENOSPC (disk full). The partial file written to disk is NOT
+          automatically cleaned up on failure.
+        throws: >
+          RestError for storage service errors, or Error with code ENOENT/EACCES/ENOSPC
+          for filesystem errors. Partial file remains on disk in both cases.
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtofile
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap downloadToFile in try-catch AND clean up the partial file
+          on error: catch (err) { await fs.unlink(filePath).catch(() => {}); throw err; }
+
+      - id: downloadtofile-blob-not-found
+        condition: >
+          source blob does not exist — throws RestError with statusCode 404 and
+          errorCode BlobNotFound. The local file may be created as empty or partially
+          written before the error surfaces from the stream.
+        throws: 'RestError with statusCode 404 and errorCode: BlobNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-downloadtofile
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST check error.statusCode === 404 to detect missing blobs and
+          delete any partially created local file before re-throwing.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobserviceclient#@azure-storage-blob-blobserviceclient-getuserdelegationkey
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key
+  - name: getUserDelegationKey
+    import_path: '@azure/storage-blob.BlobServiceClient'
+    description: >
+      Retrieves a user delegation key from the Azure AD identity for the
+      BlobServiceClient. The key is used to sign user delegation SAS tokens —
+      which are more secure than account key SAS because they're scoped to
+      a specific user identity and have a maximum 7-day lifetime. Required
+      when the storage account uses Azure AD authentication (no account key)
+      and the application needs to generate SAS tokens for end users.
+    postconditions:
+      - id: getuserdelegationkey-no-try-catch
+        condition: >
+          credential lacks the Microsoft.Storage generateUserDelegationKey permission —
+          throws RestError with statusCode 403. Also throws RestError on network failures.
+          In production, RBAC permissions are often more restrictive than development
+          environments, causing this to fail at runtime.
+        throws: 'RestError with statusCode 403 (permission denied) or 401 (unauthenticated)'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobserviceclient#@azure-storage-blob-blobserviceclient-getuserdelegationkey
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        required_handling: >
+          Caller MUST wrap getUserDelegationKey in try-catch. The calling identity needs
+          Storage Blob Delegator role (Microsoft.Storage/storageAccounts/blobServices/
+          generateUserDelegationKey). Cache the returned key until its expiresOn time.
+
+      - id: getuserdelegationkey-expired-window
+        condition: >
+          user delegation key is cached past its expiresOn timestamp — SAS tokens
+          signed with an expired key return 403 AuthorizationPermissionMismatch
+          when clients use them. No error is thrown at key retrieval time.
+        throws: >
+          Does NOT throw at key retrieval. SAS tokens signed with the expired key return
+          HTTP 403 when used. The error surfaces in downstream client operations, not here.
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobserviceclient#@azure-storage-blob-blobserviceclient-getuserdelegationkey
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST track key.expiresOn and refresh the key before it expires.
+          Do NOT cache user delegation keys indefinitely. Cache with TTL of
+          expiresOn minus 5 minutes to ensure rotation before expiry.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-generatesasurl
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+  - name: generateSasUrl
+    import_path: '@azure/storage-blob.ContainerClient'
+    description: >
+      Generates a Shared Access Signature (SAS) URL for this container. The SAS
+      encodes permissions (read, write, delete, list) and an expiry time. The URL
+      can be shared with clients to grant temporary, scoped access to the container
+      without sharing the storage account key. Only works when ContainerClient was
+      constructed with a StorageSharedKeyCredential (account key), not with token
+      credentials.
+    postconditions:
+      - id: generatesasurl-not-shared-key
+        condition: >
+          ContainerClient was constructed with TokenCredential (Azure AD) or
+          AnonymousCredential instead of StorageSharedKeyCredential — throws Error
+          locally without making a network call. Teams migrating from account key
+          to managed identity break SAS generation at runtime.
+        throws: >
+          Error with message "A shared key credential must be provided to generate a SAS URL".
+          Local error — no network call is made.
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-generatesasurl
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        required_handling: >
+          Caller MUST use StorageSharedKeyCredential for SAS generation, or use
+          generateUserDelegationSasUrl() with a user delegation key obtained from
+          getUserDelegationKey() when using managed identity / Azure AD credentials.
+
+      - id: generatesasurl-expired-sas
+        condition: >
+          generated SAS URL is cached or shared and used after options.expiresOn —
+          clients using the URL receive 403 AuthorizationPermissionMismatch.
+          No error is thrown at generation time; the invalid SAS is silently issued.
+        throws: >
+          Does NOT throw at SAS generation. Clients using the expired SAS URL receive
+          HTTP 403 AuthorizationPermissionMismatch from the storage service.
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/containerclient#@azure-storage-blob-containerclient-generatesasurl
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST set options.expiresOn to an appropriate future time (typically
+          15 minutes for upload forms, up to 1 hour for download links). Communicate
+          expiry to end users and provide a mechanism to generate fresh URLs.
