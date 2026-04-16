@@ -2,9 +2,10 @@ package: cookie-parser
 semver: '>=1.4.0 <2.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-02'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 functions:
   - name: cookieParser
     import_path: cookie-parser
@@ -125,3 +126,218 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js (source inspection)
+  # Evidence: https://github.com/tj/node-cookie-signature/blob/master/index.js (cookie-signature unsign behavior)
+  # Evidence: https://raw.githubusercontent.com/expressjs/cookie-parser/master/README.md
+  # signedCookie() returns false for tampered cookies; undefined for non-string input.
+  # The cookie-signature library throws TypeError if secret is a non-string type.
+  - name: signedCookie
+    import_path: cookie-parser
+    description: >-
+      Utility function that validates and decodes a single signed cookie value.
+      Returns the unsigned value if the signature is valid, the original string if
+      the cookie is not signed (does not start with 's:'), or false if the signature
+      is invalid. This function is synchronous — no Promises, no async behavior.
+      Useful when developers need to manually validate a signed cookie outside the
+      middleware context.
+    patterns:
+      - 'cookieParser.signedCookie('
+      - 'signedCookie('
+    postconditions:
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # Source: signedCookie() returns false when all secrets fail to unsign the value.
+      # The cookie-signature unsign() function returns false on HMAC mismatch.
+      - id: signed-cookie-tampered-false
+        condition: >-
+          The cookie value starts with 's:' but the HMAC signature does not match
+          any of the provided secrets. The cookie has been tampered with or the
+          wrong secret is being used.
+        returns: >-
+          Returns boolean false. Does NOT throw an error. Callers that check
+          truthiness (e.g. `if (result)`) will silently treat a tampered cookie
+          as "not present" rather than as a security violation.
+        required_handling: >-
+          Callers MUST explicitly check `result === false` (strict equality) rather
+          than truthiness. A falsy check conflates "invalid signature" (false) with
+          "not a signed cookie" (original string). Use the result to reject the
+          request or invalidate the session when false.
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+          - https://github.com/tj/node-cookie-signature/blob/master/index.js
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # Source: if (typeof str !== 'string') { return undefined }
+      - id: signed-cookie-non-string-undefined
+        condition: >-
+          The `str` argument is not a string (e.g. undefined, null, number, or object).
+          This happens when the cookie value is missing or when the caller passes
+          req.cookies[name] without checking existence first.
+        returns: >-
+          Returns undefined. No error is thrown. Callers that do not check for
+          undefined will pass undefined downstream silently.
+        required_handling: >-
+          Callers MUST check that the input is a defined string before calling
+          signedCookie(). Alternatively, check the return value for undefined
+          before using it.
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js (source inspection)
+  # signedCookies() MUTATES the input cookies object — removes signed cookies from it.
+  # Returns a new object with {name: value_or_false} for all signed cookies found.
+  - name: signedCookies
+    import_path: cookie-parser
+    description: >-
+      Utility function that processes an object of cookie key-value pairs and
+      extracts all signed cookies. Signed cookies (prefixed with 's:') are removed
+      from the input object and moved to a new returned object. Invalid signatures
+      produce a false value in the returned object. This function MUTATES the input
+      object. Synchronous — no Promises.
+    patterns:
+      - 'cookieParser.signedCookies('
+      - 'signedCookies('
+    postconditions:
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # Source: `delete obj[key]` — the input object is mutated in-place.
+      - id: signed-cookies-mutates-input
+        condition: >-
+          The function is called with a cookies object containing any signed cookies
+          (values starting with 's:'). All signed cookie keys are deleted from the
+          input object as a side effect.
+        returns: >-
+          The input `cookies` object is mutated — signed cookies are deleted from it.
+          A new separate object is returned containing the signed cookies mapped to
+          their validated values (string) or false (invalid signature). Callers who
+          pass `req.cookies` directly will find those keys removed from req.cookies.
+        required_handling: >-
+          Callers MUST be aware that the input object is mutated. If the original
+          cookies object is needed after calling signedCookies(), clone it first
+          with Object.assign({}, cookies) or spread { ...cookies }.
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # signedCookie() returns false when the signature is invalid, so the returned
+      # object will have {cookieName: false} for tampered cookies.
+      - id: signed-cookies-false-on-tamper
+        condition: >-
+          One or more signed cookies in the input have invalid HMAC signatures.
+        returns: >-
+          The returned object contains the cookie name mapped to false (boolean) for
+          each tampered cookie. Callers that iterate over the result without checking
+          for false values will silently pass tampered data downstream.
+        required_handling: >-
+          After calling signedCookies(), callers MUST check each value with strict
+          equality (`val === false`) before trusting it. Do not use truthiness check
+          as false (tampered) is falsy.
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+  # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js (source inspection)
+  # Evidence: https://raw.githubusercontent.com/expressjs/cookie-parser/master/README.md
+  # JSONCookie() returns undefined (not the original string) for non-JSON values.
+  - name: JSONCookie
+    import_path: cookie-parser
+    description: >-
+      Utility function that attempts to parse a cookie value as a JSON cookie.
+      Cookie values prefixed with 'j:' are treated as JSON-encoded. If the value
+      does not start with 'j:', or if JSON.parse fails, returns undefined — NOT the
+      original string. Synchronous — no Promises.
+    patterns:
+      - 'cookieParser.JSONCookie('
+      - 'JSONCookie('
+    postconditions:
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # Source: if (typeof str !== 'string' || str.substr(0, 2) !== 'j:') { return undefined }
+      # Source: try { return JSON.parse(...) } catch (err) { return undefined }
+      - id: json-cookie-undefined-for-non-json
+        condition: >-
+          The cookie value does not start with 'j:' (not a JSON cookie), or the
+          value after 'j:' is not valid JSON, or the input is not a string.
+        returns: >-
+          Returns undefined. Does NOT return the original string value. Callers
+          who expect the original string to be returned when parsing fails will get
+          undefined instead — a common source of bugs when using JSONCookie() as a
+          general-purpose parse-or-passthrough function.
+        required_handling: >-
+          Callers MUST check the return value for undefined before using it.
+          JSONCookie() is NOT a safe fallback parser — it returns undefined for
+          non-JSON cookies. Use it only when the cookie is expected to be a JSON
+          cookie, and handle undefined as "not a JSON cookie."
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+          - https://raw.githubusercontent.com/expressjs/cookie-parser/master/README.md
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js (source inspection)
+  # JSONCookies() mutates the input object in-place and returns the same object reference.
+  - name: JSONCookies
+    import_path: cookie-parser
+    description: >-
+      Utility function that iterates over a cookies object and calls JSONCookie()
+      on each value, replacing string values with parsed objects where the value
+      is a valid JSON cookie (prefixed with 'j:'). Mutates the input object
+      in-place and returns the same object reference. Synchronous — no Promises.
+    patterns:
+      - 'cookieParser.JSONCookies('
+      - 'JSONCookies('
+    postconditions:
+      # Evidence: https://github.com/expressjs/cookie-parser/blob/master/index.js
+      # Source: `if (val) { obj[key] = val }` — mutates in place, only replaces when truthy
+      - id: json-cookies-mutates-input
+        condition: >-
+          The cookies object contains any values starting with 'j:' that parse
+          successfully as JSON.
+        returns: >-
+          The input cookies object is mutated in-place — JSON cookie string values
+          are replaced with parsed object values. The same object reference is
+          returned. Callers who retain a reference to the original object will see
+          the mutated values.
+        required_handling: >-
+          Callers MUST be aware that the input is mutated. If the original string
+          values are needed after calling JSONCookies(), clone the object first.
+          The returned value and the input argument point to the same object.
+        sources:
+          - https://github.com/expressjs/cookie-parser/blob/master/index.js
+        severity: info
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
