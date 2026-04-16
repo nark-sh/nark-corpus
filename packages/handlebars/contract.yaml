@@ -2,9 +2,10 @@ package: "handlebars"
 semver: ">=4.7.7"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.80
 
 functions:
   - name: compile
@@ -28,3 +29,172 @@ functions:
         sources:
           - https://handlebarsjs.com/api-reference/compilation.html
           - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/compiler/compiler.js
+
+  - name: "template execution (TemplateDelegate)"
+    import_path: "handlebars"
+    description: >
+      The compiled template function returned by Handlebars.compile() or Handlebars.template().
+      Called as templateFn(context, options?) to render the template with data.
+      Throws synchronously if a referenced partial is not registered, strict mode is enabled
+      and a variable is undefined, or a helper function itself throws.
+
+    postconditions:
+      # Evidence: https://handlebarsjs.com/api-reference/runtime-options.html
+      # Source confirmed: nark-corpus/packages/handlebars/node_modules/handlebars/lib/handlebars/runtime.js
+      # invokePartial() throws Exception('The partial ' + options.name + ' could not be found')
+      - id: template-execution-partial-not-found
+        condition: >
+          Template references a partial ({{> partialName}}) that is not registered via
+          Handlebars.registerPartial() at execution time.
+        throws: "Handlebars.Exception with message \"The partial <name> could not be found\""
+        required_handling: >
+          Caller MUST wrap the template execution call in try-catch when using partials,
+          especially when partial names come from dynamic data or when partial registration
+          may be incomplete. Alternatively, register all required partials before calling
+          any template that references them.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - https://handlebarsjs.com/api-reference/runtime-options.html
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/runtime.js
+
+      # Evidence: https://handlebarsjs.com/api-reference/compilation.html (strict option)
+      # Source confirmed: runtime.js container.strict() throws Exception('"name" not defined in obj')
+      - id: template-execution-strict-undefined-variable
+        condition: >
+          Template is compiled with strict: true option (or assumeObjects: true) and the template
+          references a property that does not exist on the context object. Without strict mode,
+          missing properties silently render as empty string.
+        throws: "Handlebars.Exception with message '\"<varName>\" not defined in <obj>'"
+        required_handling: >
+          Callers using strict mode MUST wrap template execution in try-catch, or validate that
+          all template-referenced properties exist on the context object before rendering.
+          Common pitfall: strict mode is enabled for security but error handling is not added.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          - https://handlebarsjs.com/api-reference/compilation.html
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/runtime.js
+
+      # Evidence: https://handlebarsjs.com/api-reference/runtime-options.html#options-to-control-prototype-access
+      # Source confirmed: proto-access.js - prototype properties silently evaluate to undefined (no throw)
+      # BUT: combined with strict mode, undefined from prototype denial DOES throw
+      - id: template-execution-prototype-access-silent-failure
+        condition: >
+          Template accesses a prototype property (e.g., {{user.trim}}, {{arr.map}}) on an object.
+          Since Handlebars 4.6.0, prototype access is forbidden by default and silently returns
+          undefined rather than the property value. This is NOT an exception — it is a silent failure
+          where data appears missing in the rendered output.
+        throws: "No exception — silently returns undefined; template renders with empty value"
+        required_handling: >
+          Callers MUST either (a) use plain data objects without prototype methods in template context,
+          (b) set allowProtoPropertiesByDefault: true or allowedProtoProperties in runtime options, or
+          (c) restructure data to only pass own properties. Silent failure is the primary risk:
+          rendered output appears partially blank without any error signal.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          - https://handlebarsjs.com/api-reference/runtime-options.html#options-to-control-prototype-access
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/internal/proto-access.js
+
+  - name: precompile
+    import_path: "handlebars"
+    description: >
+      Precompiles a Handlebars template string into a template specification (serializable string)
+      for use with Handlebars.template() at runtime. Used in build pipelines to move compilation
+      cost out of production runtime. Throws the same errors as compile() since it performs
+      the same parsing and compilation steps. Also throws on invalid input types.
+
+    postconditions:
+      # Evidence: https://handlebarsjs.com/api-reference/compilation.html
+      # Source confirmed: compiler.js throws Exception('You must pass a string or Handlebars AST to Handlebars.precompile. You passed ' + input)
+      - id: precompile-invalid-template-syntax
+        condition: >
+          Template string contains syntax errors (unclosed mustache, invalid expression, unknown
+          helper in knownHelpersOnly mode). Identical behavior to compile() at parse/compile time.
+        throws: "Handlebars.Exception (extends Error, with lineNumber and column properties)"
+        required_handling: >
+          Build scripts and CLI tools calling precompile() MUST wrap in try-catch or the
+          entire build step will crash. precompile() is often called without error handling
+          because it runs in a build context where errors are "assumed to be caught by the
+          build tool" — this is incorrect; Handlebars.Exception propagates unless caught.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          - https://handlebarsjs.com/api-reference/compilation.html
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/compiler/compiler.js
+
+      # Source confirmed: compiler.js line: 'You must pass a string or Handlebars AST to Handlebars.precompile. You passed ' + input
+      - id: precompile-invalid-input-type
+        condition: >
+          precompile() receives a non-string, non-AST input (e.g., null, undefined, number, Buffer).
+          Unlike compile() which may coerce, precompile() enforces the input type strictly.
+        throws: "Handlebars.Exception with message \"You must pass a string or Handlebars AST to Handlebars.precompile. You passed <type>\""
+        required_handling: >
+          Validate that precompile() input is a string before calling, especially when template
+          content is loaded from files, databases, or APIs that may return null/undefined.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/compiler/compiler.js
+
+  - name: template
+    import_path: "handlebars"
+    description: >
+      Converts a precompiled template specification (from Handlebars.precompile()) into an
+      executable template function. Used at runtime to avoid compilation overhead. Throws
+      when the precompiled template was compiled with an incompatible version of Handlebars,
+      or when the template specification is malformed.
+
+    postconditions:
+      # Evidence: https://handlebarsjs.com/api-reference/compilation.html
+      # Source confirmed: runtime.js checkRevision() throws on version mismatch
+      - id: template-version-mismatch
+        condition: >
+          The precompiled template specification was generated by a different version of
+          Handlebars than the current runtime. This happens when the handlebars version
+          used at build time (precompile) differs from the version installed at runtime
+          (template). Common in microservices where build and runtime environments diverge,
+          or after upgrading handlebars without recompiling templates.
+        throws: >
+          Handlebars.Exception: "Template was precompiled with an older/newer version of
+          Handlebars than the current runtime. Please update your precompiler/runtime."
+        required_handling: >
+          Callers MUST wrap Handlebars.template() in try-catch. Ensure precompiled templates
+          are regenerated whenever handlebars is upgraded. Pin handlebars to exact versions
+          in both build and runtime environments to prevent version drift.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - https://handlebarsjs.com/api-reference/compilation.html
+          - https://github.com/handlebars-lang/handlebars.js/blob/master/lib/handlebars/runtime.js
