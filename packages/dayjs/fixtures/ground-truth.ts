@@ -117,3 +117,98 @@ export function setTimezoneDefaultSafely(timezone: string): void {
     throw e;
   }
 }
+
+// ============================================================
+// toISOString() postconditions
+// ============================================================
+
+// @expect-violation: toisostring-invalid-date-throws
+// No isValid() check before calling toISOString() on a user-supplied date string.
+// If the string is invalid, dayjs() produces an invalid object and toISOString()
+// throws RangeError: Invalid time value.
+export async function serializeDateToISOStringNoValidation(
+  dateStr: string
+): Promise<string> {
+  const d = dayjs(dateStr);
+  return d.toISOString(); // throws if dateStr is invalid
+}
+
+// @expect-violation: toisostring-invalid-date-throws
+// Parsing from API response without validation, then serializing to ISO string.
+// Database store will crash if API returns a malformed timestamp field.
+export async function storeApiTimestampNoValidation(
+  apiResponseTimestamp: string
+): Promise<{ iso: string }> {
+  const parsed = dayjs(apiResponseTimestamp);
+  return { iso: parsed.toISOString() }; // throws for invalid timestamp
+}
+
+// @expect-clean
+// Using isValid() guard before calling toISOString() — safe pattern.
+export async function serializeDateToISOStringSafe(
+  dateStr: string
+): Promise<string | null> {
+  const d = dayjs(dateStr);
+  if (!d.isValid()) {
+    return null;
+  }
+  return d.toISOString();
+}
+
+// @expect-clean
+// Using toJSON() as a safe alternative to toISOString() — toJSON() has isValid() guard
+// in dayjs source and returns null for invalid dates instead of throwing.
+export async function serializeDateToJSONSafe(
+  dateStr: string
+): Promise<string | null> {
+  const d = dayjs(dateStr);
+  return d.toJSON(); // null-safe — no throw for invalid dates
+}
+
+// ============================================================
+// duration() postconditions
+// ============================================================
+
+// @expect-violation: duration-invalid-iso-string-silent-zero
+// Passing a natural-language duration string to dayjs.duration() —
+// does NOT match ISO 8601 format, silently produces 0ms duration.
+// Subscription will appear expired immediately.
+export async function createSubscriptionDurationFromString(
+  durationStr: string
+): Promise<number> {
+  // durationStr might be "30 days" or "1 month" (natural language, not ISO 8601)
+  const dur = dayjs.duration(durationStr);
+  return dur.asMilliseconds(); // silently returns 0 for non-ISO strings
+}
+
+// @expect-violation: duration-invalid-iso-string-silent-zero
+// Parsing trial period duration from config without validation.
+// If config has "14d" instead of "P14D", trial expires immediately.
+export async function getTrialExpiryDate(
+  trialDurationStr: string
+): Promise<string> {
+  const dur = dayjs.duration(trialDurationStr); // "14d" → 0ms (silent)
+  return dayjs().add(dur).toISOString();
+}
+
+// @expect-clean
+// Validate that duration produces non-zero result, or pre-validate format.
+export async function createSubscriptionDurationSafe(
+  durationStr: string
+): Promise<number | null> {
+  const dur = dayjs.duration(durationStr);
+  const ms = dur.asMilliseconds();
+  // Guard against silent zero-duration from invalid ISO 8601 string
+  if (ms === 0 && durationStr !== 'P0D' && durationStr !== 'PT0S' && durationStr !== 'P0DT0H0M0S') {
+    console.error(`Invalid ISO 8601 duration string: ${durationStr}`);
+    return null;
+  }
+  return ms;
+}
+
+// @expect-clean
+// Using a hardcoded valid ISO 8601 duration string — no runtime parsing risk.
+export async function getTrialExpiryDateHardcoded(): Promise<string> {
+  const dur = dayjs.duration('P14D'); // 14 days in ISO 8601
+  return dayjs().add(dur).toISOString();
+}
