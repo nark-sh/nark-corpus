@@ -1,673 +1,484 @@
+# Square Node.js SDK v44 — SquareClient-based API
+# SDK throws SquareError on all API and network failures. SquareError has:
+#   .statusCode — HTTP status code (number | undefined)
+#   .body — raw response body (unknown)
+#   .errors — Array<{ category, code, detail?, field? }>
+#   .rawResponse — raw HTTP response
+# SquareTimeoutError is thrown on network timeouts (distinct class from SquareError).
+#
+# Error categories (ErrorCategory enum — confirmed from square@44.0.1 ErrorCategory.d.ts):
+#   API_ERROR — server error, safe to retry
+#   AUTHENTICATION_ERROR — bad/expired/revoked token
+#   INVALID_REQUEST_ERROR — bad request params
+#   RATE_LIMIT_ERROR — too many requests, use backoff
+#   PAYMENT_METHOD_ERROR — card declined, CVV failure, etc.
+#   REFUND_ERROR — refund-specific failures
+#   MERCHANT_SUBSCRIPTION_ERROR — subscription plan issues
+#   EXTERNAL_VENDOR_ERROR — third-party processor failure
+#
+# Evidence sources (all fetched 2026-04-16):
+#   square@44.0.1 TypeScript declarations (local npm install)
+#   https://developer.squareup.com/reference/square/payments-api/create-payment
+#   https://developer.squareup.com/reference/square/refunds-api/refund-payment
+#   https://developer.squareup.com/reference/square/subscriptions-api/create-subscription
+#   https://developer.squareup.com/reference/square/enums/ErrorCategory
+#   https://developer.squareup.com/reference/square/enums/ErrorCode
+#   https://developer.squareup.com/docs/build-basics/handling-errors
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 3):
+# API surface: 15 async write operations (primary SaaS usage)
+# Contracted before: 8 stub functions (wrong method names, no evidence)
+# Contracted after: 10 functions (correct v44 namespaced API, confirmed errors)
+# Omitted: 5 (read-only GETs: payments.get, payments.list, refunds.get, refunds.list, orders.batchGet)
+# Coverage: 10/15 = 0.67
+coverage_score: 0.67
+
 package: square
-semver: ">=8.0.0"
-contract_version: "1.0.0"
+semver: ">=40.0.0"
+contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-02-25"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: stub
+evidence_quality: confirmed
+
+detection:
+  class_names:
+    - "SquareClient"
+    - "PaymentsClient"
+    - "OrdersClient"
+    - "CustomersClient"
+    - "RefundsClient"
+    - "SubscriptionsClient"
 
 functions:
-  - name: create
+  - name: payments.create
     import_path: "square"
-    description: "Creates a Square payment via the Payments API"
+    description: >
+      Creates a payment using the provided source. The most critical Square method.
+      Usage: await client.payments.create({ sourceId, idempotencyKey, amountMoney }).
+      Returns HttpResponsePromise<CreatePaymentResponse>.
 
     postconditions:
-      - id: invalid-request-error
-        condition: "Invalid request parameters (missing required fields, invalid values)"
-        throws: "SquareError with 4xx statusCode"
+      - id: square-payments-create-auth-error
+        condition: >
+          Access token is missing, expired (ACCESS_TOKEN_EXPIRED), revoked
+          (ACCESS_TOKEN_REVOKED), or lacks required permissions (INSUFFICIENT_SCOPES).
+        throws: >
+          SquareError with errors[0].category === AUTHENTICATION_ERROR.
+          Codes: UNAUTHORIZED, ACCESS_TOKEN_EXPIRED, ACCESS_TOKEN_REVOKED,
+          CLIENT_DISABLED, FORBIDDEN, INSUFFICIENT_SCOPES.
         required_handling: >
-          Caller MUST catch SquareError and validate request parameters.
-          Check err.body and err.errors array for specific validation failures.
-          DO NOT retry without fixing the request parameters.
+          Caller MUST wrap in try-catch. Check errors[0].code to distinguish expired
+          (rotate token) from revoked (alert ops). Do NOT retry without resolving auth.
         sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs/quick-start"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCategory"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
         severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
+          incident_cost_range: critical
+
+      - id: square-payments-create-card-declined
+        condition: >
+          Card is declined by the issuer during payment processing.
+        throws: >
+          SquareError with errors[0].category === PAYMENT_METHOD_ERROR.
+          Codes: GENERIC_DECLINE, INSUFFICIENT_FUNDS, CVV_FAILURE, CARD_EXPIRED,
+          EXPIRATION_FAILURE, INVALID_CARD, PAN_FAILURE, ADDRESS_VERIFICATION_FAILURE,
+          TRANSACTION_LIMIT, CARD_DECLINED_VERIFICATION_REQUIRED,
+          CARDHOLDER_INSUFFICIENT_PERMISSIONS, VOICE_FAILURE.
+        required_handling: >
+          Caller MUST wrap in try-catch and read errors[0].code to show appropriate
+          user message. GENERIC_DECLINE means try another card. INSUFFICIENT_FUNDS
+          means notify user. CARD_DECLINED_VERIFICATION_REQUIRED triggers 3DS flow.
+          Do NOT show raw error codes to users.
+        sources:
+          - "https://developer.squareup.com/reference/square/payments-api/create-payment"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: authentication-error
-        condition: "Invalid or expired access token"
-        throws: "SquareError with statusCode 401"
+      - id: square-payments-create-invalid-request
+        condition: >
+          Required fields missing (sourceId or amountMoney), nonce expired (5 min TTL),
+          nonce already used (single-use only), appFeeMoney exceeds payment amount,
+          or locationId not found or inactive.
+        throws: >
+          SquareError with errors[0].category === INVALID_REQUEST_ERROR.
+          Codes: MISSING_REQUIRED_PARAMETER, CARD_TOKEN_EXPIRED, CARD_TOKEN_USED,
+          INVALID_FEES, INVALID_LOCATION.
         required_handling: >
-          Caller MUST NOT retry. This indicates invalid credentials.
-          Log error and alert operations team to check API credentials.
+          Caller MUST wrap in try-catch. CARD_TOKEN_USED is critical: nonces are
+          single-use. On network error, do NOT retry with same nonce — generate fresh
+          nonce. Check errors[0].code to distinguish token issues from missing fields.
         sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
+          - "https://developer.squareup.com/reference/square/payments-api/create-payment"
+          - "https://developer.squareup.com/docs/build-basics/handling-errors"
         severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-payments-create-rate-limit
+        condition: >
+          Request rate exceeds Square API rate limits for the payments endpoint.
+        throws: >
+          SquareError with errors[0].category === RATE_LIMIT_ERROR. SDK does NOT
+          auto-retry. Caller must implement backoff.
+        required_handling: >
+          Caller MUST implement exponential backoff with jitter before retrying.
+          MUST use idempotency_key on all retries to prevent duplicate charges.
+        sources:
+          - "https://developer.squareup.com/reference/square/enums/ErrorCategory"
+          - "https://developer.squareup.com/docs/build-basics/handling-errors"
+        severity: warning
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: rate-limit-error
-        condition: "Too many API requests"
-        throws: "SquareError with statusCode 429"
+      - id: square-payments-create-timeout
+        condition: >
+          Network connection times out before receiving a response from Square servers.
+        throws: >
+          SquareTimeoutError — a distinct class from SquareError. Catching only
+          SquareError does NOT catch SquareTimeoutError. Payment status is UNKNOWN.
         required_handling: >
-          Caller MUST implement exponential backoff retry logic.
-          SDK automatically retries on 429 (default: 2 attempts).
-          For extended rate limiting, implement backoff with longer delays.
+          Caller MUST catch SquareTimeoutError separately from SquareError. On timeout,
+          check payment status via payments.get() with the original idempotency_key
+          before retrying. Retrying without checking risks double-charging the customer.
         sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
+          - "https://developer.squareup.com/reference/square/payments-api/create-payment"
+        severity: warning
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: payment-declined
-        condition: "Payment method declined or card verification failed"
-        throws: "SquareError with statusCode 422 and payment-specific error codes"
-        required_handling: >
-          Caller MUST handle payment failures gracefully.
-          Check err.errors array for specific decline reasons.
-          Display user-friendly message and allow payment method update.
-          DO NOT retry declined payments without user intervention.
-        sources:
-          - "https://developer.squareup.com/docs/payments-api/error-handling"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: idempotency-conflict
-        condition: "Idempotency key already used with different parameters"
-        throws: "SquareError with statusCode 409"
-        required_handling: >
-          Caller MUST generate a new idempotency key.
-          This indicates duplicate request with conflicting data.
-          Either retry with new key or retrieve the original result.
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/idempotency"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: server-error
-        condition: "Square server error"
-        throws: "SquareError with 5xx statusCode"
-        required_handling: >
-          Caller MUST implement retry with exponential backoff.
-          SDK automatically retries 5xx errors (default: 2 attempts).
-          Log error and monitor for persistent issues.
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: network-error
-        condition: "Network connectivity issue or timeout"
-        throws: "SquareError with statusCode 408 or connection error"
-        required_handling: >
-          Caller MUST implement retry with exponential backoff.
-          SDK automatically retries 408 timeout errors (default: 2 attempts).
-          Use idempotency keys to prevent duplicate charges on retry.
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: createPayment
+  - name: refunds.refundPayment
     import_path: "square"
-    description: "Creates a payment using PaymentsApi (legacy method)"
+    description: >
+      Refunds a payment fully or partially. Usage: await client.refunds.refundPayment({
+      idempotencyKey, amountMoney, paymentId }). Returns HttpResponsePromise<RefundPaymentResponse>.
 
     postconditions:
-      - id: invalid-request-error
-        condition: "Invalid request parameters"
-        throws: "SquareError with 4xx statusCode"
-        required_handling: "Validate request parameters. DO NOT retry without fixing issues."
-        sources:
-          - "https://developer.squareup.com/docs/payments-api/error-handling"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Alert operations team."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: payment-declined
-        condition: "Payment declined"
-        throws: "SquareError with statusCode 422"
-        required_handling: "Handle gracefully, allow user to update payment method"
-        sources:
-          - "https://developer.squareup.com/docs/payments-api/error-handling"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError with statusCode 408 or connection error"
-        required_handling: "Retry with idempotency key"
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: createOrder
-    import_path: "square"
-    description: "Creates an order via the Orders API"
-
-    postconditions:
-      - id: invalid-request-error
-        condition: "Invalid order data"
-        throws: "SquareError with 4xx statusCode"
+      - id: square-refunds-refund-payment-error
+        condition: >
+          Payment is in non-refundable state (too old, fully refunded, or has active
+          dispute), refund amount exceeds available balance, or card issuer declines refund.
+        throws: >
+          SquareError with errors[0].category === REFUND_ERROR.
+          Codes: PAYMENT_NOT_REFUNDABLE, PAYMENT_NOT_REFUNDABLE_DUE_TO_DISPUTE,
+          REFUND_AMOUNT_INVALID, REFUND_DECLINED, INSUFFICIENT_PERMISSIONS_FOR_REFUND.
         required_handling: >
-          Validate order line items, prices, and location_id.
-          Check err.errors array for specific validation issues.
+          Caller MUST wrap in try-catch and read errors[0].code. Route differently:
+          PAYMENT_NOT_REFUNDABLE_DUE_TO_DISPUTE requires escalation to dispute team.
+          REFUND_AMOUNT_INVALID requires checking remaining refundable balance.
+          Use idempotency_key to prevent duplicate refunds on retry.
         sources:
-          - "https://developer.squareup.com/docs/orders-api/error-scenarios"
+          - "https://developer.squareup.com/reference/square/refunds-api/refund-payment"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCategory"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check API credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError"
-        required_handling: "Retry with idempotency key"
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: updateOrder
-    import_path: "square"
-    description: "Updates an existing order"
-
-    postconditions:
-      - id: order-not-found
-        condition: "Order ID does not exist"
-        throws: "SquareError with statusCode 404"
-        required_handling: "Handle missing order gracefully. DO NOT retry."
-        sources:
-          - "https://developer.squareup.com/docs/orders-api/error-scenarios"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: invalid-version
-        condition: "Order version mismatch (concurrent update)"
-        throws: "SquareError with 409 statusCode"
+      - id: square-refunds-auth-or-rate-limit
+        condition: >
+          Access token is invalid or expired, or refund rate exceeds Square limits
+          (common in batch refund jobs processing many orders at once).
+        throws: >
+          SquareError with category AUTHENTICATION_ERROR or RATE_LIMIT_ERROR.
         required_handling: >
-          Retrieve latest order version and retry with correct version.
-          This prevents overwriting concurrent updates.
+          Caller MUST implement exponential backoff for RATE_LIMIT_ERROR. Track
+          per-refund status in batch jobs to resume correctly after interruption.
+          Do NOT retry AUTHENTICATION_ERROR without fixing the token.
         sources:
-          - "https://developer.squareup.com/docs/orders-api/manage-orders"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCategory"
+          - "https://developer.squareup.com/docs/build-basics/handling-errors"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: createCustomer
+  - name: payments.complete
     import_path: "square"
-    description: "Creates a customer via the Customers API"
+    description: >
+      Completes (captures) a payment with APPROVED status in two-step payment flows.
+      Usage: await client.payments.complete({ paymentId }). Returns HttpResponsePromise<CompletePaymentResponse>.
 
     postconditions:
-      - id: invalid-request-error
-        condition: "Invalid customer data"
-        throws: "SquareError with 4xx statusCode"
-        required_handling: "Validate customer fields. Check err.errors for details."
-        sources:
-          - "https://developer.squareup.com/docs/customers-api/use-the-api"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: duplicate-customer
-        condition: "Customer with same email or phone already exists"
-        throws: "SquareError with statusCode 409"
+      - id: square-payments-complete-error
+        condition: >
+          Payment is not in APPROVED state (already COMPLETED, CANCELED, or FAILED),
+          authorization hold has expired (6 days card-present, 7 days card-not-present),
+          or access token is invalid.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (wrong state or expired hold) or
+          AUTHENTICATION_ERROR. Expired hold: new payment must be created, not retried.
         required_handling: >
-          Handle duplicate gracefully. Either retrieve existing customer or
-          update existing customer instead of creating new one.
+          Caller MUST wrap in try-catch. Monitor time between auth and capture to
+          complete before hold expiry. On error, check errors[0].code to determine
+          if a new payment is required vs a retryable transient error.
         sources:
-          - "https://developer.squareup.com/docs/customers-api/use-the-api"
+          - "https://developer.squareup.com/docs/payments-api/take-payments"
+          - "https://developer.squareup.com/reference/square/payments-api/complete-payment"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: retrieveCustomer
+  - name: payments.cancel
     import_path: "square"
-    description: "Retrieves a customer by ID"
+    description: >
+      Cancels (voids) a payment with APPROVED status. Usage: await client.payments.cancel({
+      paymentId }). Returns HttpResponsePromise<CancelPaymentResponse>.
 
     postconditions:
-      - id: customer-not-found
-        condition: "Customer ID does not exist"
-        throws: "SquareError with statusCode 404"
-        required_handling: "Handle missing customer gracefully. DO NOT retry."
+      - id: square-payments-cancel-error
+        condition: >
+          Payment is already COMPLETED (captured — must refund instead), in FAILED state,
+          already CANCELED, or access token is invalid.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (non-cancellable state) or
+          AUTHENTICATION_ERROR. COMPLETED payments cannot be voided.
+        required_handling: >
+          Caller MUST wrap in try-catch. If payment is COMPLETED, route to
+          refunds.refundPayment() instead of retrying cancel(). Do not assume
+          cancellation succeeded without confirming the API response.
         sources:
-          - "https://developer.squareup.com/docs/customers-api/use-the-api"
+          - "https://developer.squareup.com/reference/square/payments-api/cancel-payment"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: list
+  - name: subscriptions.create
     import_path: "square"
-    description: "Lists locations via the Locations API"
+    description: >
+      Enrolls a customer in a subscription plan. Usage: await client.subscriptions.create({
+      idempotencyKey, locationId, planVariationId, customerId, cardId? }).
+      Returns HttpResponsePromise<CreateSubscriptionResponse>.
 
     postconditions:
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
+      - id: square-subscriptions-create-customer-error
+        condition: >
+          Customer ID does not exist in merchant directory, customer has no email
+          (required for invoice delivery), or customer has no recorded name.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400 Bad Request).
+          Confirmed codes: CUSTOMER_NOT_FOUND, CUSTOMER_MISSING_EMAIL, CUSTOMER_MISSING_NAME.
+        required_handling: >
+          Caller MUST wrap in try-catch. CUSTOMER_NOT_FOUND: create customer first.
+          CUSTOMER_MISSING_EMAIL: update customer profile before enrolling. Do NOT
+          show subscribed state until API confirms status === ACTIVE.
         sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs/quick-start"
+          - "https://developer.squareup.com/reference/square/subscriptions-api/create-subscription"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
+          incident_label: PAYMENT_RISK
           production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
+          visibility: silent
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
+      - id: square-subscriptions-create-card-error
+        condition: >
+          card_id is invalid or declined, or location is not configured for credit
+          card processing (CARD_PROCESSING_NOT_ENABLED, 403 Forbidden). Subscription
+          may be created in PENDING state when card payment fails at enrollment.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR or PAYMENT_METHOD_ERROR, or 403
+          with CARD_PROCESSING_NOT_ENABLED. Subscription may exist in PENDING state.
+        required_handling: >
+          Caller MUST wrap in try-catch and check response.subscription.status === ACTIVE
+          before granting access. PENDING means Square will invoice but has NOT confirmed
+          payment. Do NOT grant paid-feature access until status is ACTIVE.
         sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
+          - "https://developer.squareup.com/reference/square/subscriptions-api/create-subscription"
+          - "https://developer.squareup.com/docs/subscriptions-api/manage-subscriptions"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError with statusCode 408 or connection error"
-        required_handling: "Retry with exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: retrieveOrder
+  - name: subscriptions.cancel
     import_path: "square"
-    description: "Retrieves an existing order by ID"
+    description: >
+      Cancels an active subscription. Usage: await client.subscriptions.cancel({
+      subscriptionId }). Returns HttpResponsePromise<CancelSubscriptionResponse>.
 
     postconditions:
-      - id: order-not-found
-        condition: "Order ID does not exist"
-        throws: "SquareError with statusCode 404"
-        required_handling: "Handle missing order gracefully. DO NOT retry."
+      - id: square-subscriptions-cancel-error
+        condition: >
+          Subscription ID does not exist, subscription is already CANCELLED or
+          DEACTIVATED, or access token is invalid.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (not found or not cancellable) or
+          AUTHENTICATION_ERROR.
+        required_handling: >
+          Caller MUST wrap in try-catch. Swallowing this error leaves the subscription
+          active while the app assumes it was cancelled — customer continues to be billed.
+          Log and alert on all cancellation failures. Verify by checking subscription
+          status after the call. Treat NOT_FOUND as possible soft success (already cancelled)
+          but log for audit trail.
         sources:
-          - "https://developer.squareup.com/docs/orders-api/error-scenarios"
+          - "https://developer.squareup.com/reference/square/subscriptions-api/cancel-subscription"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError"
-        required_handling: "Retry with exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: getPayment
+  - name: orders.create
     import_path: "square"
-    description: "Retrieves a payment by ID via Payments API"
+    description: >
+      Creates an order with line items, taxes, and discounts. Usage: await client.orders.create({
+      order: { locationId, lineItems }, idempotencyKey }). Returns HttpResponsePromise<CreateOrderResponse>.
 
     postconditions:
-      - id: payment-not-found
-        condition: "Payment ID does not exist"
-        throws: "SquareError with statusCode 404"
-        required_handling: "Handle missing payment gracefully. DO NOT retry."
+      - id: square-orders-create-error
+        condition: >
+          Location ID not found or inactive, required order fields missing, line item
+          price or quantity invalid, or currency not supported for merchant location.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400) or 403 for INVALID_LOCATION.
+          Codes: INVALID_LOCATION, MISSING_REQUIRED_PARAMETER, INVALID_VALUE,
+          UNSUPPORTED_CURRENCY. Also AUTHENTICATION_ERROR for bad token.
+        required_handling: >
+          Caller MUST wrap in try-catch. INVALID_LOCATION surfaces when merchants
+          deactivate locations — app must refresh cached location_id. Use idempotency_key
+          to safely retry failed order creation without creating duplicates.
         sources:
-          - "https://developer.squareup.com/docs/payments-api/error-handling"
+          - "https://developer.squareup.com/reference/square/orders-api/create-order"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
         severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError"
-        required_handling: "Retry with exponential backoff"
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
-
-  - name: createPaymentLink
+  - name: customers.create
     import_path: "square"
-    description: "Creates a payment link via Checkout API"
+    description: >
+      Creates a customer profile. Usage: await client.customers.create({
+      givenName, familyName, emailAddress, phoneNumber }). At least one field required.
+      Returns HttpResponsePromise<CreateCustomerResponse>.
 
     postconditions:
-      - id: invalid-request-error
-        condition: "Invalid request parameters"
-        throws: "SquareError with 4xx statusCode"
-        required_handling: "Validate request parameters. DO NOT retry without fixing issues."
+      - id: square-customers-create-error
+        condition: >
+          No identifying field provided (givenName, familyName, companyName,
+          emailAddress, or phoneNumber — at least one required), or email/phone
+          format is malformed.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR.
+          Codes: MISSING_REQUIRED_PARAMETER, INVALID_EMAIL_ADDRESS, INVALID_PHONE_NUMBER.
+          Also AUTHENTICATION_ERROR for bad token.
+        required_handling: >
+          Caller MUST wrap in try-catch. Validate email/phone formats client-side before
+          calling. Customer creation failure blocks downstream card-on-file and subscription
+          enrollment. Log repeated INVALID_REQUEST_ERROR — may indicate malformed data pipeline.
         sources:
-          - "https://developer.squareup.com/docs/checkout-api/error-handling"
+          - "https://developer.squareup.com/reference/square/customers-api/create-customer"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
         severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
           incident_cost_range: medium
 
-      - id: authentication-error
-        condition: "Invalid credentials"
-        throws: "SquareError with statusCode 401"
-        required_handling: "DO NOT retry. Check credentials."
-        sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
-        severity: error
-        business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+  - name: customers.delete
+    import_path: "square"
+    description: >
+      Permanently deletes a customer profile (GDPR/CCPA deletion). Irreversible.
+      Usage: await client.customers.delete({ customerId }).
+      Returns HttpResponsePromise<DeleteCustomerResponse>.
 
-      - id: rate-limit-error
-        condition: "Rate limit exceeded"
-        throws: "SquareError with statusCode 429"
-        required_handling: "Implement exponential backoff"
+    postconditions:
+      - id: square-customers-delete-error
+        condition: >
+          Customer ID does not exist in merchant directory, or access token is invalid.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (CUSTOMER_NOT_FOUND) or
+          AUTHENTICATION_ERROR.
+        required_handling: >
+          Caller MUST wrap in try-catch and verify deletion completed. Operation is
+          irreversible — swallowing errors causes app to assume deletion succeeded while
+          Square customer data persists. GDPR/CCPA requires confirmed deletion.
+          Treat CUSTOMER_NOT_FOUND as soft success (already deleted) but log for audit.
         sources:
-          - "https://developer.squareup.com/docs/build-basics/common-api-patterns/rate-limiting"
+          - "https://developer.squareup.com/reference/square/customers-api/delete-customer"
         severity: error
         business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
-      - id: network-error
-        condition: "Network error"
-        throws: "SquareError"
-        required_handling: "Retry with idempotency key"
+  - name: checkout.paymentLinks.create
+    import_path: "square"
+    description: >
+      Creates a Square-hosted checkout page. Usage: await client.checkout.paymentLinks.create({
+      idempotencyKey, quickPay: { name, priceMoney, locationId } }).
+      Returns HttpResponsePromise<CreatePaymentLinkResponse>.
+
+    postconditions:
+      - id: square-checkout-payment-links-create-error
+        condition: >
+          quickPay missing required fields (name and priceMoney both required),
+          locationId inactive or not found, price data malformed, or access token invalid.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (missing fields, INVALID_LOCATION) or
+          AUTHENTICATION_ERROR.
+        required_handling: >
+          Caller MUST wrap in try-catch. Validate quickPay fields before calling.
+          Do NOT cache link URLs long-term — payment links expire and redirect customers
+          to Square error page without notifying the application. Regenerate on demand.
         sources:
-          - "https://developer.squareup.com/docs/sdks/nodejs"
+          - "https://developer.squareup.com/reference/square/checkout-api/create-payment-link"
         severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
-          user_experience: service_unavailable
+          user_experience: lost_transaction
           incident_cost_range: medium
