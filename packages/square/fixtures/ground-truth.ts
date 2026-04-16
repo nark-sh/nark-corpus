@@ -17,6 +17,16 @@
  *   square-orders-create-error
  *   square-customers-create-error
  *   square-customers-delete-error
+ *   square-cards-create-source-used          (deepen-stream-2 pass 4)
+ *   square-cards-create-customer-not-found   (deepen-stream-2 pass 4)
+ *   square-cards-create-processing-not-enabled (deepen-stream-2 pass 4)
+ *   square-invoices-create-error             (deepen-stream-2 pass 4)
+ *   square-invoices-publish-card-declined    (deepen-stream-2 pass 4)
+ *   square-invoices-publish-wrong-version    (deepen-stream-2 pass 4)
+ *   square-orders-update-version-conflict    (deepen-stream-2 pass 4)
+ *   square-orders-update-closed-order        (deepen-stream-2 pass 4)
+ *   square-orders-pay-amount-mismatch        (deepen-stream-2 pass 4)
+ *   square-orders-pay-timeout                (deepen-stream-2 pass 4)
  */
 
 import { SquareClient, SquareError, SquareTimeoutError } from "square";
@@ -125,6 +135,154 @@ async function cancelPaymentMissingErrorHandling(paymentId: string) {
   // ❌ No try-catch — INVALID_REQUEST_ERROR for already-completed payment unhandled
   const response = await client.payments.cancel({ paymentId });
   return response;
+}
+
+// ─── NEW VIOLATION CASES (deepen-stream-2 pass 4) ────────────────────────────
+
+// @expect-violation: square-cards-create-source-used
+// @expect-violation: square-cards-create-customer-not-found
+// @expect-violation: square-cards-create-processing-not-enabled
+async function createCardMissingErrorHandling(customerId: string, sourceId: string) {
+  // ❌ No try-catch — SOURCE_USED (nonce reuse), CUSTOMER_NOT_FOUND,
+  // and CARD_PROCESSING_NOT_ENABLED all unhandled
+  const response = await client.cards.create({
+    idempotencyKey: `card-${Date.now()}`,
+    sourceId,
+    card: { customerId },
+  });
+  return response;
+}
+
+// @expect-violation: square-invoices-create-error
+async function createInvoiceMissingErrorHandling(orderId: string, customerId: string) {
+  // ❌ No try-catch — INVALID_REQUEST_ERROR (bad order, missing customer data) unhandled
+  const response = await client.invoices.create({
+    invoice: {
+      locationId: "LOCATION_ID",
+      orderId,
+      primaryRecipient: { customerId },
+      paymentRequests: [{ requestType: "BALANCE", dueDate: "2030-01-24" }],
+      deliveryMethod: "EMAIL",
+    },
+    idempotencyKey: `inv-${Date.now()}`,
+  });
+  return response;
+}
+
+// @expect-violation: square-invoices-publish-card-declined
+// @expect-violation: square-invoices-publish-wrong-version
+async function publishInvoiceMissingErrorHandling(invoiceId: string, version: number) {
+  // ❌ No try-catch — CARD_DECLINED at publish time and version mismatch unhandled
+  const response = await client.invoices.publish({
+    invoiceId,
+    version,
+    idempotencyKey: `pub-${Date.now()}`,
+  });
+  return response;
+}
+
+// @expect-violation: square-orders-update-version-conflict
+// @expect-violation: square-orders-update-closed-order
+async function updateOrderMissingErrorHandling(orderId: string, version: number) {
+  // ❌ No try-catch — version conflict and closed-order errors unhandled
+  const response = await client.orders.update({
+    orderId,
+    order: {
+      locationId: "LOCATION_ID",
+      lineItems: [
+        {
+          name: "Widget",
+          quantity: "2",
+          basePriceMoney: { amount: BigInt(500), currency: "USD" },
+        },
+      ],
+      version,
+    },
+    idempotencyKey: `upd-${Date.now()}`,
+  });
+  return response;
+}
+
+// @expect-violation: square-orders-pay-amount-mismatch
+// @expect-violation: square-orders-pay-timeout
+async function payOrderMissingErrorHandling(orderId: string, paymentIds: string[]) {
+  // ❌ No try-catch — amount mismatch and SquareTimeoutError unhandled
+  const response = await client.orders.pay({
+    orderId,
+    idempotencyKey: `pay-${Date.now()}`,
+    paymentIds,
+  });
+  return response;
+}
+
+// ─── NEW CLEAN CASES (deepen-stream-2 pass 4) ────────────────────────────────
+
+// @expect-clean
+async function createCardWithProperHandling(customerId: string, sourceId: string) {
+  try {
+    const response = await client.cards.create({
+      idempotencyKey: `card-${Date.now()}`,
+      sourceId,
+      card: { customerId },
+    });
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      const code = err.errors?.[0]?.code;
+      if (code === "SOURCE_USED" || code === "SOURCE_EXPIRED") {
+        throw new Error("Card nonce expired or already used — generate a new nonce");
+      }
+      if (code === "CUSTOMER_NOT_FOUND") {
+        throw new Error("Customer not found — create customer profile first");
+      }
+      if (code === "CARD_PROCESSING_NOT_ENABLED") {
+        throw new Error("Card processing not enabled for this location — contact Square support");
+      }
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function publishInvoiceWithProperHandling(invoiceId: string, version: number) {
+  try {
+    const response = await client.invoices.publish({
+      invoiceId,
+      version,
+      idempotencyKey: `pub-${Date.now()}`,
+    });
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      const category = err.errors?.[0]?.category;
+      const code = err.errors?.[0]?.code;
+      if (category === "PAYMENT_METHOD_ERROR") {
+        throw new Error(`Invoice payment declined: ${code}`);
+      }
+      throw new Error(`Invoice publish failed: ${code}`);
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function payOrderWithProperHandling(orderId: string, paymentIds: string[]) {
+  try {
+    const response = await client.orders.pay({
+      orderId,
+      idempotencyKey: `pay-${Date.now()}`,
+      paymentIds,
+    });
+    return response;
+  } catch (err) {
+    if (err instanceof SquareTimeoutError) {
+      throw new Error("Order pay timeout — verify order status before retrying");
+    }
+    if (err instanceof SquareError) {
+      throw new Error(`Order payment failed: ${err.errors?.[0]?.code}`);
+    }
+    throw err;
+  }
 }
 
 // ─── CLEAN CASES ─────────────────────────────────────────────────────────────
@@ -245,4 +403,13 @@ export {
   refundPaymentWithProperHandling,
   createSubscriptionWithProperHandling,
   createOrderWithProperHandling,
+  // deepen-stream-2 pass 4 additions
+  createCardMissingErrorHandling,
+  createInvoiceMissingErrorHandling,
+  publishInvoiceMissingErrorHandling,
+  updateOrderMissingErrorHandling,
+  payOrderMissingErrorHandling,
+  createCardWithProperHandling,
+  publishInvoiceWithProperHandling,
+  payOrderWithProperHandling,
 };

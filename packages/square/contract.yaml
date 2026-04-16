@@ -31,13 +31,20 @@
 # Contracted after: 10 functions (correct v44 namespaced API, confirmed errors)
 # Omitted: 5 (read-only GETs: payments.get, payments.list, refunds.get, refunds.list, orders.batchGet)
 # Coverage: 10/15 = 0.67
-coverage_score: 0.67
+#
+# Depth pass 2026-04-16 (deepen-stream-2 pass 4):
+# API surface: 20 async write operations (expanded — cards, invoices, orders.update/pay, customers.update)
+# Contracted before: 10 (pass 3 total)
+# Contracted after: 15 (added: cards.create, invoices.create, invoices.publish, orders.update, orders.pay)
+# Omitted: 5 (unchanged: read-only GETs)
+# Coverage: 15/20 = 0.75
+coverage_score: 0.75
 
 package: square
 semver: ">=40.0.0"
 contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-16"  # updated by deepen-stream-2 pass 4
 status: production
 evidence_quality: confirmed
 
@@ -482,3 +489,298 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: medium
+
+  - name: cards.create
+    import_path: "square"
+    description: >
+      Stores a card on file for a customer (card-on-file / card vault).
+      Usage: await client.cards.create({ idempotencyKey, sourceId, card: { customerId } }).
+      Returns HttpResponsePromise<CreateCardResponse>. The stored card id (e.g. "ccof:...")
+      is then used in subscriptions.create(cardId) and payments.create(sourceId).
+      Cards are reusable and persist until explicitly disabled.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/cards-api/create-card (fetched 2026-04-16)
+      # Error codes SOURCE_USED, SOURCE_EXPIRED, CUSTOMER_NOT_FOUND, CARD_PROCESSING_NOT_ENABLED
+      # confirmed from Square developer reference.
+      - id: square-cards-create-source-used
+        condition: >
+          The sourceId (nonce) provided was already used in a previous cards.create() call.
+          Card nonces are single-use. On network error or timeout, retrying with the same
+          sourceId always fails with SOURCE_USED — even if the first call never reached Square.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR and code SOURCE_USED.
+          Code SOURCE_EXPIRED occurs if the nonce exceeded its 5-minute TTL.
+        required_handling: >
+          Caller MUST wrap in try-catch. On SOURCE_USED or SOURCE_EXPIRED: discard the nonce
+          and generate a fresh one from the Square Web Payments SDK. Do NOT retry with the same
+          sourceId. Storing the nonce for later re-use causes permanent failure on all
+          subsequent calls. This is the #1 mistake in card vaulting flows.
+        sources:
+          - "https://developer.squareup.com/reference/square/cards-api/create-card"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-cards-create-customer-not-found
+        condition: >
+          The customerId provided in the card object does not exist in the merchant's
+          customer directory. Common when customer creation fails silently and the card
+          vaulting step is not gated on successful customer creation.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR and code CUSTOMER_NOT_FOUND (HTTP 400).
+        required_handling: >
+          Caller MUST wrap in try-catch and ensure customers.create() succeeded before
+          calling cards.create(). Do NOT proceed to subscription enrollment without a
+          valid stored card — caller should surface the failure to the user rather than
+          silently continuing with no card on file.
+        sources:
+          - "https://developer.squareup.com/reference/square/cards-api/create-card"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-cards-create-processing-not-enabled
+        condition: >
+          The locationId provided is not enabled for credit card processing.
+          Occurs when a merchant's location is newly created or not activated for payments.
+        throws: >
+          SquareError with HTTP 403 and code CARD_PROCESSING_NOT_ENABLED.
+        required_handling: >
+          Caller MUST wrap in try-catch. CARD_PROCESSING_NOT_ENABLED is not a transient
+          error — retrying will always fail. Alert ops team to activate card processing
+          for the location in the Square Dashboard. Do NOT silently swallow this error.
+        sources:
+          - "https://developer.squareup.com/reference/square/cards-api/create-card"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: invoices.create
+    import_path: "square"
+    description: >
+      Creates a draft invoice linked to an existing order. The invoice stays in DRAFT
+      state until invoices.publish() is called. Usage: await client.invoices.create({
+      invoice: { locationId, orderId, primaryRecipient: { customerId }, paymentRequests,
+      deliveryMethod }, idempotencyKey }).
+      Returns HttpResponsePromise<CreateInvoiceResponse>.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/invoices-api/create-invoice (fetched 2026-04-16)
+      # INVALID_CARD code confirmed; INVALID_REQUEST_ERROR codes inferred from Square general error docs
+      # and invoice field requirements.
+      - id: square-invoices-create-error
+        condition: >
+          The linked orderId does not exist or is in a non-invoiceable state (already PAID,
+          CANCELED, or has another invoice), primaryRecipient customerId is invalid,
+          paymentRequests fields are missing or malformed, or card-on-file specified is
+          invalid (INVALID_CARD, PAYMENT_METHOD_ERROR).
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400 — missing order, invalid customer,
+          malformed payment schedule) or PAYMENT_METHOD_ERROR with code INVALID_CARD.
+        required_handling: >
+          Caller MUST wrap in try-catch. Verify the order is in OPEN state before creating
+          invoice. Confirm the customer exists and has an email address (required for email
+          delivery). A successfully created invoice is in DRAFT state — it will NOT charge
+          the customer until invoices.publish() is called. Do NOT assume draft creation
+          means the customer has been notified or charged.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/create-invoice"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: invoices.publish
+    import_path: "square"
+    description: >
+      Publishes a draft invoice, triggering Square to email it to the customer or charge
+      the customer's card on file. Usage: await client.invoices.publish({ invoiceId, version,
+      idempotencyKey }). After publishing, status changes from DRAFT to UNPAID (if email
+      delivery) or PARTIALLY_PAID (if card charged immediately). Requires INVOICES_WRITE,
+      ORDERS_WRITE, and optionally CUSTOMERS_READ + PAYMENTS_WRITE for card payments.
+      Returns HttpResponsePromise<PublishInvoiceResponse>.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/invoices-api/publish-invoice (fetched 2026-04-16)
+      # INVALID_CARD (PAYMENT_METHOD_ERROR) and CARD_DECLINED confirmed from Square reference.
+      - id: square-invoices-publish-card-declined
+        condition: >
+          The invoice is configured for automatic card-on-file payment and the card is declined
+          during publish. Occurs if the stored card expired, was reported stolen, or has
+          insufficient funds at the moment of publishing.
+        throws: >
+          SquareError with PAYMENT_METHOD_ERROR and code CARD_DECLINED (HTTP 402), or
+          INVALID_CARD if the card data cannot be validated.
+        required_handling: >
+          Caller MUST wrap in try-catch and check the invoice status after publish failure.
+          On CARD_DECLINED: notify the customer to update payment method. The invoice may
+          still be created and in an error state — do NOT consider it unpublished without
+          confirming via invoices.get(). Do NOT silently swallow this error or show the
+          customer a success message.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/publish-invoice"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-invoices-publish-wrong-version
+        condition: >
+          The version field does not match the invoice's current version in Square's system.
+          This is Square's optimistic concurrency control — two concurrent publish attempts
+          for the same invoice, or a publish after an update, will cause a version mismatch.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). The version must exactly match the
+          current invoice version returned by invoices.get() or invoices.create().
+        required_handling: >
+          Caller MUST wrap in try-catch. On version mismatch: re-fetch the invoice with
+          invoices.get() to get the latest version, then retry publish with the new version.
+          Using idempotency_key ensures that if the first publish succeeded, the retry returns
+          the same published invoice. Always pass version from the most recent fetch.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/publish-invoice"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: orders.update
+    import_path: "square"
+    description: >
+      Updates an open order by adding, replacing, or deleting fields. Orders in COMPLETED
+      or CANCELED state cannot be updated. Usage: await client.orders.update({ orderId,
+      order: { locationId, lineItems, version }, fieldsToClear?, idempotencyKey? }).
+      The version must match the current order version (optimistic locking).
+      Returns HttpResponsePromise<UpdateOrderResponse>.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/orders-api/update-order
+      # Version/state errors confirmed from Square's documented optimistic concurrency pattern.
+      - id: square-orders-update-version-conflict
+        condition: >
+          The version field in the request does not match the current version of the order
+          in Square. Concurrent modifications (e.g., POS and API both updating the same order)
+          or stale cached order data cause this error. Version is required for all updates.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). Must always include the latest
+          version from a recent orders.get() call. Cannot be retried without re-fetching.
+        required_handling: >
+          Caller MUST wrap in try-catch. On version conflict: re-fetch the order with
+          orders.get() to get the current version and state, then re-apply changes and retry.
+          Do NOT retry the same update request with the same version — it will always fail.
+        sources:
+          - "https://developer.squareup.com/reference/square/orders-api/update-order"
+          - "https://developer.squareup.com/docs/orders-api/manage-orders/update-orders"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-orders-update-closed-order
+        condition: >
+          Attempting to update an order in COMPLETED or CANCELED state. These orders are
+          immutable — all fields are read-only after the order reaches a terminal state.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). The order state cannot be
+          reverted, and updates to completed/canceled orders are not permitted.
+        required_handling: >
+          Caller MUST wrap in try-catch and check order state before calling update.
+          On closed-order error: do NOT retry. If a refund or correction is needed,
+          use refunds.refundPayment() for completed orders, not orders.update().
+          Log and alert — this often indicates a race condition or UI bug.
+        sources:
+          - "https://developer.squareup.com/reference/square/orders-api/update-order"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: orders.pay
+    import_path: "square"
+    description: >
+      Finalizes an order by applying one or more approved payments. The sum of all
+      payment_ids must equal the order total. Orders with total of 0 can be paid with
+      an empty payment_ids array. Completes any APPROVED delayed-capture payments.
+      Usage: await client.orders.pay({ orderId, idempotencyKey, paymentIds }).
+      Returns HttpResponsePromise<PayOrderResponse>.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/docs/orders-api/pay-for-orders (fetched 2026-04-16)
+      # https://developer.squareup.com/reference/square/orders-api/pay-order
+      # Amount mismatch and payment state errors confirmed from Square order-flow documentation.
+      - id: square-orders-pay-amount-mismatch
+        condition: >
+          The sum of all payment_ids does not equal the order total_money. Any partial
+          payment coverage or over-payment causes immediate failure. Also fails if a
+          payment referenced by payment_id is not in APPROVED state (already COMPLETED,
+          CANCELED, or FAILED).
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). Payments not referenced in
+          payment_ids and previously approved for the same order_id are automatically
+          CANCELED by Square.
+        required_handling: >
+          Caller MUST wrap in try-catch. Before calling pay(), verify: (1) sum of
+          payment amounts equals order total, (2) all referenced payments are in APPROVED
+          state via payments.get(). On failure, check which payments were auto-canceled
+          by Square — do NOT attempt to re-complete canceled payments without creating
+          new payment authorizations.
+        sources:
+          - "https://developer.squareup.com/docs/orders-api/pay-for-orders"
+          - "https://developer.squareup.com/reference/square/orders-api/pay-order"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-orders-pay-timeout
+        condition: >
+          Network connection times out while Square is processing the pay-order request.
+          Payment status is UNKNOWN — the order may or may not have been marked as COMPLETED.
+        throws: >
+          SquareTimeoutError — a distinct class from SquareError. Catching only SquareError
+          does NOT catch SquareTimeoutError.
+        required_handling: >
+          Caller MUST catch SquareTimeoutError separately. On timeout: do NOT immediately
+          retry pay(). First verify order state via orders.get() — if COMPLETED, the payment
+          succeeded. Retrying with the same idempotency_key is safe (returns the same result),
+          but retrying without checking may trigger duplicate captures on APPROVED payments.
+        sources:
+          - "https://developer.squareup.com/docs/orders-api/pay-for-orders"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
