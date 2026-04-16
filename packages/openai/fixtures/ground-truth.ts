@@ -783,3 +783,62 @@ export async function responsesInputTokensCountWithCatch(input: string) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. webhooks.unwrap — missing error handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: webhooks-invalid-signature-error
+// @expect-violation: webhooks-missing-secret-error
+export async function webhookUnwrapNoCatch(payload: string, headers: Record<string, string>) {
+  // SHOULD_FIRE: webhooks.unwrap throws InvalidWebhookSignatureError and plain Error —
+  // missing try-catch in webhook handler means ANY invalid/expired signature crashes the process
+  const event = await openai.webhooks.unwrap(payload, headers);
+  return event;
+}
+
+// @expect-clean
+export async function webhookUnwrapWithCatch(payload: string, headers: Record<string, string>) {
+  try {
+    // SHOULD_NOT_FIRE: proper error handling for webhooks.unwrap()
+    const event = await openai.webhooks.unwrap(payload, headers);
+    return event;
+  } catch (err) {
+    if (err instanceof OpenAI.InvalidWebhookSignatureError) {
+      // Return 400 to OpenAI — do NOT return 200 which would ack the failed event
+      throw Object.assign(new Error('Invalid webhook signature'), { statusCode: 400 });
+    }
+    // Catches missing secret (plain Error) and JSON parse errors (SyntaxError)
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. webhooks.verifySignature — missing error handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: webhooks-verify-invalid-signature-error
+// @expect-violation: webhooks-verify-missing-secret-error
+export async function webhookVerifyNoCatch(payload: string, headers: Record<string, string>) {
+  // SHOULD_FIRE: webhooks.verifySignature throws InvalidWebhookSignatureError —
+  // no try-catch means signature failures crash the webhook handler
+  await openai.webhooks.verifySignature(payload, headers);
+  const event = JSON.parse(payload);
+  return event;
+}
+
+// @expect-clean
+export async function webhookVerifyWithCatch(payload: string, headers: Record<string, string>) {
+  try {
+    // SHOULD_NOT_FIRE: proper error handling for webhooks.verifySignature()
+    await openai.webhooks.verifySignature(payload, headers);
+    const event = JSON.parse(payload);
+    return event;
+  } catch (err) {
+    if (err instanceof OpenAI.InvalidWebhookSignatureError) {
+      throw Object.assign(new Error('Webhook signature verification failed'), { statusCode: 400 });
+    }
+    // Catches missing secret (plain Error)
+    throw err;
+  }
+}

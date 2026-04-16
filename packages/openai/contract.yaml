@@ -29,7 +29,18 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.64  # 23 contracted / 36 total async-callable functions (15 intentionally omitted)
+coverage_score: 0.61  # 25 contracted / 41 total async-callable functions (20 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-1 pass 6):
+# Expanded coverage from 23→25 contracted functions (+2 this pass).
+# API surface total updated: 36→41 (discovered 5 more in openai@6.34.0:
+#   webhooks.unwrap, webhooks.verifySignature, videos.create, evals.create, evals.runs.create)
+# Contracted this pass: webhooks.unwrap (3 postconditions), webhooks.verifySignature (2 postconditions)
+# Newly omitted this pass: videos.create (async-job pattern, errors in response.status not thrown),
+#   evals.create (ML evaluation framework, rare in prod SaaS), evals.runs.create (same),
+#   containers.create (niche code execution environment), conversations.create (multi-turn managed API — admin lifecycle op)
+# Evidence from openai-node@6.34.0 source:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 # Depth pass 2026-04-16 (deepen-stream-2 pass 3):
 # Expanded coverage from 20→23 contracted functions (+3 this pass).
 # API surface total updated: 31→36 (discovered 5 more: responses.compact, responses.inputTokens.count,
@@ -1610,6 +1621,188 @@ functions:
         sources:
           - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts"
           - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # webhooks.unwrap()  (via openai.webhooks.unwrap())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Validates the webhook signature AND parses the event payload.
+  # Used in production webhook handlers to verify OpenAI events before processing.
+  # Calls verifySignature() first, then JSON.parse() on the payload.
+  # Throws InvalidWebhookSignatureError (extends Error, not APIError) on any
+  # signature validation failure — callers must use Error not APIError in catch.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: webhooks.unwrap
+    import_path: "openai"
+    description: >
+      Validates that a webhook payload was sent by OpenAI and parses the event.
+      First calls verifySignature() to validate HMAC-SHA256 signature and timestamp,
+      then calls JSON.parse() on the raw payload. Returns a typed UnwrapWebhookEvent
+      discriminated union covering all OpenAI webhook event types (batch.completed,
+      batch.failed, fine_tuning.job.succeeded, response.completed, etc.).
+      Used in production webhook endpoint handlers to authenticate incoming events.
+
+    postconditions:
+      # Evidence: InvalidWebhookSignatureError confirmed in webhooks.ts source
+      # Thrown by verifySignature() when timestamp is expired, future-dated, or
+      # when no signature in the header matches the expected HMAC-SHA256 value
+      - id: webhooks-invalid-signature-error
+        condition: >
+          The webhook signature header does not match the expected HMAC-SHA256 value,
+          or the timestamp in webhook-timestamp header is older than the tolerance
+          (default 300 seconds = 5 minutes), or the timestamp is too far in the future
+          (replay attack prevention), or the timestamp format is not a valid integer.
+        throws: "InvalidWebhookSignatureError (extends Error, NOT APIError)"
+        required_handling: >
+          Caller MUST catch InvalidWebhookSignatureError to prevent webhook processing
+          from crashing. Return HTTP 400 to OpenAI on signature failure — do NOT return
+          200 as that tells OpenAI the event was successfully processed.
+          IMPORTANT: InvalidWebhookSignatureError extends plain Error, NOT APIError.
+          Catch blocks that only catch OpenAIError or APIError will miss this error.
+          Pattern: catch (err) { if (err instanceof OpenAI.InvalidWebhookSignatureError) return res.status(400).send('Invalid signature'); }
+          Stale webhooks (older than tolerance) are rejected — increase tolerance param
+          if clock skew between your servers and OpenAI is causing false rejections.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: Error (plain) confirmed in webhooks.ts _validateSecret and _getRequiredHeader
+      # Thrown when webhook secret is missing from env, client config, or function arg
+      - id: webhooks-missing-secret-error
+        condition: >
+          The webhook secret is not configured — either OPENAI_WEBHOOK_SECRET env var
+          is not set, webhookSecret was not passed to OpenAI() constructor, and no
+          secret was passed to the unwrap() call directly. Or required headers
+          (webhook-signature, webhook-timestamp, webhook-id) are absent from the request.
+        throws: "Error (plain, not InvalidWebhookSignatureError or APIError)"
+        required_handling: >
+          Caller MUST catch plain Error in addition to InvalidWebhookSignatureError.
+          Missing secret is a configuration error that causes ALL webhook verifications
+          to fail — surface to operations team immediately.
+          Required headers (webhook-signature, webhook-timestamp, webhook-id) must be
+          forwarded from the raw HTTP request to unwrap(). If using Next.js, use
+          req.headers directly — do NOT rely on framework-normalized header objects
+          that may lowercase or drop non-standard headers.
+          Return HTTP 400 on missing secret/header errors.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: SyntaxError from JSON.parse() confirmed in webhooks.ts unwrap()
+      # unwrap() calls JSON.parse(payload) after verifySignature() succeeds —
+      # a malformed payload that passes signature check would still throw SyntaxError
+      - id: webhooks-json-parse-error
+        condition: >
+          The webhook payload is valid UTF-8 and passes signature verification but
+          is not valid JSON (e.g. truncated payload, encoding corruption in transit,
+          middleware that modified the body after signature was computed).
+        throws: "SyntaxError from JSON.parse()"
+        required_handling: >
+          Caller MUST include plain Error handling to catch SyntaxError from JSON.parse.
+          This is rare in practice but can occur if the request body was processed
+          by middleware (bodyParser, express.json()) before reaching the webhook handler.
+          Raw body MUST be used for signature verification — never parse the body first.
+          In Express: use express.raw({ type: 'application/json' }) for the webhook route.
+          In Next.js: read from req.body as string or use the raw body from the request stream.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # webhooks.verifySignature()  (via openai.webhooks.verifySignature())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Validates HMAC-SHA256 signature without parsing the payload.
+  # Use when you want to verify the webhook authenticity but handle payload parsing yourself.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: webhooks.verifySignature
+    import_path: "openai"
+    description: >
+      Validates that the webhook payload was sent by OpenAI by checking the HMAC-SHA256
+      signature in the webhook-signature header against the computed signature using the
+      webhook secret. Also validates the webhook-timestamp header to prevent replay attacks
+      (rejects events older than tolerance seconds, default 300). Returns Promise<void> on
+      success. Does NOT parse the payload — use webhooks.unwrap() to also get the parsed event.
+
+    postconditions:
+      # Evidence: InvalidWebhookSignatureError confirmed in webhooks.ts
+      # Thrown for bad signatures, expired timestamps, future timestamps, invalid timestamp format
+      - id: webhooks-verify-invalid-signature-error
+        condition: >
+          The HMAC-SHA256 signature in the webhook-signature header does not match the
+          expected value computed from the payload, webhook-id, and webhook-timestamp.
+          Also thrown when: timestamp is more than tolerance seconds in the past (default 5 min),
+          timestamp is more than tolerance seconds in the future, or timestamp is not a valid integer.
+        throws: "InvalidWebhookSignatureError (extends Error, NOT APIError)"
+        required_handling: >
+          Caller MUST catch InvalidWebhookSignatureError and return HTTP 400 to OpenAI.
+          Do NOT swallow this error and process the event — that defeats the security purpose.
+          Note: If clock skew causes legitimate events to fail, adjust the tolerance parameter:
+            await openai.webhooks.verifySignature(payload, headers, secret, 600);  // 10 minute window
+          IMPORTANT: InvalidWebhookSignatureError extends plain Error, not APIError.
+          Pattern: catch (err) { if (err instanceof OpenAI.InvalidWebhookSignatureError) return res.status(400).send(); }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: Error (plain) confirmed in _validateSecret() in webhooks.ts
+      - id: webhooks-verify-missing-secret-error
+        condition: >
+          The webhook secret is undefined, null, or empty string — not set via
+          OPENAI_WEBHOOK_SECRET env var, not passed to OpenAI() constructor, and not
+          passed directly to verifySignature(). Or required webhook headers are missing
+          from the request (webhook-signature, webhook-timestamp, webhook-id).
+        throws: "Error (plain, not InvalidWebhookSignatureError or APIError)"
+        required_handling: >
+          Missing webhook secret causes every verification call to throw — this is a
+          configuration error, not a per-request error. Alert operations team.
+          OPENAI_WEBHOOK_SECRET must be set in production environment — add it to
+          deployment secrets and verify its presence on application startup.
+          Missing headers: ensure the raw HTTP headers are passed unmodified.
+          Some middleware strips non-standard headers or lowercases them — the SDK
+          normalizes header names so case is not an issue, but headers must be present.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/webhooks/webhooks.ts"
         severity: error
         business_impact:
           incident_label: DOWNTIME
