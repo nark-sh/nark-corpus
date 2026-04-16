@@ -10,6 +10,11 @@
  *   - sendEmailBatch()              → SHOULD_FIRE if no try-catch (postcondition: api-error)
  *   - sendEmailWithTemplate()       → SHOULD_FIRE if no try-catch (postcondition: api-error)
  *   - sendEmailBatchWithTemplates() → SHOULD_FIRE if no try-catch (postcondition: api-error)
+ *   - activateBounce()             → SHOULD_FIRE if no try-catch (postcondition: activate-bounce-no-try-catch)
+ *   - createSuppressions()         → SHOULD_FIRE if no try-catch (postcondition: create-suppressions-no-try-catch)
+ *   - deleteSuppressions()         → SHOULD_FIRE if no try-catch (postcondition: delete-suppressions-no-try-catch)
+ *   - createTemplate()             → SHOULD_FIRE if no try-catch (postcondition: create-template-no-try-catch)
+ *   - editTemplate()               → SHOULD_FIRE if no try-catch (postcondition: edit-template-no-try-catch)
  *   - Any of the above inside try-catch → SHOULD_NOT_FIRE
  *   - .catch() chain → SHOULD_NOT_FIRE
  *   - try-finally without catch → SHOULD_FIRE
@@ -27,11 +32,21 @@
  *   - Section 10: sendEmailBatchWithTemplates() in try-catch → SHOULD_NOT_FIRE
  *   - Section 11: class field — sendEmail() bare → SHOULD_FIRE
  *   - Section 12: class field — sendEmail() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 13: activateBounce() bare → SHOULD_FIRE
+ *   - Section 14: activateBounce() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 15: createSuppressions() bare → SHOULD_FIRE
+ *   - Section 16: createSuppressions() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 17: deleteSuppressions() bare → SHOULD_FIRE
+ *   - Section 18: deleteSuppressions() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 19: createTemplate() bare → SHOULD_FIRE
+ *   - Section 20: createTemplate() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 21: editTemplate() bare → SHOULD_FIRE
+ *   - Section 22: editTemplate() in try-catch → SHOULD_NOT_FIRE
  *
  * Design: spec-driven, NOT based on V1 behavior.
  */
 
-import { ServerClient } from 'postmark';
+import { ServerClient, Errors } from 'postmark';
 
 const client = new ServerClient(process.env.POSTMARK_API_TOKEN!);
 
@@ -262,5 +277,169 @@ class SafeNotificationService {
       console.error('Notification failed:', error);
       throw error;
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. activateBounce() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareActivateBounceNoCatch(bounceId: number) {
+  // SHOULD_FIRE: activate-bounce-no-try-catch — activateBounce() throws on API failure, no try-catch
+  const result = await client.activateBounce(bounceId);
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. activateBounce() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function activateBounceWithTryCatch(bounceId: number) {
+  try {
+    // SHOULD_NOT_FIRE: activate-bounce-no-try-catch — activateBounce() inside try-catch
+    const result = await client.activateBounce(bounceId);
+    return result;
+  } catch (error) {
+    console.error('Bounce activation failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. createSuppressions() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateSuppressionsNoCatch(email: string) {
+  // SHOULD_FIRE: create-suppressions-no-try-catch — createSuppressions() throws on API failure, no try-catch
+  const result = await client.createSuppressions('outbound', {
+    Suppressions: [{ EmailAddress: email }]
+  });
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. createSuppressions() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createSuppressionsWithTryCatch(email: string) {
+  try {
+    // SHOULD_NOT_FIRE: create-suppressions-no-try-catch — createSuppressions() inside try-catch
+    const result = await client.createSuppressions('outbound', {
+      Suppressions: [{ EmailAddress: email }]
+    });
+    const failed = result.Suppressions.filter((s: { Status: string }) => s.Status === 'Failed');
+    if (failed.length > 0) {
+      console.error('Failed to suppress:', failed);
+    }
+    return result;
+  } catch (error) {
+    console.error('Suppression API failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. deleteSuppressions() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareDeleteSuppressionsNoCatch(email: string) {
+  // SHOULD_FIRE: delete-suppressions-no-try-catch — deleteSuppressions() throws on API failure, no try-catch
+  const result = await client.deleteSuppressions('outbound', {
+    Suppressions: [{ EmailAddress: email }]
+  });
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. deleteSuppressions() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteSuppressionsWithTryCatch(email: string) {
+  try {
+    // SHOULD_NOT_FIRE: delete-suppressions-no-try-catch — deleteSuppressions() inside try-catch
+    const result = await client.deleteSuppressions('outbound', {
+      Suppressions: [{ EmailAddress: email }]
+    });
+    const failed = result.Suppressions.filter((s: { Status: string }) => s.Status === 'Failed');
+    if (failed.length > 0) {
+      // SpamComplaint suppressions cannot be deleted
+      console.warn('Could not remove suppressions (may be SpamComplaint):', failed);
+    }
+    return result;
+  } catch (error) {
+    console.error('Delete suppressions failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. createTemplate() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateTemplateNoCatch() {
+  // SHOULD_FIRE: create-template-no-try-catch — createTemplate() throws on API failure, no try-catch
+  const template = await client.createTemplate({
+    Name: 'Welcome Email',
+    Subject: 'Welcome to {{product_name}}',
+    HtmlBody: '<p>Hello, {{name}}!</p>',
+    TextBody: 'Hello, {{name}}!',
+    Alias: 'welcome-v1',
+  });
+  return template.TemplateId;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. createTemplate() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createTemplateWithTryCatch() {
+  try {
+    // SHOULD_NOT_FIRE: create-template-no-try-catch — createTemplate() inside try-catch
+    const template = await client.createTemplate({
+      Name: 'Welcome Email',
+      Subject: 'Welcome to {{product_name}}',
+      HtmlBody: '<p>Hello, {{name}}!</p>',
+      TextBody: 'Hello, {{name}}!',
+      Alias: 'welcome-v1',
+    });
+    return template.TemplateId;
+  } catch (error) {
+    console.error('Template creation failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. editTemplate() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareEditTemplateNoCatch(alias: string) {
+  // SHOULD_FIRE: edit-template-no-try-catch — editTemplate() throws on API failure, no try-catch
+  const updated = await client.editTemplate(alias, {
+    Subject: 'Welcome to {{company_name}}!',
+    HtmlBody: '<p>Hi {{name}}, welcome aboard!</p>',
+  });
+  return updated.TemplateId;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. editTemplate() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function editTemplateWithTryCatch(alias: string) {
+  try {
+    // SHOULD_NOT_FIRE: edit-template-no-try-catch — editTemplate() inside try-catch
+    const updated = await client.editTemplate(alias, {
+      Subject: 'Welcome to {{company_name}}!',
+      HtmlBody: '<p>Hi {{name}}, welcome aboard!</p>',
+    });
+    return updated.TemplateId;
+  } catch (error) {
+    if (error instanceof Errors.ApiInputError) {
+      console.error('Template not found or validation failed:', (error as Error).message);
+    } else {
+      console.error('Template update failed:', error);
+    }
+    throw error;
   }
 }

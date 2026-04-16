@@ -7,9 +7,10 @@ package: postmark
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.82  # 9 contracted / 11 applicable (52 total - 41 intentionally omitted: all read-only GETs, analytics, webhook admin, message stream admin, AccountClient admin ops)
 
 detection:
   class_names:
@@ -182,6 +183,279 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: activateBounce
+    import_path: "postmark"
+    description: >
+      Reactivates an email address that was deactivated due to a hard bounce.
+      Called as client.activateBounce(bounceId). Requires the bounce to have
+      CanActivate: true — not all bounces can be reactivated. Makes a PUT request
+      to /bounces/{bounceid}/activate. Throws on auth failure, invalid bounce ID,
+      or if the bounce cannot be activated.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/bounce-api (fetched 2026-04-16)
+      # Error types confirmed from postmark.js source: PostmarkError hierarchy
+      # (InvalidAPIKeyError 401, ApiInputError 422, UnknownError for invalid bounce ID)
+      - id: activate-bounce-no-try-catch
+        severity: error
+        condition: >
+          activateBounce() called in async context without surrounding try/catch.
+          Throws PostmarkError subclasses on any HTTP or network failure including
+          invalid bounce ID (ApiInputError), revoked token (InvalidAPIKeyError),
+          or bounce not eligible for reactivation (CanActivate: false).
+        description: >
+          activateBounce() makes a live API call that throws PostmarkError subclasses
+          on any HTTP or network failure. Callers that omit try-catch cause unhandled
+          rejections when the bounce ID is invalid, the token is revoked, or the
+          bounce cannot be activated (CanActivate: false). Failed bounce reactivation
+          silently blocks email delivery to that address — if unhandled in a
+          customer-support flow (e.g. "resend verification email"), the request
+          handler crashes and the user receives no feedback.
+        required_handling: >
+          Caller MUST wrap activateBounce() in try-catch:
+
+            try {
+              const result = await client.activateBounce(bounceId);
+              // result.Bounce.CanActivate tells you if it worked
+            } catch (error) {
+              if (error instanceof Errors.InvalidAPIKeyError) {
+                // Auth token invalid
+              }
+              console.error('Bounce activation failed:', error.message);
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/bounce-api"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/errors/Errors.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createSuppressions
+    import_path: "postmark"
+    description: >
+      Adds email addresses to the suppression list for a specific message stream.
+      Called as client.createSuppressions(messageStream, options). Returns a
+      SuppressionStatuses response where each address has a Status of "Suppressed"
+      or "Failed" — the API returns 200 OK even on partial failures. Makes a POST
+      request to /message-streams/{messageStream}/suppressions.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/suppressions-api (fetched 2026-04-16)
+      # Key insight: API returns 200 OK with per-address Status: "Suppressed" | "Failed"
+      # HTTP errors (401, 429, 5xx) are still thrown as PostmarkError subclasses.
+      - id: create-suppressions-no-try-catch
+        severity: error
+        condition: >
+          createSuppressions() called in async context without surrounding try/catch,
+          OR called without checking per-item Status in the response. The API returns
+          200 OK with Status: "Failed" for individual addresses on validation or
+          authorization failure — not just on HTTP 4xx/5xx errors.
+        description: >
+          createSuppressions() throws PostmarkError subclasses on HTTP failures
+          (auth failure, rate limit, server error). Callers that omit try-catch
+          crash on these errors. Additionally, even on 200 OK, individual addresses
+          may have Status: "Failed" — callers that don't check response items miss
+          suppression failures silently. Unhandled failures mean recipients stay
+          on the active list and continue receiving emails they've opted out of,
+          creating legal exposure under CAN-SPAM/GDPR.
+        required_handling: >
+          Caller MUST wrap createSuppressions() in try-catch AND check item statuses:
+
+            try {
+              const result = await client.createSuppressions('outbound', {
+                Suppressions: [{ EmailAddress: email }]
+              });
+              const failed = result.Suppressions.filter(s => s.Status === 'Failed');
+              if (failed.length > 0) {
+                console.error('Failed to suppress:', failed.map(s => s.EmailAddress));
+              }
+            } catch (error) {
+              console.error('Suppression API failed:', error.message);
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/suppressions-api"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/ServerClient.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: deleteSuppressions
+    import_path: "postmark"
+    description: >
+      Removes email addresses from the suppression list for a specific message stream.
+      Called as client.deleteSuppressions(messageStream, options). Returns a
+      SuppressionStatuses response where each address has Status: "Deleted" or "Failed".
+      SpamComplaint suppressions CANNOT be deleted — attempting returns Status: "Failed"
+      with message "SpamComplaint suppressions cannot be deleted." API returns 200 OK
+      even on partial failures.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/suppressions-api (fetched 2026-04-16)
+      # Key insight: SpamComplaint suppressions cannot be removed — Status: "Failed" silently
+      # HTTP errors still thrown as PostmarkError subclasses (401, 429, 5xx).
+      - id: delete-suppressions-no-try-catch
+        severity: error
+        condition: >
+          deleteSuppressions() called in async context without surrounding try/catch,
+          OR called without checking per-item Status in the response. SpamComplaint
+          suppressions always return Status: "Failed" with HTTP 200 OK — this is
+          not an exception, it is a silent API-level constraint that callers must check.
+        description: >
+          deleteSuppressions() throws PostmarkError subclasses on HTTP failures.
+          Callers without try-catch crash on auth/network failures. Critically,
+          SpamComplaint suppressions always return Status: "Failed" — callers
+          that don't check item statuses silently fail to remove the suppression,
+          causing continued email blocking. A failed deletion means the customer's
+          email address remains blocked — in re-engagement flows (e.g. "user wants
+          to resubscribe"), this silently breaks email delivery with no alert.
+          Legal and business risk if users cannot opt back in.
+        required_handling: >
+          Caller MUST wrap deleteSuppressions() in try-catch AND check item statuses:
+
+            try {
+              const result = await client.deleteSuppressions('outbound', {
+                Suppressions: [{ EmailAddress: email }]
+              });
+              const failed = result.Suppressions.filter(s => s.Status === 'Failed');
+              if (failed.length > 0) {
+                // SpamComplaint suppressions cannot be deleted
+                console.warn('Could not remove suppressions:', failed);
+              }
+            } catch (error) {
+              console.error('Delete suppressions failed:', error.message);
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/suppressions-api"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/ServerClient.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: createTemplate
+    import_path: "postmark"
+    description: >
+      Creates a new email template on the server. Called as client.createTemplate(options).
+      Requires Name, Subject (for standard templates), and at least HtmlBody or TextBody.
+      Alias format restricted to ASCII letters, numbers, '.', '-', '_'.
+      Server limit: 100 templates per server — creating beyond this limit fails.
+      Returns the created Template object on success.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/templates-api (fetched 2026-04-16)
+      # Error types: ApiInputError (422 — validation), InvalidAPIKeyError (401),
+      # RateLimitExceededError (429), InternalServerError (500)
+      # Server 100-template limit returns ApiInputError (422) when exceeded.
+      - id: create-template-no-try-catch
+        severity: error
+        condition: >
+          createTemplate() called in async context without surrounding try/catch.
+          Throws ApiInputError (422) for invalid alias format, missing required fields,
+          or 100-template server limit exceeded. Throws InvalidAPIKeyError (401) for
+          bad server token. Throws RateLimitExceededError (429) under high load.
+        description: >
+          createTemplate() makes an API call that throws PostmarkError subclasses on
+          validation failures (422 ApiInputError — invalid alias format, missing required
+          fields, or 100-template server limit exceeded), auth failure (401 InvalidAPIKeyError),
+          or network error. Callers without try-catch crash on these errors. Template
+          creation is typically called in provisioning/setup flows — an unhandled error
+          means the template is never created, breaking all future sendEmailWithTemplate()
+          calls for that alias silently.
+        required_handling: >
+          Caller MUST wrap createTemplate() in try-catch:
+
+            try {
+              const template = await client.createTemplate({
+                Name: 'Welcome Email',
+                Subject: 'Welcome to {{product_name}}',
+                HtmlBody: '<p>Hello, {{name}}!</p>',
+                TextBody: 'Hello, {{name}}!',
+                Alias: 'welcome-v1',
+              });
+              console.log('Template ID:', template.TemplateId);
+            } catch (error) {
+              console.error('Template creation failed:', error.message);
+              // Check if 100-template limit exceeded
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/templates-api"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/ServerClient.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: editTemplate
+    import_path: "postmark"
+    description: >
+      Updates an existing template on the server. Called as client.editTemplate(idOrAlias, options).
+      Can update Name, Subject, HtmlBody, TextBody, and Alias. An invalid idOrAlias throws
+      ApiInputError (template not found). Updating template content affects ALL future emails
+      sent with that template — breaking changes to HtmlBody can silently corrupt outbound emails.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/templates-api (fetched 2026-04-16)
+      # Error types: ApiInputError (422 — template not found, invalid alias),
+      # InvalidAPIKeyError (401), RateLimitExceededError (429), InternalServerError (500)
+      - id: edit-template-no-try-catch
+        severity: error
+        condition: >
+          editTemplate() called in async context without surrounding try/catch.
+          Throws ApiInputError (422) when template ID or alias is not found on the server,
+          or when the alias format is invalid. Throws InvalidAPIKeyError (401) for auth
+          failures. Throws RateLimitExceededError (429) and InternalServerError (500)
+          under API failure conditions.
+        description: >
+          editTemplate() throws PostmarkError subclasses on API and network failures.
+          Template-not-found errors (ApiInputError) are thrown when the idOrAlias
+          doesn't match any template on the server. Callers without try-catch
+          crash on these errors, leaving templates in a partially-updated state
+          if multiple updates are batched. Called in deployment/migration scripts —
+          an unhandled error leaves old template content in place, causing stale
+          email content to be sent. Partial failure in multi-step provisioning flows
+          is hard to detect and recover.
+        required_handling: >
+          Caller MUST wrap editTemplate() in try-catch:
+
+            try {
+              const updated = await client.editTemplate('welcome-v1', {
+                Subject: 'Welcome to {{company_name}}!',
+                HtmlBody: '<p>Hi {{name}}, welcome aboard!</p>',
+              });
+              console.log('Template updated:', updated.TemplateId);
+            } catch (error) {
+              if (error instanceof Errors.ApiInputError) {
+                console.error('Template not found or validation failed:', error.message);
+              } else {
+                console.error('Template update failed:', error.message);
+              }
+              throw error;
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/templates-api"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/ServerClient.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "All ServerClient methods make HTTPS calls to the Postmark API — all can throw"
   - "No auto-retry logic — all errors thrown immediately to caller"
@@ -189,3 +463,6 @@ notes:
   - "Rate limit: varies by plan. RateLimitExceededError thrown on 429"
   - "ServiceUnavailablerError has a typo in the SDK (missing 'e') — this is the actual class name"
   - "AccountClient has similar methods but for account-level operations — same error handling"
+  - "createSuppressions/deleteSuppressions return 200 OK with per-item Status — check Status field even on success"
+  - "SpamComplaint suppressions cannot be deleted — deleteSuppressions returns Status: Failed silently"
+  - "Server limit: 100 templates per server — createTemplate throws ApiInputError when exceeded"
