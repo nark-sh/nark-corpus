@@ -1,10 +1,52 @@
+# @aws-sdk/client-lambda — AWS Lambda SDK v3
+#
+# Error class hierarchy (confirmed from SDK source + TypeScript declarations):
+#   LambdaServiceException (base for all Lambda HTTP errors, extends ServiceException)
+#     ResourceNotFoundException — function/alias/layer does not exist
+#     TooManyRequestsException — concurrency/rate limit exceeded (retryable)
+#     EC2ThrottledException / EC2UnexpectedException / EC2AccessDeniedException — VPC/EC2 issues
+#     KMSAccessDeniedException / KMSDisabledException / KMSNotFoundException / KMSInvalidStateException
+#     ENILimitReachedException / SubnetIPAddressLimitReachedException — VPC networking
+#     EFSIOException / EFSMountConnectivityException / EFSMountFailureException / EFSMountTimeoutException
+#     S3FilesMountConnectivityException / S3FilesMountFailureException / S3FilesMountTimeoutException
+#     InvalidParameterValueException — bad inputs
+#     InvalidRequestContentException — malformed JSON payload
+#     InvalidRuntimeException — unsupported runtime
+#     RequestTooLargeException — payload >6MB (sync) or >1MB (async)
+#     ResourceConflictException — function being modified / already exists
+#     ResourceNotReadyException — VPC resources reclaimed after idle
+#     SnapStartException / SnapStartNotReadyException / SnapStartTimeoutException
+#     CodeStorageExceededException / CodeVerificationFailedException
+#     ServiceException — internal Lambda service error
+#   SdkClientError (base for SDK/network errors, from @smithy)
+#     ConnectionError — DNS failure, ECONNREFUSED, ENOTFOUND
+#     TimeoutError (from waiter checkExceptions) — waiter exceeded maxWaitTime
+#
+# FunctionError field (InvokeCommand-specific):
+#   When the invoked function itself throws an unhandled error or times out,
+#   Lambda returns HTTP 200 (success) but sets response.FunctionError to "Handled" or "Unhandled".
+#   The HTTP response code does NOT indicate function execution failure.
+#   This is a SILENT failure pattern — callers must explicitly check response.FunctionError.
+#
+# Evidence sources fetched:
+#   https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_InvokeWithResponseStream.html
+#   https://docs.aws.amazon.com/lambda/latest/dg/functions-states.html
+#   TypeScript declarations: node_modules/@aws-sdk/client-lambda/dist-types/commands/
+#   Waiter source: node_modules/@smithy/util-waiter/dist-es/waiter.js (checkExceptions confirms TimeoutError)
+#   Waiter source: node_modules/@aws-sdk/client-lambda/dist-es/waiters/waitForFunctionActiveV2.js
 package: "@aws-sdk/client-lambda"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.71  # 5 contracted / 7 runtime-relevant (2 omitted: InvokeAsyncCommand deprecated, DeleteFunctionCommand admin-only)
+
+detection:
+  class_names:
+    - "LambdaClient"
 
 functions:
   - name: send
@@ -17,19 +59,18 @@ functions:
       permission error.
 
     postconditions:
-      # Evidence: 0 violations across 2 repos in scan-aws-sdk-client-lambda-2026-04-06.json
-      # FP check: 0/100 FPs (0.0% FP rate) — confirmed no false positives
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html
+      # TypeScript declarations confirmed error types from dist-types/commands/InvokeCommand.d.ts
       - id: aws-lambda-service-error
         condition: >
-          Any AWS service error or network failure: function does not exist
+          Any AWS service error or network failure when calling lambdaClient.send(): function does not exist
           (ResourceNotFoundException), insufficient permissions (EC2AccessDeniedException,
           KMSAccessDeniedException), request throttling (TooManyRequestsException),
           code storage limit exceeded (CodeStorageExceededException), function is
           too large (RequestTooLargeException), EC2 errors (EC2ThrottledException,
           EC2UnexpectedException), KMS errors (KMSDisabledException,
           KMSNotFoundException), ENI limit exceeded (EniLimitReachedException),
-          service unavailable, or any network-level failure (DNS, timeout, connection
-          refused)
+          service unavailable, or any network-level failure (DNS, timeout, connection refused)
         throws: >
           LambdaServiceException subclass with error.name set to the specific error
           code (e.g., "ResourceNotFoundException", "TooManyRequestsException",
@@ -52,7 +93,6 @@ functions:
                 FunctionName: functionArn,
                 Payload: Buffer.from(JSON.stringify(payload))
               }));
-              // Also check response.FunctionError for application errors
               if (response.FunctionError) {
                 throw new Error(`Function error: ${response.FunctionError}`);
               }
@@ -78,6 +118,267 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html
+      # "The status code in the API response doesn't reflect function errors."
+      # Confirmed: FunctionError is "Handled" or "Unhandled" when function fails internally
+      # Pattern confirmed by TypeScript declarations: InvocationResponse.FunctionError is optional string
+      - id: aws-lambda-invoke-function-error-unchecked
+        condition: >
+          InvokeCommand (synchronous RequestResponse invocation) called and response.FunctionError
+          is not checked before using response.Payload. Lambda returns HTTP 200 with FunctionError
+          set to "Handled" or "Unhandled" when the invoked function threw an unhandled exception
+          or timed out — callers must explicitly inspect this field.
+        throws: >
+          Does NOT throw. This is a silent data loss pattern. Lambda returns HTTP 200 with
+          FunctionError "Handled" or "Unhandled". Caller silently processes an error payload
+          as a success payload, causing downstream data corruption or silent workflow failures.
+        required_handling: >
+          After every synchronous InvokeCommand, check response.FunctionError before using Payload.
+          Not applicable for InvocationType="Event" (async invocations return 202, no FunctionError).
+
+          const response = await lambdaClient.send(new InvokeCommand({
+            FunctionName: 'my-function',
+            Payload: Buffer.from(JSON.stringify(payload)),
+          }));
+          if (response.FunctionError) {
+            const errorPayload = JSON.parse(Buffer.from(response.Payload!).toString());
+            throw new Error(`Lambda function error: ${response.FunctionError} — ${errorPayload.errorMessage}`);
+          }
+          const result = JSON.parse(Buffer.from(response.Payload!).toString());
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/troubleshooting-invocation.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: send (InvokeWithResponseStreamCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Invokes a Lambda function and streams the response back progressively.
+      Used for AI/LLM functions that produce streaming text output. The response
+      includes an EventStream that delivers PayloadChunk events followed by an
+      InvokeComplete event. Errors in streaming functions are delivered via
+      InvokeComplete.ErrorCode, NOT via thrown exceptions after the stream starts.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_InvokeWithResponseStream.html
+      # TypeScript declarations from dist-types/commands/InvokeWithResponseStreamCommand.d.ts
+      - id: aws-lambda-stream-no-error-handling
+        condition: >
+          InvokeWithResponseStreamCommand called without try-catch or .catch() handler.
+          Same error types as InvokeCommand are thrown before streaming begins:
+          ResourceNotFoundException, TooManyRequestsException, EC2AccessDeniedException,
+          KMSAccessDeniedException, InvalidParameterValueException, ServiceException, etc.
+        throws: >
+          LambdaServiceException subclass (same error types as InvokeCommand) thrown
+          when the invocation cannot start. Network errors throw SdkClientError.
+        required_handling: >
+          Caller MUST wrap in try-catch for pre-stream errors, AND must iterate the
+          EventStream and check InvokeComplete.ErrorCode for post-stream function errors.
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_InvokeWithResponseStream.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_InvokeWithResponseStream.html
+      # InvokeWithResponseStreamResponse.EventStream contains InvokeWithResponseStreamCompleteEvent
+      # InvokeWithResponseStreamCompleteEvent.ErrorCode is string — set when streaming function fails
+      # TypeScript: dist-types/commands/InvokeWithResponseStreamCommand.d.ts confirms EventStream union type
+      - id: aws-lambda-stream-invokecomplete-errorcode-unchecked
+        condition: >
+          Caller iterates InvokeWithResponseStreamCommand EventStream but does not check
+          the InvokeComplete event's ErrorCode field. The streaming function may fail after
+          sending partial PayloadChunks, delivering an InvokeComplete event with ErrorCode set.
+          Caller silently processes partial data as a complete successful response.
+        throws: >
+          Does NOT throw. ErrorCode is delivered in the EventStream's terminal InvokeComplete
+          event. A streaming function can emit PayloadChunk events before failing — callers
+          must check InvokeComplete.ErrorCode even after successfully receiving chunks.
+        required_handling: >
+          When iterating the EventStream, check InvokeComplete event and its ErrorCode field:
+
+          for await (const event of response.EventStream!) {
+            if (event.PayloadChunk) {
+              yield Buffer.from(event.PayloadChunk.Payload!).toString();
+            }
+            if (event.InvokeComplete) {
+              if (event.InvokeComplete.ErrorCode) {
+                throw new Error(
+                  `Streaming function error: ${event.InvokeComplete.ErrorCode} — ${event.InvokeComplete.ErrorDetails}`
+                );
+              }
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_InvokeWithResponseStream.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: waitUntilFunctionActive
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Waits for a newly-created Lambda function to reach Active state by polling
+      GetFunctionConfiguration. Used after CreateFunctionCommand to verify the
+      function is ready to invoke. Required because Lambda functions go through
+      Pending state while VPC, EFS, or other resources are provisioned.
+      waitUntilFunctionActiveV2 uses GetFunction API instead (preferred for new code).
+    postconditions:
+      # Evidence: node_modules/@smithy/util-waiter/dist-es/waiter.js — checkExceptions source confirmed
+      # checkExceptions throws Error with name "TimeoutError" when WaiterState.TIMEOUT
+      # checkExceptions throws generic Error when WaiterState.FAILURE (function enters Failed state)
+      # Source: node_modules/@aws-sdk/client-lambda/dist-es/waiters/waitForFunctionActiveV2.js
+      - id: aws-lambda-waiter-no-error-handling
+        condition: >
+          waitUntilFunctionActive(), waitUntilFunctionActiveV2(), or waitUntilFunctionExists()
+          called without try-catch. Throws Error with name "TimeoutError" when maxWaitTime exceeded
+          and function has not reached Active state; throws generic Error when function enters Failed
+          state (resource provisioning failed); throws LambdaServiceException if polling fails.
+        throws: >
+          Error with name "TimeoutError" (from checkExceptions in @smithy/util-waiter) when
+          maxWaitTime exceeded. Generic Error with WaiterResult JSON payload when function reaches
+          Failed state. LambdaServiceException if underlying GetFunctionConfiguration polls fail.
+        required_handling: >
+          Always wrap waiter calls in try-catch and handle both timeout and failure states:
+
+          try {
+            await waitUntilFunctionActiveV2(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName }
+            );
+          } catch (error) {
+            if (error.name === 'TimeoutError') {
+              throw new Error(`Function ${functionName} stuck in Pending state after 5 minutes`);
+            }
+            console.error('Function activation failed:', error.message);
+            throw error;
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/dg/functions-states.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: waitUntilFunctionUpdated
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Waits for a Lambda function's LastUpdateStatus to reach Successful after a
+      code or configuration update. Used after UpdateFunctionCodeCommand or
+      UpdateFunctionConfigurationCommand in deployment pipelines. Functions cannot
+      be re-updated while LastUpdateStatus is InProgress.
+    postconditions:
+      # Evidence: node_modules/@aws-sdk/client-lambda/dist-es/waiters/ (same checkExceptions pattern)
+      # WaiterState.FAILURE when LastUpdateStatus is "Failed" (bad ZIP, invalid handler, etc.)
+      # Confirmed via parallel source to waitForFunctionActiveV2.js
+      - id: aws-lambda-update-waiter-no-error-handling
+        condition: >
+          waitUntilFunctionUpdated() or waitUntilFunctionUpdatedV2() called without try-catch
+          after UpdateFunctionCodeCommand. Throws TimeoutError on timeout; throws generic Error
+          when LastUpdateStatus reaches Failed (bad ZIP, code size exceeded, invalid handler).
+        throws: >
+          Error with name "TimeoutError" when maxWaitTime exceeded.
+          Generic Error with WaiterResult JSON when LastUpdateStatus is "Failed".
+          ResourceConflictException from underlying polls if another update is simultaneously in progress.
+        required_handling: >
+          Wrap in try-catch and distinguish timeout from failed update:
+
+          try {
+            await waitUntilFunctionUpdatedV2(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName }
+            );
+          } catch (error) {
+            if (error.name === 'TimeoutError') {
+              console.error('Function update did not complete in 5 minutes');
+            } else {
+              console.error('Function update failed (bad code/config?):', error.message);
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/dg/functions-states.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: send (CreateFunctionCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Creates a new Lambda function. Used in deployment automation, IaC code executed
+      at runtime, and multi-tenant systems that provision per-customer Lambda functions.
+      The function is initially in Pending state — use waitUntilFunctionActive before
+      invoking it.
+    postconditions:
+      # Evidence: dist-types/commands/CreateFunctionCommand.d.ts — @throws annotations confirmed
+      # https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunction.html
+      - id: aws-lambda-create-no-error-handling
+        condition: >
+          CreateFunctionCommand sent via lambdaClient.send() without try-catch.
+          Throws ResourceConflictException (409) when a function with the same name already
+          exists, CodeStorageExceededException when account Lambda code storage quota is
+          exceeded, TooManyRequestsException on throttling, InvalidParameterValueException
+          for bad runtime/handler/role, ResourceNotFoundException when IAM role or VPC
+          resources do not exist.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (function already exists),
+          CodeStorageExceededException (75 GB account quota exceeded), TooManyRequestsException
+          (rate limit), InvalidParameterValueException (bad config), ResourceNotFoundException
+          (IAM role/VPC not found).
+        required_handling: >
+          Wrap in try-catch and handle idempotency (ResourceConflictException means function
+          already exists — often safe to continue by updating code instead):
+
+          try {
+            await lambdaClient.send(new CreateFunctionCommand({
+              FunctionName: functionName,
+              Runtime: 'nodejs22.x',
+              Role: roleArn,
+              Handler: 'index.handler',
+              Code: { ZipFile: zipBuffer },
+            }));
+          } catch (error) {
+            if (error.name === 'ResourceConflictException') {
+              await lambdaClient.send(new UpdateFunctionCodeCommand({ ... }));
+            } else if (error.name === 'CodeStorageExceededException') {
+              throw new Error('Lambda code storage quota exceeded — delete old versions');
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunction.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'ResourceNotFoundException', 'TooManyRequestsException')"
@@ -86,3 +387,7 @@ notes:
   - "InvokeCommand with InvocationType='Event' (async invocation) returns StatusCode 202 on success — check this, not FunctionError"
   - "LambdaClient instance is reusable across multiple send() calls — no per-call instantiation needed"
   - "TooManyRequestsException has different sub-codes: Rate, Concurrency, CallerRate, FunctionRate — all retryable"
+  - "waitUntilFunctionActiveV2 uses GetFunction API; waitUntilFunctionActive uses GetFunctionConfiguration — both call checkExceptions which throws TimeoutError"
+  - "InvokeWithResponseStream: pre-stream errors throw LambdaServiceException; post-stream function errors are in InvokeComplete.ErrorCode"
+  - "Functions go through Pending->Active or Pending->Failed on creation; always use waitUntilFunctionActive before first invoke"
+  - "Coverage: 5 contracted functions out of 7 runtime-relevant. Omitted: InvokeAsyncCommand (deprecated), DeleteFunctionCommand (admin-only)."
