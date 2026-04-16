@@ -2,10 +2,10 @@ package: "mailgun.js"
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.57
+coverage_score: 1.0
 
 detection:
   class_names:
@@ -493,6 +493,446 @@ functions:
           production_behavior: immediate_exception
           visibility: silent
           user_experience: lost_data
+          incident_cost_range: low
+
+  - name: suppressions.destroy
+    import_path: "mailgun.js"
+    description: >
+      Removes a single address from a suppression list (bounces, unsubscribes, complaints, or whitelists).
+      Called as mg.suppressions.destroy(domain, type, address). This is the primary mechanism for
+      re-enabling delivery to a previously suppressed address — e.g., when a user reports a false bounce
+      or clicks "re-subscribe". Throws on authentication failure (401), domain not found (404), address
+      not in suppression list (404), or network errors.
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces--address-
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference confirmed: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces--address-
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      # Confirmed from source: class k extends Error { type = "MailgunAPIError"; static isApiError(e) { return "MailgunAPIError" === e?.type } }
+      - id: suppressions-destroy-no-try-catch
+        condition: >
+          mg.suppressions.destroy() is called without a surrounding try-catch block. Any HTTP error or
+          network failure — authentication failure (401), domain not found (404), address not found in
+          list (404), or connection errors — will cause an unhandled promise rejection.
+        throws: >
+          APIError with { status: 401|404|5xx, type: 'MailgunAPIError', details: string }.
+          For network errors: generic Error with connection message.
+        required_handling: >
+          Caller MUST wrap mg.suppressions.destroy() in try-catch. Suppression removal is a compliance
+          operation — if the error is silently swallowed, the address remains suppressed and the user
+          is never re-enabled, silently breaking the re-subscribe or false-bounce-correction workflow.
+
+          Minimum handling:
+            try {
+              const result = await mg.suppressions.destroy(domain, 'unsubscribes', address);
+              return result; // { message, address, status: 200 }
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status === 404) {
+                  // Address not in list — treat as success (idempotent)
+                  return null;
+                }
+                logger.error('Failed to remove suppression', { status: error.status, address });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces--address-"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/unsubscribe/delete-v3--domainid--unsubscribes--address-"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: suppressions.destroyAll
+    import_path: "mailgun.js"
+    description: >
+      Bulk-removes ALL addresses from a suppression list for a domain. Called as
+      mg.suppressions.destroyAll(domain, type) where type is 'bounces', 'unsubscribes', 'complaints',
+      or 'whitelists'. This is a catastrophic operation — it permanently removes ALL suppression records
+      of the given type for the domain. Added in mailgun.js v12.8.0 (2026-04-14). Throws on authentication
+      failure (401), domain not found (404), or network errors.
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces
+
+    postconditions:
+      # Evidence: README.md and CHANGELOG.md from mailgun.js package (installed v12.9.0)
+      # CHANGELOG v12.8.0: "Add 'destroyAll' method to SuppressionClient"
+      # API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: suppressions-destroy-all-no-try-catch
+        condition: >
+          mg.suppressions.destroyAll() is called without a surrounding try-catch block. Authentication
+          failure (401), domain not found (404), or network errors cause an unhandled promise rejection.
+        throws: >
+          APIError with { status: 401|404|5xx, type: 'MailgunAPIError', details: string }.
+          For network errors: generic Error with connection message.
+        required_handling: >
+          Caller MUST wrap mg.suppressions.destroyAll() in try-catch. This is a destructive bulk
+          operation — unhandled errors mean the caller cannot confirm whether the bulk deletion
+          succeeded or partially failed.
+
+          Minimum handling:
+            try {
+              const result = await mg.suppressions.destroyAll(domain, 'bounces');
+              logger.info('All bounce suppressions cleared', result);
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Failed to clear all suppressions', { status: error.status, domain });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/bounces/delete-v3--domainid--bounces"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: suppressions-destroy-all-catastrophic-misuse
+        condition: >
+          mg.suppressions.destroyAll() is called without explicit operator confirmation or safeguard.
+          Unlike suppressions.destroy (single-address removal), this call irreversibly deletes ALL
+          suppression records of the given type for the entire domain. There is no undo.
+          A single miscall can re-enable thousands of previously bounced/unsubscribed addresses,
+          causing mass resend to dead addresses (bounce rate spike) or opted-out users (CAN-SPAM violation).
+        throws: >
+          Does NOT throw on success — the danger is that success is silent. The operation
+          completes and returns { message: '...addresses for this domain have been removed', status: 200 }.
+          The risk is calling this method at all without proper safeguards.
+        required_handling: >
+          Callers MUST require explicit confirmation before calling destroyAll. This is not a
+          routine operation — it should be restricted to admin-only interfaces with a confirmation
+          dialog. Never call in automated workflows without a human-in-the-loop check.
+
+          Minimum safeguard:
+            // Always confirm intent before calling
+            if (!explicitAdminConfirmation) {
+              throw new Error('destroyAll requires explicit admin confirmation');
+            }
+            try {
+              const result = await mg.suppressions.destroyAll(domain, type);
+              logger.warn('BULK suppression deletion completed', { domain, type, result });
+            } catch (error) {
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+        severity: warning
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: lists.update
+    import_path: "mailgun.js"
+    description: >
+      Updates a mailing list's properties (address, name, description, access_level, reply_preference).
+      Called as mg.lists.update(mailListAddress, data). Throws on authentication failure (401),
+      list not found (404), invalid address format (400), or network errors.
+      Used in applications that let users manage their mailing list settings.
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-v3-lists-address
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-v3-lists-address
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: lists-update-no-try-catch
+        condition: >
+          mg.lists.update() is called without a surrounding try-catch block. Authentication failure
+          (401), list not found (404), invalid address format (400), or network errors cause an
+          unhandled promise rejection.
+        throws: >
+          APIError with { status: 401|404|400|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.lists.update() in try-catch. Mailing list update failures should be
+          surfaced to the user — silently swallowing errors means the update appeared to succeed
+          but the list was not actually modified.
+
+          Minimum handling:
+            try {
+              const updated = await mg.lists.update(listAddress, { name: newName });
+              return updated;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status === 404) {
+                  throw new Error('Mailing list not found');
+                }
+                logger.error('List update failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-v3-lists-address"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: lists.destroy
+    import_path: "mailgun.js"
+    description: >
+      Deletes a mailing list. Called as mg.lists.destroy(mailListAddress). This is a destructive
+      operation — all list members are permanently lost. Throws on authentication failure (401),
+      list not found (404), or network errors. The Mailgun API confirms deletion with
+      { address, message: 'Mailing list has been removed' }.
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-v3-lists-address
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-v3-lists-address
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: lists-destroy-no-try-catch
+        condition: >
+          mg.lists.destroy() is called without a surrounding try-catch block. Authentication failure
+          (401), list not found (404), or network errors cause an unhandled promise rejection.
+        throws: >
+          APIError with { status: 401|404|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.lists.destroy() in try-catch. Mailing list deletion errors should be
+          caught and logged — a 404 should be treated as a success (idempotent deletion), while
+          other errors indicate a real failure.
+
+          Minimum handling:
+            try {
+              const result = await mg.lists.destroy(listAddress);
+              return result; // { address, message: 'Mailing list has been removed' }
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status === 404) {
+                  return null; // Already deleted — treat as success
+                }
+                logger.error('List deletion failed', { status: error.status, listAddress });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-v3-lists-address"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: lists.members.updateMember
+    import_path: "mailgun.js"
+    description: >
+      Updates a single mailing list member's properties (address, name, vars, subscribed status).
+      Called as mg.lists.members.updateMember(listAddress, memberAddress, data). The critical use case
+      is setting subscribed: false to soft-unsubscribe a member without removing them from the list.
+      Throws on authentication failure (401), list not found (404), member not found (404), or
+      invalid data format (400).
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-lists-list_address-members-member_address
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-lists-list_address-members-member_address
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: list-member-update-no-try-catch
+        condition: >
+          mg.lists.members.updateMember() is called without a surrounding try-catch block. This
+          is especially risky when used to set subscribed: false — a failed unsubscribe silently
+          continues delivering to an opted-out user, which is a CAN-SPAM compliance violation.
+        throws: >
+          APIError with { status: 401|404|400|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.lists.members.updateMember() in try-catch. Particularly when
+          setting subscribed: false, errors must NOT be silently swallowed — a failed unsubscribe
+          means the user continues receiving mail despite opting out.
+
+          Minimum handling:
+            try {
+              const member = await mg.lists.members.updateMember(listAddress, email, {
+                subscribed: false
+              });
+              return member;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status === 404) {
+                  // Member doesn't exist — unsubscribe is effectively a no-op
+                  return null;
+                }
+                logger.error('Member update failed', { status: error.status, email });
+                // Must retry or alert — failing to record unsubscribe is a compliance risk
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/put-lists-list_address-members-member_address"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: lists.members.destroyMember
+    import_path: "mailgun.js"
+    description: >
+      Removes a single member from a mailing list. Called as
+      mg.lists.members.destroyMember(listAddress, memberAddress). This is a hard removal —
+      the member record is deleted entirely from the list. Used for GDPR "right to be forgotten"
+      workflows and hard unsubscribe flows. Throws on authentication failure (401), list not found
+      (404), member not found (404), or network errors.
+      API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-lists-list_address-members-member_address
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-lists-list_address-members-member_address
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: list-member-destroy-no-try-catch
+        condition: >
+          mg.lists.members.destroyMember() is called without a surrounding try-catch block. This is
+          high-risk when used in GDPR deletion workflows or unsubscribe flows — a silently swallowed
+          error means the member remains on the list and continues receiving mail despite requesting
+          deletion.
+        throws: >
+          APIError with { status: 401|404|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.lists.members.destroyMember() in try-catch. In GDPR/unsubscribe
+          flows, errors MUST be logged and the operation must be retried or escalated — failure to
+          remove a member who requested deletion is a compliance violation.
+
+          Minimum handling:
+            try {
+              const result = await mg.lists.members.destroyMember(listAddress, memberAddress);
+              return result; // { member: { address }, message: 'Mailing list member has been deleted' }
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status === 404) {
+                  // Member already removed — treat as success (idempotent)
+                  return null;
+                }
+                logger.error('Member deletion failed', { status: error.status, memberAddress });
+                // Must retry or alert for compliance workflows
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/delete-lists-list_address-members-member_address"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: webhooks.create
+    import_path: "mailgun.js"
+    description: >
+      Registers a webhook URL for a specific event type on a domain. Called as
+      mg.webhooks.create(domain, id, url, test?) where id is the event type (bounce, deliver,
+      drop, spam, unsubscribe, click, open). When test=true, Mailgun fires a test request to
+      validate the endpoint is reachable. Throws on authentication failure (401), domain not found
+      (404), invalid webhook event ID, or URL validation failure.
+      API Reference: https://documentation.mailgun.com/docs/inboxready/api-reference/optimize/mailgun/webhooks/
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: webhooks section of Mailgun docs
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: webhooks-create-no-try-catch
+        condition: >
+          mg.webhooks.create() is called without a surrounding try-catch block. Authentication
+          failure (401), domain not found (404), invalid event type, or URL validation failure
+          cause an unhandled promise rejection. If the webhook creation fails silently, events
+          are never delivered to the registered URL — the application loses all email event
+          notifications without alerting operators.
+        throws: >
+          APIError with { status: 401|404|400|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.webhooks.create() in try-catch. Webhook creation is typically done
+          during application setup — a silent failure means the entire event notification pipeline
+          is broken from day one.
+
+          Minimum handling:
+            try {
+              const webhook = await mg.webhooks.create(domain, 'bounce', 'https://app.example.com/webhooks/mailgun');
+              logger.info('Webhook registered', { event: 'bounce', domain });
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Webhook creation failed', { status: error.status, domain });
+                throw new Error(`Failed to register Mailgun webhook: ${error.status}`);
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: webhooks.update
+    import_path: "mailgun.js"
+    description: >
+      Updates the URL(s) for an existing webhook. Called as mg.webhooks.update(domain, id, url)
+      or mg.webhooks.update(domain, id, [url1, url2]) for multiple endpoints. Used to rotate webhook
+      endpoints during infrastructure changes without downtime. Throws on authentication failure (401),
+      webhook not found (404), or network errors.
+      API Reference: https://documentation.mailgun.com/docs/inboxready/api-reference/optimize/mailgun/webhooks/put-v3-domains--domain-name--webhooks--webhook-name-
+
+    postconditions:
+      # Evidence: README.md from mailgun.js package (installed v12.9.0)
+      # API Reference: https://documentation.mailgun.com/docs/inboxready/api-reference/optimize/mailgun/webhooks/put-v3-domains--domain-name--webhooks--webhook-name-
+      # Error class: APIError with { status: number, type: 'MailgunAPIError', details: string }
+      - id: webhooks-update-no-try-catch
+        condition: >
+          mg.webhooks.update() is called without a surrounding try-catch block. Authentication
+          failure (401) or webhook not found (404) cause an unhandled promise rejection. A silently
+          failed update means the webhook continues pointing at the old (possibly offline) URL,
+          causing silent event delivery failures.
+        throws: >
+          APIError with { status: 401|404|5xx, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Caller MUST wrap mg.webhooks.update() in try-catch. Webhook URL rotation is a critical
+          infrastructure operation — failures must be surfaced to prevent silent event loss.
+
+          Minimum handling:
+            try {
+              const result = await mg.webhooks.update(domain, 'bounce', 'https://new.example.com/webhooks');
+              logger.info('Webhook updated', { event: 'bounce' });
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Webhook update failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/README.md"
+          - "https://documentation.mailgun.com/docs/inboxready/api-reference/optimize/mailgun/webhooks/put-v3-domains--domain-name--webhooks--webhook-name-"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
           incident_cost_range: low
 
 notes:

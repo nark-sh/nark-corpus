@@ -225,3 +225,255 @@ export {
   gt_list_member_missing,
   gt_list_member_safe,
 };
+
+// ══════════════════════════════════════════════════
+// DEEPENED FUNCTIONS — Added 2026-04-16 (pass 4)
+// New postcondition IDs:
+//   suppressions-destroy-no-try-catch
+//   suppressions-destroy-all-no-try-catch
+//   suppressions-destroy-all-catastrophic-misuse
+//   lists-update-no-try-catch
+//   lists-destroy-no-try-catch
+//   list-member-update-no-try-catch
+//   list-member-destroy-no-try-catch
+//   webhooks-create-no-try-catch
+//   webhooks-update-no-try-catch
+// ══════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────
+// 7. suppressions.destroy — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_suppressions_destroy_missing(mg: IMailgunClient, domain: string, email: string): Promise<void> {
+  // SHOULD_FIRE: suppressions-destroy-no-try-catch
+  // @expect-violation: suppressions-destroy-no-try-catch
+  await mg.suppressions.destroy(domain, 'unsubscribes', email);
+}
+
+// @expect-clean
+async function gt_suppressions_destroy_safe(mg: IMailgunClient, domain: string, email: string): Promise<void> {
+  try {
+    await mg.suppressions.destroy(domain, 'unsubscribes', email);
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      if (apiError.status === 404) {
+        return; // Already removed
+      }
+      console.error('Failed to remove suppression', { status: apiError.status, email });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 8. suppressions.destroyAll — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_suppressions_destroy_all_missing(mg: IMailgunClient, domain: string): Promise<void> {
+  // SHOULD_FIRE: suppressions-destroy-all-no-try-catch
+  // @expect-violation: suppressions-destroy-all-no-try-catch
+  await mg.suppressions.destroyAll(domain, 'bounces');
+}
+
+// @expect-clean
+async function gt_suppressions_destroy_all_safe(mg: IMailgunClient, domain: string): Promise<void> {
+  try {
+    const result = await mg.suppressions.destroyAll(domain, 'bounces');
+    console.info('All bounce suppressions cleared', result);
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      console.error('Failed to clear all suppressions', { status: apiError.status, domain });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 9. lists.update — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_lists_update_missing(mg: IMailgunClient, listAddress: string): Promise<void> {
+  // SHOULD_FIRE: lists-update-no-try-catch
+  // @expect-violation: lists-update-no-try-catch
+  await mg.lists.update(listAddress, { name: 'New Name' });
+}
+
+// @expect-clean
+async function gt_lists_update_safe(mg: IMailgunClient, listAddress: string): Promise<unknown> {
+  try {
+    return await mg.lists.update(listAddress, { name: 'New Name' });
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      if (apiError.status === 404) {
+        throw new Error('Mailing list not found');
+      }
+      console.error('List update failed', { status: apiError.status });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 10. lists.destroy — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_lists_destroy_missing(mg: IMailgunClient, listAddress: string): Promise<void> {
+  // SHOULD_FIRE: lists-destroy-no-try-catch
+  // @expect-violation: lists-destroy-no-try-catch
+  await mg.lists.destroy(listAddress);
+}
+
+// @expect-clean
+async function gt_lists_destroy_safe(mg: IMailgunClient, listAddress: string): Promise<unknown> {
+  try {
+    return await mg.lists.destroy(listAddress);
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      if (apiError.status === 404) {
+        return null; // Already deleted
+      }
+      console.error('List deletion failed', { status: apiError.status, listAddress });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 11. lists.members.updateMember — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_list_member_update_missing(
+  mg: IMailgunClient,
+  listAddress: string,
+  memberAddress: string
+): Promise<void> {
+  // SHOULD_FIRE: list-member-update-no-try-catch
+  // @expect-violation: list-member-update-no-try-catch
+  await mg.lists.members.updateMember(listAddress, memberAddress, { subscribed: false });
+}
+
+// @expect-clean
+async function gt_list_member_update_safe(
+  mg: IMailgunClient,
+  listAddress: string,
+  memberAddress: string
+): Promise<unknown> {
+  try {
+    return await mg.lists.members.updateMember(listAddress, memberAddress, { subscribed: false });
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      if (apiError.status === 404) {
+        return null; // Member not found — unsubscribe is a no-op
+      }
+      console.error('Member update failed', { status: apiError.status, memberAddress });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 12. lists.members.destroyMember — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_list_member_destroy_missing(
+  mg: IMailgunClient,
+  listAddress: string,
+  memberAddress: string
+): Promise<void> {
+  // SHOULD_FIRE: list-member-destroy-no-try-catch
+  // @expect-violation: list-member-destroy-no-try-catch
+  await mg.lists.members.destroyMember(listAddress, memberAddress);
+}
+
+// @expect-clean
+async function gt_list_member_destroy_safe(
+  mg: IMailgunClient,
+  listAddress: string,
+  memberAddress: string
+): Promise<unknown> {
+  try {
+    return await mg.lists.members.destroyMember(listAddress, memberAddress);
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      if (apiError.status === 404) {
+        return null; // Already removed
+      }
+      console.error('Member deletion failed', { status: apiError.status, memberAddress });
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 13. webhooks.create — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_webhooks_create_missing(mg: IMailgunClient, domain: string): Promise<void> {
+  // SHOULD_FIRE: webhooks-create-no-try-catch
+  // @expect-violation: webhooks-create-no-try-catch
+  await mg.webhooks.create(domain, 'bounce', 'https://app.example.com/webhooks/mailgun');
+}
+
+// @expect-clean
+async function gt_webhooks_create_safe(mg: IMailgunClient, domain: string): Promise<void> {
+  try {
+    await mg.webhooks.create(domain, 'bounce', 'https://app.example.com/webhooks/mailgun');
+    console.info('Webhook registered', { event: 'bounce', domain });
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      console.error('Webhook creation failed', { status: apiError.status, domain });
+      throw new Error(`Failed to register Mailgun webhook: ${apiError.status}`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 14. webhooks.update — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_webhooks_update_missing(mg: IMailgunClient, domain: string): Promise<void> {
+  // SHOULD_FIRE: webhooks-update-no-try-catch
+  // @expect-violation: webhooks-update-no-try-catch
+  await mg.webhooks.update(domain, 'bounce', 'https://new.example.com/webhooks');
+}
+
+// @expect-clean
+async function gt_webhooks_update_safe(mg: IMailgunClient, domain: string): Promise<void> {
+  try {
+    await mg.webhooks.update(domain, 'bounce', 'https://new.example.com/webhooks');
+    console.info('Webhook updated', { event: 'bounce' });
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number };
+    if (apiError?.type === 'MailgunAPIError') {
+      console.error('Webhook update failed', { status: apiError.status });
+    }
+    throw error;
+  }
+}
+
+export {
+  gt_suppressions_destroy_missing,
+  gt_suppressions_destroy_safe,
+  gt_suppressions_destroy_all_missing,
+  gt_suppressions_destroy_all_safe,
+  gt_lists_update_missing,
+  gt_lists_update_safe,
+  gt_lists_destroy_missing,
+  gt_lists_destroy_safe,
+  gt_list_member_update_missing,
+  gt_list_member_update_safe,
+  gt_list_member_destroy_missing,
+  gt_list_member_destroy_safe,
+  gt_webhooks_create_missing,
+  gt_webhooks_create_safe,
+  gt_webhooks_update_missing,
+  gt_webhooks_update_safe,
+};
