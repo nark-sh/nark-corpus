@@ -26,6 +26,7 @@
  *   connectors-call-tool-no-error-handling    (added pass 3)
  *   judge-conversation-no-error-handling      (added pass 6)
  *   judge-event-no-error-handling             (added pass 6)
+ *   judge-dataset-record-no-error-handling    (added pass 12)
  */
 import { Mistral } from '@mistralai/mistralai';
 
@@ -642,6 +643,44 @@ async function gt_judge_event_with_try_catch(eventId: string) {
     return result.answer;
   } catch (error) {
     console.error('Judge event error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 19. beta.observability.datasets.records.judge — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 12 (2026-04-16, deepen-stream-2 pass 12)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: judge-dataset-record-no-error-handling
+async function gt_judge_dataset_record_missing(datasetRecordId: string) {
+  // SHOULD_FIRE: judge-dataset-record-no-error-handling — no try-catch
+  // Throws ObservabilityError (JUDGE_NOT_FOUND, DATASET_RECORD_NOT_FOUND,
+  // DATASET_RECORD_FORMAT_ERROR, JUDGE_MISTRAL_API_ERROR, JUDGE_MISTRAL_API_TIMEOUT)
+  // or MistralError (401, 429) on uncaught call
+  const result = await client.beta.observability.datasets.records.judge({
+    datasetRecordId,
+    judgeDatasetRecordRequest: {
+      judgeId: 'judge-123',
+    },
+  });
+  return result.answer;
+}
+
+// 19. beta.observability.datasets.records.judge — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_judge_dataset_record_with_try_catch(datasetRecordId: string) {
+  try {
+    // SHOULD_NOT_FIRE: datasets.records.judge has try-catch
+    const result = await client.beta.observability.datasets.records.judge({
+      datasetRecordId,
+      judgeDatasetRecordRequest: {
+        judgeId: process.env.MISTRAL_JUDGE_ID ?? '',
+      },
+    });
+    return typeof result.answer === 'number' ? result.answer : parseFloat(result.answer as string);
+  } catch (error) {
+    console.error('Judge dataset record error:', error);
     throw error;
   }
 }

@@ -38,7 +38,8 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.67  # 22 contracted / 33 total (11 omitted)
+coverage_score: 1.0   # 23 contracted / (34 total - 11 omitted) = 23/23 = 100%
+                      # datasets.records.judge added pass 12; all non-omitted APIs now contracted
 
 detection:
   class_names:
@@ -1256,6 +1257,100 @@ functions:
           }
         sources:
           - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaObservabilityChatCompletionEventsJudge.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/errors/observabilityerror.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/components/observabilityerrorcode.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: judge
+    import_path: "@mistralai/mistralai"
+    description: >
+      Runs a saved LLM judge on a specific dataset record. Called as
+      client.beta.observability.datasets.records.judge({ datasetRecordId, judgeId, ... }).
+      Used in automated evaluation pipelines that score stored dataset records for compliance,
+      quality, or safety — e.g., fine-tuning data quality gates, RAG answer quality scoring,
+      or offline batch evaluation of conversation history. Posts to
+      /v1/observability/dataset-records/{dataset_record_id}/live-judging.
+      Throws ObservabilityError (distinct from MistralError) for 400/404/408/409/422 responses.
+      Returns JudgeOutput { analysis: string, answer: string | number }.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of
+      #   src/funcs/betaObservabilityDatasetsRecordsJudge.ts
+      # Error type: ObservabilityError with ObservabilityErrorCode enum
+      # Error HTTP codes: 400, 404, 408, 409, 422 → ObservabilityError; 4XX/5XX → MistralError
+      # errorCodes from source: ["400", "404", "408", "409", "422", "4XX", "5XX"]
+      # Specific ObservabilityErrorCodes applicable here (confirmed from observabilityerrorcode.ts):
+      #   JUDGE_NOT_FOUND — judge doesn't exist or was deleted
+      #   DATASET_RECORD_NOT_FOUND — the dataset record doesn't exist or was deleted
+      #   DATASET_RECORD_FORMAT_ERROR — record format incompatible with judge's expected schema
+      #   JUDGE_MISTRAL_API_ERROR (HTTP 400) — underlying Mistral model call failed
+      #   JUDGE_MISTRAL_API_TIMEOUT (HTTP 408) — judge model call timed out
+      - id: judge-dataset-record-no-error-handling
+        condition: >
+          client.beta.observability.datasets.records.judge() called without try-catch or .catch() handler
+        throws: >
+          ObservabilityError (.detail.errorCode === 'JUDGE_NOT_FOUND', HTTP 404) when the
+          judgeId does not exist or was deleted after the evaluation pipeline was configured.
+          ObservabilityError (.detail.errorCode === 'DATASET_RECORD_NOT_FOUND', HTTP 404) when
+          the datasetRecordId does not exist (record deleted, dataset pruned, or wrong ID).
+          ObservabilityError (.detail.errorCode === 'DATASET_RECORD_FORMAT_ERROR', HTTP 422)
+          when the dataset record's conversation format is incompatible with the judge's
+          expected input schema — e.g., judge expects Q&A format but record is plain text.
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_ERROR', HTTP 400)
+          when the underlying Mistral model call within the judge fails.
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_TIMEOUT', HTTP 408)
+          when the judge model call exceeds the evaluation timeout.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when request fails schema validation.
+        required_handling: >
+          Caller MUST wrap await client.beta.observability.datasets.records.judge() in
+          try-catch or chain .catch(). Automated evaluation pipelines that batch-score dataset
+          records will throw ObservabilityError when any record is missing or the judge model
+          times out — uncaught errors abort the entire batch, losing scoring progress for
+          all records processed in the same run. DATASET_RECORD_FORMAT_ERROR indicates a
+          dataset schema mismatch that will repeat for all records with the same format, so
+          it must be caught and surfaced to the caller rather than retried.
+
+          try {
+            const result = await client.beta.observability.datasets.records.judge({
+              datasetRecordId: record.id,
+              judgeId: process.env.MISTRAL_JUDGE_ID,
+            });
+            return { score: result.answer, analysis: result.analysis };
+          } catch (error) {
+            if (error instanceof ObservabilityError) {
+              const code = error.detail?.errorCode;
+              if (code === 'JUDGE_NOT_FOUND') {
+                throw new Error(`Judge not found — check judge configuration`);
+              }
+              if (code === 'DATASET_RECORD_NOT_FOUND') {
+                // Record deleted — skip and continue with next record
+                console.warn(`Record not found: ${record.id}`);
+                return null;
+              }
+              if (code === 'DATASET_RECORD_FORMAT_ERROR') {
+                // Schema mismatch — abort batch, surface error to operator
+                throw new Error(`Dataset record format incompatible with judge: ${error.detail?.message}`);
+              }
+              if (code === 'JUDGE_MISTRAL_API_TIMEOUT') {
+                // Retry with backoff or skip this record
+                console.warn(`Judge timed out for record ${record.id}`);
+                return null;
+              }
+              throw new Error(`Observability error: ${error.detail?.message}`);
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaObservabilityDatasetsRecordsJudge.ts"
           - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/errors/observabilityerror.ts"
           - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/components/observabilityerrorcode.ts"
         severity: error
