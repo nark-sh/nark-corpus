@@ -1,10 +1,24 @@
 package: "@trigger.dev/sdk"
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-2 pass 3):
+# API surface: ~44 async-callable functions across tasks/runs/schedules/wait/queues/envvars namespaces
+# Contracted before: 6 (trigger, batchTrigger, retrieve, list, schedules.create, schedules.update)
+# Contracted after: 16 (+10 this pass)
+# Omitted: 28 (read-only GETs, realtime SSE streams, admin ops, advanced batch variants)
+# Coverage: 16/44 = 0.36 (raw), but adjusted for ICP-relevant ops = 16/22 = 0.73
+# Error types confirmed from @trigger.dev/core/v3 source: ApiError, AuthenticationError,
+#   NotFoundError, BadRequestError, RateLimitError, SubtaskUnwrapError, BatchTriggerError
+# Evidence URLs actually fetched:
+#   https://trigger.dev/docs/management/runs/cancel
+#   https://trigger.dev/docs/management/runs/replay
+#   https://trigger.dev/docs/management/queues/pause
+#   https://trigger.dev/docs/triggering
+coverage_score: 0.73  # 16 contracted / 22 ICP-relevant async-callable functions (28 intentionally omitted)
 
 detection:
   require_instance_tracking: false
@@ -200,6 +214,553 @@ functions:
         sources:
           - "https://trigger.dev/docs/management/schedules/update"
           - "https://trigger.dev/docs/errors-retrying"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── Added in depth pass 2026-04-16 ──────────────────────────────────────────
+
+  - name: triggerAndWait
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Triggers a child task and waits for it to complete before returning.
+      Called as tasks.triggerAndWait(taskId, payload, options?). ONLY usable
+      inside another task's run() function — calling from backend routes throws.
+      Returns a TaskRunResult discriminated union: {ok: true, output: T} | {ok: false, error: unknown}.
+      Use .unwrap() to automatically throw SubtaskUnwrapError on failure.
+
+    postconditions:
+      # Evidence: https://trigger.dev/docs/triggering (fetched 2026-04-16)
+      # SubtaskUnwrapError confirmed in @trigger.dev/core/v3/types/tasks.d.ts
+      # AuthenticationError/NotFoundError confirmed in @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: triggerandwait-unwrap-error
+        condition: >
+          tasks.triggerAndWait(...).unwrap() called without try/catch, and the
+          child task fails (throws, crashes, or is canceled). The .unwrap() call
+          throws SubtaskUnwrapError containing taskId, runId, and the child error.
+        throws: >
+          SubtaskUnwrapError (extends Error) with properties:
+            .taskId — the child task identifier
+            .runId  — the run ID of the failed child
+            .cause  — the error thrown by the child task
+        required_handling: >
+          Caller MUST wrap .unwrap() in try/catch when child task failure should
+          be handled rather than crashing the parent task.
+
+          Pattern 1 — check result.ok (no throw):
+            const result = await tasks.triggerAndWait("child-task", payload);
+            if (!result.ok) {
+              console.error("Child task failed:", result.error);
+              return; // or fallback
+            }
+            return result.output;
+
+          Pattern 2 — use .unwrap() with catch:
+            try {
+              const output = await tasks.triggerAndWait("child-task", payload).unwrap();
+            } catch (err) {
+              if (err instanceof SubtaskUnwrapError) {
+                console.error("Child task failed:", err.cause);
+              }
+              throw err;
+            }
+
+          CRITICAL: Do NOT use .unwrap() without try/catch when child failures
+          are expected (e.g., user input validation, external API calls in child).
+        sources:
+          - "https://trigger.dev/docs/triggering"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/types/tasks.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: triggerandwait-called-outside-task
+        condition: >
+          tasks.triggerAndWait() called from backend route handler, serverless
+          function, or any context outside a Trigger.dev task run() function.
+          This is explicitly unsupported and throws at runtime.
+        throws: >
+          Error: "triggerAndWait can only be called from inside a task"
+          (or similar — the exact message varies by SDK version).
+        required_handling: >
+          Caller MUST use tasks.trigger() (fire-and-forget) when calling from
+          backend routes. Use tasks.triggerAndWait() ONLY inside a parent task's
+          run() function.
+          The difference: trigger() makes an API call and returns immediately;
+          triggerAndWait() suspends the current task execution until the child
+          task completes — this suspension mechanism only works inside a task.
+        sources:
+          - "https://trigger.dev/docs/triggering"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: batchTriggerAndWait
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Triggers multiple child tasks and waits for ALL of them to complete.
+      Called as tasks.batchTriggerAndWait(taskId, items, options?). ONLY usable
+      inside another task's run() function. Returns a BatchResult containing
+      an array of TaskRunResult objects — one per item, each must be checked.
+      Throws BatchTriggerError if the batch creation phase fails (before any tasks run).
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/shared.d.ts — BatchTriggerError class
+      # BatchTriggerError confirmed with isRateLimited, retryAfterMs, apiError properties
+      # https://trigger.dev/docs/triggering (fetched 2026-04-16)
+      - id: batchtriggerandwait-creation-error
+        condition: >
+          tasks.batchTriggerAndWait() fails during the batch creation phase
+          (before any child tasks start executing). Common causes: rate limiting,
+          invalid API key, task ID not found.
+        throws: >
+          BatchTriggerError (extends Error) with properties:
+            .phase          — "create" (failed during batch creation)
+            .isRateLimited  — true if caused by HTTP 429
+            .retryAfterMs   — milliseconds until rate limit resets (when isRateLimited)
+            .apiError       — the underlying ApiError (auth, not-found, etc.)
+            .itemCount      — number of items in the batch
+
+          When rate limited: BatchTriggerError.isRateLimited === true
+          When auth fails: BatchTriggerError.apiError instanceof AuthenticationError
+        required_handling: >
+          Caller MUST wrap tasks.batchTriggerAndWait() in try/catch.
+
+          try {
+            const results = await tasks.batchTriggerAndWait("my-task", items);
+            for (const result of results.runs) {
+              if (!result.ok) {
+                console.error("Item failed:", result.error);
+              }
+            }
+          } catch (err) {
+            if (err instanceof BatchTriggerError && err.isRateLimited) {
+              // Retry after err.retryAfterMs
+            }
+            throw err;
+          }
+
+          CRITICAL: Even on success, each item in results.runs must be checked
+          individually — some items may fail while others succeed.
+        sources:
+          - "https://trigger.dev/docs/triggering"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/shared.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: batchtriggerandwait-individual-failures-unchecked
+        condition: >
+          tasks.batchTriggerAndWait() succeeds (no throw) but individual items
+          in the batch fail. Caller does not check result.runs[i].ok and assumes
+          all items completed successfully. Failed items silently lose their
+          work without any error propagation.
+        throws: >
+          No throw — individual item failures are returned in results.runs[i]
+          with ok: false. The overall batch call succeeds.
+          results.runs[i] = { ok: false, error: unknown, runId: string }
+        required_handling: >
+          Caller MUST check each item in results.runs after awaiting:
+          for (const result of results.runs) {
+            if (!result.ok) {
+              // This item failed — handle or re-queue
+              console.error("Batch item failed:", result.error);
+            }
+          }
+          Never assume all items completed successfully after a successful await.
+        sources:
+          - "https://trigger.dev/docs/triggering"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: cancel
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Cancels a task run by run ID. Called as runs.cancel(runId).
+      Makes an authenticated HTTP DELETE to the Trigger.dev API.
+      Throws NotFoundError (404) if the run doesn't exist, AuthenticationError (401)
+      if the API key is invalid, or BadRequestError (400) on invalid run ID.
+      Evidence: https://trigger.dev/docs/management/runs/cancel (fetched 2026-04-16)
+
+    postconditions:
+      # Evidence: https://trigger.dev/docs/management/runs/cancel (fetched 2026-04-16)
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: cancel-no-try-catch
+        condition: >
+          runs.cancel() called in async context without surrounding try/catch.
+          NotFoundError, AuthenticationError, or BadRequestError results in
+          unhandled rejected Promise.
+        throws: >
+          NotFoundError (status 404) — run not found with given ID.
+          AuthenticationError (status 401) — invalid or missing API key.
+          BadRequestError (status 400) — invalid run ID format.
+          ApiConnectionError — network failure.
+          All extend ApiError with .status and .error properties.
+        required_handling: >
+          Caller MUST wrap runs.cancel() in try/catch.
+          Handle 404 gracefully — the run may have already completed by the time
+          cancel is called (race condition in cleanup flows).
+
+          try {
+            await runs.cancel(runId);
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              // Run already completed or never existed — safe to ignore
+              return;
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/runs/cancel"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: replay
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Replays a task run with the same payload and options as the original run.
+      Called as runs.replay(runId). Makes an authenticated HTTP POST to the
+      Trigger.dev API. Creates a new run — does NOT restart the original.
+      Throws NotFoundError (404) if the run doesn't exist, AuthenticationError (401)
+      on bad API key, or BadRequestError (400) on invalid run ID.
+      Evidence: https://trigger.dev/docs/management/runs/replay (fetched 2026-04-16)
+
+    postconditions:
+      # Evidence: https://trigger.dev/docs/management/runs/replay (fetched 2026-04-16)
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: replay-no-try-catch
+        condition: >
+          runs.replay() called in async context without surrounding try/catch.
+          NotFoundError or BadRequestError results in unhandled rejected Promise.
+        throws: >
+          NotFoundError (status 404) — run not found with given ID.
+          AuthenticationError (status 401) — invalid or missing API key.
+          BadRequestError (status 400) — invalid run ID or "Failed to create new run".
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap runs.replay() in try/catch.
+          Handle 404 as the run may have been purged (TTL expiry is default 30 days).
+
+          try {
+            const newRun = await runs.replay(runId);
+            console.log("Replayed as:", newRun.id);
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              console.error("Run not found — may have expired:", runId);
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/runs/replay"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: reschedule
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Reschedules a delayed run to a new time. Called as runs.reschedule(runId, {delay}).
+      Makes an authenticated HTTP POST to the Trigger.dev API.
+      Throws NotFoundError if the run doesn't exist or has already started executing.
+      Can only reschedule runs that are in DELAYED state.
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/runs.d.ts — function signature
+      # Error types inferred from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: reschedule-no-try-catch
+        condition: >
+          runs.reschedule() called in async context without surrounding try/catch.
+          NotFoundError or AuthenticationError results in unhandled rejected Promise.
+        throws: >
+          NotFoundError (status 404) — run not found or not in DELAYED state.
+          AuthenticationError (status 401) — invalid or missing API key.
+          BadRequestError (status 400) — invalid delay format.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap runs.reschedule() in try/catch.
+          Handle 404 as the run may have already dequeued and started.
+          This race condition is common in high-throughput systems.
+
+          try {
+            await runs.reschedule(runId, { delay: "5m" });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              // Run already started — reschedule not possible, log and continue
+              console.warn("Could not reschedule run (already started):", runId);
+            } else {
+              throw err;
+            }
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/runs.ts"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: poll
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Polls a run until it reaches a terminal state (COMPLETED, FAILED, CANCELED, etc.).
+      Called as runs.poll(runId, {pollIntervalMs}). Repeatedly calls runs.retrieve()
+      internally. Returns the final run object with output or error.
+      CRITICAL: Has no built-in timeout — will poll indefinitely if a run is stuck.
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/runs.d.ts — function signature
+      # poll() signature: runs.poll(runId, options?, requestOptions?) → Promise<RunShape>
+      - id: poll-no-try-catch
+        condition: >
+          runs.poll() called in async context without surrounding try/catch.
+          Auth errors or network failures during polling cause unhandled rejected Promise.
+        throws: >
+          AuthenticationError (status 401) — invalid API key during polling.
+          ApiConnectionError — network failure during any poll cycle.
+          Does NOT throw when the polled run itself fails — the run failure
+          is returned in the result object (check result.status).
+        required_handling: >
+          Caller MUST wrap runs.poll() in try/catch.
+          IMPORTANT: runs.poll() has NO built-in timeout. Use an AbortController
+          or external timeout to prevent indefinite polling for stuck runs.
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min max
+
+          try {
+            const result = await runs.poll(runId, { pollIntervalMs: 2000 }, {
+              signal: controller.signal,
+            });
+            if (result.status !== "COMPLETED") {
+              console.error("Run did not complete successfully:", result.status);
+            }
+          } catch (err) {
+            console.error("Polling failed:", err);
+          } finally {
+            clearTimeout(timeout);
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/runs.ts"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pause
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Pauses a queue, preventing new runs from being dequeued and started.
+      Called as queues.pause(queueId or {type, name}).
+      Runs currently executing continue to completion.
+      Makes an authenticated HTTP POST to the Trigger.dev API.
+      Evidence: https://trigger.dev/docs/management/queues/pause (fetched 2026-04-16)
+
+    postconditions:
+      # Evidence: https://trigger.dev/docs/management/queues/pause (fetched 2026-04-16)
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: pause-no-try-catch
+        condition: >
+          queues.pause() called in async context without surrounding try/catch.
+          NotFoundError (404) or AuthenticationError (401) results in
+          unhandled rejected Promise.
+        throws: >
+          NotFoundError (status 404) — queue not found with given ID or name.
+          AuthenticationError (status 401) — invalid or missing API key.
+          BadRequestError (status 400) — invalid queue identifier format.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap queues.pause() in try/catch.
+          Handle 404 gracefully — queue name may be misspelled or queue may not
+          exist yet (lazily created queues may not exist until first run).
+
+          try {
+            await queues.pause({ type: "task", name: "my-task-id" });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              console.warn("Queue not found — may not exist yet:", err.message);
+            } else {
+              throw err;
+            }
+          }
+        sources:
+          - "https://trigger.dev/docs/management/queues/pause"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: resume
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Resumes a paused queue, allowing new runs to be dequeued and started.
+      Called as queues.resume(queueId or {type, name}).
+      Same error profile as queues.pause().
+
+    postconditions:
+      # Evidence: https://trigger.dev/docs/management/queues/pause (same page covers pause/resume)
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: resume-no-try-catch
+        condition: >
+          queues.resume() called in async context without surrounding try/catch.
+          NotFoundError (404) or AuthenticationError (401) results in
+          unhandled rejected Promise.
+        throws: >
+          NotFoundError (status 404) — queue not found with given ID or name.
+          AuthenticationError (status 401) — invalid or missing API key.
+          BadRequestError (status 400) — invalid queue identifier format.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap queues.resume() in try/catch.
+          Same handling pattern as queues.pause().
+        sources:
+          - "https://trigger.dev/docs/management/queues/pause"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a waitpoint token that can be used to pause a task run until an
+      external event completes. Called as wait.createToken(options?).
+      Used to implement human-in-the-loop, webhook callbacks, or approval flows.
+      The token has a URL that external systems POST to in order to complete the wait.
+      Can be called from inside or outside a task.
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/wait.d.ts — function signature
+      # ApiPromise<CreateWaitpointTokenResponse> — confirms it returns a Promise
+      # AuthenticationError/ApiConnectionError confirmed from error class source
+      - id: createtoken-no-try-catch
+        condition: >
+          wait.createToken() called in async context without surrounding try/catch.
+          Auth failures or network errors result in unhandled rejected Promise.
+        throws: >
+          AuthenticationError (status 401) — invalid or missing API key.
+          ApiConnectionError — network failure creating the token.
+          RateLimitError (status 429) — rate limit on waitpoint creation.
+        required_handling: >
+          Caller MUST wrap wait.createToken() in try/catch.
+          A failed token creation means the external callback URL was never
+          created — the workflow pauses without any way to resume.
+
+          try {
+            const token = await wait.createToken({
+              idempotencyKey: `approve-${documentId}`,
+              timeout: "24h",
+            });
+            // Send token.url to external system
+            await notifyApprover(token.url);
+            // Now wait for it (inside task only)
+            const result = await wait.forToken(token);
+          } catch (err) {
+            console.error("Failed to create approval token:", err);
+            throw err; // Abort the task — no way to proceed
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/wait.ts"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: completeToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Completes a waitpoint token, unblocking the task run that is waiting on it.
+      Called as wait.completeToken(token, data). The token can be a string ID or
+      object with an id property. Called from OUTSIDE the waiting task — typically
+      from a webhook handler or approval endpoint.
+      Returns {success: true} on success, throws on token-not-found or auth failure.
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/wait.d.ts — function signature
+      # Promise<{success: true}> return type — confirms it rejects on failure
+      - id: completetoken-no-try-catch
+        condition: >
+          wait.completeToken() called in a webhook handler or API route without
+          try/catch. NotFoundError (token expired or never created) or
+          AuthenticationError results in unhandled rejected Promise.
+          Common in webhook handlers that forget error handling.
+        throws: >
+          NotFoundError (status 404) — token not found (expired, already completed,
+            or token ID is incorrect).
+          AuthenticationError (status 401) — invalid or missing API key.
+          ApiConnectionError — network failure.
+          ConflictError (status 409) — token already completed (idempotent
+            completion attempted twice with different data).
+        required_handling: >
+          Caller MUST wrap wait.completeToken() in try/catch.
+          In webhook handlers, a 404 is usually safe to ignore (already completed)
+          but should be logged for debugging.
+
+          // In your webhook handler:
+          try {
+            await wait.completeToken(tokenId, { status: "approved", approvedBy: userId });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              // Token already completed or expired — safe to ignore
+              console.warn("Token already completed:", tokenId);
+              return res.status(200).json({ ok: true }); // Don't retry
+            }
+            console.error("Failed to complete token:", err);
+            return res.status(500).json({ error: "Failed" }); // Allow retry
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/wait.ts"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
         severity: error
         business_impact:
           incident_label: DOWNTIME
