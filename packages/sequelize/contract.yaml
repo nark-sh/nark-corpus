@@ -2,9 +2,10 @@ package: sequelize
 semver: ">=6.28.1"
 contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.92
 
 # CRITICAL SECURITY NOTE:
 # sequelize has 6 CVEs in versions < 6.28.1:
@@ -891,6 +892,382 @@ functions:
           Returns 0 if no records match. Not an error.
         sources:
           - "https://sequelize.org/docs/v6/core-concepts/model-querying-basics/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── HIGH PRIORITY: Transaction Explicit Methods ──
+
+  - name: commit
+    import_path: "sequelize"
+    description: >
+      Commits an unmanaged transaction. Only called directly in the unmanaged
+      transaction pattern (const t = await sequelize.transaction(); ... await t.commit()).
+      Managed transactions (sequelize.transaction(callback)) auto-commit — never call
+      commit() manually for those.
+    postconditions:
+      # Evidence: sequelize/lib/transaction.js line 39 — source inspection
+      # Source: https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts
+      - id: commit-already-finished
+        condition: "Transaction already committed or rolled back"
+        throws: "Error — 'Transaction cannot be committed because it has been finished with state: commit|rollback'"
+        required_handling: >
+          Caller MUST NOT call commit() more than once per transaction.
+          MUST NOT call commit() after rollback().
+          Pattern: use try-catch-finally — rollback in catch, commit only in try.
+          Calling commit() on a finished transaction throws a generic Error (not a
+          Sequelize-specific subclass), so catch (err) will catch it.
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts"
+          - "https://sequelize.org/docs/v6/other-topics/transactions/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: commit-database-error
+        condition: "Database connection lost or driver error during COMMIT"
+        throws: "DatabaseError — underlying driver error; connection is force-cleaned"
+        required_handling: >
+          Caller MUST catch errors from commit().
+          If commit() throws, the transaction is in an undetermined state and
+          the connection is forcibly closed. The operation MAY or MAY NOT have
+          committed on the database side. Check for idempotency before retrying.
+          This is a critical edge case: data integrity may be uncertain.
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: rollback
+    import_path: "sequelize"
+    description: >
+      Rolls back an unmanaged transaction. Only called directly in the unmanaged
+      transaction pattern. Call in the catch block after transaction operations fail.
+      Managed transactions auto-rollback on error — never call rollback() for those.
+    postconditions:
+      # Evidence: sequelize/lib/transaction.js line 57 — source inspection
+      # Source: https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts
+      - id: rollback-already-finished
+        condition: "Transaction already committed or rolled back"
+        throws: "Error — 'Transaction cannot be rolled back because it has been finished with state: commit|rollback'"
+        required_handling: >
+          Caller MUST NOT call rollback() on an already-finished transaction.
+          MUST NOT call rollback() after commit() succeeds.
+          Pattern: track whether commit() succeeded before calling rollback() in finally.
+          Use a flag: let committed = false; try { await t.commit(); committed = true; }
+          finally { if (!committed) await t.rollback(); }
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts"
+          - "https://sequelize.org/docs/v6/other-topics/transactions/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: rollback-never-started
+        condition: "Transaction was never started (no connection acquired)"
+        throws: "Error — 'Transaction cannot be rolled back because it never started'"
+        required_handling: >
+          Caller MUST ensure transaction was successfully initialized before rollback.
+          This can happen if sequelize.transaction() itself threw during connection
+          acquisition. Wrap the transaction initialization in try-catch as well.
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: rollback-database-error
+        condition: "Database driver error during ROLLBACK"
+        throws: "DatabaseError — driver error; connection force-cleaned"
+        required_handling: >
+          Caller MUST catch errors from rollback().
+          If rollback() throws, the connection is forcibly killed.
+          Always wrap rollback() in its own try-catch to avoid masking the original error.
+          Do NOT let a rollback failure suppress the original transaction error.
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/v6/src/transaction.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: rollback-masks-original-error
+        description: >
+          CRITICAL ANTI-PATTERN: If rollback() itself throws, it can mask the original
+          error that caused the rollback. Use this safe pattern:
+          catch (err) { try { await t.rollback(); } catch (rbErr) { /* log but ignore */ } throw err; }
+          Never let rollback failure propagate instead of the original error.
+        sources:
+          - "https://sequelize.org/docs/v6/other-topics/transactions/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── HIGH PRIORITY: Instance Methods (distinct from static class methods) ──
+
+  - name: instance.update
+    import_path: "sequelize"
+    description: >
+      Instance method that updates specified fields on this model instance and saves
+      to database. Equivalent to calling instance.set(values) + instance.save().
+      Distinct from static Model.update() which updates multiple rows by WHERE clause.
+      The instance must already exist in the database.
+    postconditions:
+      # Evidence: sequelize/lib/model.js line 2576 — delegates to this.save()
+      # Source: https://sequelize.org/docs/v6/core-concepts/model-instances/#updating-an-instance
+      - id: instance-update-unique-constraint
+        condition: "Updated value violates unique constraint"
+        throws: "UniqueConstraintError — same as save() since instance.update() delegates to save()"
+        required_handling: >
+          Caller MUST catch UniqueConstraintError.
+          instance.update() internally calls save() — all save() error contracts apply.
+          Extract conflicting fields from error.fields.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-instances/#updating-an-instance"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: instance-update-validation-error
+        condition: "Updated values fail model validation"
+        throws: "ValidationError with error.errors array"
+        required_handling: >
+          Caller MUST catch ValidationError.
+          Model validations run before UPDATE query.
+          Check error.errors array for individual field errors.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/validations-and-constraints/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: instance-update-optimistic-lock
+        condition: "Concurrent modification detected (optimistic locking enabled)"
+        throws: "OptimisticLockError when version column mismatch on save"
+        required_handling: >
+          Caller MUST catch OptimisticLockError if model uses version column.
+          Reload instance and retry with fresh data or surface conflict to user.
+        sources:
+          - "https://sequelize.org/docs/v6/other-topics/optimistic-locking/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: instance.destroy
+    import_path: "sequelize"
+    description: >
+      Deletes this model instance from the database. For paranoid models (soft-delete),
+      sets deletedAt timestamp instead of removing the row. Use { force: true } to
+      permanently delete even paranoid models. Distinct from static Model.destroy()
+      which deletes rows by WHERE clause.
+    postconditions:
+      # Evidence: sequelize/lib/model.js line 2600 — source inspection
+      # Source: https://sequelize.org/docs/v6/core-concepts/model-instances/#deleting-an-instance
+      - id: instance-destroy-foreign-key
+        condition: "Other records reference this instance via foreign key constraint"
+        throws: "ForeignKeyConstraintError — database rejects DELETE when child records exist"
+        required_handling: >
+          Caller MUST catch ForeignKeyConstraintError.
+          Check error.index and error.table to identify referencing records.
+          Delete or reassign child records first, or configure CASCADE in schema.
+          instance.destroy() on paranoid models (soft-delete) does NOT trigger FK
+          constraints — only hard-delete does.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-instances/#deleting-an-instance"
+          - "https://sequelize.org/docs/v6/core-concepts/paranoid/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: instance-destroy-connection-error
+        condition: "Database connection lost during DELETE"
+        throws: "DatabaseError, ConnectionError"
+        required_handling: >
+          Caller MUST catch connection errors.
+          The row may or may not have been deleted — check existence before retry.
+        sources:
+          - "https://sequelize.org/docs/v6/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── MED PRIORITY: Finder Variants ──
+
+  - name: findOrBuild
+    import_path: "sequelize"
+    description: >
+      Finds a record matching the where clause, or builds (but does NOT save) a new
+      instance with the defaults if none found. Returns [instance, wasBuilt].
+      Unlike findOrCreate(), this does NOT write to the database — the caller must
+      call save() if they want to persist the built instance.
+    postconditions:
+      # Evidence: sequelize/lib/model.js line 1370 — source inspection
+      # Source: https://sequelize.org/docs/v6/core-concepts/model-querying-finders/#findorbuild
+      - id: findorbuild-query-failure
+        condition: "Network error or timeout during the find phase"
+        throws: "DatabaseError, ConnectionError, TimeoutError"
+        required_handling: >
+          Caller MUST catch query errors from findOrBuild().
+          The find phase can fail with any standard query error.
+          If find fails, no instance is built.
+          If build is needed after find, subsequent save() may throw UniqueConstraintError
+          or ValidationError — handle those separately on save().
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-querying-finders/#findorbuild"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: findorbuild-save-not-called
+        description: >
+          COMMON MISUSE: findOrBuild() does NOT save the new instance.
+          The second element of the returned tuple (boolean) indicates if a new instance
+          was built. If true, caller MUST call save() to persist it.
+          Forgetting save() silently discards the new record — no error is thrown.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-querying-finders/#findorbuild"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: findCreateFind
+    import_path: "sequelize"
+    description: >
+      A performant alternative to findOrCreate() that does NOT use a transaction.
+      Executes: find -> if not found, create -> if UniqueConstraintError, find again.
+      Not safe under concurrent access on all databases (unlike findOrCreate()).
+      Returns [instance, wasCreated].
+    postconditions:
+      # Evidence: sequelize/lib/model.js line 1460 — source inspection
+      # Source: https://sequelize.org/api/v6/class/src/model.js~Model.html#static-method-findCreateFind
+      - id: findcreatefind-validation-error
+        condition: "Record to create fails model validation"
+        throws: "ValidationError — bubbles up from create() during the insert phase"
+        required_handling: >
+          Caller MUST catch ValidationError.
+          If the find returns null and creation is attempted, validation runs.
+          Unlike findOrCreate(), UniqueConstraintError is swallowed internally (retries find)
+          but ValidationError propagates to the caller.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/validations-and-constraints/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: findcreatefind-connection-error
+        condition: "Network error during find or create phases"
+        throws: "DatabaseError, ConnectionError, TimeoutError"
+        required_handling: >
+          Caller MUST catch connection errors.
+          findCreateFind() does not wrap operations in a transaction — connection
+          failure mid-operation leaves partial state risk (find succeeded, create failed).
+        sources:
+          - "https://sequelize.org/docs/v6/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: instance.restore
+    import_path: "sequelize"
+    description: >
+      Restores a soft-deleted (paranoid) model instance by clearing its deletedAt
+      timestamp. Only works on models defined with paranoid: true. Distinct from
+      static Model.restore() which restores rows matching a WHERE clause.
+      Throws synchronously if the model is not paranoid.
+    postconditions:
+      # Evidence: sequelize/lib/model.js — restore delegates to queryInterface UPDATE
+      # Source: https://sequelize.org/docs/v6/core-concepts/paranoid/
+      - id: instance-restore-not-paranoid
+        condition: "Model was not defined with paranoid: true"
+        throws: "Error — 'Model is not paranoid' (synchronous throw, not a rejected Promise)"
+        required_handling: >
+          Caller MUST only call instance.restore() on paranoid models.
+          Check model definition (paranoid: true) before calling restore().
+          This throws synchronously — not a rejected Promise.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/paranoid/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: instance-restore-connection-error
+        condition: "Network error during UPDATE to clear deletedAt"
+        throws: "DatabaseError, ConnectionError"
+        required_handling: >
+          Caller MUST catch connection errors.
+          The UPDATE to clear deletedAt may fail mid-flight.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/paranoid/"
         severity: error
         business_impact:
           incident_label: DOWNTIME

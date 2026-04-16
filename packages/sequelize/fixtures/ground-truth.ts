@@ -21,6 +21,13 @@
  *   - instance.save()                postcondition: unique-constraint
  *   - instance.reload()              postcondition: reload-deleted
  *   - instance.validate()            postcondition: validation-failure
+ *   - t.commit()                     postcondition: commit-already-finished, commit-database-error
+ *   - t.rollback()                   postcondition: rollback-already-finished, rollback-never-started
+ *   - instance.update()              postcondition: instance-update-unique-constraint
+ *   - instance.destroy()             postcondition: instance-destroy-foreign-key
+ *   - Model.findOrBuild()            postcondition: findorbuild-query-failure
+ *   - Model.findCreateFind()         postcondition: findcreatefind-validation-error
+ *   - instance.restore()             postcondition: instance-restore-not-paranoid
  *
  * Detection path: Sequelize instance tracked →
  *   ThrowingFunctionDetector fires .authenticate()/.models.User.findAll() →
@@ -396,6 +403,178 @@ export async function sumWithCatch() {
     return result;
   } catch (err) {
     console.error('sum failed:', err);
+    throw err;
+  }
+}
+
+// ── Transaction.commit() / Transaction.rollback() ──
+
+export async function commitNoCatch() {
+  // SHOULD_FIRE: commit-already-finished, commit-database-error — commit() throws. No try-catch.
+  // @expect-violation: commit-already-finished
+  // @expect-violation: commit-database-error
+  const t = await sequelize.transaction();
+  await t.commit();
+}
+
+export async function rollbackNoCatch() {
+  // SHOULD_FIRE: rollback-already-finished, rollback-database-error — rollback() throws. No try-catch.
+  // @expect-violation: rollback-already-finished
+  // @expect-violation: rollback-database-error
+  const t = await sequelize.transaction();
+  await t.rollback();
+}
+
+export async function commitWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: commit inside try-catch
+  const t = await sequelize.transaction();
+  try {
+    await sequelize.models.User.create({ name: 'test' }, { transaction: t });
+    await t.commit();
+  } catch (err) {
+    try { await t.rollback(); } catch (rbErr) { /* ignore rollback error */ }
+    throw err;
+  }
+}
+
+export async function rollbackMasksError() {
+  // SHOULD_FIRE: rollback-masks-original-error — rollback failure can swallow original error
+  // @expect-violation: rollback-masks-original-error
+  const t = await sequelize.transaction();
+  try {
+    await sequelize.models.User.create({ name: 'test' }, { transaction: t });
+    await t.commit();
+  } catch (err) {
+    // BAD: rollback failure will propagate and mask err
+    await t.rollback();
+    throw err;
+  }
+}
+
+// ── instance.update() ──
+
+export async function instanceUpdateNoCatch() {
+  // SHOULD_FIRE: instance-update-unique-constraint — instance.update() throws. No try-catch.
+  // @expect-violation: instance-update-unique-constraint
+  // @expect-violation: instance-update-validation-error
+  const user = await sequelize.models.User.findByPk(1);
+  await (user as any).update({ email: 'new@example.com' });
+}
+
+export async function instanceUpdateWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: instance.update() inside try-catch
+  try {
+    const user = await sequelize.models.User.findByPk(1);
+    await (user as any).update({ email: 'new@example.com' });
+  } catch (err) {
+    console.error('instance.update failed:', err);
+    throw err;
+  }
+}
+
+// ── instance.destroy() ──
+
+export async function instanceDestroyNoCatch() {
+  // SHOULD_FIRE: instance-destroy-foreign-key — instance.destroy() throws. No try-catch.
+  // @expect-violation: instance-destroy-foreign-key
+  // @expect-violation: instance-destroy-connection-error
+  const user = await sequelize.models.User.findByPk(1);
+  await (user as any).destroy();
+}
+
+export async function instanceDestroyWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: instance.destroy() inside try-catch
+  try {
+    const user = await sequelize.models.User.findByPk(1);
+    await (user as any).destroy();
+  } catch (err) {
+    console.error('instance.destroy failed:', err);
+    throw err;
+  }
+}
+
+// ── Model.findOrBuild() ──
+
+export async function findOrBuildNoCatch() {
+  // SHOULD_FIRE: findorbuild-query-failure — findOrBuild() throws on DB error. No try-catch.
+  // @expect-violation: findorbuild-query-failure
+  const [user, built] = await (sequelize.models.User as any).findOrBuild({
+    where: { email: 'test@example.com' },
+    defaults: { name: 'Test User' },
+  });
+  if (built) {
+    // BUG: save() not called — silent data loss (findorbuild-save-not-called)
+  }
+  return user;
+}
+
+export async function findOrBuildWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: findOrBuild() inside try-catch, save() called
+  try {
+    const [user, built] = await (sequelize.models.User as any).findOrBuild({
+      where: { email: 'test@example.com' },
+      defaults: { name: 'Test User' },
+    });
+    if (built) {
+      await (user as any).save();
+    }
+    return user;
+  } catch (err) {
+    console.error('findOrBuild failed:', err);
+    throw err;
+  }
+}
+
+// ── Model.findCreateFind() ──
+
+export async function findCreateFindNoCatch() {
+  // SHOULD_FIRE: findcreatefind-validation-error — findCreateFind() throws ValidationError. No try-catch.
+  // @expect-violation: findcreatefind-validation-error
+  // @expect-violation: findcreatefind-connection-error
+  const [user, created] = await (sequelize.models.User as any).findCreateFind({
+    where: { email: 'new@example.com' },
+    defaults: { name: 'New User' },
+  });
+  return user;
+}
+
+export async function findCreateFindWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: findCreateFind() inside try-catch
+  try {
+    const [user, created] = await (sequelize.models.User as any).findCreateFind({
+      where: { email: 'new@example.com' },
+      defaults: { name: 'New User' },
+    });
+    return user;
+  } catch (err) {
+    console.error('findCreateFind failed:', err);
+    throw err;
+  }
+}
+
+// ── instance.restore() ──
+
+export async function instanceRestoreNoCatch() {
+  // SHOULD_FIRE: instance-restore-not-paranoid — instance.restore() throws. No try-catch.
+  // @expect-violation: instance-restore-not-paranoid
+  // @expect-violation: instance-restore-connection-error
+  const user = await sequelize.models.User.findByPk(1);
+  await (user as any).restore();
+}
+
+export async function instanceRestoreWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: instance.restore() inside try-catch
+  try {
+    const user = await sequelize.models.User.findByPk(1);
+    await (user as any).restore();
+  } catch (err) {
+    console.error('instance.restore failed:', err);
     throw err;
   }
 }
