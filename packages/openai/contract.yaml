@@ -2,7 +2,7 @@ package: openai
 semver: ">=4.0.0 <7.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # deepen-stream-1 pass 7
+last_verified: "2026-04-16"  # deepen-stream-1 pass 8
 status: production
 evidence_quality: confirmed
 # Depth pass 2026-04-16 (deepen-stream-2 pass 3):
@@ -29,7 +29,26 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.66  # 27 contracted / 41 total async-callable functions (20 intentionally omitted)
+coverage_score: 0.71  # 29 contracted / 41 total async-callable functions (20 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-1 pass 8):
+# Expanded coverage from 27→29 contracted functions (+2 this pass).
+# API surface total unchanged: 41 async-callable functions.
+# Contracted this pass: chat.completions.stream (4 postconditions), chat.completions.runTools (3 postconditions)
+# Key insights:
+#   chat.completions.stream() is a distinct streaming helper from create({stream:true}) —
+#   it converts finish_reason 'length' and 'content_filter' into thrown exceptions
+#   (LengthFinishReasonError, ContentFilterFinishReasonError), making truncation visible.
+#   APIUserAbortError and OpenAIError('stream ended') also surface via finalChatCompletion().
+#   chat.completions.runTools() throws immediately on missing function implementations
+#   ('Tool given to .runTools() that does not have an associated function') — this is a
+#   runtime programming error that fires when the model invokes a tool with no executor.
+#   Also throws on n>1 params (client-side guard before any API call).
+#   Tool execution failures (invalid tool names, parse errors) are returned as
+#   tool messages for the model to recover — they are NOT thrown.
+# Evidence:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStream.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 # Depth pass 2026-04-16 (deepen-stream-1 pass 7):
 # Expanded coverage from 25→27 contracted functions (+2 this pass).
 # API surface total unchanged: 41 async-callable functions.
@@ -2135,4 +2154,267 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # chat.completions.stream()  (via openai.chat.completions.stream())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStream.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Streaming helper for Chat Completions API. Returns ChatCompletionStream<ParsedT>.
+  # Distinct from chat.completions.create({stream:true}) — this helper tracks
+  # accumulated state and throws on finish_reason errors. Callers MUST await
+  # stream.finalChatCompletion() to get the complete response and detect errors.
+  # Throws LengthFinishReasonError and ContentFilterFinishReasonError during chunk
+  # accumulation (not at stream creation), and APIUserAbortError on abort().
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: chat.completions.stream
+    import_path: "openai"
+    description: >
+      Streaming helper for Chat Completions API via openai.chat.completions.stream().
+      Returns ChatCompletionStream<ParsedT> that emits events and accumulates the
+      full completion. Unlike chat.completions.create({stream:true}), this helper
+      converts finish_reason errors into thrown exceptions and supports
+      .finalChatCompletion() to await the complete result. Callers MUST await
+      stream.finalChatCompletion() in a try-catch to detect all errors —
+      iterating over stream events alone does not surface finish_reason errors.
+
+    postconditions:
+      # Evidence: LengthFinishReasonError confirmed in ChatCompletionStream.ts source —
+      # thrown inside #accumulateChatCompletion() when choice.finish_reason === 'length'
+      # This is distinct from chat.completions.create() which silently returns truncated output.
+      - id: stream-length-finish-reason-error
+        condition: >
+          Response truncated due to max_tokens limit (finish_reason === 'length').
+          Thrown during chunk accumulation inside the stream — surfaces when awaiting
+          stream.finalChatCompletion() or stream.done(). chat.completions.create({stream:true})
+          would silently return truncated output; this helper converts it to an exception.
+        throws: "LengthFinishReasonError (extends OpenAIError)"
+        required_handling: >
+          Caller MUST catch LengthFinishReasonError when awaiting stream.finalChatCompletion().
+          This distinguishes stream() from create({stream:true}) — stream() makes truncation
+          a hard error so callers cannot silently consume incomplete output.
+          Fix: increase max_tokens, reduce prompt size, or switch to a model with larger context.
+          DO NOT retry with same parameters — response will be truncated again.
+          Pattern:
+            try {
+              const completion = await stream.finalChatCompletion();
+            } catch (err) {
+              if (err instanceof OpenAI.LengthFinishReasonError) { /* truncation */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStream.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: ContentFilterFinishReasonError confirmed in ChatCompletionStream.ts source —
+      # thrown inside #accumulateChatCompletion() when finish_reason === 'content_filter'
+      - id: stream-content-filter-finish-reason-error
+        condition: >
+          Response blocked by content filter (finish_reason === 'content_filter').
+          Thrown during chunk accumulation — surfaces when awaiting
+          stream.finalChatCompletion() or stream.done().
+        throws: "ContentFilterFinishReasonError (extends OpenAIError)"
+        required_handling: >
+          Caller MUST catch ContentFilterFinishReasonError when using stream().
+          Content filter errors are thrown DURING streaming — no partial output is
+          available, unlike completions.create({stream:true}) which may stream
+          partial content before cutting off.
+          Return user-friendly error indicating content policy blocked the response.
+          Log occurrences for compliance monitoring.
+          DO NOT retry with the same prompt without modifying content.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStream.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: APIUserAbortError confirmed in ChatCompletionStream.ts —
+      # thrown when stream.controller.signal?.aborted is true at chunk processing time
+      # Also confirmed in AbstractChatCompletionRunner.ts EventStream._handleError()
+      - id: stream-abort-error
+        condition: >
+          The stream is aborted — either via stream.controller.abort() explicitly,
+          via an AbortController signal passed in options, or via stream.abort() method.
+          Surfaces as APIUserAbortError when awaiting finalChatCompletion().
+        throws: "APIUserAbortError (extends OpenAIError, NOT APIError)"
+        required_handling: >
+          Caller MUST handle APIUserAbortError separately from other OpenAIError subtypes.
+          APIUserAbortError extends OpenAIError, NOT APIError — catch blocks that only
+          catch APIError will miss this.
+          Common pattern: server-side request timeout that aborts the stream.
+          After abort, do NOT call finalChatCompletion() expecting a result.
+          Pattern:
+            stream.controller.abort();  // or pass AbortController to options
+            try {
+              await stream.finalChatCompletion();
+            } catch (err) {
+              if (err instanceof OpenAI.APIUserAbortError) { /* user cancelled */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStream.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: OpenAIError confirmed in AbstractChatCompletionRunner.ts finalChatCompletion():
+      #   throw new OpenAIError('stream ended without producing a ChatCompletion');
+      # Occurs when network drops mid-stream, server closes connection early
+      - id: stream-premature-termination-error
+        condition: >
+          The stream terminates before producing a complete chat completion.
+          Causes: network interruption mid-stream, server closing SSE connection early,
+          or invalid event sequence from the API. Surfaces when awaiting
+          stream.finalChatCompletion() — the for-await loop completes without error
+          but no completion was produced.
+        throws: "OpenAIError('stream ended without producing a ChatCompletion')"
+        required_handling: >
+          Caller MUST await stream.finalChatCompletion() in a try-catch.
+          If only iterating events via 'for await', the loop ends without error
+          even when the completion is missing — always check with finalChatCompletion().
+          Retry with a fresh stream() call for transient network errors.
+          Pattern:
+            try {
+              const completion = await stream.finalChatCompletion();
+            } catch (err) {
+              if (err instanceof OpenAI.OpenAIError) { /* stream failed */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # chat.completions.runTools()  (via openai.chat.completions.runTools())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ChatCompletionStreamingRunner.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Agentic tool-use runner that automatically calls functions and re-submits results
+  # until the model stops using tools. Returns ChatCompletionRunner (non-streaming)
+  # or ChatCompletionStreamingRunner (streaming). Throws on missing function implementations,
+  # n>1 params, and stream termination failures. Tool execution errors (parse failures,
+  # invalid tool names) are returned as tool messages for the model to recover, NOT thrown.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: chat.completions.runTools
+    import_path: "openai"
+    description: >
+      Agentic tool execution runner via openai.chat.completions.runTools().
+      Automatically executes tool call functions returned by the model and re-submits
+      results until the model stops invoking tools. Returns ChatCompletionRunner
+      (non-streaming) or ChatCompletionStreamingRunner (streaming variant).
+      Callers MUST await runner.finalChatCompletion() to get the result and detect errors.
+      CRITICAL: Only n=1 is supported. Tool execution errors (invalid tool names, parse
+      failures) are returned as tool messages for the model to retry — not thrown.
+      Missing function implementations throw immediately.
+
+    postconditions:
+      # Evidence: OpenAIError confirmed in AbstractChatCompletionRunner.ts _validateParams():
+      #   throw new OpenAIError('ChatCompletion convenience helpers only support n=1 at this time.')
+      # This is a client-side guard that fires before any API call.
+      - id: run-tools-n-gt-1-error
+        condition: >
+          params.n is set to a value greater than 1. Thrown client-side before any
+          API call — the convenience runner only supports producing a single completion path.
+        throws: "OpenAIError('ChatCompletion convenience helpers only support n=1 at this time. To use n>1, please use chat.completions.create() directly.')"
+        required_handling: >
+          Caller MUST NOT set n>1 when using runTools() or stream().
+          Use chat.completions.create() directly if multiple completions (n>1) are needed.
+          This error fires before any network request — it is a configuration error,
+          not a transient failure. Remove or set n=1 in params.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: OpenAIError confirmed in AbstractChatCompletionRunner.ts _runTools():
+      #   throw new OpenAIError('Tool given to `.runTools()` that does not have an associated function')
+      # Thrown when the tools array contains a tool definition with no matching function implementation
+      - id: run-tools-missing-function-error
+        condition: >
+          A tool in the tools array does not have an associated function implementation
+          in the RunnableFunction map. The model calls a tool by name that was declared
+          in the schema but whose executor function was not provided to runTools().
+        throws: "OpenAIError('Tool given to `.runTools()` that does not have an associated function')"
+        required_handling: >
+          Caller MUST ensure every tool definition passed to runTools() has a matching
+          function implementation in the tools map.
+          This is a programming error — the tool schema and the function implementations
+          must stay in sync. When adding a new tool to the schema, always add its executor.
+          This throws mid-run (when the model first calls the missing tool), not at setup,
+          so the error may occur after multiple successful tool calls if the missing tool
+          is rarely invoked.
+          Do NOT retry without fixing the implementation — the model will call the tool again.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: OpenAIError confirmed in AbstractChatCompletionRunner.ts finalChatCompletion():
+      #   throw new OpenAIError('stream ended without producing a ChatCompletion');
+      # Same pattern as chat.completions.stream() — surfaces from finalChatCompletion()
+      - id: run-tools-stream-termination-error
+        condition: >
+          The underlying stream terminates before producing a complete chat completion —
+          same as chat.completions.stream() premature termination. Surfaces when awaiting
+          runner.finalChatCompletion(). Can occur in multi-turn tool loops if network
+          drops during a tool-calling round.
+        throws: "OpenAIError('stream ended without producing a ChatCompletion')"
+        required_handling: >
+          Caller MUST await runner.finalChatCompletion() in a try-catch block.
+          In multi-turn tool loops, stream termination mid-run leaves the conversation
+          in a partial state — the model may have called some tools but not all.
+          On failure: restart the entire tool loop from the beginning — do not attempt
+          to resume from intermediate tool results.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/AbstractChatCompletionRunner.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
         evidence_quality: confirmed

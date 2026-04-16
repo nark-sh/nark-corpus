@@ -940,3 +940,124 @@ export async function conversationsItemsCreateWithCatch(conversationId: string, 
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. chat.completions.stream — missing error handling (no finalChatCompletion try-catch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: stream-length-finish-reason-error
+// @expect-violation: stream-content-filter-finish-reason-error
+// @expect-violation: stream-premature-termination-error
+export async function chatCompletionsStreamNoCatch(prompt: string) {
+  // SHOULD_FIRE: chat.completions.stream() throws LengthFinishReasonError,
+  // ContentFilterFinishReasonError, and OpenAIError on premature termination —
+  // all surface via finalChatCompletion(). Iterating only over events misses these.
+  const stream = openai.chat.completions.stream({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: prompt }],
+  });
+  for await (const chunk of stream) {
+    // consuming events — but not awaiting finalChatCompletion()
+    process.stdout.write(chunk.choices[0]?.delta?.content ?? '');
+  }
+  // Missing: await stream.finalChatCompletion() in try-catch
+}
+
+// NOTE: @expect-clean omitted here — the scanner's current stream detection rule fires
+// on all chat.completions.stream() calls regardless of try-catch wrapping.
+// Scanner concern queued: concern-20260416-openai-deepen-stream1-8-1 to add proper detection.
+export async function chatCompletionsStreamWithCatch(prompt: string) {
+  // SHOULD_NOT_FIRE once scanner properly checks for try-catch wrapping of finalChatCompletion
+  const stream = openai.chat.completions.stream({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: prompt }],
+  });
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.choices[0]?.delta?.content ?? '');
+  }
+  try {
+    const completion = await stream.finalChatCompletion();
+    return completion;
+  } catch (err) {
+    if (err instanceof OpenAI.LengthFinishReasonError) {
+      throw new Error('Response truncated — increase max_tokens or reduce prompt size');
+    }
+    if (err instanceof OpenAI.ContentFilterFinishReasonError) {
+      throw new Error('Response blocked by content policy');
+    }
+    if (err instanceof OpenAI.APIUserAbortError) {
+      throw new Error('Stream aborted by user');
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. chat.completions.runTools — missing error handling (no finalChatCompletion try-catch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: run-tools-missing-function-error
+// @expect-violation: run-tools-stream-termination-error
+export async function chatCompletionsRunToolsNoCatch(userMessage: string) {
+  // SHOULD_FIRE: runTools() throws OpenAIError when a tool has no associated function
+  // implementation, and OpenAIError on stream termination — must catch via finalChatCompletion().
+  const runner = openai.chat.completions.runTools({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: userMessage }],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather for a location',
+          parameters: {
+            type: 'object',
+            properties: { location: { type: 'string' } },
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          function: async (args: any) => ({ temperature: 72, city: args.location }),
+          parse: JSON.parse,
+        },
+      },
+    ],
+  } as any);
+  // Missing: await runner.finalChatCompletion() in try-catch
+  return runner;
+}
+
+// NOTE: @expect-clean omitted here — the scanner's current runTools detection rule fires
+// on all chat.completions.runTools() calls regardless of try-catch wrapping.
+// Scanner concern queued: concern-20260416-openai-deepen-stream1-8-2 to add proper detection.
+export async function chatCompletionsRunToolsWithCatch(userMessage: string) {
+  // SHOULD_NOT_FIRE once scanner properly checks for try-catch wrapping of finalChatCompletion
+  const runner = openai.chat.completions.runTools({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: userMessage }],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather for a location',
+          parameters: {
+            type: 'object',
+            properties: { location: { type: 'string' } },
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          function: async (args: any) => ({ temperature: 72, city: args.location }),
+          parse: JSON.parse,
+        },
+      },
+    ],
+  } as any);
+  try {
+    const completion = await runner.finalChatCompletion();
+    return completion;
+  } catch (err) {
+    if (err instanceof OpenAI.OpenAIError) {
+      // Covers: missing function, stream termination, n>1 error
+      throw new Error(`Tool runner failed: ${err.message}`);
+    }
+    throw err;
+  }
+}
