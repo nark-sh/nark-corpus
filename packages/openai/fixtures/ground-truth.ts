@@ -1148,3 +1148,80 @@ async function chatkitSessionsCreateWithErrorHandling(userId: string, workflowId
     throw err;
   }
 }
+
+// ─── files.content ────────────────────────────────────────────────────────────
+
+// @expect-violation: files-content-no-error-handling
+async function filesContentMissingErrorHandling(fileId: string) {
+  // SHOULD_FIRE: no try-catch — NotFoundError, BadRequestError, APIConnectionError not handled
+  const response = await openai.files.content(fileId);
+  return await response.arrayBuffer();
+}
+
+// @expect-clean
+async function filesContentWithErrorHandling(fileId: string) {
+  // SHOULD_NOT_FIRE: waitForProcessing + try-catch handles all error types
+  try {
+    const file = await openai.files.waitForProcessing(fileId);
+    if (file.status \!== 'processed') {
+      throw new Error(`File not ready for content retrieval: ${file.status}`);
+    }
+    const response = await openai.files.content(fileId);
+    if (\!response.ok) {
+      throw new Error(`File download failed: ${response.status}`);
+    }
+    return await response.arrayBuffer();
+  } catch (err) {
+    if (err instanceof OpenAI.NotFoundError) {
+      throw new Error(`File ${fileId} not found or already deleted`);
+    }
+    if (err instanceof OpenAI.BadRequestError) {
+      throw new Error(`File not ready for content retrieval: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─── conversations.items.delete ───────────────────────────────────────────────
+
+// @expect-violation: conversations-items-delete-no-error-handling
+async function conversationsItemsDeleteMissingErrorHandling(itemId: string, conversationId: string) {
+  // SHOULD_FIRE: no try-catch — NotFoundError on expired conversation not handled
+  await openai.conversations.items.delete(itemId, { conversation_id: conversationId });
+}
+
+// @expect-clean
+async function conversationsItemsDeleteWithErrorHandling(itemId: string, conversationId: string) {
+  // SHOULD_NOT_FIRE: NotFoundError treated as conversation-expired signal
+  try {
+    await openai.conversations.items.delete(itemId, { conversation_id: conversationId });
+  } catch (err) {
+    if (err instanceof OpenAI.NotFoundError) {
+      // Conversation or item expired — rebuild conversation context
+      throw new Error('Conversation expired — rebuild context required');
+    }
+    throw err;
+  }
+}
+
+// ─── beta.chatkit.sessions.cancel ─────────────────────────────────────────────
+
+// @expect-violation: chatkit-sessions-cancel-no-error-handling
+async function chatkitSessionsCancelMissingErrorHandling(sessionId: string) {
+  // SHOULD_FIRE: no try-catch — NotFoundError on expired session not handled
+  await openai.beta.chatkit.sessions.cancel(sessionId);
+}
+
+// @expect-clean
+async function chatkitSessionsCancelWithErrorHandling(sessionId: string) {
+  // SHOULD_NOT_FIRE: NotFoundError treated as already-expired (acceptable)
+  try {
+    await openai.beta.chatkit.sessions.cancel(sessionId);
+  } catch (err) {
+    if (err instanceof OpenAI.NotFoundError) {
+      // Session already expired or cancelled — no action needed
+      return;
+    }
+    throw err;
+  }
+}

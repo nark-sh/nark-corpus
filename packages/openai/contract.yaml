@@ -2,7 +2,7 @@ package: openai
 semver: ">=4.0.0 <7.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # deepen-stream-1 pass 9
+last_verified: "2026-04-16"  # deepen-stream-1 pass 10
 status: production
 evidence_quality: confirmed
 # Depth pass 2026-04-16 (deepen-stream-2 pass 3):
@@ -29,7 +29,24 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.73  # 32 contracted / 44 total async-callable functions (20 intentionally omitted)
+coverage_score: 0.80  # 35 contracted / 44 total async-callable functions (20 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-1 pass 10):
+# Expanded coverage from 32→35 contracted functions (+3 this pass).
+# API surface unchanged: still 44 total async-callable functions.
+# Contracted this pass: files.content (2 postconditions),
+#   conversations.items.delete (1 postcondition), beta.chatkit.sessions.cancel (2 postconditions)
+# Key insights:
+#   files.content() throws BadRequestError (400) when called on a file still in 'uploaded' status
+#   — callers must waitForProcessing() first. Also throws NotFoundError (404) on deleted files.
+#   conversations.items.delete() is NOT idempotent — throws NotFoundError (404) on re-deletion
+#   or when conversation has expired; agent loops MUST handle this as a conversation rebuild signal.
+#   beta.chatkit.sessions.cancel() has a TOCTOU race: session may expire naturally (10min TTL)
+#   before explicit cancellation — cleanup flows must treat NotFoundError as acceptable.
+# Evidence:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
 # Depth pass 2026-04-16 (deepen-stream-1 pass 9):
 # Expanded coverage from 29→32 contracted functions (+3 this pass).
 # API surface updated: 41→44 (added files.waitForProcessing, beta.chatkit.sessions.create,
@@ -2587,6 +2604,185 @@ functions:
         evidence_quality: confirmed
 
   # ─────────────────────────────────────────────────────────────────────────────
+  # files.content()  (via openai.files.content())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # GET /files/{file_id}/content with Accept: application/binary.
+  # Returns raw binary Response object. Throws NotFoundError (404) for missing/deleted files,
+  # BadRequestError (400) when attempting to retrieve content of a file whose purpose
+  # doesn't support content retrieval (e.g. fine-tuning input files), and
+  # AuthenticationError (401) for invalid API keys.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: files.content
+    import_path: "openai"
+    description: >
+      Retrieves the binary contents of an uploaded file via openai.files.content(fileId).
+      Returns a native Response object with binary payload (Accept: application/binary).
+      Used in RAG pipelines to re-read uploaded documents, in fine-tuning workflows to
+      download training files, and in eval pipelines to access stored datasets.
+      Distinct from files.retrieve() which returns only metadata — this method returns
+      the actual file bytes.
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) confirmed from error.ts status→class mapping.
+      # files.content() is commonly called after files.waitForProcessing() to read the
+      # processed document. If the file was deleted between waitForProcessing() and
+      # content(), or if the fileId was never created in this org, throws NotFoundError.
+      - id: files-content-no-error-handling
+        condition: >
+          openai.files.content(fileId) called without try-catch.
+          The method makes a GET request to /files/{fileId}/content and can throw:
+          (1) NotFoundError (404) — file does not exist, was already deleted,
+              or belongs to a different project/organization;
+          (2) BadRequestError (400) — file purpose does not support content retrieval
+              (e.g., attempting to download a fine-tuning file that is not yet accessible);
+          (3) AuthenticationError (401) — invalid or revoked API key;
+          (4) PermissionDeniedError (403) — insufficient permissions to access the file;
+          (5) APIConnectionError — network failure during binary download (especially
+              for large files where connection drops mid-stream).
+        throws: "NotFoundError | BadRequestError | AuthenticationError | PermissionDeniedError | APIConnectionError"
+        required_handling: >
+          Caller MUST wrap files.content() in try-catch.
+          The returned Response object must also be error-checked before consuming:
+            try {
+              const response = await openai.files.content(fileId);
+              if (!response.ok) {
+                throw new Error(`File download failed: ${response.status}`);
+              }
+              const buffer = await response.arrayBuffer();
+              // process buffer...
+            } catch (err) {
+              if (err instanceof OpenAI.NotFoundError) {
+                // File deleted or ID invalid — log and skip
+              } else {
+                throw err;
+              }
+            }
+          For large files: implement timeout handling — APIConnectionTimeoutError
+          can fire for slow network connections downloading large binary files.
+          Do NOT buffer the entire Response in memory for large files — use streaming.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: Files uploaded for fine-tuning or certain API purposes have
+      # their content locked behind access restrictions. The purpose field on FileObject
+      # determines retrievability. Fine-tune files with purpose='fine-tune' are not
+      # always downloadable via content() after training is complete.
+      # Additionally: calling content() on a file that is still in 'uploaded' (not 'processed')
+      # status returns a 400 BadRequestError because the file is not ready for retrieval.
+      - id: files-content-not-ready
+        condition: >
+          openai.files.content(fileId) called on a file that is still in 'uploaded'
+          status (not yet processed by OpenAI infrastructure) or whose purpose does not
+          support content retrieval at the current API tier.
+          Returns BadRequestError (400). Common in pipeline flows where files.create()
+          is called and content() is called immediately without waiting for processing.
+          Also occurs when the file.purpose is 'fine-tune' and the file is only
+          accessible by the fine-tuning system, not by direct content retrieval.
+        throws: "BadRequestError (HTTP 400)"
+        required_handling: >
+          Caller MUST call files.waitForProcessing(fileId) before files.content(fileId)
+          for files that require processing (purpose='user_data', vision, etc.).
+          After waitForProcessing(), check status === 'processed' before calling content().
+          For fine-tuning files: do NOT call content() after the fine-tune job completes.
+          Use the fine_tuning.jobs API to retrieve training results instead.
+          Pattern:
+            const file = await openai.files.waitForProcessing(fileId);
+            if (file.status !== 'processed') {
+              throw new Error(`File not ready: ${file.status}`);
+            }
+            const content = await openai.files.content(fileId);
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # conversations.items.delete()  (via openai.conversations.items.delete())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # DELETE /conversations/{conversation_id}/items/{item_id}.
+  # Removes an item from a conversation. Throws NotFoundError (404) if the item or
+  # conversation does not exist or has already been deleted. Returns the parent Conversation.
+  # NOT idempotent — re-deleting an item throws rather than succeeding silently.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: conversations.items.delete
+    import_path: "openai"
+    description: >
+      Deletes an item from a conversation via openai.conversations.items.delete(itemId, { conversation_id }).
+      Returns the parent Conversation object after the item is removed.
+      Used in agent frameworks to trim conversation history, remove errored or stale
+      items, and implement context window management for long-running conversations.
+      NOT idempotent — deleting an already-deleted item throws NotFoundError (404).
+
+    postconditions:
+      # Evidence: NotFoundError (HTTP 404) confirmed from error.ts status→class mapping.
+      # In agent frameworks that maintain long-running conversations, item IDs may be
+      # cached. If a conversation expires or is garbage-collected on the OpenAI side,
+      # attempting to delete items throws NotFoundError for both the item and conversation.
+      - id: conversations-items-delete-no-error-handling
+        condition: >
+          openai.conversations.items.delete(itemId, params) called without try-catch.
+          Can throw:
+          (1) NotFoundError (404) — the itemId or conversation_id does not exist,
+              has already been deleted, or belongs to a different project/organization;
+          (2) UnprocessableEntityError (422) — malformed itemId or missing required params;
+          (3) RateLimitError (429) — conversation mutation rate limit exceeded (common in
+              agent loops that delete and re-add items rapidly);
+          (4) AuthenticationError (401) — invalid or revoked API key.
+          This is a critical operation in agent context window management flows —
+          an unhandled NotFoundError will crash the agent loop entirely.
+        throws: "NotFoundError | UnprocessableEntityError | RateLimitError | AuthenticationError"
+        required_handling: >
+          Caller MUST wrap conversations.items.delete() in try-catch.
+          In agent context management flows, treat NotFoundError as an expired
+          conversation signal — rebuild the conversation from scratch:
+            try {
+              await openai.conversations.items.delete(itemId, { conversation_id });
+            } catch (err) {
+              if (err instanceof OpenAI.NotFoundError) {
+                // Conversation or item expired — rebuild conversation context
+                await rebuildConversation();
+                return;
+              }
+              throw err;
+            }
+          For agent loops with high item mutation rates: implement exponential backoff
+          for RateLimitError. The conversation mutation rate limit is separate from
+          the completions rate limit.
+          Do NOT silently swallow all errors — only NotFoundError is safe to handle
+          as a recoverable condition; re-throw all others.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/conversations/items.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # beta.chatkit.sessions.create()  (via openai.beta.chatkit.sessions.create())
   # Evidence source: openai-node SDK source at
   #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts
@@ -2672,4 +2868,121 @@ functions:
           visibility: silent
           user_experience: authentication_failure
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # beta.chatkit.sessions.cancel()  (via openai.beta.chatkit.sessions.cancel())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # POST /chatkit/sessions/{session_id}/cancel with header 'OpenAI-Beta: chatkit_beta=v1'.
+  # Cancels an active ChatKit session and returns final session metadata.
+  # After cancellation, the session's client_secret is invalidated immediately.
+  # Throws NotFoundError (404) if the session has already expired or been cancelled.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: beta.chatkit.sessions.cancel
+    import_path: "openai"
+    description: >
+      Cancels an active ChatKit session via openai.beta.chatkit.sessions.cancel(sessionId).
+      Returns the final ChatSession metadata after cancellation.
+      After calling cancel(), the issued client_secret is immediately invalidated —
+      any in-flight frontend connections using that secret will fail.
+      Used in server-side cleanup flows to revoke frontend AI access: user logout,
+      session timeout, abuse detection, or premature session termination.
+      Typically called from server-side API routes that manage session lifecycle.
+
+    postconditions:
+      # Evidence: NotFoundError (404) confirmed from error.ts status→class mapping.
+      # cancel() is a POST to /chatkit/sessions/{sessionID}/cancel. If the session
+      # was already cancelled (either by a prior call or automatic expiry after
+      # expires_after seconds), the API returns 404 NotFoundError.
+      # This is the most common failure in cleanup flows where sessions expire
+      # before the server explicitly cancels them.
+      - id: chatkit-sessions-cancel-no-error-handling
+        condition: >
+          openai.beta.chatkit.sessions.cancel(sessionId) called without try-catch.
+          Can throw:
+          (1) NotFoundError (404) — session has already expired (TTL exceeded) or
+              was already cancelled by a prior call; session IDs that are stale or
+              belong to a different org/project also throw 404;
+          (2) AuthenticationError (401) — invalid or revoked API key;
+          (3) PermissionDeniedError (403) — insufficient permissions to cancel
+              this session (e.g., cross-organization session ID);
+          (4) UnprocessableEntityError (422) — malformed sessionId format.
+          In session cleanup flows (user logout, timeout handling), the most
+          likely scenario is that the session already expired — and an uncaught
+          NotFoundError will crash the cleanup handler.
+        throws: "NotFoundError | AuthenticationError | PermissionDeniedError | UnprocessableEntityError"
+        required_handling: >
+          Caller MUST wrap beta.chatkit.sessions.cancel() in try-catch.
+          In session cleanup and logout flows, NotFoundError should be treated as
+          an acceptable result — the session is already inactive:
+            try {
+              await openai.beta.chatkit.sessions.cancel(sessionId);
+            } catch (err) {
+              if (err instanceof OpenAI.NotFoundError) {
+                // Session already expired or cancelled — no action needed
+                return;
+              }
+              throw err;
+            }
+          Do NOT silently swallow all errors — only NotFoundError is safe to
+          treat as a no-op. Re-throw AuthenticationError and PermissionDeniedError
+          as these indicate infrastructure problems.
+          Important: cancellation is immediate and irreversible. Do NOT call cancel()
+          unless you intend to permanently invalidate the session's client_secret.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: sessions.cancel() is documented as: "Cancelling prevents new requests
+      # from using the issued client secret." (from sessions.ts JSDoc).
+      # In cleanup flows that race with expiry: if the session expires naturally
+      # (after expires_after seconds, default 600) at the same moment the server
+      # tries to cancel it, the cancel call throws NotFoundError.
+      # This creates a TOCTOU race: session may expire between the check and the cancel call.
+      - id: chatkit-sessions-cancel-already-expired
+        condition: >
+          beta.chatkit.sessions.cancel() is called after the session has naturally
+          expired (default TTL: 10 minutes). The session was never explicitly cancelled
+          but has timed out. This is a silent race condition in logout and cleanup
+          flows: the server assumes the session is active and tries to cancel it,
+          but the TTL has already elapsed. NotFoundError (404) is thrown.
+          Common in flows that store session IDs for later cleanup — by the time
+          cleanup runs, the session has long since expired.
+        throws: "NotFoundError (HTTP 404)"
+        required_handling: >
+          Track session creation timestamps and expires_after values alongside
+          the sessionId. In cleanup flows:
+            const sessionAgeMs = Date.now() - session.createdAt.getTime();
+            const sessionTtlMs = (session.expiresAfter ?? 600) * 1000;
+            if (sessionAgeMs < sessionTtlMs) {
+              // Only cancel if within TTL
+              try {
+                await openai.beta.chatkit.sessions.cancel(session.id);
+              } catch (err) {
+                if (!(err instanceof OpenAI.NotFoundError)) throw err;
+              }
+            }
+            // If already expired: nothing to cancel, proceed with local cleanup.
+          For high-throughput systems: use a soft expiry check (TTL minus 30 seconds
+          buffer) to account for clock skew between server and OpenAI infrastructure.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/beta/chatkit/sessions.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
         evidence_quality: confirmed
