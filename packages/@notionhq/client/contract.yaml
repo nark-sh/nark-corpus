@@ -7,9 +7,10 @@ package: "@notionhq/client"
 semver: ">=1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   class_names:
@@ -22,15 +23,22 @@ detection:
     - ".pages.create("
     - ".pages.retrieve("
     - ".pages.update("
+    - ".pages.move("
     - ".blocks.children.append("
     - ".blocks.children.list("
     - ".blocks.retrieve("
     - ".blocks.update("
+    - ".blocks.delete("
     - ".users.list("
     - ".users.retrieve("
+    - ".users.me("
     - ".search("
     - ".comments.create("
     - ".comments.list("
+    - ".fileUploads.create("
+    - ".fileUploads.send("
+    - ".fileUploads.complete("
+    - ".oauth.token("
 
 functions:
   - name: query
@@ -259,6 +267,755 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: retrieve
+    import_path: "@notionhq/client"
+    namespace: "databases"
+    description: >
+      Retrieves a Notion database object including its schema (properties), title, and metadata.
+      Used to inspect database structure before querying, or to validate that a database ID is
+      valid and accessible. Makes an outbound HTTPS GET request. Auto-retried on 500/503.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/retrieve-a-database
+      # SDK source: error hierarchy confirmed from errors.d.ts (APIResponseError, RequestTimeoutError)
+      - id: databases-retrieve-object-not-found
+        condition: >
+          databases.retrieve() called when database_id refers to a database that has been
+          deleted, trashed, or was never shared with the integration. Notion databases are
+          frequently shared/unshared by workspace members — code that cached a database_id
+          may encounter this error on subsequent calls.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+          SDK auto-retries rate_limited (429) but NOT object_not_found — this error is thrown
+          immediately.
+        required_handling: >
+          Caller MUST wrap notion.databases.retrieve() in try-catch. Handle ObjectNotFound
+          to avoid crashing when databases are deleted or unshared:
+            try {
+              const db = await notion.databases.retrieve({ database_id: id });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return null; // Database deleted or not shared with integration
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: databases-retrieve-restricted-resource
+        condition: >
+          databases.retrieve() called when the integration lacks read content capabilities,
+          or when the database exists but has not been explicitly shared with the integration
+          token. This is the most common error for new integrations.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.databases.retrieve() in try-catch. A 403 on retrieve() is
+          typically a setup error — the integration must be added to the database via the
+          Notion UI. Log clearly to help developers diagnose.
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: create
+    import_path: "@notionhq/client"
+    namespace: "databases"
+    description: >
+      Creates a new Notion database as a child of a page or at the workspace level. The database
+      includes a title, optional description, and property schema. Used in integrations that
+      programmatically provision Notion workspaces. Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-database
+      # SDK source: errors.d.ts, Client.d.ts
+      - id: databases-create-parent-not-found
+        condition: >
+          databases.create() called with a parent.page_id that does not exist or the
+          integration does not have access to it. The database can only be created under
+          pages the integration can access.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.databases.create() in try-catch. Database provisioning
+          workflows fail if the parent page is deleted or the integration lacks access:
+            try {
+              const db = await notion.databases.create({ parent: { page_id }, ... });
+            } catch (error) {
+              if (isNotionClientError(error)) {
+                console.error('Failed to create Notion database:', error.code);
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: databases-create-missing-capabilities
+        condition: >
+          databases.create() called when the integration lacks "insert content" capabilities.
+          This is a capability setting in the integration configuration, distinct from
+          page-level permissions. Integration appears functional (auth works) but cannot create.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.databases.create() in try-catch. Log clearly — a 403 on
+          create() usually indicates a missing capability in the integration configuration,
+          not a data error.
+        sources:
+          - "https://developers.notion.com/reference/create-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: databases-create-validation-error
+        condition: >
+          databases.create() called with malformed request body — invalid property type names,
+          invalid parent specification, title/description arrays exceeding 100 items,
+          or parent is not a page or wiki database.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400).
+        required_handling: >
+          Caller MUST wrap notion.databases.create() in try-catch. Validate property schema
+          and parent type before calling to reduce 400 errors at runtime.
+        sources:
+          - "https://developers.notion.com/reference/create-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: update
+    import_path: "@notionhq/client"
+    namespace: "databases"
+    description: >
+      Updates a Notion database's title, description, or property schema. Used to rename
+      properties, add new columns, archive properties, or update database metadata. Makes
+      an outbound HTTPS PATCH request. NOT auto-retried on 500/503 (PATCH is not idempotent).
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/update-a-database
+      # SDK source: errors.d.ts, Client.d.ts
+      - id: databases-update-schema-too-large
+        condition: >
+          databases.update() called on a database whose schema exceeds 50KB after the update
+          is applied. The error message identifies the largest property by name, ID, and byte size.
+          Databases with many properties or long property names hit this limit when adding new columns.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400)
+          with a message identifying the oversized property.
+        required_handling: >
+          Caller MUST wrap notion.databases.update() in try-catch. Monitor schema size when
+          programmatically adding properties. On ValidationError, read the error message to
+          identify the largest property and consider archiving unused properties:
+            try {
+              await notion.databases.update({ database_id, properties: newProps });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ValidationError) {
+                console.error('Schema too large — reduce properties:', error.message);
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: databases-update-not-retried-on-server-error
+        condition: >
+          databases.update() (PATCH) receives 500 internal_server_error or 503 service_unavailable.
+          PATCH is NOT idempotent so the SDK does NOT auto-retry it. The caller receives the
+          error after a single attempt. The database schema update may be partially applied.
+        throws: >
+          APIResponseError with code InternalServerError (500) or ServiceUnavailable (503).
+          Unlike GET/DELETE, these are NOT auto-retried for PATCH requests.
+        required_handling: >
+          Caller MUST wrap notion.databases.update() in try-catch. On 500/503 errors,
+          re-read the database to determine if the update was applied before retrying:
+            try {
+              await notion.databases.update({ database_id, properties: updates });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error)) {
+                // Re-read to check if partial update was applied
+                const current = await notion.databases.retrieve({ database_id });
+                // Compare current.properties to expected state
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-database"
+          - "https://developers.notion.com/reference/errors"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: retrieve
+    import_path: "@notionhq/client"
+    namespace: "pages"
+    description: >
+      Retrieves a Notion page object including its properties, metadata, and archived/trashed
+      state. The response includes an in_trash boolean — trashed pages return 200 with
+      in_trash: true, not 404. Permanently deleted pages return 404.
+      Makes an outbound HTTPS GET request. Auto-retried on 500/503.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/retrieve-a-page
+      # SDK source: errors.d.ts, Client.d.ts
+      - id: pages-retrieve-object-not-found
+        condition: >
+          pages.retrieve() called when page_id refers to a permanently deleted page or a page
+          the integration cannot access. Note: trashed (soft-deleted) pages return 200 with
+          in_trash: true — callers that don't check in_trash may process stale/archived content.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404)
+          for permanently deleted pages or inaccessible pages.
+        required_handling: >
+          Caller MUST wrap notion.pages.retrieve() in try-catch. Also check page.in_trash
+          in the response to detect soft-deleted pages:
+            try {
+              const page = await notion.pages.retrieve({ page_id: id });
+              if (page.object === 'page' && 'in_trash' in page && page.in_trash) {
+                return null; // Page is trashed
+              }
+              return page;
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return null; // Page permanently deleted or inaccessible
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-page"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: pages-retrieve-missing-capabilities
+        condition: >
+          pages.retrieve() called when the integration lacks read content capabilities,
+          or when the page exists but was not shared with the integration token.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.pages.retrieve() in try-catch.
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-page"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: create
+    import_path: "@notionhq/client"
+    namespace: "comments"
+    description: >
+      Creates a new comment on a Notion page, block, or existing discussion thread.
+      Requires the "insert comment" capability on the integration. Each comment must contain
+      exactly one of rich_text or markdown, and one of parent or discussion_id.
+      Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-comment
+      # SDK source: errors.d.ts, Client.d.ts
+      - id: comments-create-missing-capabilities
+        condition: >
+          comments.create() called when the integration lacks "insert comment" capabilities.
+          This is a capability flag in the integration settings, not a page-level permission.
+          Callers receive 403 even when the integration has full read/write content access.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+          Distinct from a page permission 403 — this means the integration was not granted
+          comment capabilities during setup.
+        required_handling: >
+          Caller MUST wrap notion.comments.create() in try-catch. A 403 on comments.create()
+          typically indicates a missing "insert comment" capability in the integration settings,
+          not a page access error:
+            try {
+              await notion.comments.create({ parent: { page_id }, rich_text: [...] });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.RestrictedResource) {
+                console.error('Integration lacks insert comment capability');
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: comments-create-parent-not-found
+        condition: >
+          comments.create() called when the referenced parent page, block, or discussion_id
+          no longer exists or is not accessible to the integration. Async workflows that post
+          comments after a delay are vulnerable to this race condition.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.comments.create() in try-catch. In async/queued workflows,
+          check that the parent page still exists before posting the comment.
+        sources:
+          - "https://developers.notion.com/reference/create-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: comments-create-validation-error
+        condition: >
+          comments.create() called with invalid body: missing both rich_text and markdown,
+          providing both simultaneously, rich_text array exceeds 100 items, attachments
+          array exceeds 3 items, or markdown contains unsupported block-level elements.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400).
+        required_handling: >
+          Caller MUST wrap notion.comments.create() in try-catch. Validate that exactly one
+          of rich_text/markdown is provided and that array sizes are within limits.
+        sources:
+          - "https://developers.notion.com/reference/create-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: create
+    import_path: "@notionhq/client"
+    namespace: "fileUploads"
+    description: >
+      Initiates a file upload to Notion. For files ≤20MB use single-part mode; for larger files
+      use multi-part mode with number_of_parts. Returns a file upload object with an id that
+      MUST be used for subsequent fileUploads.send() and fileUploads.complete() calls.
+      The upload is NOT attached to any page/block until explicitly referenced in a block.
+      Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-file-upload
+      # SDK source: errors.d.ts, Client.d.ts (SendFileUploadParameters, CompleteFileUploadParameters)
+      - id: file-uploads-create-id-not-used
+        condition: >
+          fileUploads.create() succeeds but the caller does not use the returned id in
+          a subsequent fileUploads.send() call to upload file data, followed by
+          fileUploads.complete() to finalize. The upload stays in "pending" state.
+        throws: >
+          No error thrown from create() itself, but downstream callers fail silently —
+          the file is never accessible in Notion and storage quota is consumed.
+        required_handling: >
+          The returned id from fileUploads.create() MUST be passed to fileUploads.send()
+          then fileUploads.complete(). All three steps must be wrapped in try-catch:
+            try {
+              const upload = await notion.fileUploads.create({ filename, content_type });
+              await notion.fileUploads.send({ file_upload_id: upload.id, file: { data, filename } });
+              await notion.fileUploads.complete({ file_upload_id: upload.id });
+            } catch (error) {
+              console.error('File upload failed:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-file-upload"
+          - "https://developers.notion.com/reference/errors"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: file-uploads-create-filename-too-long
+        condition: >
+          fileUploads.create() called with a filename string exceeding 900 bytes. Filenames
+          with non-ASCII characters (CJK, emoji, accented chars) can hit this limit with
+          fewer visible characters than expected due to multi-byte UTF-8 encoding.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400).
+        required_handling: >
+          Caller MUST wrap notion.fileUploads.create() in try-catch. Truncate or sanitize
+          user-provided filenames to stay within the 900-byte limit before calling.
+        sources:
+          - "https://developers.notion.com/reference/create-a-file-upload"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: send
+    import_path: "@notionhq/client"
+    namespace: "fileUploads"
+    description: >
+      Uploads the actual file data for a file upload initiated with fileUploads.create().
+      For multi-part uploads, call once per part with the part_number parameter.
+      Uses multipart/form-data encoding. Must be called after create() and before complete().
+      Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-file-upload (send section)
+      # SDK source: SendFileUploadParameters in api-endpoints.d.ts
+      - id: file-uploads-send-wrong-state
+        condition: >
+          fileUploads.send() called with a file_upload_id that refers to an already-completed
+          or expired upload, or when parts are sent out of order. File uploads cannot receive
+          new parts after being completed.
+        throws: >
+          APIResponseError with code ConflictError (409 conflict_error) or
+          ObjectNotFound (404 object_not_found) depending on the specific invalid state.
+        required_handling: >
+          Caller MUST wrap notion.fileUploads.send() in try-catch. In retry logic, never
+          call send() after complete() has already succeeded. Track upload state explicitly:
+            try {
+              await notion.fileUploads.send({ file_upload_id: id, file: { data, filename } });
+            } catch (error) {
+              console.error('File send failed — check upload state before retrying:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-file-upload"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: file-uploads-send-no-try-catch
+        condition: >
+          fileUploads.send() called without try-catch when uploading binary data via
+          multipart/form-data. Large files approaching the 60s timeout will throw
+          RequestTimeoutError. Any network interruption throws UnknownHTTPResponseError.
+          Missing try-catch leaves the upload in broken intermediate state with no cleanup.
+        throws: >
+          APIResponseError for API errors; RequestTimeoutError for large files near 60s timeout;
+          UnknownHTTPResponseError for unexpected HTTP responses.
+        required_handling: >
+          Caller MUST wrap notion.fileUploads.send() in try-catch. On failure after create()
+          has succeeded, the entire flow must restart from create():
+            try {
+              await notion.fileUploads.send({ file_upload_id: id, file: { data, filename } });
+            } catch (error) {
+              // The upload is now in an indeterminate state. Must restart from create().
+              console.error('File send failed — restart upload flow:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-file-upload"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: complete
+    import_path: "@notionhq/client"
+    namespace: "fileUploads"
+    description: >
+      Finalizes a file upload after all parts have been sent via fileUploads.send().
+      For single-part uploads, called after the single send(). For multi-part uploads,
+      called after all N parts have been sent. Once complete, the file upload id can be
+      referenced in page/block content. Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-file-upload
+      # SDK source: CompleteFileUploadParameters in Client.d.ts
+      - id: file-uploads-complete-no-try-catch
+        condition: >
+          fileUploads.complete() called without try-catch. Can throw APIResponseError
+          (including conflict_error if the upload was already completed or parts are missing),
+          or RequestTimeoutError. Missing try-catch leaves the upload permanently incomplete
+          after file data was already sent.
+        throws: >
+          APIResponseError with code ConflictError (409) if upload already completed or parts
+          are missing; RequestTimeoutError if the completion request times out.
+        required_handling: >
+          Caller MUST wrap notion.fileUploads.complete() in try-catch. Unlike send(), a
+          failure on complete() means the file data was already fully transmitted but the
+          upload is not finalized. The entire flow (create + send + complete) must restart:
+            try {
+              const completed = await notion.fileUploads.complete({ file_upload_id: id });
+              return completed.id; // Now can be referenced in Notion blocks
+            } catch (error) {
+              console.error('Upload finalization failed — restart full flow:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-file-upload"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: token
+    import_path: "@notionhq/client"
+    namespace: "oauth"
+    description: >
+      Exchanges an OAuth authorization code for an access token during the Notion OAuth
+      callback flow. Requires client_id and client_secret passed in the args. Uses HTTP
+      Basic auth. Returns access_token, workspace_id, workspace_name, and bot_id.
+      Authorization codes are single-use and expire quickly. Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-token
+      # SDK source: OauthTokenParameters, OauthTokenResponse in api-endpoints.d.ts
+      - id: oauth-token-invalid-grant
+        condition: >
+          oauth.token() called when the authorization code has expired, was already used,
+          or does not match the redirect_uri. Authorization codes are single-use and expire
+          quickly. Any network error or redirect during the OAuth callback leaves the code unusable.
+        throws: >
+          APIResponseError with code InvalidRequest (APIErrorCode.InvalidRequest, HTTP 400)
+          or an OAuth error body with "invalid_grant" per RFC 6749.
+        required_handling: >
+          Caller MUST wrap notion.oauth.token() in try-catch. OAuth callback handlers that
+          don't catch errors return 500 to users who cannot retry. On invalid_grant, redirect
+          the user back to the OAuth authorization URL:
+            try {
+              const token = await notion.oauth.token({ grant_type: 'authorization_code', code, ...creds });
+              await saveAccessToken(token.access_token);
+            } catch (error) {
+              // Redirect user to restart OAuth flow — the code cannot be reused
+              console.error('OAuth token exchange failed:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-token"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: oauth-token-invalid-client
+        condition: >
+          oauth.token() called when client_id or client_secret are wrong, missing, or have
+          been rotated. The token endpoint uses HTTP Basic auth with client credentials —
+          misconfigured env vars (wrong secret, extra whitespace, old rotated secret)
+          cause all OAuth flows to fail.
+        throws: >
+          APIResponseError with code Unauthorized (APIErrorCode.Unauthorized, HTTP 401).
+        required_handling: >
+          Caller MUST wrap notion.oauth.token() in try-catch. A 401 on oauth.token() is
+          a configuration error — check NOTION_CLIENT_ID and NOTION_CLIENT_SECRET env vars:
+            try {
+              const token = await notion.oauth.token({ ..., client_id: env.CLIENT_ID, client_secret: env.CLIENT_SECRET });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.Unauthorized) {
+                console.error('Invalid Notion OAuth client credentials — check env vars');
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-token"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: retrieve
+    import_path: "@notionhq/client"
+    namespace: "blocks"
+    description: >
+      Retrieves a single block object by its ID, including its type and type-specific content.
+      Used to fetch a specific block (paragraph, heading, to-do, etc.) without listing all
+      children. Makes an outbound HTTPS GET request. Auto-retried on 500/503.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/retrieve-a-block
+      # SDK source: errors.d.ts
+      - id: blocks-retrieve-object-not-found
+        condition: >
+          blocks.retrieve() called when block_id refers to a block that has been deleted or
+          is not accessible to the integration. Deleted and access-restricted blocks both
+          return 404, making them indistinguishable at the API level.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.blocks.retrieve() in try-catch. When traversing page
+          block trees by cached IDs, handle 404 gracefully:
+            try {
+              const block = await notion.blocks.retrieve({ block_id: id });
+              return block;
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return null; // Block deleted or inaccessible
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: blocks-retrieve-missing-capabilities
+        condition: >
+          blocks.retrieve() called when the integration lacks read content capabilities.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.blocks.retrieve() in try-catch.
+        sources:
+          - "https://developers.notion.com/reference/retrieve-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: delete
+    import_path: "@notionhq/client"
+    namespace: "blocks"
+    description: >
+      Soft-deletes a block, moving it to the Notion trash. The block is archived (in_trash: true)
+      rather than permanently removed. Requires update content capabilities on the integration.
+      Makes an outbound HTTPS DELETE request. Auto-retried on 500/503 (DELETE is idempotent).
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/delete-a-block
+      # SDK source: errors.d.ts, Client.d.ts
+      - id: blocks-delete-object-not-found
+        condition: >
+          blocks.delete() called when block_id does not exist, the integration cannot access it,
+          or the block was already deleted (trashed blocks also return 404 on delete).
+          Cleanup jobs that retry deletions must treat 404 as a success condition.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.blocks.delete() in try-catch. In cleanup flows,
+          treat ObjectNotFound as success (already deleted):
+            try {
+              await notion.blocks.delete({ block_id: id });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return; // Already deleted — treat as success
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/delete-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: blocks-delete-missing-capabilities
+        condition: >
+          blocks.delete() called when the integration lacks update content capabilities.
+          Read-only integrations cannot delete blocks even when they can read them.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.blocks.delete() in try-catch. A 403 on delete() indicates
+          missing update content capability in the integration settings.
+        sources:
+          - "https://developers.notion.com/reference/delete-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - "All Client methods make HTTPS calls to the Notion API — all require try-catch"
   - "SDK auto-retries: rate_limited (429) for all methods; 500/503 for GET/DELETE only"
@@ -269,3 +1026,6 @@ notes:
   - "object_not_found (404) is extremely common — databases/pages get deleted or unshared"
   - "pages.create / pages.update / blocks.children.append are PATCH/POST — NOT auto-retried on 500/503"
   - "iteratePaginatedAPI() and collectPaginatedAPI() helpers still throw on API errors"
+  - "fileUploads is a 3-step flow: create() → send() → complete() — errors at any step require full restart"
+  - "oauth.token() authorization codes are single-use and expire quickly — always catch errors in OAuth callback handlers"
+  - "databases.update() PATCH is NOT auto-retried on 500/503 — schema may be partially applied on server error"

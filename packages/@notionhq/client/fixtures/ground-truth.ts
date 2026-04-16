@@ -8,10 +8,21 @@
  * Key contract rules:
  *   - All Client methods make HTTPS calls — all require try-catch
  *   - databases.query()         → SHOULD_FIRE if no try-catch (postcondition: api-error)
+ *   - databases.retrieve()      → SHOULD_FIRE if no try-catch (postcondition: databases-retrieve-object-not-found)
+ *   - databases.create()        → SHOULD_FIRE if no try-catch (postcondition: databases-create-parent-not-found)
+ *   - databases.update()        → SHOULD_FIRE if no try-catch (postcondition: databases-update-schema-too-large)
  *   - pages.create()            → SHOULD_FIRE if no try-catch (postcondition: api-error)
  *   - pages.update()            → SHOULD_FIRE if no try-catch (postcondition: api-error)
+ *   - pages.retrieve()          → SHOULD_FIRE if no try-catch (postcondition: pages-retrieve-object-not-found)
  *   - blocks.children.append()  → SHOULD_FIRE if no try-catch (postcondition: api-error)
+ *   - blocks.retrieve()         → SHOULD_FIRE if no try-catch (postcondition: blocks-retrieve-object-not-found)
+ *   - blocks.delete()           → SHOULD_FIRE if no try-catch (postcondition: blocks-delete-object-not-found)
  *   - search()                  → SHOULD_FIRE if no try-catch (postcondition: api-error)
+ *   - comments.create()         → SHOULD_FIRE if no try-catch (postcondition: comments-create-missing-capabilities)
+ *   - fileUploads.create()      → SHOULD_FIRE if no try-catch (postcondition: file-uploads-create-id-not-used)
+ *   - fileUploads.send()        → SHOULD_FIRE if no try-catch (postcondition: file-uploads-send-no-try-catch)
+ *   - fileUploads.complete()    → SHOULD_FIRE if no try-catch (postcondition: file-uploads-complete-no-try-catch)
+ *   - oauth.token()             → SHOULD_FIRE if no try-catch (postcondition: oauth-token-invalid-grant)
  *   - Any of the above inside try-catch → SHOULD_NOT_FIRE
  *   - .catch() chain → SHOULD_NOT_FIRE
  *   - try-finally without catch → SHOULD_FIRE
@@ -31,6 +42,24 @@
  *   - Section 12: search() in try-catch → SHOULD_NOT_FIRE
  *   - Section 13: class field — databases.query() bare → SHOULD_FIRE
  *   - Section 14: class field — databases.query() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 15: databases.retrieve() bare → SHOULD_FIRE
+ *   - Section 16: databases.retrieve() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 17: databases.create() bare → SHOULD_FIRE
+ *   - Section 18: databases.create() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 19: databases.update() bare → SHOULD_FIRE
+ *   - Section 20: databases.update() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 21: pages.retrieve() bare → SHOULD_FIRE
+ *   - Section 22: pages.retrieve() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 23: blocks.retrieve() bare → SHOULD_FIRE
+ *   - Section 24: blocks.retrieve() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 25: blocks.delete() bare → SHOULD_FIRE
+ *   - Section 26: blocks.delete() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 27: comments.create() bare → SHOULD_FIRE
+ *   - Section 28: comments.create() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 29: fileUploads.create() bare → SHOULD_FIRE
+ *   - Section 30: fileUploads multi-step all wrapped → SHOULD_NOT_FIRE
+ *   - Section 31: oauth.token() bare → SHOULD_FIRE
+ *   - Section 32: oauth.token() in try-catch → SHOULD_NOT_FIRE
  */
 
 import { Client } from '@notionhq/client';
@@ -304,5 +333,292 @@ class SafeNotionDataSource {
       console.error('Fetch failed:', error);
       throw error;
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. databases.retrieve() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareRetrieveDatabaseNoCatch(databaseId: string) {
+  // @expect-violation: databases-retrieve-object-not-found
+  // SHOULD_FIRE: databases-retrieve-object-not-found — databases.retrieve() throws on 404/403, no try-catch
+  const db = await notion.databases.retrieve({ database_id: databaseId });
+  return db;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. databases.retrieve() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function retrieveDatabaseWithTryCatch(databaseId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: databases-retrieve-object-not-found — inside try-catch
+    const db = await notion.databases.retrieve({ database_id: databaseId });
+    return db;
+  } catch (error) {
+    console.error('Database retrieve failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. databases.create() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateDatabaseNoCatch(pageId: string) {
+  // @expect-violation: databases-create-parent-not-found
+  // @expect-violation: databases-create-missing-capabilities
+  // SHOULD_FIRE: databases-create-parent-not-found — databases.create() throws on parent not found, no try-catch
+  const db = await notion.databases.create({
+    parent: { type: 'page_id', page_id: pageId },
+    title: [{ type: 'text', text: { content: 'New Database' } }],
+    properties: {
+      Name: { title: {} },
+    },
+  });
+  return db.id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. databases.create() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createDatabaseWithTryCatch(pageId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: databases-create-parent-not-found — inside try-catch
+    const db = await notion.databases.create({
+      parent: { type: 'page_id', page_id: pageId },
+      title: [{ type: 'text', text: { content: 'New Database' } }],
+      properties: {
+        Name: { title: {} },
+      },
+    });
+    return db.id;
+  } catch (error) {
+    console.error('Database create failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. databases.update() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareUpdateDatabaseNoCatch(databaseId: string) {
+  // @expect-violation: databases-update-schema-too-large
+  // @expect-violation: databases-update-not-retried-on-server-error
+  // SHOULD_FIRE: databases-update-schema-too-large — databases.update() PATCH not auto-retried, no try-catch
+  await notion.databases.update({
+    database_id: databaseId,
+    title: [{ type: 'text', text: { content: 'Updated Title' } }],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. databases.update() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function updateDatabaseWithTryCatch(databaseId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: databases-update-schema-too-large — inside try-catch
+    await notion.databases.update({
+      database_id: databaseId,
+      title: [{ type: 'text', text: { content: 'Updated Title' } }],
+    });
+  } catch (error) {
+    console.error('Database update failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. pages.retrieve() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareRetrievePageNoCatch(pageId: string) {
+  // @expect-violation: pages-retrieve-object-not-found
+  // SHOULD_FIRE: pages-retrieve-object-not-found — pages.retrieve() throws 404/403, no try-catch
+  const page = await notion.pages.retrieve({ page_id: pageId });
+  return page;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. pages.retrieve() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function retrievePageWithTryCatch(pageId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: pages-retrieve-object-not-found — inside try-catch
+    const page = await notion.pages.retrieve({ page_id: pageId });
+    return page;
+  } catch (error) {
+    console.error('Page retrieve failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. blocks.retrieve() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareRetrieveBlockNoCatch(blockId: string) {
+  // @expect-violation: blocks-retrieve-object-not-found
+  // SHOULD_FIRE: blocks-retrieve-object-not-found — blocks.retrieve() throws 404/403, no try-catch
+  const block = await notion.blocks.retrieve({ block_id: blockId });
+  return block;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. blocks.retrieve() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function retrieveBlockWithTryCatch(blockId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: blocks-retrieve-object-not-found — inside try-catch
+    const block = await notion.blocks.retrieve({ block_id: blockId });
+    return block;
+  } catch (error) {
+    console.error('Block retrieve failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. blocks.delete() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareDeleteBlockNoCatch(blockId: string) {
+  // @expect-violation: blocks-delete-object-not-found
+  // SHOULD_FIRE: blocks-delete-object-not-found — blocks.delete() throws 404/403, no try-catch
+  await notion.blocks.delete({ block_id: blockId });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. blocks.delete() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteBlockWithTryCatch(blockId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: blocks-delete-object-not-found — inside try-catch
+    await notion.blocks.delete({ block_id: blockId });
+  } catch (error) {
+    // 404 should be treated as success in cleanup operations
+    console.error('Block delete failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. comments.create() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateCommentNoCatch(pageId: string) {
+  // @expect-violation: comments-create-missing-capabilities
+  // @expect-violation: comments-create-parent-not-found
+  // SHOULD_FIRE: comments-create-missing-capabilities — comments.create() throws on missing capabilities, no try-catch
+  await notion.comments.create({
+    parent: { page_id: pageId },
+    rich_text: [{ type: 'text', text: { content: 'Review complete' } }],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. comments.create() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createCommentWithTryCatch(pageId: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: comments-create-missing-capabilities — inside try-catch
+    await notion.comments.create({
+      parent: { page_id: pageId },
+      rich_text: [{ type: 'text', text: { content: 'Review complete' } }],
+    });
+  } catch (error) {
+    console.error('Comment create failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. fileUploads.create() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateFileUploadNoCatch(filename: string) {
+  // Note: file-uploads-create-id-not-used (response-value check) requires scanner upgrade to detect
+  // SHOULD_FIRE: file-uploads-create-filename-too-long — fileUploads.create() throws on filename > 900 bytes, no try-catch
+  const upload = await notion.fileUploads.create({ filename, content_type: 'image/png' });
+  return upload.id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. fileUploads multi-step flow — all wrapped → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function uploadFileWithFullErrorHandling(filename: string, fileData: Blob) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: all three steps wrapped in try-catch
+  let uploadId: string | undefined;
+  try {
+    const upload = await notion.fileUploads.create({ filename, content_type: 'image/png' });
+    uploadId = upload.id;
+
+    await notion.fileUploads.send({
+      file_upload_id: uploadId,
+      file: { filename, data: fileData },
+    });
+
+    const completed = await notion.fileUploads.complete({ file_upload_id: uploadId });
+    return completed.id;
+  } catch (error) {
+    console.error('File upload failed at step:', uploadId ? 'send/complete' : 'create', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. oauth.token() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareOAuthTokenNoCatch(code: string) {
+  // @expect-violation: oauth-token-invalid-grant
+  // @expect-violation: oauth-token-invalid-client
+  // SHOULD_FIRE: oauth-token-invalid-grant — oauth.token() throws on expired/invalid code, no try-catch
+  const tokenResponse = await notion.oauth.token({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: 'https://example.com/oauth/callback',
+    client_id: process.env.NOTION_CLIENT_ID!,
+    client_secret: process.env.NOTION_CLIENT_SECRET!,
+  });
+  return tokenResponse.access_token;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 32. oauth.token() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function oauthTokenWithTryCatch(code: string) {
+  try {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: oauth-token-invalid-grant — inside try-catch
+    const tokenResponse = await notion.oauth.token({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: 'https://example.com/oauth/callback',
+      client_id: process.env.NOTION_CLIENT_ID!,
+      client_secret: process.env.NOTION_CLIENT_SECRET!,
+    });
+    return tokenResponse.access_token;
+  } catch (error) {
+    console.error('OAuth token exchange failed:', error);
+    throw error;
   }
 }
