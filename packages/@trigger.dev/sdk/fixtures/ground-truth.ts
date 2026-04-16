@@ -23,8 +23,14 @@
  *   resume-no-try-catch                (queues.resume)
  *   createtoken-no-try-catch           (wait.createToken)
  *   completetoken-no-try-catch         (wait.completeToken)
+ *   createpublictoken-no-try-catch     (auth.createPublicToken)
+ *   createtriggerpublictoken-no-try-catch (auth.createTriggerPublicToken)
+ *   createbatchtriggerpublictoken-no-try-catch (auth.createBatchTriggerPublicToken)
+ *   tags-add-outside-task-context      (tags.add outside task run)
+ *   tags-add-no-try-catch              (tags.add inside task without try-catch)
+ *   metadata-flush-silent-failure      (metadata.flush swallows errors — no detector possible)
  */
-import { tasks, schedules, runs, queues, wait, SubtaskUnwrapError, NotFoundError } from "@trigger.dev/sdk";
+import { tasks, schedules, runs, queues, wait, auth, tags, metadata, SubtaskUnwrapError, NotFoundError } from "@trigger.dev/sdk";
 
 // ──────────────────────────────────────────────────
 // 1. tasks.trigger — no try/catch (SHOULD_FIRE)
@@ -381,4 +387,126 @@ async function gt_completeToken_safe(tokenId: string) {
       throw err;
     }
   }
+}
+
+// ──────────────────────────────────────────────────
+// 16. auth.createPublicToken — no try/catch (SHOULD_FIRE)
+// Added: deepen-stream-1 pass 6 (2026-04-16)
+// ──────────────────────────────────────────────────
+
+async function gt_createPublicToken_missing(runId: string) {
+  // SHOULD_FIRE: createpublictoken-no-try-catch — auth.createPublicToken without try-catch
+  const token = await auth.createPublicToken({
+    scopes: { read: { runs: [runId] } },
+    expirationTime: "15m",
+  });
+  return token;
+}
+
+async function gt_createPublicToken_safe(runId: string) {
+  try {
+    // SHOULD_NOT_FIRE: auth.createPublicToken has try-catch
+    const token = await auth.createPublicToken({
+      scopes: { read: { runs: [runId] } },
+      expirationTime: "15m",
+    });
+    return token;
+  } catch (err) {
+    console.error("Failed to create public token:", err);
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 17. auth.createTriggerPublicToken — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createTriggerPublicToken_missing() {
+  // SHOULD_FIRE: createtriggerpublictoken-no-try-catch — no try-catch
+  const token = await auth.createTriggerPublicToken("send-welcome-email");
+  return token;
+}
+
+async function gt_createTriggerPublicToken_safe() {
+  try {
+    // SHOULD_NOT_FIRE: auth.createTriggerPublicToken has try-catch
+    const token = await auth.createTriggerPublicToken("send-welcome-email");
+    return token;
+  } catch (err) {
+    console.error("Failed to create trigger token:", err);
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 18. auth.createBatchTriggerPublicToken — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createBatchTriggerPublicToken_missing() {
+  // SHOULD_FIRE: createbatchtriggerpublictoken-no-try-catch — no try-catch
+  const token = await auth.createBatchTriggerPublicToken("process-items");
+  return token;
+}
+
+async function gt_createBatchTriggerPublicToken_safe() {
+  try {
+    // SHOULD_NOT_FIRE: auth.createBatchTriggerPublicToken has try-catch
+    const token = await auth.createBatchTriggerPublicToken("process-items");
+    return token;
+  } catch (err) {
+    console.error("Failed to create batch trigger token:", err);
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 19. tags.add — outside task context (SHOULD_FIRE)
+// Note: tags-add-outside-task-context fires at RUNTIME (taskContext.ctx is null).
+// The scanner detects tags.add() called in non-task async functions (route handlers, etc.)
+// ──────────────────────────────────────────────────
+
+// SHOULD_FIRE: tags-add-outside-task-context — tags.add called from a route handler
+// (not inside a task run() function)
+async function gt_tagsAdd_outsideTaskContext_missing(userId: string) {
+  // SHOULD_FIRE: tags-add-outside-task-context — tags.add outside task
+  await tags.add([`user:${userId}`, "processing"]);
+}
+
+// tags.add used correctly inside a task — annotated as SHOULD_NOT_FIRE
+// (cannot easily represent task context in fixture — shown for documentation)
+async function gt_tagsAdd_insideTask_safe(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: tags.add inside task with try-catch
+    await tags.add([`user:${userId}`, "processing"]);
+  } catch (err) {
+    console.warn("Failed to add tags:", err);
+    // Non-critical — continue task execution
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 20. metadata.flush — silent failure (SHOULD_FIRE annotation)
+// Note: metadata-flush-silent-failure cannot be detected by a try-catch scanner
+// because flush() NEVER throws. The scanner concern documents that this needs
+// a different detection strategy (pattern: flush() followed by child task trigger
+// without verifying flush succeeded via metadata.current()).
+// ──────────────────────────────────────────────────
+
+async function gt_metadataFlush_silentFailure() {
+  // SHOULD_FIRE: metadata-flush-silent-failure — flush swallows errors silently
+  // Caller assumes flush succeeded, but there is no way to verify
+  metadata.set("progress", 0.5);
+  await metadata.flush(); // Silently fails on network error — no exception raised
+  // Child task triggered next may see stale metadata
+  await tasks.trigger("process-next-step", { step: "post-flush" });
+}
+
+async function gt_metadataFlush_withLogging() {
+  // SHOULD_NOT_FIRE: acknowledged pattern — logging current state before flush
+  // (best practice when metadata is critical)
+  metadata.set("progress", 0.5);
+  const current = metadata.current();
+  console.log("Flushing metadata:", current); // Log before flush for audit trail
+  await metadata.flush();
+  // Note: still no guarantee flush succeeded, but at least state is logged
 }

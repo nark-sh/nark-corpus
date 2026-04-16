@@ -18,7 +18,23 @@ evidence_quality: confirmed
 #   https://trigger.dev/docs/management/runs/replay
 #   https://trigger.dev/docs/management/queues/pause
 #   https://trigger.dev/docs/triggering
-coverage_score: 0.73  # 16 contracted / 22 ICP-relevant async-callable functions (28 intentionally omitted)
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 6):
+# API surface: 28 total ICP-relevant (22 prior + added auth.* and tags.add and metadata.flush)
+# Contracted before: 16  Contracted after: 22 (+6 this pass)
+# Omitted: 28 (unchanged — no new intentional omissions)
+# Coverage: 22/28 = 0.79
+# New error types: ApiClientMissingError (missing TRIGGER_SECRET_KEY — synchronous throw),
+#   metadata.flush silent failure (catches all errors, never re-throws)
+# Evidence URLs actually fetched:
+#   https://trigger.dev/docs/frontend/overview
+#   https://trigger.dev/docs/tags
+#   https://trigger.dev/docs/runs/metadata
+# Source-inspected:
+#   @trigger.dev/sdk/dist/commonjs/v3/auth.js — createPublicToken, createTriggerPublicToken, createBatchTriggerPublicToken
+#   @trigger.dev/sdk/dist/commonjs/v3/tags.js — addTags() context check
+#   @trigger.dev/core/dist/commonjs/v3/runMetadata/manager.js — flush() error-swallowing
+coverage_score: 0.79  # 22 contracted / 28 ICP-relevant async-callable functions (28 intentionally omitted)
 
 detection:
   require_instance_tracking: false
@@ -768,3 +784,301 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # ── Added in depth pass 2026-04-16 (deepen-stream-1 pass 6) ─────────────────
+
+  - name: createPublicToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a scoped Public Access Token for use in frontend or backend code to
+      subscribe to run updates in real time. Called as auth.createPublicToken(options?).
+      MUST be called from backend (server-side) code — never from the browser.
+      Makes an authenticated HTTP POST to /api/v1/auth/jwt/claims, then signs a
+      local JWT. The network call can fail with auth or rate-limit errors.
+      If TRIGGER_SECRET_KEY is not configured, throws synchronously before any
+      network call.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/auth.js (fetched 2026-04-16)
+      # createPublicToken() calls apiClientManager.clientOrThrow() then apiClient.generateJWTClaims()
+      # generateJWTClaims makes HTTP POST to /api/v1/auth/jwt/claims
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts:
+      #   AuthenticationError (401), RateLimitError (429), ApiConnectionError
+      # ApiClientMissingError confirmed from @trigger.dev/core/v3/apiClientManager/index.js
+      - id: createpublictoken-no-try-catch
+        condition: >
+          auth.createPublicToken() called in an API route or server action without
+          surrounding try/catch. Auth failure or network error causes unhandled
+          rejected Promise, resulting in a 500 response to the frontend.
+          The frontend receives no token and cannot subscribe to run updates.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set or
+            configure() not called before auth.createPublicToken().
+          AuthenticationError (status 401) — API key is invalid or revoked.
+            The generateJWTClaims() HTTP call fails with 401.
+          RateLimitError (status 429) — Token creation rate limit exceeded.
+          ApiConnectionError — Network failure reaching api.trigger.dev.
+        required_handling: >
+          Caller MUST wrap auth.createPublicToken() in try/catch.
+
+          // In your API route (e.g., Next.js route handler):
+          try {
+            const token = await auth.createPublicToken({
+              scopes: { read: { runs: [runId] } },
+              expirationTime: "15m",
+            });
+            return Response.json({ token });
+          } catch (err) {
+            if (err instanceof AuthenticationError) {
+              // TRIGGER_SECRET_KEY is wrong — alert ops team
+              console.error("Trigger.dev auth failed:", err.message);
+              return Response.json({ error: "Internal error" }, { status: 500 });
+            }
+            throw err;
+          }
+
+          CRITICAL: If TRIGGER_SECRET_KEY is not set, throws synchronously
+          before any await — a plain try/catch still catches this.
+        sources:
+          - "https://trigger.dev/docs/frontend/overview"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/auth.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createTriggerPublicToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a one-time-use public token that grants permission to trigger a
+      specific task from frontend code. Called as auth.createTriggerPublicToken(taskId, options?).
+      Supports multipleUse: true for reusable tokens. Same underlying mechanism as
+      createPublicToken — calls generateJWTClaims() (HTTP POST) then signs a JWT.
+      Throws if API key is missing, invalid, or network fails.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/auth.js (fetched 2026-04-16)
+      # createTriggerPublicToken() follows identical error path to createPublicToken:
+      #   1. apiClientManager.clientOrThrow() => ApiClientMissingError if no secret key
+      #   2. apiClient.generateJWTClaims() => HTTP POST => AuthenticationError/RateLimitError/ApiConnectionError
+      #   3. generateJWT() => local signing, no network, cannot throw HTTP errors
+      - id: createtriggerpublictoken-no-try-catch
+        condition: >
+          auth.createTriggerPublicToken() called in a backend route without try/catch.
+          Token generation fails (auth, rate limit, or network), causing an unhandled
+          rejected Promise. The frontend trigger button has no token and the trigger call fails.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — API key is invalid or revoked.
+          RateLimitError (status 429) — Rate limit on JWTClaims endpoint.
+          ApiConnectionError — Network failure.
+        required_handling: >
+          Caller MUST wrap auth.createTriggerPublicToken() in try/catch.
+
+          try {
+            const token = await auth.createTriggerPublicToken("send-welcome-email");
+            return Response.json({ token });
+          } catch (err) {
+            console.error("Failed to create trigger token:", err);
+            return Response.json({ error: "Could not authorize trigger" }, { status: 500 });
+          }
+
+          NOTE: Each call to createTriggerPublicToken() is an API network round-trip.
+          Token creation can be rate-limited under high traffic — consider caching tokens
+          with TTL shorter than expirationTime.
+        sources:
+          - "https://trigger.dev/docs/frontend/overview"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/auth.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createBatchTriggerPublicToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a one-time-use public token that grants permission to batch-trigger
+      a specific task from frontend code. Called as
+      auth.createBatchTriggerPublicToken(taskId, options?). Identical error profile
+      to createTriggerPublicToken — uses the same generateJWTClaims() HTTP call
+      under the hood.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/auth.js (fetched 2026-04-16)
+      # createBatchTriggerPublicToken() is structurally identical to createTriggerPublicToken()
+      # Same call path: clientOrThrow() => generateJWTClaims() => generateJWT()
+      - id: createbatchtriggerpublictoken-no-try-catch
+        condition: >
+          auth.createBatchTriggerPublicToken() called in a backend route without
+          try/catch. Failure causes unhandled rejected Promise — frontend cannot
+          batch-trigger any tasks.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — API key invalid.
+          RateLimitError (status 429) — Rate limit on JWTClaims endpoint.
+          ApiConnectionError — Network failure.
+        required_handling: >
+          Caller MUST wrap auth.createBatchTriggerPublicToken() in try/catch.
+          Same pattern as createTriggerPublicToken — return 500 on failure.
+        sources:
+          - "https://trigger.dev/docs/frontend/overview"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/auth.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: add
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Adds tags to the current task run. Called as tags.add(runTags) inside a
+      task's run() function. Accepts a string or array of strings (max 10 tags total
+      per run). Makes an authenticated HTTP POST to add tags to the run.
+      CRITICAL: Throws synchronously if called outside a task run context
+      (e.g., in a route handler or module-level code).
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/tags.js (fetched 2026-04-16)
+      # tags.add() calls taskContext.ctx?.run — if not in a task, throws Error immediately:
+      #   "Can't set tags outside of a run. You can trigger a task and set tags in the options."
+      - id: tags-add-outside-task-context
+        condition: >
+          tags.add() called from outside a Trigger.dev task run() function —
+          for example, from a Next.js route handler, an Express middleware, or
+          any module-level initialization code. taskContext.ctx is undefined,
+          causing tags.add() to throw immediately.
+        throws: >
+          Error: "Can't set tags outside of a run. You can trigger a task and
+          set tags in the options."
+          (Thrown synchronously before any async work)
+        required_handling: >
+          tags.add() MUST only be called inside a task's run() function.
+          To add tags at trigger time, pass them in the trigger options instead:
+
+          // CORRECT: pass tags at trigger time (works from anywhere):
+          await tasks.trigger("my-task", payload, { tags: ["user:1234"] });
+
+          // CORRECT: add tags dynamically inside the task:
+          export const myTask = task({
+            id: "my-task",
+            run: async (payload) => {
+              await tags.add(["processing", "user:1234"]);
+            }
+          });
+
+          // WRONG: calling tags.add() from a route handler throws:
+          // await tags.add("user:1234") => Error: "Can't set tags outside of a run"
+        sources:
+          - "https://trigger.dev/docs/tags"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/tags.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: tags-add-no-try-catch
+        condition: >
+          tags.add() called inside a task without surrounding try/catch.
+          Network failure or auth error during the tag API call causes the
+          entire task run to fail — not just the tagging operation.
+        throws: >
+          AuthenticationError (status 401) — API key invalid during tag write.
+          ApiConnectionError — Network failure during tag write.
+          RateLimitError (status 429) — Rate limit on tag updates.
+        required_handling: >
+          If tag failures should not abort the entire task, wrap in try/catch:
+
+          try {
+            await tags.add(["processing", `user:${userId}`]);
+          } catch (err) {
+            // Tags are non-critical — log and continue
+            console.warn("Failed to add tags:", err);
+          }
+
+          If tags are critical for observability/routing, let it throw and
+          fail the task so the run is retried with correct tags applied.
+        sources:
+          - "https://trigger.dev/docs/tags"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/tags.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: flush
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Explicitly flushes pending metadata operations to the Trigger.dev API.
+      Called as metadata.flush(). Normally the SDK auto-flushes every 1 second.
+      Use flush() when you need guaranteed persistence before a checkpoint or
+      before triggering child tasks that depend on parent metadata.
+      CRITICAL SILENT FAILURE: metadata.flush() catches and swallows all errors.
+      A failed flush does NOT throw — the caller has no way to know metadata
+      was lost without checking logs.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/core/dist/commonjs/v3/runMetadata/manager.js (fetched 2026-04-16)
+      # flush() wraps the entire apiClient.updateRunMetadata() call in try/catch
+      # catch block: console.error("Failed to flush metadata", error) — then swallows error
+      # This means callers cannot detect flush failures via try/catch
+      - id: metadata-flush-silent-failure
+        condition: >
+          metadata.flush() is called and the underlying API call fails (network
+          error, auth failure, rate limit). The caller assumes the flush succeeded
+          because no error is thrown. Metadata operations queued before the flush
+          (set, append, increment, etc.) are permanently lost — never persisted
+          to the database. Child tasks triggered after the apparent "flush" may
+          read stale or empty metadata from the parent.
+        throws: >
+          No throw — metadata.flush() catches ALL errors internally and logs them.
+          The function always resolves (never rejects).
+          Error is only visible in process logs as:
+            "Failed to flush metadata <error details>"
+          Callers CANNOT detect failure via try/catch.
+        required_handling: >
+          IMPORTANT: You cannot rely on try/catch to detect metadata.flush() failures.
+          The flush either succeeds or silently fails with only a console.error log.
+
+          To maximize reliability of metadata persistence:
+          1. Use idempotent metadata operations (set with fixed keys, not append
+             to growing arrays) — safe to retry automatically by the periodic flush.
+          2. Log metadata state before flushing for debugging:
+             console.log("Flushing metadata:", metadata.current());
+             await metadata.flush();
+          3. For CRITICAL metadata that child tasks depend on, pass it as part of
+             the task payload instead — payload is durably stored at trigger time.
+          4. The periodic auto-flush (every 1s) retries failed flushes — a
+             transient network error during an explicit flush may succeed in the
+             next automatic flush cycle.
+
+          // MISLEADING PATTERN: this try/catch does NOT catch flush failures:
+          try {
+            await metadata.flush(); // Never throws even on failure
+          } catch (err) {
+            // This block never executes on flush failure — swallowed internally
+          }
+        sources:
+          - "https://trigger.dev/docs/runs/metadata"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/runMetadata/manager.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
