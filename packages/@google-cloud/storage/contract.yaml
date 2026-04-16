@@ -1,10 +1,11 @@
 package: "@google-cloud/storage"
 semver: ">=5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83
 
 functions:
   # Bucket Operations
@@ -489,6 +490,373 @@ functions:
           For write URLs, file will be created on upload.
         sources:
           - "https://googleapis.dev/nodejs/storage/latest/File.html#getSignedUrl"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: copy
+    import_path: "@google-cloud/storage"
+    description: >
+      Copies a file to a new location within the same bucket or to a different bucket.
+      Called as file.copy(destination, options). Uses the GCS Objects.rewrite API under
+      the hood, which supports cross-bucket, cross-region, and cross-project copies.
+    postconditions:
+      # Evidence: source confirmed from file.js implementation; GCS Objects.rewrite API
+      # file.js line 804: throws Error(FileExceptionMessages.DESTINATION_NO_NAME) if destination missing
+      # GCS API returns 404 for missing source, 403 for insufficient permissions
+      - id: copy-source-not-found
+        condition: "Source file does not exist in the bucket"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle not found errors. Verify source file exists before copying,
+          or catch 404 and handle gracefully. Common when copying files from user-uploaded
+          content that may have been deleted concurrently.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#copy"
+          - "https://cloud.google.com/storage/docs/json_api/v1/objects/rewrite"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: copy-permission-error
+        condition: "Insufficient IAM permissions to read source or write to destination"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors. Requires storage.objects.get on source
+          and storage.objects.create on destination bucket. Cross-bucket copies also
+          require the service account to have permissions on the destination project.
+          This error is NOT automatically retried.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#copy"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: copy-precondition-failed
+        condition: "Generation or metageneration precondition check fails"
+        throws: "ApiError with HTTP 412 Precondition Failed"
+        required_handling: >
+          Caller MUST handle precondition failures when using ifGenerationMatch or
+          ifMetagenerationMatch options. This error indicates the object was modified
+          between the time the caller last read it and the copy attempt. Retry with
+          updated preconditions or handle as a conflict.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#copy"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: move
+    import_path: "@google-cloud/storage"
+    description: >
+      Moves a file to a new location. Called as file.move(destination, options).
+      IMPORTANT: This operation is NOT atomic — it is implemented as a copy() followed
+      by delete(). If the delete fails after a successful copy, both the source and
+      destination files will exist, leaving a duplicate. This non-atomicity is a key
+      behavioral contract callers must handle.
+    postconditions:
+      # Evidence: source confirmed from file.js — move() is copy() + delete()
+      # File.html#move explicitly documents: "not an atomic move method...a composition of copy and delete"
+      # "an error returned to your callback could be triggered from either one of these API calls failing,
+      # which could leave a duplicate file lingering"
+      - id: move-non-atomic-duplicate-risk
+        condition: "Copy succeeds but delete of source fails, leaving duplicate files"
+        throws: "ApiError from the delete phase — source file still exists alongside copied destination"
+        required_handling: >
+          Caller MUST handle move() errors by checking whether the destination was
+          successfully created before treating the error as a full failure. If delete
+          fails with 404 (already deleted by another process), treat as success.
+          Consider using moveFileAtomic() for same-bucket moves that require atomicity.
+          The file.move() non-atomicity is explicitly documented: "a composition of File#copy
+          and File#delete... which could leave a duplicate file lingering."
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#move"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: move-source-not-found
+        condition: "Source file does not exist"
+        throws: "ApiError with HTTP 404 Not Found (from copy phase)"
+        required_handling: >
+          Caller MUST handle not found errors. Verify source file exists before moving.
+          404 errors occur in the copy phase (source doesn't exist) or delete phase
+          (source was deleted between copy and delete, which is safe to ignore).
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#move"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: rename
+    import_path: "@google-cloud/storage"
+    description: >
+      Renames a file within the same bucket. Called as file.rename(newName, options).
+      Internally calls move() — inherits all non-atomic behavior of move().
+      Destination must be a string (file name within the same bucket only).
+    postconditions:
+      # Evidence: source confirmed from file.js — rename() wraps move() for same-bucket renaming
+      # Inherits non-atomic behavior from move()
+      - id: rename-non-atomic-duplicate-risk
+        condition: "Underlying move() operation leaves duplicate files if delete fails"
+        throws: "ApiError — inherits from move() non-atomic behavior"
+        required_handling: >
+          Caller MUST handle rename() errors the same way as move() errors. If an error
+          is thrown, the file may have been copied to the new name but the original not
+          deleted, resulting in duplicates. Check destination existence before retrying.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#rename"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: rename-not-found
+        condition: "File does not exist"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle not found errors. Verify file exists before renaming.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#rename"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: TransferManager.uploadManyFiles
+    import_path: "@google-cloud/storage"
+    description: >
+      Uploads multiple files in parallel to a GCS bucket. Called as
+      transferManager.uploadManyFiles(filePathsOrDirectory, options). Uses p-limit
+      for concurrency control. Internally calls bucket.upload() for each file.
+      Returns Promise.all() — ALL individual errors will cause the entire operation to fail.
+    postconditions:
+      # Evidence: source confirmed from transfer-manager.js
+      # Lines 380-410: uses Promise.all(promises) — first failure rejects the entire promise
+      # No partial failure handling — if one file fails, all in-progress uploads may be abandoned
+      - id: transfer-upload-many-all-or-nothing
+        condition: "Any single file upload fails — the entire batch fails with Promise.all rejection"
+        throws: "ApiError from the first failing upload — other in-flight uploads are NOT cancelled"
+        required_handling: >
+          Caller MUST handle errors as a batch failure. uploadManyFiles() uses Promise.all()
+          internally, so the first file failure throws, but other concurrent uploads continue
+          to their natural completion (they are NOT cancelled). Some files may have been
+          uploaded successfully before the error is surfaced. To identify which files
+          succeeded, check GCS for the uploaded objects after the error.
+          For resilient batch uploads, use individual bucket.upload() calls with your own
+          error tracking, or wrap each upload in a try-catch before using Promise.all.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: transfer-upload-many-permission-error
+        condition: "Service account lacks write permissions on the bucket"
+        throws: "ApiError with HTTP 403 Forbidden from the first file that encounters the permission error"
+        required_handling: >
+          Caller MUST handle permission errors. Verify service account has
+          storage.objects.create permission before starting a batch upload.
+          Permission errors will typically affect ALL files in the batch.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: TransferManager.downloadManyFiles
+    import_path: "@google-cloud/storage"
+    description: >
+      Downloads multiple files in parallel from a GCS bucket to the local filesystem.
+      Called as transferManager.downloadManyFiles(filesOrFolder, options). Uses
+      Promise.all() — first failure rejects the entire batch operation.
+    postconditions:
+      # Evidence: source confirmed from transfer-manager.js lines 456-504
+      # Promise.all(promises) — batch failure semantics same as uploadManyFiles
+      - id: transfer-download-many-all-or-nothing
+        condition: "Any single file download fails — the entire batch fails"
+        throws: "ApiError from the first failing download"
+        required_handling: >
+          Caller MUST handle errors as a batch failure. downloadManyFiles() uses
+          Promise.all() — the first file failure throws and surfaces as the batch error,
+          but other concurrent downloads continue running. Some files may be written
+          to disk while others are missing. Check local filesystem for which files
+          were successfully downloaded before retrying.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: transfer-download-many-file-not-found
+        condition: "One or more requested files do not exist in the bucket"
+        throws: "ApiError with HTTP 404 Not Found from the first missing file"
+        required_handling: >
+          Caller MUST handle not found errors. Verify all files exist before starting
+          a batch download, or use skipIfExists option to avoid overwriting local files.
+          A single missing file will fail the entire batch.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: TransferManager.downloadFileInChunks
+    import_path: "@google-cloud/storage"
+    description: >
+      Downloads a large file in parallel chunks to the local filesystem.
+      Called as transferManager.downloadFileInChunks(fileOrName, options).
+      Calls file.get() to get metadata, then splits the download into parallel ranges.
+      Supports CRC32C validation of the fully assembled file.
+    postconditions:
+      # Evidence: source confirmed from transfer-manager.js lines 539-600
+      # Line 584: throws RequestError with code 'CONTENT_DOWNLOAD_MISMATCH' on CRC32C validation failure
+      # Line 549: fileInfo = await file.get() — throws ApiError if file not found
+      - id: transfer-download-chunks-crc32c-mismatch
+        condition: "CRC32C validation enabled and assembled file does not match stored checksum"
+        throws: "RequestError with code 'CONTENT_DOWNLOAD_MISMATCH'"
+        required_handling: >
+          Caller MUST handle CONTENT_DOWNLOAD_MISMATCH errors when using validation: 'crc32c'.
+          This error means data was corrupted in transit — some downloaded chunks did not
+          assemble correctly. The local file is incomplete or corrupted. Delete the local
+          file and retry the download. Use err.code === 'CONTENT_DOWNLOAD_MISMATCH' to
+          detect this specific error type.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: transfer-download-chunks-file-not-found
+        condition: "File does not exist in the bucket (fails at metadata fetch stage)"
+        throws: "ApiError with HTTP 404 Not Found (from file.get() call)"
+        required_handling: >
+          Caller MUST handle not found errors. The download fails at the metadata
+          retrieval stage (before any chunks are downloaded) if the file doesn't exist.
+          No partial files are written to disk at this stage.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: transfer-download-chunks-partial-chunk-failure
+        condition: "One or more chunk downloads fail mid-transfer after file is opened for writing"
+        throws: "ApiError from the first failed chunk download"
+        required_handling: >
+          Caller MUST handle chunk failures. When a chunk fails, the local file handle
+          is still closed (finally block), but the file on disk will be partially written
+          with missing or corrupted byte ranges. Delete the partially written file before
+          retrying. Do not rely on a partially downloaded file.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: TransferManager.uploadFileInChunks
+    import_path: "@google-cloud/storage"
+    description: >
+      Uploads a large file in parallel chunks using GCS XML API multipart upload.
+      Called as transferManager.uploadFileInChunks(filePath, options).
+      Throws MultiPartUploadError on failure — this error contains the uploadId and
+      partsMap needed to resume the upload. If autoAbortFailure is true (default),
+      the partial upload is automatically aborted on failure.
+    postconditions:
+      # Evidence: source confirmed from transfer-manager.js lines 637-681
+      # Lines 675-679: throws MultiPartUploadError(e.message, mpuHelper.uploadId, mpuHelper.partsMap)
+      # This is a UNIQUE error class — not ApiError. Callers must handle MultiPartUploadError specifically.
+      - id: transfer-upload-chunks-multipart-error
+        condition: "Any chunk upload or upload initiation fails"
+        throws: "MultiPartUploadError with uploadId and partsMap properties (NOT a standard ApiError)"
+        required_handling: >
+          Caller MUST catch MultiPartUploadError specifically — it is NOT a subclass of ApiError.
+          The error contains two critical properties for resuming:
+          - err.uploadId: the GCS multipart upload ID (to resume the upload later)
+          - err.partsMap: Map of successfully uploaded part numbers to ETags
+          Store these values to resume the upload. Pass them back as options.uploadId and
+          options.partsMap to resume from the last successful chunk.
+          If autoAbortFailure is true (default), the upload is automatically aborted on failure
+          and these fields contain the aborted session — the upload cannot be resumed.
+          Set autoAbortFailure: false to enable resumable failures.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: transfer-upload-chunks-permission-error
+        condition: "Service account lacks permission to initiate or complete multipart upload"
+        throws: "MultiPartUploadError wrapping an underlying 403 Forbidden from GCS XML API"
+        required_handling: >
+          Caller MUST handle permission errors from uploadFileInChunks(). The underlying
+          403 is wrapped in MultiPartUploadError. Verify service account has
+          storage.objects.create permission. The uploadId in the error will be empty/null
+          if the failure occurred during upload initiation (before any parts were uploaded).
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/TransferManager.html"
         severity: error
         business_impact:
           incident_label: DOWNTIME
