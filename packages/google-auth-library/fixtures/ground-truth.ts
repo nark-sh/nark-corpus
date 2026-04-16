@@ -15,6 +15,7 @@
  *   - GoogleAuth.getProjectId() throws 'Unable to detect a Project Id' → MUST try-catch
  *   - GoogleAuth.sign() throws 'Cannot sign data without client_email' → MUST try-catch
  *   - JWT.authorize() throws GaxiosError from token endpoint → MUST try-catch
+ *   - JWT.fetchIdToken() throws GaxiosError on token endpoint rejection → MUST try-catch
  *   - A try-catch (any catch block) satisfies the requirement
  *   - A .catch() chain also satisfies the requirement
  *   - try-finally without catch does NOT satisfy the requirement
@@ -249,6 +250,28 @@ export async function jwtAuthorizeWithCatch() {
     return credentials;
   } catch (error) {
     console.error('JWT authorization failed:', error);
+    throw error;
+  }
+}
+
+// ─── 19. JWT.fetchIdToken — bare call ────────────────────────────────────────
+
+// @expect-violation: jwt-fetch-id-token-unprotected
+export async function fetchIdTokenNoCatch(targetAudience: string) {
+  // SHOULD_FIRE: jwt-fetch-id-token-unprotected — GaxiosError on token endpoint rejection,
+  // Error('Unknown error: Failed to fetch ID token') if idToken missing from response
+  const idToken = await jwtClient.fetchIdToken(targetAudience);
+  return idToken;
+}
+
+// @expect-clean
+export async function fetchIdTokenWithCatch(targetAudience: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — jwt-fetch-id-token-unprotected satisfied
+    const idToken = await jwtClient.fetchIdToken(targetAudience);
+    return idToken;
+  } catch (error) {
+    console.error('ID token fetch failed:', error);
     throw error;
   }
 }
