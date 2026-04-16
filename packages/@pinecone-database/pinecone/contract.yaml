@@ -1,21 +1,31 @@
 # @pinecone-database/pinecone — Pinecone Vector Database Node.js SDK
 #
-# All index operations (upsert, query, fetch, deleteOne, deleteMany, update) make
-# HTTPS requests to the Pinecone API. They can throw PineconeConnectionError,
-# PineconeApiError (non-2xx responses including 401 auth, 404 not found, 429 rate
-# limit, 5xx server errors), or network errors (ECONNREFUSED, ETIMEDOUT).
-# listIndexes() and createIndex() on the Pinecone client have the same behavior.
+# All index operations (upsert, query, fetch, deleteOne, deleteMany, update,
+# listPaginated, upsertRecords, searchRecords) make HTTPS requests to the
+# Pinecone API. They throw specific error classes from the @pinecone-database/pinecone
+# errors module (confirmed from SDK source at dist/errors/http.js):
+#   PineconeAuthorizationError  — HTTP 401 (bad/revoked API key)
+#   PineconeBadRequestError     — HTTP 400 (invalid params) OR HTTP 403 (quota exceeded)
+#   PineconeNotFoundError       — HTTP 404 (index/collection/record not found)
+#   PineconeConflictError       — HTTP 409 (name already exists)
+#   PineconeInternalServerError — HTTP 500 (Pinecone server error)
+#   PineconeUnavailableError    — HTTP 503 (Pinecone down)
+#   PineconeConnectionError     — Network failures (ECONNREFUSED, ETIMEDOUT)
+#   PineconeArgumentError       — Runtime validation failure (bad args)
+#
+# IMPORTANT: 403 (quota/forbidden) maps to PineconeBadRequestError, NOT a separate class.
+# update() has a silent success behavior: missing record IDs return HTTP 200, NOT an error.
 #
 # v1.x API: new Pinecone({ apiKey }) + pinecone.index('name').<method>()
 # v0.x API: new PineconeClient() + await client.init({}) — NOT covered here (EOL)
-# Both APIs require try-catch around index operations.
 package: "@pinecone-database/pinecone"
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.73  # 11 contracted / 15 non-omitted async-callable functions
 
 detection:
   class_names:
@@ -219,13 +229,440 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: update
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Updates a vector's values, sparse values, or metadata by ID (or by metadata filter).
+      Makes an HTTPS PATCH request to the Pinecone data-plane API.
+      CRITICAL: Returns HTTP 200 even when the record ID does not exist — the operation
+      silently succeeds with no indication that the targeted record was not found.
+      Throws on auth failure, bad request, or network error.
+
+    postconditions:
+      # Evidence: confirmed from https://docs.pinecone.io/guides/manage-data/update-data
+      # SDK source: dist/data/vectors/update.d.ts + dist/errors/http.js
+      - id: update-no-error-handling
+        condition: >
+          index.update() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid params, or HTTP 403 — quota exceeded).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.update() in try-catch.
+          Network and auth failures throw — metadata pipelines that update
+          records fail silently if exceptions are swallowed.
+
+          try {
+            await index.update({ id: 'doc-1', metadata: { status: 'processed' } });
+          } catch (error) {
+            console.error('Pinecone update failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/manage-data/update-data"
+          - "https://docs.pinecone.io/reference/api/data-plane/update"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/errors/http.js)"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: update-silent-missing-id
+        condition: >
+          index.update() called with an id that does not exist in the index,
+          and the caller assumes a returned success means the record was updated.
+        throws: >
+          Does NOT throw. Returns HTTP 200 (success) even when no record matched
+          the provided ID. The Pinecone API silently ignores updates to non-existent
+          records per documented behavior.
+        required_handling: >
+          Callers that require confirmation of the update MUST call
+          index.fetch({ ids: [id] }) after the update to verify the record exists
+          and contains the updated values. Do not assume update success implies
+          the record exists.
+
+          // Pattern: verify update actually landed
+          await index.update({ id: recordId, metadata: newMeta });
+          const verify = await index.fetch({ ids: [recordId] });
+          if (!verify.records[recordId]) {
+            throw new Error(`Record ${recordId} not found — update had no effect`);
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/manage-data/update-data"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: createIndex
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Creates a new Pinecone vector index. Called on the Pinecone client directly.
+      Makes an HTTPS POST request to the control-plane API. Can fail due to quota
+      limits (403→PineconeBadRequestError), name conflicts (409→PineconeConflictError),
+      invalid parameters (400→PineconeBadRequestError), or network failures.
+      Used in admin routes, startup scripts, and provisioning workflows.
+
+    postconditions:
+      # Evidence: confirmed from https://docs.pinecone.io/reference/api/control-plane/create_index
+      # HTTP status codes verified from pinecone-ts-client source: dist/errors/http.js
+      # 400/403 both map to PineconeBadRequestError (403 = quota exceeded)
+      - id: createindex-no-error-handling
+        condition: >
+          pinecone.createIndex() called without try-catch or .catch() handler
+        throws: >
+          PineconeBadRequestError (HTTP 400 — invalid params: bad metric, invalid name;
+            or HTTP 403 — project quota exceeded, "Increase your quota or upgrade").
+          PineconeConflictError (HTTP 409 — index name already exists in project).
+          PineconeNotFoundError (HTTP 404 — invalid cloud/region combination for serverless).
+          PineconeConnectionError (network failures).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await pinecone.createIndex() in try-catch.
+          Quota errors (PineconeBadRequestError with 403 body) require account upgrade.
+          Conflict errors (PineconeConflictError) are often handled by using
+          suppressConflicts: true option, which skips creation when index exists.
+
+          try {
+            await pinecone.createIndex({
+              name: 'my-index',
+              dimension: 1536,
+              spec: { serverless: { cloud: 'aws', region: 'us-east-1' } },
+              suppressConflicts: true,
+            });
+          } catch (error) {
+            if (error instanceof Errors.PineconeBadRequestError) {
+              // Check error.message: may be quota exceeded (403) or bad params (400)
+              console.error('Index creation failed:', error.message);
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/reference/api/control-plane/create_index"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/errors/http.js)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: deleteIndex
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Deletes a Pinecone vector index permanently. Called on the Pinecone client directly.
+      Makes an HTTPS DELETE request to the control-plane API.
+      CRITICAL: Irreversible operation — all vectors and metadata are permanently lost.
+      Can fail if deletion protection is enabled (403→PineconeBadRequestError), index
+      not found (404→PineconeNotFoundError), or pending collections exist (412).
+      Used in cleanup scripts, test teardown, and admin routes.
+
+    postconditions:
+      # Evidence: confirmed from https://docs.pinecone.io/reference/api/control-plane/delete_index
+      # 403 (deletion protection enabled) maps to PineconeBadRequestError per dist/errors/http.js
+      # 412 (FAILED_PRECONDITION) maps to PineconeUnmappedHttpError
+      - id: deleteindex-no-error-handling
+        condition: >
+          pinecone.deleteIndex() called without try-catch or .catch() handler
+        throws: >
+          PineconeBadRequestError (HTTP 403 — "Deletion protection is enabled for this index.
+            Disable deletion protection before retrying.").
+          PineconeNotFoundError (HTTP 404 — index name not found in project).
+          PineconeUnmappedHttpError (HTTP 412 FAILED_PRECONDITION — pending collections
+            exist for the index; must delete collections first).
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeConnectionError (network failures).
+        required_handling: >
+          Caller MUST wrap await pinecone.deleteIndex() in try-catch.
+          Deletion protection errors require explicitly disabling protection first.
+          Not-found errors may be expected in idempotent teardown flows — catch and
+          handle PineconeNotFoundError separately.
+
+          try {
+            await pinecone.deleteIndex('my-index');
+          } catch (error) {
+            if (error instanceof Errors.PineconeNotFoundError) {
+              // Index already gone — idempotent, continue
+              return;
+            }
+            if (error instanceof Errors.PineconeBadRequestError) {
+              // Likely deletion protection enabled — disable first
+              console.error('Cannot delete index:', error.message);
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/reference/api/control-plane/delete_index"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/errors/http.js)"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: inference.embed
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Generates vector embeddings using Pinecone's hosted inference models.
+      Called as pc.inference.embed(). Makes an HTTPS POST request to the
+      Pinecone inference API. Used in RAG pipelines to convert text/documents
+      into vectors before upsert or query. Throws on auth failure, invalid model
+      name, invalid params, or network failure.
+
+    postconditions:
+      # Evidence: confirmed from https://docs.pinecone.io/guides/inference/generate-embeddings
+      # HTTP status codes verified from SDK source: dist/errors/http.js
+      # API errors: 400 (invalid params/model), 401 (bad API key), 500 (server error)
+      - id: inference-embed-no-error-handling
+        condition: >
+          pc.inference.embed() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — "Invalid API key.").
+          PineconeBadRequestError (HTTP 400 — invalid model name, unsupported parameters,
+            or input_type not supported by the selected model;
+            HTTP 403 — inference quota exceeded for account tier).
+          PineconeInternalServerError (HTTP 500 — Pinecone inference server error).
+          PineconeUnavailableError (HTTP 503 — Pinecone inference service down).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+        required_handling: >
+          Caller MUST wrap await pc.inference.embed() in try-catch.
+          In RAG pipelines, uncaught embed() failure silently breaks the entire
+          ingestion pipeline — documents are not stored in Pinecone and search
+          quality degrades to zero without alerting.
+
+          try {
+            const embeddings = await pc.inference.embed({
+              model: 'multilingual-e5-large',
+              inputs: ['Hello world'],
+              parameters: { inputType: 'passage', truncate: 'END' },
+            });
+            return embeddings.data[0].values;
+          } catch (error) {
+            console.error('Embedding generation failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/inference/generate-embeddings"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/inference/inference.d.ts)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: listPaginated
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Lists vectors by ID prefix within a namespace, returning paginated results
+      with a pagination token for continuation. Supported only for serverless indexes.
+      Makes an HTTPS GET request to the data-plane API. Used for bulk export,
+      deletion by prefix pattern, or audit workflows.
+
+    postconditions:
+      # Evidence: confirmed from https://docs.pinecone.io/docs/get-record-ids
+      # SDK source: dist/data/index.d.ts listPaginated() → Promise<ListResponse>
+      - id: listpaginated-no-error-handling
+        condition: >
+          index.listPaginated() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — unsupported on pod-based indexes;
+            or HTTP 403 — quota exceeded).
+          PineconeConnectionError (network failures).
+          PineconeArgumentError (runtime validation — invalid arguments).
+        required_handling: >
+          Caller MUST wrap await index.listPaginated() in try-catch.
+          Pod-based index callers receive PineconeBadRequestError (400) since
+          listPaginated is only supported for serverless indexes.
+
+          try {
+            const results = await index.listPaginated({ prefix: 'doc1#' });
+            return results.vectors?.map(v => v.id) ?? [];
+          } catch (error) {
+            console.error('Pinecone listPaginated failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/docs/get-record-ids"
+          - "https://docs.pinecone.io/reference/api/data-plane/list"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: upsertRecords
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Upserts integrated records (with text fields for auto-embedding) into a
+      serverless index created with pc.createIndexForModel(). Uses Pinecone's
+      integrated inference to automatically embed the records at write time.
+      Makes an HTTPS POST request to the data-plane API. Used in RAG pipelines
+      that rely on Pinecone's integrated inference instead of external embedding.
+
+    postconditions:
+      # Evidence: confirmed from SDK source dist/data/index.d.ts
+      # upsertRecords() is only available on indexes created with createIndexForModel()
+      - id: upsertrecords-no-error-handling
+        condition: >
+          index.upsertRecords() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — index does not have integrated inference,
+            or text field exceeds model's max token length;
+            HTTP 403 — inference quota exceeded).
+          PineconeConnectionError (network failures).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.upsertRecords() in try-catch.
+          Failures stop the embedding and storage of records — documents missing
+          from the index will not appear in search results, causing silent
+          knowledge base gaps.
+
+          try {
+            await index.upsertRecords({
+              records: [{ id: 'doc-1', chunk_text: 'Hello world' }]
+            });
+          } catch (error) {
+            console.error('upsertRecords failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/inference/integrated-inference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: searchRecords
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Searches records in an index using integrated inference (serverless indexes
+      with auto-embedding). Converts the query text to embeddings at search time
+      using the index's built-in model, then returns ranked results. Used in
+      RAG pipelines powered by Pinecone's integrated inference.
+      Makes an HTTPS POST request to the data-plane API.
+
+    postconditions:
+      # Evidence: confirmed from SDK source dist/data/index.d.ts searchRecords()
+      - id: searchrecords-no-error-handling
+        condition: >
+          index.searchRecords() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — index does not have integrated inference,
+            invalid rerank model, or unsupported query format;
+            HTTP 403 — inference quota exceeded).
+          PineconeConnectionError (network failures).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+          PineconeArgumentError (runtime validation — invalid arguments).
+        required_handling: >
+          Caller MUST wrap await index.searchRecords() in try-catch.
+          Uncaught errors in search cause API routes to return 500 and users
+          get no results, making the RAG system completely unavailable.
+
+          try {
+            const response = await index.searchRecords({
+              query: { inputs: { text: 'user query' }, topK: 5 },
+              fields: ['chunk_text', 'source'],
+            });
+            return response.result.hits;
+          } catch (error) {
+            console.error('searchRecords failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/inference/integrated-inference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: startImport
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Starts an asynchronous bulk import of vectors from object storage (S3) into
+      a Pinecone serverless index. The import runs in the background — startImport()
+      returns an import ID that must be polled for completion status.
+      Makes an HTTPS POST request to the data-plane API.
+      Used in data migration and large-scale ingestion workflows.
+
+    postconditions:
+      # Evidence: confirmed from SDK source dist/data/index.d.ts startImport()
+      # → Promise<StartImportResponse>
+      - id: startimport-no-error-handling
+        condition: >
+          index.startImport() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid S3 URI, unsupported storage type,
+            or index is not serverless;
+            HTTP 403 — insufficient permissions to access the S3 bucket,
+            or storage import quota exceeded).
+          PineconeConnectionError (network failures).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+          PineconeArgumentError (runtime validation — missing uri parameter).
+        required_handling: >
+          Caller MUST wrap await index.startImport() in try-catch.
+          Errors here mean no import was started — the S3 data was not ingested.
+          For 403 errors, verify S3 bucket permissions include Pinecone's service
+          account. Store the returned id to poll status.
+
+          try {
+            const { id } = await index.startImport({
+              uri: 's3://my-bucket/embeddings/',
+              errorMode: 'CONTINUE',
+            });
+            console.log(`Import started: ${id}`);
+          } catch (error) {
+            console.error('startImport failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/data-management/import-data"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 notes:
   - "Pinecone client (new Pinecone({apiKey})) constructor does NOT make network calls — no try-catch needed there"
   - "pinecone.index('name') does NOT make a network call — returns a local Index client object"
-  - "All Index instance methods (upsert, query, fetch, deleteOne, deleteMany, update, describeIndexStats) make HTTPS requests"
-  - "PineconeApiError is thrown for non-2xx responses; PineconeConnectionError for network failures"
-  - "Rate limit (429) should be handled with exponential backoff"
+  - "All Index instance methods (upsert, query, fetch, deleteOne, deleteMany, update, listPaginated, upsertRecords, searchRecords, startImport) make HTTPS requests"
+  - "Error class mapping confirmed from SDK source dist/errors/http.js: 400→PineconeBadRequestError, 401→PineconeAuthorizationError, 403→PineconeBadRequestError, 404→PineconeNotFoundError, 409→PineconeConflictError, 500→PineconeInternalServerError, 503→PineconeUnavailableError"
+  - "NOTE: 403 (quota/forbidden) maps to PineconeBadRequestError — NOT a separate class"
   - "v0.x API used PineconeClient class with async init() — NOT covered by this contract (EOL)"
   - "Namespace operations (index.namespace('ns').upsert()) have the same error behavior as index operations"
+  - "update() has critical silent behavior: missing record ID returns HTTP 200 (success), not an error"
   - "deleteAll() deletes all vectors in a namespace — same error characteristics as deleteMany"
-  - "update() and listPaginated() not included — less common in application code but have same behavior"
+  - "listPaginated() is supported only for serverless indexes — pod-based indexes throw PineconeBadRequestError (400)"
+  - "upsertRecords() and searchRecords() require indexes created with createIndexForModel() (integrated inference)"
+  - "startImport() is async — returns import ID immediately; poll with describeImport() for completion"
+  - "configureIndex(), createCollection(), deleteCollection(), describeIndex(), describeCollection() intentionally omitted — admin/config operations not typical app code"
+  - "createAssistant(), listAssistants() etc. intentionally omitted — assistant feature, separate from core vector ops"
+  - "pc.inference.rerank() omitted — less adoption than embed, same error contract as embed"
+  - "pc.inference.listModels(), pc.inference.getModel() omitted — read-only, no write or destructive behavior"

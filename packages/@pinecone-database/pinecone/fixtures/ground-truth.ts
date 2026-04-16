@@ -4,13 +4,24 @@
  * Annotations placed DIRECTLY before the violating call site.
  * The line number stored is the line of the awaited method call.
  *
- * Postcondition IDs:
+ * Postcondition IDs (original):
  *   upsert-no-error-handling
  *   query-no-error-handling
  *   fetch-no-error-handling
  *   deleteone-no-error-handling
  *   deletemany-no-error-handling
  *   listindexes-no-error-handling
+ *
+ * Postcondition IDs (added by deepen pass 2026-04-16):
+ *   update-no-error-handling
+ *   update-silent-missing-id
+ *   createindex-no-error-handling
+ *   deleteindex-no-error-handling
+ *   inference-embed-no-error-handling
+ *   listpaginated-no-error-handling
+ *   upsertrecords-no-error-handling
+ *   searchrecords-no-error-handling
+ *   startimport-no-error-handling
  */
 import { Pinecone } from '@pinecone-database/pinecone';
 
@@ -147,5 +158,208 @@ async function gt_listIndexes_with_try_catch() {
   } catch (error) {
     console.error('List indexes failed:', error);
     return [];
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 7. update — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_update_missing(id: string) {
+  // SHOULD_FIRE: update-no-error-handling — update without try-catch
+  await index.update({ id, metadata: { status: 'processed' } });
+}
+
+// 7. update — with try-catch (SHOULD_NOT_FIRE)
+async function gt_update_with_try_catch(id: string) {
+  try {
+    // SHOULD_NOT_FIRE: update has try-catch
+    await index.update({ id, metadata: { status: 'processed' } });
+  } catch (error) {
+    console.error('Update failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 8. createIndex — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createIndex_missing() {
+  // SHOULD_FIRE: createindex-no-error-handling — createIndex without try-catch
+  await pinecone.createIndex({
+    name: 'my-new-index',
+    dimension: 1536,
+    metric: 'cosine',
+    spec: { serverless: { cloud: 'aws', region: 'us-east-1' } },
+  });
+}
+
+// 8. createIndex — with try-catch (SHOULD_NOT_FIRE)
+async function gt_createIndex_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: createIndex has try-catch
+    await pinecone.createIndex({
+      name: 'my-new-index',
+      dimension: 1536,
+      metric: 'cosine',
+      spec: { serverless: { cloud: 'aws', region: 'us-east-1' } },
+      suppressConflicts: true,
+    });
+  } catch (error) {
+    console.error('Create index failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 9. deleteIndex — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_deleteIndex_missing() {
+  // SHOULD_FIRE: deleteindex-no-error-handling — deleteIndex without try-catch
+  await pinecone.deleteIndex('my-old-index');
+}
+
+// 9. deleteIndex — with try-catch (SHOULD_NOT_FIRE)
+async function gt_deleteIndex_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: deleteIndex has try-catch
+    await pinecone.deleteIndex('my-old-index');
+  } catch (error) {
+    console.error('Delete index failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 10. inference.embed — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_inferenceEmbed_missing(text: string) {
+  // SHOULD_FIRE: inference-embed-no-error-handling — embed without try-catch
+  const embeddings = await pinecone.inference.embed({
+    model: 'multilingual-e5-large',
+    inputs: [text],
+    parameters: { inputType: 'passage', truncate: 'END' },
+  });
+  return embeddings.data[0];
+}
+
+// 10. inference.embed — with try-catch (SHOULD_NOT_FIRE)
+async function gt_inferenceEmbed_with_try_catch(text: string) {
+  try {
+    // SHOULD_NOT_FIRE: embed has try-catch
+    const embeddings = await pinecone.inference.embed({
+      model: 'multilingual-e5-large',
+      inputs: [text],
+      parameters: { inputType: 'passage', truncate: 'END' },
+    });
+    return embeddings.data[0];
+  } catch (error) {
+    console.error('Embedding failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 11. listPaginated — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_listPaginated_missing() {
+  // SHOULD_FIRE: listpaginated-no-error-handling — listPaginated without try-catch
+  const result = await index.listPaginated({ prefix: 'doc1#' });
+  return result.vectors ?? [];
+}
+
+// 11. listPaginated — with try-catch (SHOULD_NOT_FIRE)
+async function gt_listPaginated_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: listPaginated has try-catch
+    const result = await index.listPaginated({ prefix: 'doc1#' });
+    return result.vectors ?? [];
+  } catch (error) {
+    console.error('listPaginated failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 12. upsertRecords — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_upsertRecords_missing() {
+  // SHOULD_FIRE: upsertrecords-no-error-handling — upsertRecords without try-catch
+  await index.upsertRecords({
+    records: [{ id: 'rec1', chunk_text: 'Hello world' }],
+  });
+}
+
+// 12. upsertRecords — with try-catch (SHOULD_NOT_FIRE)
+async function gt_upsertRecords_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: upsertRecords has try-catch
+    await index.upsertRecords({
+      records: [{ id: 'rec1', chunk_text: 'Hello world' }],
+    });
+  } catch (error) {
+    console.error('upsertRecords failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 13. searchRecords — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_searchRecords_missing() {
+  // SHOULD_FIRE: searchrecords-no-error-handling — searchRecords without try-catch
+  const response = await index.searchRecords({
+    query: { inputs: { text: 'disease prevention' }, topK: 4 },
+    fields: ['chunk_text'],
+  });
+  return response.result.hits;
+}
+
+// 13. searchRecords — with try-catch (SHOULD_NOT_FIRE)
+async function gt_searchRecords_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: searchRecords has try-catch
+    const response = await index.searchRecords({
+      query: { inputs: { text: 'disease prevention' }, topK: 4 },
+      fields: ['chunk_text'],
+    });
+    return response.result.hits;
+  } catch (error) {
+    console.error('searchRecords failed:', error);
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 14. startImport — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_startImport_missing() {
+  // SHOULD_FIRE: startimport-no-error-handling — startImport without try-catch
+  const result = await index.startImport({
+    uri: 's3://my-bucket/embeddings/',
+    errorMode: 'CONTINUE',
+  });
+  return result.id;
+}
+
+// 14. startImport — with try-catch (SHOULD_NOT_FIRE)
+async function gt_startImport_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: startImport has try-catch
+    const result = await index.startImport({
+      uri: 's3://my-bucket/embeddings/',
+      errorMode: 'CONTINUE',
+    });
+    return result.id;
+  } catch (error) {
+    console.error('startImport failed:', error);
+    throw error;
   }
 }
