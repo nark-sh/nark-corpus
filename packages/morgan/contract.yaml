@@ -1,10 +1,20 @@
 package: morgan
 semver: ">=1.0.0 <2.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-1 pass 1):
+# API surface: 4 callable exports (morgan, morgan.token, morgan.format, morgan.compile)
+# Contracted before: 1 (morgan factory with 2 postconditions + 3 edge cases)
+# Contracted after: 3 (added morgan.compile, morgan.token)
+# Omitted: 1 (morgan.format — pure name registry, no distinct error surface)
+# Coverage: 3/4 = 0.75 (up from 0.25)
+# Evidence from morgan@1.10.1 source:
+#   https://raw.githubusercontent.com/expressjs/morgan/master/index.js — line 395: throw new TypeError
+#   https://raw.githubusercontent.com/expressjs/morgan/master/README.md — token overwrite behavior documented
+coverage_score: 0.75  # 3 contracted / 4 total callable exports (1 intentionally omitted)
 
 functions:
   - name: morgan
@@ -99,3 +109,89 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: compile
+    import_path: "morgan"
+    description: >
+      Compiles a morgan format string (containing :token-name references) into a reusable
+      format function. Called internally by the morgan middleware factory, but also exported
+      for app code that needs to pre-compile format strings before passing them to morgan()
+      or for use in custom logging pipelines.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/expressjs/morgan/master/index.js line 395
+      # Source confirms: if (typeof format !== 'string') { throw new TypeError('argument format must be a string') }
+      - id: compile-non-string-throws
+        condition: "format argument is not a string (e.g., undefined, null, number, object)"
+        throws: "TypeError: argument format must be a string"
+        required_handling: >
+          Caller MUST ensure the format argument is a string before calling compile().
+          Passing undefined, null, or any non-string value throws TypeError synchronously.
+          This is a startup-time crash — validate format strings at app initialization.
+          Common mistake: morgan.compile(undefined) when format comes from config that
+          may not be set.
+        sources:
+          - "https://raw.githubusercontent.com/expressjs/morgan/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://raw.githubusercontent.com/expressjs/morgan/master/index.js line 399-411
+      # compile() uses new Function() internally — format strings with invalid token syntax
+      # produce format functions that silently return "-" for unresolved tokens, not errors.
+      # However, the new Function() call itself can throw SyntaxError for extremely malformed input.
+      - id: compile-invalid-token-syntax-silent
+        condition: "Format string contains valid syntax but references undefined token names (e.g., ':nonexistent-token')"
+        throws: "No error thrown — undefined tokens silently resolve to '-' in log output"
+        required_handling: >
+          Caller SHOULD verify that all token names used in format strings are registered
+          via morgan.token() before the format is compiled. Unregistered tokens resolve to
+          '-' silently, producing misleading log output without any runtime error.
+          Validate token names during integration testing.
+        sources:
+          - "https://raw.githubusercontent.com/expressjs/morgan/master/index.js"
+          - "https://github.com/expressjs/morgan#readme"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: token
+    import_path: "morgan"
+    description: >
+      Registers a custom token function with the given name. The token becomes available
+      in format strings as :token-name. Called at application startup to extend morgan's
+      built-in token set. Returns the morgan instance for chaining.
+
+    postconditions:
+      # Evidence: https://github.com/expressjs/morgan#readme
+      # "Calling morgan.token() using the same name as an existing token will overwrite that token definition."
+      # Source confirmed: morgan.token() sets morgan[name] = fn directly, no guard against overwrite.
+      - id: token-name-overwrite-silent
+        condition: "morgan.token() is called with a name that matches a built-in token (e.g., 'status', 'method', 'url', 'response-time') or a previously registered custom token"
+        throws: "No error thrown — existing token definition is silently replaced"
+        required_handling: >
+          Caller MUST avoid reusing built-in token names unless intentionally overriding
+          built-in behavior. Built-in tokens: 'date', 'http-version', 'method', 'referrer',
+          'remote-addr', 'remote-user', 'req', 'res', 'response-time', 'status',
+          'total-time', 'url', 'user-agent'.
+          Overwriting 'status' or 'response-time' silently changes log output for ALL
+          morgan middleware instances in the same process, including third-party middleware.
+          Use namespaced token names (e.g., 'x-request-id', 'app-user-id') to avoid collisions.
+        sources:
+          - "https://github.com/expressjs/morgan#readme"
+          - "https://raw.githubusercontent.com/expressjs/morgan/master/index.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
