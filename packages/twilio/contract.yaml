@@ -2,10 +2,15 @@ package: twilio
 semver: ">=3.0.0 <6.0.0"
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: 2026-04-14
+last_verified: 2026-04-15
 status: production
 evidence_quality: confirmed
-coverage_score: 0.64
+coverage_score: 0.92
+# coverage_score = 11 contracted / 12 total async-callable functions (1 intentionally omitted)
+# Intentionally omitted: incomingPhoneNumbers.create() — provisioning is admin/setup not runtime SaaS path
+# Functions contracted: messages.create, calls.create, verifications.create, verificationCheck.create,
+#   lookups.v2.phoneNumbers.fetch, twilio (constructor), validateRequest, calls.update,
+#   messages.fetch, calls.recordings.create, verify.services.create
 functions:
   - name: create
     import_path: twilio
@@ -340,3 +345,249 @@ functions:
         source: https://www.twilio.com/docs/lookup/api
         sources:
           - https://www.twilio.com/docs/lookup/api
+
+  - name: update
+    import_path: twilio
+    namespace: calls
+    description: >
+      Modifies an in-progress voice call — redirect it to new TwiML, cancel a
+      queued/ringing call (status: "canceled"), or terminate an active call
+      (status: "completed"). Called as: client.calls(callSid).update({ status: "canceled" })
+      or client.calls(callSid).update({ url: newTwimlUrl }).
+      Commonly used in IVR systems, on-call routing, and call-center applications
+      to programmatically end or redirect calls.
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/voice/api/call-resource#update-a-call-resource (fetched 2026-04-15)
+      # Evidence: https://www.twilio.com/docs/errors/21220 (invalid call state, HTTP 400)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (auth failure, HTTP 401)
+      # Error types confirmed from twilio-node source: RestException with .code, .status, .message
+      # Source: https://github.com/twilio/twilio-node/blob/main/src/rest/api/v2010/account/call.ts
+      - id: calls-update-no-try-catch
+        condition: calls(sid).update() called without try-catch or .catch() handler
+        throws: >
+          RestException with error.status and error.code.
+          Error 21220 (HTTP 400) — call is no longer in-progress (already completed,
+          failed, or cancelled); this is the most common runtime error.
+          Error 20003 (HTTP 401) — authentication failure.
+          Error 20429 (HTTP 429) — rate limit exceeded.
+          NetworkError — connection timeout or DNS failure.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          client.calls(callSid).update() is called without try-catch. This method
+          makes an HTTP request to Twilio and can fail with RestException 21220
+          when the call has already ended (race condition common in production:
+          caller hangs up between your check and the update). Unhandled promise
+          rejections crash the application.
+        detector: |
+          If client.calls(callSid).update() is called in an async context without
+          try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.calls(sid).update() in try-catch. Handle error.code
+          === 21220 gracefully — it means the call already ended, which is usually
+          not a fatal condition. Handle error.code === 20003 with ops alerting.
+        source: https://www.twilio.com/docs/voice/api/call-resource
+        sources:
+          - https://www.twilio.com/docs/voice/api/call-resource
+          - https://www.twilio.com/docs/errors/21220
+      - id: calls-update-stale-call-not-handled
+        condition: calls(sid).update() does not handle error 21220 (call already ended)
+        throws: RestException with error.code 21220 (HTTP 400)
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          Error 21220 occurs when you attempt to update a call that is no longer
+          in-progress (caller hung up, call timed out, or already cancelled). This
+          is a very common race condition in production systems: the call ends
+          between your status check and the update call. A generic catch that
+          re-throws will propagate a confusing error to the user instead of
+          handling the "call already ended" case gracefully.
+        detector: |
+          If try-catch around calls(sid).update() does not check
+          error.code === 21220 to handle the "call already ended" case
+        required_handling: |
+          SHOULD check error.code === 21220 in the catch block and treat it as
+          a no-op (the call is already ended, which was the goal of cancellation)
+          rather than propagating as an unrecoverable error.
+        source: https://www.twilio.com/docs/errors/21220
+        sources:
+          - https://www.twilio.com/docs/errors/21220
+
+  - name: fetch
+    import_path: twilio
+    namespace: messages
+    description: >
+      Fetches the current status and metadata of a previously sent SMS message.
+      Called as: client.messages(messageSid).fetch()
+      Used by SaaS apps to check delivery status, debug failed messages, or
+      implement delivery tracking webhooks fallback. Returns a MessageInstance
+      with status: 'queued' | 'sending' | 'sent' | 'delivered' | 'undelivered' | 'failed'.
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/sms/api/message-resource (fetched 2026-04-15)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (auth failure, HTTP 401)
+      # Error types confirmed from twilio-node source: RestException with .status and .code
+      - id: messages-fetch-no-try-catch
+        condition: messages(sid).fetch() called without try-catch or .catch() handler
+        throws: >
+          RestException with error.status and error.code.
+          HTTP 404 (status 404) — message SID not found or belongs to different account.
+          Error 20003 (HTTP 401) — authentication failure.
+          Error 20429 (HTTP 429) — rate limit exceeded on status polling.
+          NetworkError — connection timeout.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: |
+          client.messages(messageSid).fetch() is called without try-catch. Throws
+          RestException with status 404 when the message SID is not found or
+          does not belong to the authenticated account (common when polling messages
+          created by a different subaccount). Unhandled rejections crash the app.
+        detector: |
+          If client.messages(messageSid).fetch() is called in an async context
+          without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages(sid).fetch() in try-catch. Handle
+          error.status === 404 to detect invalid/foreign message SIDs rather than
+          crashing the status-check loop.
+        source: https://www.twilio.com/docs/sms/api/message-resource
+        sources:
+          - https://www.twilio.com/docs/sms/api/message-resource
+      - id: messages-fetch-undelivered-not-checked
+        condition: >
+          messages(sid).fetch() result status not checked for 'undelivered' or 'failed'
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: |
+          The fetch() response returns a MessageInstance with a status field.
+          Status can be 'undelivered' (carrier rejected) or 'failed' (Twilio
+          internal error) even when the HTTP call succeeds (200 OK). If the caller
+          does not check message.status, they incorrectly assume delivery succeeded
+          when it actually failed. This leads to silent failures: users never
+          receive critical notifications (password resets, 2FA codes, alerts) with
+          no visibility to the application.
+        detector: |
+          If messages(sid).fetch() result is used without checking
+          result.status for 'undelivered' or 'failed' before treating as delivered
+        required_handling: |
+          SHOULD check message.status after fetch(). If status is 'undelivered'
+          or 'failed', inspect message.errorCode and message.errorMessage for the
+          root cause and implement retry logic or user notification.
+        source: https://www.twilio.com/docs/sms/api/message-resource
+        sources:
+          - https://www.twilio.com/docs/sms/api/message-resource
+
+  - name: create
+    import_path: twilio
+    namespace: calls.recordings
+    description: >
+      Starts recording an in-progress voice call. Called as:
+      client.calls(callSid).recordings.create()
+      Used by SaaS apps to record customer service calls, generate transcripts,
+      or meet compliance requirements. Requires the call to be actively in-progress.
+      Returns a RecordingInstance with status 'in-progress'.
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/voice/api/recording-resource (fetched 2026-04-15)
+      # Evidence: https://www.twilio.com/docs/errors/21220 (realtime op on non-in-progress call)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (auth failure)
+      # Error types confirmed from twilio-node source: RestException with .code, .status
+      - id: recordings-create-no-try-catch
+        condition: calls(sid).recordings.create() called without try-catch
+        throws: >
+          RestException with error.status and error.code.
+          Error 21220 (HTTP 400) — call is not in-progress (already ended, ringing, or queued);
+          cannot start recording on an inactive call.
+          Error 20003 (HTTP 401) — authentication failure.
+          Error 20429 (HTTP 429) — rate limit exceeded.
+          NetworkError — connection failure.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          client.calls(callSid).recordings.create() is called without try-catch.
+          Recording can only be started on calls that are actively in-progress.
+          Error 21220 is thrown if the call has not yet connected or has already
+          ended — a race condition in production when callers hang up quickly.
+          Unhandled rejections crash the application.
+        detector: |
+          If client.calls(callSid).recordings.create() is called in an async
+          context without try-catch wrapping the await, or without .catch() in
+          promise chain
+        required_handling: |
+          MUST wrap await calls(callSid).recordings.create() in try-catch.
+          Handle error.code === 21220 gracefully — log the missed recording but
+          do not propagate as a fatal error when the call already ended.
+        source: https://www.twilio.com/docs/voice/api/recording-resource
+        sources:
+          - https://www.twilio.com/docs/voice/api/recording-resource
+          - https://www.twilio.com/docs/errors/21220
+
+  - name: create
+    import_path: twilio
+    namespace: verify.services
+    description: >
+      Creates a new Twilio Verify Service — the configuration container for a
+      2FA/OTP verification workflow. Called as: client.verify.v2.services.create({ friendlyName })
+      This is typically called once during application setup or when onboarding
+      a new tenant in multi-tenant SaaS apps. Returns a ServiceInstance with
+      the service SID used for subsequent verifications.create() calls.
+    postconditions:
+      # Evidence: https://www.twilio.com/docs/verify/api/service (fetched 2026-04-15)
+      # Evidence: https://www.twilio.com/docs/errors/20003 (auth failure, HTTP 401)
+      # Evidence: https://www.twilio.com/docs/errors/20429 (rate limit, HTTP 429)
+      # Error types confirmed from twilio-node source: RestException with .code, .status
+      - id: verify-services-create-no-try-catch
+        condition: verify.v2.services.create() called without try-catch
+        throws: >
+          RestException with error.status and error.code.
+          HTTP 400 — invalid parameters (e.g., friendlyName too long, invalid codeLength).
+          Error 20003 (HTTP 401) — authentication failure, invalid Account SID or Auth Token.
+          Error 20429 (HTTP 429) — rate limit exceeded (too many service creation attempts).
+          NetworkError — connection failure.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: |
+          client.verify.v2.services.create() is called without try-catch. Though
+          this is often called once during setup, failure in a multi-tenant SaaS
+          where each tenant gets their own Verify service means new tenants cannot
+          complete 2FA enrollment. Auth errors (20003) indicate misconfigured
+          credentials. Unhandled rejections crash the initialization path.
+        detector: |
+          If client.verify.v2.services.create() is called in an async context
+          without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await verify.v2.services.create() in try-catch. On error,
+          log with full error.code context and fail the tenant provisioning flow
+          with a clear user-facing error rather than leaving the tenant in a
+          half-initialized state.
+        source: https://www.twilio.com/docs/verify/api/service
+        sources:
+          - https://www.twilio.com/docs/verify/api/service
+          - https://www.twilio.com/docs/errors/20003
