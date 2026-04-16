@@ -38,13 +38,21 @@
 # Contracted after: 15 (added: cards.create, invoices.create, invoices.publish, orders.update, orders.pay)
 # Omitted: 5 (unchanged: read-only GETs)
 # Coverage: 15/20 = 0.75
-coverage_score: 0.75
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 5):
+# API surface: 25 async write operations (expanded — catalog.batchUpsert, disputes.accept,
+#   disputes.submitEvidence, giftCards.activities.create, giftCards.create)
+# Contracted before: 15 (pass 4 total)
+# Contracted after: 20 (+5 this pass)
+# Omitted: 5 (unchanged: read-only GETs)
+# Coverage: 20/25 = 0.80
+coverage_score: 0.80
 
 package: square
 semver: ">=40.0.0"
 contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # updated by deepen-stream-2 pass 4
+last_verified: "2026-04-16"  # updated by deepen-stream-1 pass 5
 status: production
 evidence_quality: confirmed
 
@@ -56,6 +64,9 @@ detection:
     - "CustomersClient"
     - "RefundsClient"
     - "SubscriptionsClient"
+    - "CatalogClient"
+    - "DisputesClient"
+    - "GiftCardsClient"
 
 functions:
   - name: payments.create
@@ -784,3 +795,367 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: high
+
+  - name: catalog.batchUpsert
+    import_path: "square"
+    description: >
+      Batch creates or updates catalog objects (items, variations, categories, discounts,
+      taxes, modifier lists). The most common catalog write operation in SaaS apps that
+      sync product catalogs, inventory, or pricing. Usage: await client.catalog.batchUpsert({
+      idempotencyKey, batches: [{ objects: [...] }] }).
+      Returns HttpResponsePromise<BatchUpsertCatalogObjectsResponse>.
+      Max 1,000 objects per batch, 10,000 objects per request.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/catalog-api/batch-upsert-catalog-objects
+      # https://developer.squareup.com/docs/build-basics/using-rest-api (IDEMPOTENCY_KEY_REUSED confirmed)
+      # Concurrent update 429 and batch-level partial failure confirmed from Square API reference.
+      - id: square-catalog-batch-upsert-concurrent-update
+        condition: >
+          Another catalog update request (batch or non-batch) is already being processed for the
+          same seller account. Square processes only one catalog update at a time per account.
+          Common in sync jobs that fire concurrent batches.
+        throws: >
+          SquareError with RATE_LIMIT_ERROR and HTTP 429. Code: RATE_LIMITED.
+          The entire request is rejected — no objects from this request are inserted.
+        required_handling: >
+          Caller MUST wrap in try-catch and implement sequential retry with backoff.
+          Do NOT fire parallel catalog update requests for the same seller — serialize them.
+          On RATE_LIMITED (429), wait and retry the full batch. Use idempotency_key to
+          prevent duplicate insertions on retry.
+        sources:
+          - "https://developer.squareup.com/reference/square/catalog-api/batch-upsert-catalog-objects"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: square-catalog-batch-upsert-idempotency-reuse
+        condition: >
+          The same idempotency_key is reused with different request parameters (different
+          objects or different batches). This is a developer error that occurs when a sync
+          job generates idempotency keys from a non-unique seed (e.g., date only, not UUID).
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400) and code IDEMPOTENCY_KEY_REUSED.
+          Detail: "The idempotency key can only be retried with the same request data."
+        required_handling: >
+          Caller MUST wrap in try-catch. Generate idempotency keys from a content hash
+          of the objects being upserted, or use UUID v4 per request. If IDEMPOTENCY_KEY_REUSED
+          is returned, do NOT retry with the same key — generate a new key and retry.
+          This is not retryable without changing the key.
+        sources:
+          - "https://developer.squareup.com/docs/build-basics/using-rest-api"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: square-catalog-batch-upsert-partial-batch-failure
+        condition: >
+          One or more batches within the request contain malformed objects (exceeds size
+          limits, references non-existent modifier list, invalid is_deleted flag). Square
+          processes each batch independently — some batches may succeed while others fail.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). The error response indicates which
+          batch failed. Successful batches in the same request are committed; failed batches
+          are not.
+        required_handling: >
+          Caller MUST wrap in try-catch. After a partial failure, inspect errors to determine
+          which batch failed and re-submit only the failed batch with a new idempotency_key.
+          Do NOT re-submit the entire request — already-committed batches will be treated
+          as updates (same IDs), not duplicates. Validate objects client-side to catch
+          size limit violations (max 1,000 objects per batch, 10,000 per request).
+        sources:
+          - "https://developer.squareup.com/reference/square/catalog-api/batch-upsert-catalog-objects"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: disputes.accept
+    import_path: "square"
+    description: >
+      Accepts a chargeback dispute, immediately triggering Square to refund the disputed
+      amount to the cardholder and debit the seller's Square account. This is a permanent,
+      irreversible financial action. Usage: await client.disputes.accept({ disputeId }).
+      Returns HttpResponsePromise<AcceptDisputeResponse>. Dispute must be in an actionable
+      state (not already accepted, not past due_at deadline).
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/disputes-api/accept-dispute
+      # https://developer.squareup.com/docs/disputes-api/process-disputes (fetched 2026-04-16)
+      # Financial debit and bank account fallback confirmed from Square disputes guide.
+      - id: square-disputes-accept-financial-debit
+        condition: >
+          disputes.accept() succeeds but the caller does not handle the response or swallows
+          errors. Square IMMEDIATELY debits the disputed amount from the seller's Square balance.
+          If the balance is insufficient, Square debits the linked bank account. This is
+          not a queued or asynchronous operation — the debit happens at accept time.
+        throws: >
+          No exception on success. The risk is silent SUCCESS: the caller may not confirm
+          the debit occurred or update internal state. On actual error (wrong dispute state,
+          authentication): SquareError with INVALID_REQUEST_ERROR or AUTHENTICATION_ERROR.
+        required_handling: >
+          Caller MUST wrap in try-catch. On success, update internal dispute state to ACCEPTED
+          and trigger accounting entries for the debit. Do NOT accept disputes in batch loops
+          without tracking which disputes were accepted — if the loop crashes mid-way, some
+          disputes are accepted (debited) and some are not, causing accounting inconsistency.
+          Verify dispute is in actionable state (not ACCEPTED, not COMPLETED, not past due_at).
+        sources:
+          - "https://developer.squareup.com/reference/square/disputes-api/accept-dispute"
+          - "https://developer.squareup.com/docs/disputes-api/process-disputes"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-disputes-accept-deadline-missed
+        condition: >
+          Attempt to accept or challenge a dispute after the due_at deadline has passed.
+          Square automatically challenges the dispute on the seller's behalf after the deadline,
+          transitioning the dispute to a state where seller actions are no longer permitted.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). Dispute state will be in an
+          auto-challenged terminal state. The seller loses control of the dispute response.
+        required_handling: >
+          Caller MUST check dispute.due_at before calling accept() or submitEvidence().
+          Implement deadline monitoring: alert the operations team at due_at - 24h.
+          Do NOT assume disputes can be accepted at any time — the window is typically
+          30 days from notification but varies per card network.
+        sources:
+          - "https://developer.squareup.com/docs/disputes-api/process-disputes"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: disputes.submitEvidence
+    import_path: "square"
+    description: >
+      Submits all uploaded evidence (via createEvidenceFile/createEvidenceText) to the
+      card network for dispute adjudication. Once submitted, evidence cannot be removed.
+      Submission moves the dispute to a WAITING_THIRD_PARTY state. Usage:
+      await client.disputes.submitEvidence({ disputeId }).
+      Returns HttpResponsePromise<SubmitEvidenceResponse>.
+      IMPORTANT: Once sellers use the API for evidence, they cannot use the Square Dashboard
+      for that dispute — the two channels are mutually exclusive.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/disputes-api/submit-evidence
+      # https://developer.squareup.com/docs/disputes-api/process-disputes (fetched 2026-04-16)
+      # Evidence irrevocability and dashboard exclusion confirmed from Square disputes guide.
+      - id: square-disputes-submit-evidence-irrevocable
+        condition: >
+          submitEvidence() succeeds but the caller swallows the response without confirming
+          submission. Evidence submission is permanent — evidence cannot be removed after
+          calling this endpoint. If called before all evidence files are uploaded, the
+          submission is final with incomplete evidence.
+        throws: >
+          No exception on success. Risk is premature submission (no exception thrown).
+          On actual error (dispute already submitted, authentication, wrong state):
+          SquareError with INVALID_REQUEST_ERROR or AUTHENTICATION_ERROR.
+        required_handling: >
+          Caller MUST wrap in try-catch. Verify all evidence is uploaded (createEvidenceFile/
+          createEvidenceText succeed) BEFORE calling submitEvidence(). Do NOT call
+          submitEvidence() in the same request as evidence upload without confirming upload
+          success. After successful submission, update internal state to prevent re-submission.
+          Evidence submission is final — no retry recovers from incomplete evidence submission.
+        sources:
+          - "https://developer.squareup.com/reference/square/disputes-api/submit-evidence"
+          - "https://developer.squareup.com/docs/disputes-api/process-disputes"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-disputes-submit-evidence-dashboard-exclusion
+        condition: >
+          After calling any Disputes API endpoint for a specific dispute, the seller can no
+          longer manage that dispute through the Square Dashboard. Evidence and dispute status
+          in the Dashboard are not updated when using the API. If submitEvidence() fails and
+          the seller tries to use the Dashboard as a fallback, the two systems are out of sync.
+        throws: >
+          No exception — this is an operational constraint, not a thrown error. If submitEvidence()
+          fails, callers cannot advise sellers to complete the submission via Dashboard.
+        required_handling: >
+          Caller MUST implement complete evidence submission flow with retry logic. Do NOT
+          partially implement dispute management and expect sellers to fall back to the Dashboard.
+          If the API flow fails, the seller is locked out of Dashboard management for that dispute.
+          Alert ops team immediately on any submitEvidence() failure.
+        sources:
+          - "https://developer.squareup.com/docs/disputes-api/process-disputes"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: giftCards.activities.create
+    import_path: "square"
+    description: >
+      Creates a gift card activity (ACTIVATE, LOAD, REDEEM, DEACTIVATE, CLEAR_BALANCE, etc.)
+      that modifies the gift card's balance. The most critical gift card write operation.
+      A newly created gift card is in PENDING state until an ACTIVATE activity is created.
+      Usage: await client.giftCards.activities.create({ idempotencyKey, giftCardActivity:
+      { type, locationId, giftCardId? | giftCardGan? } }).
+      Returns HttpResponsePromise<CreateGiftCardActivityResponse>.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/gift-card-activities-api/create-gift-card-activity
+      # INSUFFICIENT_FUNDS, GIFT_CARD_AVAILABLE_AMOUNT confirmed from Square gift card activities API reference.
+      # PENDING state trap confirmed from Square gift cards client TypeScript declarations.
+      - id: square-gift-card-activities-insufficient-funds
+        condition: >
+          Attempting a REDEEM activity when the gift card balance is insufficient for the
+          requested redemption amount. GIFT_CARD_AVAILABLE_AMOUNT is thrown when the remaining
+          balance is less than the redemption amount.
+        throws: >
+          SquareError with PAYMENT_METHOD_ERROR (400) and code GIFT_CARD_AVAILABLE_AMOUNT
+          (insufficient balance) or INSUFFICIENT_FUNDS (funding source insufficient).
+          Also PAYMENT_LIMIT_EXCEEDED if the amount exceeds processing limits.
+        required_handling: >
+          Caller MUST wrap in try-catch and check the gift card balance before redemption.
+          On GIFT_CARD_AVAILABLE_AMOUNT: split payment (partial gift card + another tender) or
+          reject transaction. Do NOT assume gift card balance equals the full purchase amount
+          without checking first. Log GIFT_CARD_AVAILABLE_AMOUNT errors to detect fraudulent
+          redemption attempts.
+        sources:
+          - "https://developer.squareup.com/reference/square/gift-card-activities-api/create-gift-card-activity"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-gift-card-activities-pending-state
+        condition: >
+          Attempting to LOAD or REDEEM a gift card that is still in PENDING state (created
+          but never activated). A gift card created via giftCards.create() remains in PENDING
+          state until an ACTIVATE activity is successfully processed.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). The gift card cannot be used for
+          transactions until an ACTIVATE activity is processed via giftCards.activities.create().
+        required_handling: >
+          Caller MUST wrap in try-catch. Do NOT assume a gift card is usable immediately
+          after giftCards.create() — always create an ACTIVATE activity before issuing
+          the gift card to a customer. Validate gift card state before any LOAD or REDEEM
+          activity. On PENDING state error: call giftCards.activities.create() with type=ACTIVATE
+          and the initial balance before retrying.
+        sources:
+          - "https://developer.squareup.com/reference/square/gift-cards-api/create-gift-card"
+          - "https://developer.squareup.com/reference/square/gift-card-activities-api/create-gift-card-activity"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-gift-card-activities-temporary-error
+        condition: >
+          Square's internal gift card service returns a transient 503 Service Unavailable
+          during activity creation. Common during peak transaction periods. TEMPORARY_ERROR
+          means the activity status is unknown — it may or may not have been recorded.
+        throws: >
+          SquareError with PAYMENT_METHOD_ERROR and HTTP 503. Code: TEMPORARY_ERROR.
+          Square confirms this is safe to retry with the same idempotency key.
+        required_handling: >
+          Caller MUST wrap in try-catch and implement retry logic. Use the same idempotency_key
+          on retry — Square guarantees idempotency for gift card activities. On TEMPORARY_ERROR:
+          wait and retry (exponential backoff). Do NOT show a failure to the customer until
+          all retries are exhausted — the activity may have succeeded.
+        sources:
+          - "https://developer.squareup.com/reference/square/gift-card-activities-api/create-gift-card-activity"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: giftCards.create
+    import_path: "square"
+    description: >
+      Creates a digital or physical (plastic) gift card. Newly created gift cards are in
+      PENDING state and CANNOT be used for transactions until an ACTIVATE activity is
+      created via giftCards.activities.create(). Usage: await client.giftCards.create({
+      idempotencyKey, locationId, giftCard: { type: 'DIGITAL' | 'PHYSICAL', gan? } }).
+      Returns HttpResponsePromise<CreateGiftCardResponse>.
+      GANs (gift card account numbers) must be 8-20 alphanumeric chars, unique per seller,
+      and must not start with major credit card BIN patterns.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/gift-cards-api/create-gift-card (fetched 2026-04-16)
+      # PENDING state and GAN validation confirmed from Square gift cards API reference.
+      # TEMPORARY_ERROR (503) confirmed from API reference.
+      - id: square-gift-cards-create-pending-state-trap
+        condition: >
+          giftCards.create() succeeds but the caller issues the gift card to the customer
+          without first creating an ACTIVATE activity. The gift card is in PENDING state
+          and any LOAD or REDEEM attempt will fail with INVALID_REQUEST_ERROR.
+        throws: >
+          No exception from giftCards.create() — the trap is silent SUCCESS. The error
+          occurs later when the customer attempts to use the gift card, not at creation time.
+        required_handling: >
+          Caller MUST wrap in try-catch. After successful giftCards.create(), always call
+          giftCards.activities.create() with type=ACTIVATE and the initial balance BEFORE
+          issuing the gift card to the customer. Do NOT return the gift card GAN to the
+          customer until activation succeeds. If activation fails, the gift card must be
+          re-activated before distribution.
+        sources:
+          - "https://developer.squareup.com/reference/square/gift-cards-api/create-gift-card"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-gift-cards-create-invalid-gan
+        condition: >
+          A custom GAN is provided that fails validation: not 8-20 alphanumeric characters,
+          not unique for this seller, or starts with a major credit card BIN pattern (e.g.,
+          4XXXXXXX for Visa, 5XXXXXXX for Mastercard). Predictable GANs (e.g., sequential
+          numbers) create fraud risk.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR (400). GAN validation failure prevents
+          gift card creation entirely.
+        required_handling: >
+          Caller MUST wrap in try-catch. Validate custom GANs before calling create():
+          8-20 alphanumeric, no major BIN patterns, must be unique. Prefer letting Square
+          auto-generate GANs (omit gan field) unless specific GAN format is required.
+          On INVALID_REQUEST_ERROR: fix the GAN and retry with a new idempotency_key.
+        sources:
+          - "https://developer.squareup.com/reference/square/gift-cards-api/create-gift-card"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium

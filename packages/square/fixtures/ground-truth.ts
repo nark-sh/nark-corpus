@@ -27,6 +27,18 @@
  *   square-orders-update-closed-order        (deepen-stream-2 pass 4)
  *   square-orders-pay-amount-mismatch        (deepen-stream-2 pass 4)
  *   square-orders-pay-timeout                (deepen-stream-2 pass 4)
+ *   square-catalog-batch-upsert-concurrent-update    (deepen-stream-1 pass 5)
+ *   square-catalog-batch-upsert-idempotency-reuse   (deepen-stream-1 pass 5)
+ *   square-catalog-batch-upsert-partial-batch-failure (deepen-stream-1 pass 5)
+ *   square-disputes-accept-financial-debit           (deepen-stream-1 pass 5)
+ *   square-disputes-accept-deadline-missed           (deepen-stream-1 pass 5)
+ *   square-disputes-submit-evidence-irrevocable      (deepen-stream-1 pass 5)
+ *   square-disputes-submit-evidence-dashboard-exclusion (deepen-stream-1 pass 5)
+ *   square-gift-card-activities-insufficient-funds   (deepen-stream-1 pass 5)
+ *   square-gift-card-activities-pending-state        (deepen-stream-1 pass 5)
+ *   square-gift-card-activities-temporary-error      (deepen-stream-1 pass 5)
+ *   square-gift-cards-create-pending-state-trap      (deepen-stream-1 pass 5)
+ *   square-gift-cards-create-invalid-gan             (deepen-stream-1 pass 5)
  */
 
 import { SquareClient, SquareError, SquareTimeoutError } from "square";
@@ -389,6 +401,146 @@ async function createOrderWithProperHandling() {
   }
 }
 
+// ─── NEW VIOLATION CASES (deepen-stream-1 pass 5) ────────────────────────────
+
+// @expect-violation: square-catalog-batch-upsert-concurrent-update
+// @expect-violation: square-catalog-batch-upsert-idempotency-reuse
+// @expect-violation: square-catalog-batch-upsert-partial-batch-failure
+async function batchUpsertCatalogMissingErrorHandling(objects: unknown[]) {
+  // ❌ No try-catch — RATE_LIMITED (concurrent updates), IDEMPOTENCY_KEY_REUSED,
+  // and partial batch failure all unhandled
+  const response = await client.catalog.batchUpsert({
+    idempotencyKey: `catalog-${Date.now()}`,
+    batches: [{ objects: objects as any }],
+  });
+  return response;
+}
+
+// @expect-violation: square-disputes-accept-financial-debit
+// @expect-violation: square-disputes-accept-deadline-missed
+async function acceptDisputeMissingErrorHandling(disputeId: string) {
+  // ❌ No try-catch — financial debit occurs immediately; deadline-missed error unhandled
+  // Square debits the seller's account upon accept — no error handling means
+  // no accounting record is created for the debit
+  const response = await client.disputes.accept({ disputeId });
+  return response;
+}
+
+// @expect-violation: square-disputes-submit-evidence-irrevocable
+// @expect-violation: square-disputes-submit-evidence-dashboard-exclusion
+async function submitDisputeEvidenceMissingErrorHandling(disputeId: string) {
+  // ❌ No try-catch — irrevocable evidence submission and dashboard exclusion unhandled
+  // If this fails, the seller is locked out of Dashboard dispute management
+  const response = await client.disputes.submitEvidence({ disputeId });
+  return response;
+}
+
+// @expect-violation: square-gift-card-activities-insufficient-funds
+// @expect-violation: square-gift-card-activities-pending-state
+// @expect-violation: square-gift-card-activities-temporary-error
+async function createGiftCardActivityMissingErrorHandling(giftCardId: string) {
+  // ❌ No try-catch — GIFT_CARD_AVAILABLE_AMOUNT (insufficient balance), PENDING state,
+  // and TEMPORARY_ERROR (503) all unhandled
+  const response = await client.giftCards.activities.create({
+    idempotencyKey: `gcact-${Date.now()}`,
+    giftCardActivity: {
+      type: "REDEEM",
+      locationId: "LOCATION_ID",
+      giftCardId,
+    },
+  });
+  return response;
+}
+
+// @expect-violation: square-gift-cards-create-pending-state-trap
+// @expect-violation: square-gift-cards-create-invalid-gan
+async function createGiftCardMissingErrorHandling() {
+  // ❌ No try-catch — INVALID_REQUEST_ERROR (bad GAN) unhandled
+  // ❌ Also: caller issues GAN to customer without first calling ACTIVATE activity
+  // — PENDING state trap (no exception thrown by create(), error occurs at use time)
+  const response = await client.giftCards.create({
+    idempotencyKey: `gc-${Date.now()}`,
+    locationId: "LOCATION_ID",
+    giftCard: { type: "DIGITAL" },
+  });
+  // ❌ Returns GAN directly without activating — customer will get error at checkout
+  return response;
+}
+
+// ─── NEW CLEAN CASES (deepen-stream-1 pass 5) ────────────────────────────────
+
+// @expect-clean
+async function batchUpsertCatalogWithProperHandling(objects: unknown[]) {
+  try {
+    const response = await client.catalog.batchUpsert({
+      idempotencyKey: `catalog-${crypto.randomUUID()}`,
+      batches: [{ objects: objects as any }],
+    });
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      const code = err.errors?.[0]?.code;
+      if (code === "RATE_LIMITED") {
+        // Sequential retry required — do NOT run concurrent catalog updates
+        throw new Error("Catalog update rate limited — retry after backoff");
+      }
+      if (code === "IDEMPOTENCY_KEY_REUSED") {
+        throw new Error("Idempotency key reused with different data — use UUID per request");
+      }
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function acceptDisputeWithProperHandling(disputeId: string, dueAt: string) {
+  // ✅ Check deadline before accepting
+  if (new Date(dueAt) < new Date()) {
+    throw new Error("Dispute deadline passed — cannot accept");
+  }
+  try {
+    const response = await client.disputes.accept({ disputeId });
+    // ✅ Record debit in accounting system after successful accept
+    console.log(`Dispute ${disputeId} accepted — debit recorded`);
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      throw new Error(`Dispute accept failed: ${err.errors?.[0]?.code}`);
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function createGiftCardWithActivation() {
+  try {
+    const createResponse = await client.giftCards.create({
+      idempotencyKey: `gc-${crypto.randomUUID()}`,
+      locationId: "LOCATION_ID",
+      giftCard: { type: "DIGITAL" },
+    });
+    const giftCardId = createResponse.giftCard?.id;
+    if (!giftCardId) throw new Error("Gift card creation returned no ID");
+
+    // ✅ Activate before issuing to customer
+    const activateResponse = await client.giftCards.activities.create({
+      idempotencyKey: `gcact-${crypto.randomUUID()}`,
+      giftCardActivity: {
+        type: "ACTIVATE",
+        locationId: "LOCATION_ID",
+        giftCardId,
+        activateActivityDetails: { amountMoney: { amount: BigInt(5000), currency: "USD" } },
+      },
+    });
+    return activateResponse;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      throw new Error(`Gift card create/activate failed: ${err.errors?.[0]?.code}`);
+    }
+    throw err;
+  }
+}
+
 export {
   createPaymentMissingErrorHandling,
   refundPaymentMissingErrorHandling,
@@ -412,4 +564,13 @@ export {
   createCardWithProperHandling,
   publishInvoiceWithProperHandling,
   payOrderWithProperHandling,
+  // deepen-stream-1 pass 5 additions
+  batchUpsertCatalogMissingErrorHandling,
+  acceptDisputeMissingErrorHandling,
+  submitDisputeEvidenceMissingErrorHandling,
+  createGiftCardActivityMissingErrorHandling,
+  createGiftCardMissingErrorHandling,
+  batchUpsertCatalogWithProperHandling,
+  acceptDisputeWithProperHandling,
+  createGiftCardWithActivation,
 };
