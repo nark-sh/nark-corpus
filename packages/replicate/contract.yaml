@@ -1,27 +1,44 @@
 # replicate — Replicate AI model inference SDK
 #
 # The Replicate SDK makes HTTPS requests to the Replicate API (api.replicate.com).
-# All inference methods can throw:
-#   Error: network failures, auth errors, quota exceeded
-#   HTTP 401: invalid API token
-#   HTTP 402: payment required (no credits)
-#   HTTP 404: model or version not found
-#   HTTP 422: unprocessable entity (invalid inputs)
-#   HTTP 429: rate limit exceeded
-#   Network errors: ECONNREFUSED, ETIMEDOUT
+# Error class hierarchy (confirmed from replicate@1.4.0 source lib/error.js):
+#   ApiError (extends Error) — HTTP API errors; has .request (Request) and .response (Response)
+#     message includes: "Request to <url> failed with status <N> <statusText>: <responseText>"
+#     response.status values: 401 (invalid API token), 402 (payment required/no credits),
+#     404 (model/version not found), 422 (invalid inputs), 429 (rate limit exceeded),
+#     500/503 (server error — auto-retried internally)
+#   Error — non-HTTP errors: prediction failures, invalid inputs before request, invalid identifiers
+#     "Prediction failed: <model-error-message>" — thrown by wait() and run() when status === "failed"
+#     "Invalid model version identifier" — thrown before any HTTP call
+#     "Prediction does not support streaming" — thrown by stream() when model lacks SSE URL
+#     "Invalid webhook URL" — thrown before HTTP call when webhook option is malformed
+#     "Invalid file argument, must be a Blob, File or Buffer" — thrown by files.create()
+#     "Missing required webhook headers" — thrown by validateWebhook() when headers absent
+#     "Missing required secret" — thrown by validateWebhook() when secret absent
 #
-# Primary API (v0.16.0+):
-#   const replicate = new Replicate({ auth: '...' })
-#   await replicate.run(model, { input })
-#   await replicate.predictions.create({ version?, model?, input })
-#   await replicate.predictions.get(predictionId)
+# Retry behavior (confirmed from index.js line 282):
+#   429 and 5xx (500+) are auto-retried internally by default
+#   401, 402, 404, 422 — NOT retried (permanent errors)
+#
+# Primary API (v1.x):
+#   const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
+#   await replicate.run(model, { input })              — sync run, waits for completion
+#   for await (const event of replicate.stream(model, { input })) — streaming
+#   await replicate.predictions.create({ model?, version?, input })
+#   await replicate.wait(prediction)                   — poll until done
+#   await replicate.trainings.create(owner, name, version_id, options)
+#   await replicate.files.create(file, metadata)
+#   await replicate.deployments.predictions.create(owner, name, options)
+#   await validateWebhook(request, secret)             — verify webhook signature
+#
 package: "replicate"
 semver: ">=0.16.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   class_names:
@@ -39,14 +56,15 @@ functions:
     postconditions:
       # Evidence: seen in 3 primary firings across 2 repos in scan-replicate-2026-04-11.json
       # Top affected: nbonamy/witsy (⭐ 1916 stars), pondorasti/emojis (⭐ 1769 stars)
+      # Error types confirmed from replicate@1.4.0 source: index.js lines 141-203
       - id: run-no-error-handling
         condition: >
           replicate.run() called without try-catch or .catch() handler
         throws: >
-          Error on HTTP errors (401 Unauthorized, 402 Payment Required,
-          404 Not Found, 422 Unprocessable, 429 Rate Limit).
+          ApiError on HTTP errors (401 Unauthorized, 402 Payment Required,
+          404 Not Found, 422 Unprocessable). Error("Prediction failed: <detail>")
+          if the model errors during execution (prediction.status === "failed").
           Network errors: ECONNREFUSED, ETIMEDOUT.
-          Prediction errors thrown mid-run if model fails.
         required_handling: >
           Caller MUST wrap await replicate.run() in try-catch or chain .catch().
           Uncaught error causes unhandled promise rejection — API routes crash,
@@ -62,8 +80,8 @@ functions:
             throw error;
           }
         sources:
-          - "https://github.com/replicate/replicate-javascript#readme"
-          - "https://replicate.com/docs/reference/http#create-a-prediction"
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+          - "https://replicate.com/docs/reference/error-codes"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -71,6 +89,274 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      - id: run-prediction-failure-swallowed
+        condition: >
+          replicate.run() call catches error generically and returns null/undefined
+          or continues silently when prediction.status === "failed"
+        throws: >
+          Error("Prediction failed: <model-error-message>") — contains the model's
+          error detail from the prediction object. This is a distinct error type from
+          ApiError (HTTP errors). It is thrown when the model itself reports a failure
+          (GPU OOM, model crash, E1001 out-of-memory, invalid input processed by model).
+        required_handling: >
+          Distinguish between ApiError (auth/network/rate-limit — infrastructure failure)
+          and Error with "Prediction failed:" prefix (model-level failure — may be
+          retryable with different inputs). Swallowing this error means the caller
+          returns undefined output which downstream code treats as valid.
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+          - "https://replicate.com/docs/reference/error-codes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: stream
+    import_path: "replicate"
+    description: >
+      Streams a model's output token-by-token using Server-Sent Events (SSE).
+      Called as an async generator: for await (const event of replicate.stream(model, { input })).
+      Internally creates a prediction and then reads the SSE stream from prediction.urls.stream.
+      Throws if the model identifier is invalid, if the model does not support streaming,
+      or if the underlying predictions.create() API call fails.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 index.js lines 313-361
+      # stream() calls predictions.create() then yields SSE events from prediction.urls.stream
+      # If model lacks SSE URL, throws synchronously before streaming begins
+      - id: stream-no-error-handling
+        condition: >
+          for-await loop over replicate.stream() is not wrapped in try-catch
+        throws: >
+          ApiError (from internal predictions.create() call) for HTTP errors:
+          401 (bad API token), 402 (no credits), 404 (model not found), 422 (invalid inputs).
+          Error("Invalid model version identifier") if the model ref is malformed.
+          Error("Prediction does not support streaming") if the model version lacks
+          an SSE endpoint — not all models support streaming, only those with stream: true
+          in their schema. Network errors propagate as-is.
+        required_handling: >
+          Caller MUST wrap the for-await loop in try-catch. Stream errors can surface
+          partway through iteration (e.g., model OOM mid-generation). The error from
+          predictions.create() is thrown synchronously before iteration begins.
+
+          try {
+            for await (const event of replicate.stream("owner/model", {
+              input: { prompt: "..." }
+            })) {
+              process.stdout.write(event.data);
+            }
+          } catch (error) {
+            if (error instanceof Replicate.ApiError) {
+              console.error("API error:", error.response.status, error.message);
+            } else {
+              console.error("Stream error:", error.message);
+            }
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+          - "https://replicate.com/docs/topics/predictions/streaming"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: stream-model-not-streaming-capable
+        condition: >
+          replicate.stream() called on a model that does not support streaming
+          (model version lacks an SSE endpoint URL in prediction.urls.stream)
+        throws: >
+          Error("Prediction does not support streaming") — thrown after predictions.create()
+          succeeds (HTTP 200) but before any SSE events are yielded. The prediction was
+          created and is consuming billing credits, but the caller receives no output.
+          Streaming support depends on individual model version, not the model itself.
+        required_handling: >
+          Check model capabilities before calling stream(). If streaming is not
+          guaranteed, use run() or predictions.create() + wait() instead. Catching
+          "Prediction does not support streaming" and falling back to run() is a safe
+          recovery pattern. Note: the prediction created internally is not automatically
+          canceled on this error — it may continue running in the background.
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+          - "https://replicate.com/docs/topics/predictions/streaming"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: wait
+    import_path: "replicate"
+    description: >
+      Polls a prediction until it reaches a terminal state (succeeded, failed, or canceled).
+      Used after predictions.create() or deployments.predictions.create() to wait for
+      async results. Called as await replicate.wait(prediction, { interval? }).
+      Throws when the prediction fails (status === "failed") or if polling encounters
+      an API error. Does NOT throw on canceled predictions.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 index.js lines 393-438
+      # wait() calls predictions.get() in a loop until terminal state
+      # Throws Error("Prediction failed: <detail>") when updatedPrediction.status === "failed"
+      - id: wait-prediction-failure
+        condition: >
+          replicate.wait() is not wrapped in try-catch, or catch only handles ApiError
+          but not plain Error (prediction failure is a plain Error, not ApiError)
+        throws: >
+          Error("Prediction failed: <model-error-message>") — thrown when prediction
+          reaches status "failed". This is a plain Error, NOT an ApiError. Catching
+          only (error instanceof ApiError) will miss this. The error message contains
+          the model's error string (e.g., "CUDA out of memory", "Invalid input").
+          Also throws ApiError if predictions.get() HTTP call fails during polling.
+        required_handling: >
+          Caller MUST catch both ApiError (infrastructure/HTTP failures during polling)
+          and plain Error (model execution failure). A catch-all is sufficient:
+
+          try {
+            const completed = await replicate.wait(prediction);
+            return completed.output;
+          } catch (error) {
+            if (error instanceof Replicate.ApiError) {
+              console.error("Polling failed:", error.response.status);
+            } else {
+              // Model execution failed — error.message = "Prediction failed: <reason>"
+              console.error("Model failed:", error.message);
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: wait-canceled-prediction-not-thrown
+        condition: >
+          Code checks only for output after replicate.wait() without checking
+          prediction.status, assuming resolved wait() always means success
+        throws: >
+          Does NOT throw on canceled predictions (status === "canceled") — wait() returns
+          the prediction object silently. Code that does "const result = await replicate.wait(pred);
+          return result.output" will return undefined/null if prediction was canceled
+          without any exception. Only "failed" status throws — "canceled" is a silent
+          non-throw return.
+        required_handling: >
+          After wait() resolves without throwing, check prediction.status === "succeeded"
+          before accessing output. Canceled predictions have no output.
+
+          const completed = await replicate.wait(prediction);
+          if (completed.status !== "succeeded") {
+            throw new Error(`Prediction ${completed.status}: ${completed.error || 'no output'}`);
+          }
+          return completed.output;
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: trainings.create
+    import_path: "replicate"
+    description: >
+      Creates a fine-tuning training job. Called as replicate.trainings.create(
+      model_owner, model_name, version_id, { destination, input, webhook? }).
+      Starts an async training job — returns a Training object with status "starting",
+      not the trained model. Callers must poll trainings.get() or use webhooks to
+      get the final trained version ID. Throws immediately if the API call fails.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 lib/trainings.js
+      # trainings.create() validates webhook URL client-side before HTTP call
+      # HTTP call: POST /models/{owner}/{name}/versions/{version_id}/trainings
+      - id: trainings-create-no-error-handling
+        condition: >
+          replicate.trainings.create() called without try-catch
+        throws: >
+          Error("Invalid webhook URL") — thrown synchronously before any HTTP call
+          if options.webhook is provided but is not a valid URL.
+          ApiError with response.status: 401 (API token invalid), 402 (no credits),
+          404 (model owner/name/version_id not found), 422 (invalid training input
+          or model does not support fine-tuning), 429 (rate limit).
+        required_handling: >
+          Caller MUST wrap await replicate.trainings.create() in try-catch.
+          CRITICAL: trainings.create() resolves immediately with a Training object
+          (status: "starting") — the training has NOT completed. Callers must use
+          the returned training.id to poll trainings.get() or configure a webhook.
+          Treating the returned Training as containing the trained model is a bug.
+
+          try {
+            const training = await replicate.trainings.create(
+              "stability-ai",
+              "sdxl",
+              "version-id-here",
+              {
+                destination: "my-org/my-fine-tuned-model",
+                input: { train_data_url: "...", steps: 1000 }
+              }
+            );
+            // training.status is "starting" — NOT complete!
+            // Poll training.id or wait for webhook
+          } catch (error) {
+            console.error("Training creation failed:", error);
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/trainings.js"
+          - "https://replicate.com/docs/guides/fine-tuning"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: trainings-create-result-not-polled
+        condition: >
+          Code uses training.output or training.status === "succeeded" immediately
+          after replicate.trainings.create() without waiting for job completion
+        throws: >
+          Does NOT throw — training.status is "starting" at creation time, training.output
+          is undefined. Code that destructures training.output.version immediately after
+          create() returns undefined silently. Fine-tuning jobs take minutes to hours.
+          The trained model version ID is only available in training.output.version
+          AFTER the job completes.
+        required_handling: >
+          Always track training.id and poll or use webhooks for completion:
+
+          // WRONG — output is undefined immediately after create()
+          const training = await replicate.trainings.create(...);
+          const versionId = training.output.version; // undefined!
+
+          // RIGHT — poll for completion
+          let completed = await replicate.wait(training);
+          const versionId = completed.output?.version;
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/trainings.js"
+          - "https://replicate.com/docs/guides/fine-tuning"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: predictions.create
     import_path: "replicate"
@@ -83,12 +369,14 @@ functions:
     postconditions:
       # Evidence: seen in 2 primary firings across 1 repo in scan-replicate-2026-04-11.json
       # Top affected: pondorasti/emojis (⭐ 1769 stars) — 2 violations in src/server/replicate.ts
+      # Error types confirmed from replicate@1.4.0 lib/predictions.js
       - id: predictions-create-no-error-handling
         condition: >
           replicate.predictions.create() called without try-catch or .catch() handler
         throws: >
-          Error on HTTP errors (401 Unauthorized, 402 Payment Required,
-          404 Not Found, 422 Unprocessable, 429 Rate Limit).
+          Error("Invalid webhook URL") synchronously if options.webhook is malformed.
+          ApiError with HTTP status 401 (invalid token), 402 (no credits),
+          404 (model/version not found), 422 (invalid inputs), 429 (rate limit).
           Network errors: ECONNREFUSED, ETIMEDOUT.
         required_handling: >
           Caller MUST wrap await replicate.predictions.create() in try-catch
@@ -108,7 +396,7 @@ functions:
             throw error;
           }
         sources:
-          - "https://github.com/replicate/replicate-javascript#readme"
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/predictions.js"
           - "https://replicate.com/docs/reference/http#create-a-prediction"
         severity: error
         business_impact:
@@ -118,6 +406,192 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: files.create
+    import_path: "replicate"
+    description: >
+      Uploads a file to Replicate's file storage for use as model input. Called as
+      replicate.files.create(file, metadata?). The file argument must be a Blob or
+      Buffer. Returns a FileObject with an ID that can be passed as model input.
+      Files are stored temporarily (expires_at field indicates expiry).
+      Maximum file size is 100MiB.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 lib/files.js
+      # files.create() validates file type client-side before HTTP call
+      # File size limit of 100MiB confirmed from README.md (npm package docs)
+      - id: files-create-no-error-handling
+        condition: >
+          replicate.files.create() called without try-catch
+        throws: >
+          Error("Invalid file argument, must be a Blob, File or Buffer") — thrown
+          synchronously before any HTTP call if file is not a Blob or Buffer.
+          ApiError with response.status: 401 (invalid API token), 402 (no credits/storage quota),
+          413 (file exceeds 100MiB limit — Payload Too Large),
+          422 (invalid metadata structure), 429 (rate limit).
+        required_handling: >
+          Caller MUST wrap await replicate.files.create() in try-catch.
+          Handle file size validation before upload to avoid 413 errors. Files expire
+          and must be re-uploaded if the FileObject.expires_at has passed.
+
+          try {
+            const fileBlob = new Blob([fileBuffer], { type: "image/png" });
+            const fileObj = await replicate.files.create(fileBlob, {
+              filename: "input.png"
+            });
+            // Use fileObj.id as model input
+            const output = await replicate.run("owner/model", {
+              input: { image: fileObj.urls.get }
+            });
+          } catch (error) {
+            console.error("File upload failed:", error);
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/files.js"
+          - "https://github.com/replicate/replicate-javascript#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: deployments.predictions.create
+    import_path: "replicate"
+    description: >
+      Creates a prediction on a specific deployment (a persistent, always-warm endpoint).
+      Called as replicate.deployments.predictions.create(deployment_owner, deployment_name, options).
+      Deployments are custom infrastructure (scaled instances) for high-frequency inference.
+      Throws if the deployment is not found, the caller lacks access, or the API call fails.
+      Returns a Prediction that must be polled (via wait()) or handled via webhook.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 lib/deployments.js
+      # POST /deployments/{owner}/{name}/predictions
+      # Distinct from predictions.create() — targets a specific deployment, not the shared platform
+      - id: deployments-predictions-create-no-error-handling
+        condition: >
+          replicate.deployments.predictions.create() called without try-catch
+        throws: >
+          Error("Invalid webhook URL") synchronously if options.webhook is malformed.
+          ApiError with response.status: 401 (bad API token), 403 (no access to deployment),
+          404 (deployment owner/name not found or deployment deleted),
+          422 (invalid prediction inputs), 429 (rate limit on deployment).
+          Note: 403 is deployment-specific (access control) vs 401 (API token).
+        required_handling: >
+          Caller MUST wrap in try-catch. Deployments can be deleted while code is running —
+          404 must be handled. In multi-tenant apps, 403 indicates the deployment is
+          not accessible with the current API token.
+
+          try {
+            const prediction = await replicate.deployments.predictions.create(
+              "my-org",
+              "my-deployment",
+              { input: { prompt: "..." }, wait: 30 }
+            );
+            if (prediction.status === "succeeded") {
+              return prediction.output;
+            }
+            return await replicate.wait(prediction);
+          } catch (error) {
+            if (error instanceof Replicate.ApiError && error.response.status === 404) {
+              throw new Error("Deployment not found — may have been deleted");
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/deployments.js"
+          - "https://replicate.com/docs/topics/deployments"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: validateWebhook
+    import_path: "replicate"
+    description: >
+      Verifies that an incoming webhook request was sent by Replicate using HMAC-SHA256
+      signature verification. Called as validateWebhook(request, secret) in webhook handlers.
+      Returns Promise<boolean> — true if signature is valid, false if invalid.
+      Does NOT throw on invalid signatures — only throws on missing/malformed inputs.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 lib/util.js lines 30-145
+      # validateWebhook returns false (not throw) for signature mismatch
+      # Throws only for missing headers, missing secret, or unreadable body
+      - id: validatewebhook-return-value-not-checked
+        condition: >
+          validateWebhook() return value is not checked — code processes the webhook
+          payload regardless of whether signature is valid
+        throws: >
+          Does NOT throw for invalid signatures — returns false.
+          Code that does "await validateWebhook(req, secret); processWebhook(body)"
+          without checking the return value will process forged/tampered webhooks
+          silently. The function is designed to return false, not throw, for security
+          reasons (avoids timing-attack information leakage from exception messages).
+        required_handling: >
+          ALWAYS check the return value of validateWebhook(). Treating unverified
+          webhooks as legitimate is a security vulnerability — forged webhooks can
+          trigger billing, data changes, or model deployments.
+
+          const isValid = await validateWebhook(request, secret);
+          if (!isValid) {
+            return new Response("Invalid signature", { status: 401 });
+          }
+          // Only process verified webhook here
+          const payload = await request.json();
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/util.js"
+          - "https://replicate.com/docs/topics/webhooks#verifying-webhooks"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: validatewebhook-missing-headers-throws
+        condition: >
+          validateWebhook() called on a request missing webhook-id, webhook-timestamp,
+          or webhook-signature headers (e.g., called on a non-Replicate request or
+          when testing with a plain Request object without headers)
+        throws: >
+          Error("Missing required webhook headers") — thrown when any of webhook-id,
+          webhook-timestamp, or webhook-signature headers are absent from the request.
+          Error("Missing required secret") — thrown when the secret argument is falsy.
+          Error("Invalid body type") — thrown when request.body is not a string, Blob,
+          Buffer, ReadableStream, or TypedArray.
+          These throw synchronously before any HMAC computation.
+        required_handling: >
+          Wrap validateWebhook() in try-catch in webhook handler endpoints. Missing
+          header errors indicate the request is not a Replicate webhook (e.g., a
+          health check probe hitting the webhook endpoint). These should return 400
+          rather than 500.
+
+          try {
+            const isValid = await validateWebhook(request, webhookSecret);
+            if (!isValid) return new Response("Unauthorized", { status: 401 });
+          } catch (error) {
+            if (error.message === "Missing required webhook headers") {
+              return new Response("Not a valid webhook request", { status: 400 });
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/util.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "new Replicate({ auth }) does NOT make network calls — no try-catch needed for constructor"
   - "run() is synchronous in the caller sense — it polls until completion, throws on model failure"
@@ -126,3 +600,8 @@ notes:
   - "witsy (1.9k★) calls client.run() without try-catch — real-world violation found"
   - "extrapolate (695★) wraps predictions.create() in try-catch — correct"
   - "v0.16.0+ has run(); earlier versions used predictions.create() only"
+  - "ApiError extends Error and has .request + .response properties; use instanceof ApiError to distinguish HTTP errors from model errors"
+  - "429 and 5xx are auto-retried by the SDK; 401/402/404/422 are not retried"
+  - "trainings.create() returns immediately — training.output is only populated after job completes (minutes-hours)"
+  - "validateWebhook() returns false (not throw) for invalid signatures — always check return value"
+  - "stream() requires model to support SSE streaming; not all model versions support it"
