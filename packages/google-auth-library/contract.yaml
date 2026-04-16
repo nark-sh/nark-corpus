@@ -2,7 +2,7 @@ package: google-auth-library
 semver: ">=8.0.0 <11.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
 
@@ -122,3 +122,329 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: OAuth2Client.verifyIdToken
+    import_path: "google-auth-library"
+    description: >
+      Verifies a Google ID token (from Google Sign-In, Google One Tap, or
+      Firebase Auth) by fetching Google's signing certificates and checking
+      the signature, expiry, issuer, and audience. Called in OAuth callback
+      routes to validate tokens from the frontend. Throws synchronously
+      on invalid token structure and asynchronously on network failure or
+      token verification errors.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html
+      # Source confirmed: oauth2client.js lines 527-787 (throw statements)
+      - id: verify-id-token-unprotected
+        condition: >
+          Async call to client.verifyIdToken() is not wrapped in a try-catch.
+          Throws on: (1) missing/empty idToken — Error('The verifyIdToken method
+          requires an ID Token'); (2) cert fetch failure — GaxiosError on network
+          error fetching Google certs; (3) signature mismatch — Error('Invalid
+          token signature: ...'); (4) token expiry — Error('Token used too late,
+          ...'); (5) audience mismatch — Error('Wrong recipient, payload audience
+          != requiredAudience'); (6) invalid issuer — Error('Invalid issuer,
+          expected one of [...]').
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await client.verifyIdToken({ idToken, audience }) in a
+          try-catch block. Common in Google Sign-In routes where the frontend sends
+          an ID token for server-side validation. An uncaught exception means the
+          user cannot log in and the route crashes. Distinguish token validation
+          errors (user-facing: 'Invalid token') from network errors (retry-able).
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: OAuth2Client.refreshAccessToken
+    import_path: "google-auth-library"
+    description: >
+      Refreshes an expired OAuth2 access token using the stored refresh token.
+      Called in background jobs, cron tasks, and server-side API proxies to
+      ensure tokens stay valid. Throws immediately if no refresh token is set
+      (before any network call), or GaxiosError if Google's token endpoint
+      rejects the refresh.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html
+      # Source confirmed: oauth2client.js line 240 ('No refresh token is set.')
+      # and line 262 (GaxiosError re-throw on refresh failure)
+      - id: refresh-access-token-unprotected
+        condition: >
+          Async call to client.refreshAccessToken() is not wrapped in a try-catch.
+          Throws Error('No refresh token is set.') when client.credentials.refresh_token
+          is absent — common when users authenticate with access_type:'online' (default)
+          instead of 'offline'. Also throws GaxiosError when Google's token endpoint
+          returns invalid_grant (refresh token expired/revoked), invalid_client
+          (bad client credentials), or network failure.
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await client.refreshAccessToken() in a try-catch block.
+          Handle Error message 'No refresh token is set.' as a configuration error
+          (offline access was not requested). Handle GaxiosError.response.data.error
+          === 'invalid_grant' as a revoked/expired refresh token requiring user to
+          re-authenticate. Unhandled exceptions in token refresh background tasks
+          cause cascading API call failures without alerting.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: OAuth2Client.getAccessToken
+    import_path: "google-auth-library"
+    description: >
+      Returns the current access token, automatically refreshing if it is
+      expired. Unlike refreshAccessToken(), getAccessToken() handles the
+      expiry check internally. Throws when no credentials are available
+      (neither access token nor refresh token/handler), or propagates
+      errors from the underlying refresh operation.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html
+      # Source confirmed: oauth2client.js line 314 ('No refresh token or refresh handler callback is set.')
+      # and line 319 ('Could not refresh access token.')
+      - id: get-access-token-unprotected
+        condition: >
+          Async call to client.getAccessToken() is not wrapped in a try-catch.
+          Throws Error('No refresh token or refresh handler callback is set.') when
+          neither credentials.refresh_token nor refreshHandler callback is configured.
+          Also throws Error('Could not refresh access token.') when the underlying
+          refresh attempt fails. Commonly called in middleware and API proxy helpers
+          where missing error handling causes every downstream API request to fail.
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await client.getAccessToken() in a try-catch block.
+          The Error message 'No refresh token or refresh handler callback is set.'
+          indicates incomplete OAuth configuration — the user must re-authenticate
+          with access_type:'offline'. The error 'Could not refresh access token.'
+          wraps GaxiosError and should be retried or re-authenticated.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: GoogleAuth.getApplicationDefault
+    import_path: "google-auth-library"
+    description: >
+      Retrieves Application Default Credentials (ADC) along with the project ID.
+      Alternative to getClient() — returns both credential and projectId in one
+      call. Throws the same 'Could not load the default credentials' error as
+      getClient() when no ADC is available. Commonly used in middleware and
+      initialization code outside Google infrastructure.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js line 284 (NO_ADC_FOUND constant message)
+      - id: get-application-default-unprotected
+        condition: >
+          Async call to auth.getApplicationDefault() is not wrapped in a try-catch.
+          Throws Error with message 'Could not load the default credentials. Browse
+          to https://cloud.google.com/docs/authentication/getting-started for more
+          information.' when (1) GOOGLE_APPLICATION_CREDENTIALS env var is not set,
+          (2) no well-known credentials file exists (~/.config/gcloud/), and (3) the
+          server is not running on GCP. Also throws RangeError when API keys and
+          credentials are combined (mutually exclusive).
+        throws: "Error | RangeError"
+        required_handling: >
+          Caller MUST wrap await auth.getApplicationDefault() in a try-catch block.
+          Distinguish Error('Could not load the default credentials') — configuration
+          error requiring GOOGLE_APPLICATION_CREDENTIALS — from network errors during
+          GCE metadata server checks. Commonly uncaught in server initialization code,
+          causing crash-on-startup rather than a startup-time warning.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: GoogleAuth.getIdTokenClient
+    import_path: "google-auth-library"
+    description: >
+      Creates an IdTokenClient that fetches Google ID tokens for service-to-service
+      authentication (e.g., calling Cloud Run, Cloud Functions with audience-based
+      auth). Throws an Error when the underlying credential type does not support
+      ID tokens — specifically when running outside GCP and using user credentials
+      (OAuth2) instead of service account credentials.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js line 776 ('Cannot fetch ID token in this environment...')
+      - id: get-id-token-client-unprotected
+        condition: >
+          Async call to auth.getIdTokenClient(targetAudience) is not wrapped in a
+          try-catch. Throws Error('Cannot fetch ID token in this environment, use
+          GCE or set the GOOGLE_APPLICATION_CREDENTIALS environment variable to a
+          service account credentials JSON file.') when the current credentials are
+          user credentials (OAuth2) rather than service account or Compute Engine
+          credentials. Common pattern: code works in production on GCP but crashes
+          locally where developers use user credentials from gcloud auth login.
+        throws: Error
+        required_handling: >
+          Caller MUST wrap await auth.getIdTokenClient(audience) in a try-catch.
+          Error message 'Cannot fetch ID token in this environment' indicates the
+          credential type is wrong — check that GOOGLE_APPLICATION_CREDENTIALS points
+          to a service account key file or that the runtime is GCP Compute Engine.
+          This error commonly surfaces in CI environments where gcloud user credentials
+          are active but the app expects service account credentials.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: GoogleAuth.getProjectId
+    import_path: "google-auth-library"
+    description: >
+      Retrieves the Google Cloud project ID from environment variables, credentials
+      file, gcloud config, or GCE metadata server. Throws when no project ID can
+      be found — common in non-GCP environments and CI/CD pipelines that omit
+      project configuration.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js line 168 (NO_PROJECT_ID_FOUND constant)
+      - id: get-project-id-unprotected
+        condition: >
+          Async call to auth.getProjectId() is not wrapped in a try-catch.
+          Throws Error with message 'Unable to detect a Project Id in the current
+          environment. To fix this, include the project ID when creating the
+          GoogleAuth constructor or set the GCLOUD_PROJECT or GOOGLE_CLOUD_PROJECT
+          environment variables.' when project ID cannot be found from any source.
+          Common in local development, Docker containers, and CI environments where
+          GCLOUD_PROJECT env var is not set.
+        throws: Error
+        required_handling: >
+          Caller MUST wrap await auth.getProjectId() in a try-catch block.
+          Set GOOGLE_CLOUD_PROJECT environment variable or pass projectId to
+          GoogleAuth constructor. The error message includes a URL to documentation.
+          Missing handling causes unhandled exceptions in initialization flows
+          that assume GCP context is available.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: GoogleAuth.sign
+    import_path: "google-auth-library"
+    description: >
+      Signs data using the current service account's private key, or calls the
+      IAM API to sign if running on GCE. Used for creating signed URLs, verifying
+      webhook signatures, and custom authentication flows. Throws immediately when
+      no client_email is available in the credentials (i.e., user credentials
+      instead of service account credentials).
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js line 878 ('Cannot sign data without `client_email`.')
+      - id: sign-unprotected
+        condition: >
+          Async call to auth.sign(data) is not wrapped in a try-catch.
+          Throws Error('Cannot sign data without `client_email`.') when the current
+          credentials are user credentials (OAuth2) or missing client_email — common
+          when using Application Default Credentials in environments where gcloud auth
+          login (user credentials) is active instead of a service account key file.
+          Also throws GaxiosError when the IAM signBlob API call fails (on GCE).
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await auth.sign(data) in a try-catch block.
+          Error('Cannot sign data without client_email') requires using service account
+          credentials rather than user credentials. For GCE environments, ensure the
+          service account has roles/iam.serviceAccountTokenCreator permission to use
+          signBlob API. Unhandled errors in signed URL generation break file uploads
+          and download flows silently.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: JWT.authorize
+    import_path: "google-auth-library"
+    description: >
+      Explicitly fetches an access token for a JWT (service account) client by
+      signing a JWT assertion and exchanging it at Google's OAuth2 token endpoint.
+      Throws GaxiosError when the token endpoint rejects the request — caused by
+      invalid private key, wrong scopes, or permission denied. Also throws if the
+      service account email or private key is missing from the JSON credentials.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/JWT.html
+      # Source confirmed: jwtclient.js + gtoken/getToken.js — GaxiosError re-thrown
+      # with formatted error message from Google token endpoint response
+      - id: jwt-authorize-unprotected
+        condition: >
+          Async call to jwtClient.authorize() is not wrapped in a try-catch.
+          Throws GaxiosError when Google's token endpoint (https://oauth2.googleapis.com/token)
+          returns an error — e.g. invalid_grant (wrong service account email), unauthorized_client
+          (service account not authorized for domain-wide delegation), or access_denied (API not
+          enabled in project). Error message is reformatted to include 'error: error_description'
+          from the response body. Also throws Error('A key or a keyFile must be provided')
+          from JWT.getCredentials() if key material is missing.
+        throws: "GaxiosError | Error"
+        required_handling: >
+          Caller MUST wrap await jwtClient.authorize() in a try-catch block.
+          Parse error.message for token endpoint error codes — 'invalid_grant' indicates
+          service account does not exist, 'unauthorized_client' indicates missing IAM
+          permission, 'access_denied' indicates the API is not enabled. Unhandled errors
+          in service account initialization silently fail all downstream Google API calls.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/JWT.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+metadata:
+  last_verified: "2026-04-16"
+  evidence_quality: confirmed
+  coverage_score: 0.73
+  # 11 contracted functions / 15 total async-callable (4 intentionally omitted)
+  # Omitted: revokeToken, revokeCredentials (cleanup paths, same GaxiosError profile),
+  #          getFederatedSignonCerts/getIapPublicKeys (internal auth infra),
+  #          JWT.fetchIdToken/getCredentials (covered by getIdTokenClient pattern),
+  #          getRequestHeaders/authorizeRequest/request/fetch (pass-through wrappers)

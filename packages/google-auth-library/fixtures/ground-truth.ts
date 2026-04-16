@@ -7,12 +7,20 @@
  * Key contract rules:
  *   - OAuth2Client.getToken() throws GaxiosError on invalid_grant/network failure → MUST try-catch
  *   - OAuth2Client.getTokenInfo() throws Error if token is invalid → MUST try-catch
+ *   - OAuth2Client.verifyIdToken() throws on invalid signature, expiry, audience mismatch → MUST try-catch
+ *   - OAuth2Client.refreshAccessToken() throws 'No refresh token is set.' → MUST try-catch
+ *   - OAuth2Client.getAccessToken() throws 'No refresh token or refresh handler callback is set.' → MUST try-catch
+ *   - GoogleAuth.getApplicationDefault() throws 'Could not load the default credentials' → MUST try-catch
+ *   - GoogleAuth.getIdTokenClient() throws when not on GCE → MUST try-catch
+ *   - GoogleAuth.getProjectId() throws 'Unable to detect a Project Id' → MUST try-catch
+ *   - GoogleAuth.sign() throws 'Cannot sign data without client_email' → MUST try-catch
+ *   - JWT.authorize() throws GaxiosError from token endpoint → MUST try-catch
  *   - A try-catch (any catch block) satisfies the requirement
  *   - A .catch() chain also satisfies the requirement
  *   - try-finally without catch does NOT satisfy the requirement
  */
 
-import { OAuth2Client, GaxiosError } from 'google-auth-library';
+import { OAuth2Client, GoogleAuth, JWT, GaxiosError } from 'google-auth-library';
 
 const client = new OAuth2Client({
   clientId: process.env.GOOGLE_CLIENT_ID,
@@ -103,4 +111,144 @@ export async function authenticate(params: { code: string }) {
   const { tokens } = await client.getToken(params.code);
   client.setCredentials(tokens);
   return tokens;
+}
+
+// ─── 9. verifyIdToken — bare call, no try-catch ───────────────────────────────
+
+// @expect-violation: verify-id-token-unprotected
+export async function verifyGoogleTokenNoCatch(idToken: string) {
+  // SHOULD_FIRE: verify-id-token-unprotected — throws on invalid signature, expired, audience mismatch
+  const ticket = await client.verifyIdToken({
+    idToken,
+    audience: process.env.GOOGLE_CLIENT_ID,
+  });
+  return ticket.getPayload();
+}
+
+// ─── 10. verifyIdToken — try-catch present ────────────────────────────────────
+
+// @expect-clean
+export async function verifyGoogleTokenWithCatch(idToken: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — verify-id-token-unprotected requirement satisfied
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    return ticket.getPayload();
+  } catch (error) {
+    console.error('ID token verification failed:', error);
+    throw error;
+  }
+}
+
+// ─── 11. refreshAccessToken — bare call, no try-catch ─────────────────────────
+
+// @expect-violation: refresh-access-token-unprotected
+export async function refreshTokenNoCatch() {
+  // SHOULD_FIRE: refresh-access-token-unprotected — throws 'No refresh token is set.' if missing
+  const { credentials } = await client.refreshAccessToken();
+  return credentials;
+}
+
+// ─── 12. refreshAccessToken — try-catch present ───────────────────────────────
+
+// @expect-clean
+export async function refreshTokenWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — refresh-access-token-unprotected satisfied
+    const { credentials } = await client.refreshAccessToken();
+    return credentials;
+  } catch (error) {
+    console.error('Token refresh failed:', error);
+    throw error;
+  }
+}
+
+// ─── 13. getAccessToken — bare call, no try-catch ─────────────────────────────
+
+// @expect-violation: get-access-token-unprotected
+export async function getAccessTokenNoCatch() {
+  // SHOULD_FIRE: get-access-token-unprotected — throws 'No refresh token or refresh handler callback is set.'
+  const { token } = await client.getAccessToken();
+  return token;
+}
+
+// ─── 14. GoogleAuth.getApplicationDefault — bare call ────────────────────────
+
+const auth = new GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+// @expect-violation: get-application-default-unprotected
+export async function getAppDefaultNoCatch() {
+  // SHOULD_FIRE: get-application-default-unprotected — throws 'Could not load the default credentials'
+  const { credential, projectId } = await auth.getApplicationDefault();
+  return { credential, projectId };
+}
+
+// @expect-clean
+export async function getAppDefaultWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    const { credential, projectId } = await auth.getApplicationDefault();
+    return { credential, projectId };
+  } catch (error) {
+    console.error('ADC not configured:', error);
+    throw error;
+  }
+}
+
+// ─── 15. GoogleAuth.getIdTokenClient — bare call ─────────────────────────────
+
+// @expect-violation: get-id-token-client-unprotected
+export async function getIdTokenClientNoCatch(targetAudience: string) {
+  // SHOULD_FIRE: get-id-token-client-unprotected — throws when not on GCE
+  const idClient = await auth.getIdTokenClient(targetAudience);
+  return idClient;
+}
+
+// ─── 16. GoogleAuth.getProjectId — bare call ─────────────────────────────────
+
+// @expect-violation: get-project-id-unprotected
+export async function getProjectIdNoCatch() {
+  // SHOULD_FIRE: get-project-id-unprotected — throws 'Unable to detect a Project Id'
+  const projectId = await auth.getProjectId();
+  return projectId;
+}
+
+// ─── 17. GoogleAuth.sign — bare call ─────────────────────────────────────────
+
+// @expect-violation: sign-unprotected
+export async function signDataNoCatch(data: string) {
+  // SHOULD_FIRE: sign-unprotected — throws 'Cannot sign data without client_email'
+  const signature = await auth.sign(data);
+  return signature;
+}
+
+// ─── 18. JWT.authorize — bare call ───────────────────────────────────────────
+
+const jwtClient = new JWT({
+  email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  key: process.env.GOOGLE_PRIVATE_KEY,
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+// @expect-violation: jwt-authorize-unprotected
+export async function jwtAuthorizeNoCatch() {
+  // SHOULD_FIRE: jwt-authorize-unprotected — GaxiosError on invalid_grant, unauthorized_client
+  const credentials = await jwtClient.authorize();
+  return credentials;
+}
+
+// @expect-clean
+export async function jwtAuthorizeWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — jwt-authorize-unprotected satisfied
+    const credentials = await jwtClient.authorize();
+    return credentials;
+  } catch (error) {
+    console.error('JWT authorization failed:', error);
+    throw error;
+  }
 }
