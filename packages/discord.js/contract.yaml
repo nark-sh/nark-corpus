@@ -1,10 +1,11 @@
 package: discord.js
 semver: ">=14.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-15"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
+coverage_score: 0.89  # 48 contracted functions / 54 async-callable functions (6 omitted as admin/infrastructure/read-only)
 description: "A powerful JavaScript library for interacting with the Discord API"
 
 # Detection rules for analyzer integration
@@ -28,6 +29,11 @@ detection:
     - Role
     - RoleManager
     - GuildMemberManager
+    - Webhook
+    - WebhookClient
+    - GuildChannel
+    - User
+    - GuildBanManager
 
   # No factory methods for discord.js
   factory_methods: []
@@ -50,6 +56,10 @@ detection:
     - .fetchOwner(
     - .createInvite(  # Channel/Guild operations
     - .fetchInvite(
+    - .createDM(
+    - .setNickname(
+    - .setArchived(
+    - .editMessage(  # Webhook.editMessage
 
   # Required event listeners to prevent process crashes
   required_event_listeners:
@@ -819,3 +829,317 @@ functions:
         required_handling: "MUST wrap await role.delete() in try-catch block"
         sources:
           - "https://discord.js.org/docs/packages/discord.js/main/Role:Class#delete"
+  # ============================================================================
+  # WEBHOOK OPERATIONS
+  # ============================================================================
+
+  - name: Webhook.send
+    import_path: "discord.js"
+    description: "Sends a message via webhook"
+    postconditions:
+      # Evidence: @discordjs/rest source confirms DiscordAPIError/RateLimitError hierarchy
+      # Source: /node_modules/@discordjs/rest/dist/index.d.ts - DiscordAPIError class
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/Webhook:Class#send
+      - id: discord-webhook-send-no-try-catch
+        condition: "Webhook.send() called without try-catch"
+        throws: "DiscordAPIError (10015 Unknown Webhook, 50013 Missing Permissions, 50035 Invalid Form Body) or RateLimitError"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Webhook.send() throws DiscordAPIError when the webhook token is invalid or revoked (10015),
+          the webhook lacks SEND_MESSAGES permission, or content is invalid (50035 - e.g., empty message,
+          embed exceeds 6000 chars). Throws RateLimitError when rate limits exceeded. Webhook tokens
+          expire and can be revoked via the Discord dashboard. Bots storing webhook URLs in databases
+          without validating them will crash on send.
+        detector: "If webhook.send() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap await webhook.send() in try-catch block; check error.code for 10015 to handle expired webhooks gracefully"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/Webhook:Class#send"
+          - "https://discord.com/developers/docs/resources/webhook#execute-webhook"
+      - id: discord-webhook-send-rate-limit
+        condition: "Webhook.send() called in rapid succession without rate limit handling"
+        throws: "RateLimitError with retryAfter property when webhook rate limits exceeded"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: >
+          Discord webhooks have per-webhook rate limits (typically 30 requests/minute). High-volume
+          webhook senders (notification systems, alerts pipelines) will hit RateLimitError. The error
+          exposes retryAfter (ms) for retry scheduling. Unhandled RateLimitError crashes the sender.
+        detector: "If webhook.send() is called in a loop or batch without catching RateLimitError"
+        required_handling: "MUST catch RateLimitError and implement exponential backoff using error.retryAfter"
+        sources:
+          - "https://discord.com/developers/docs/topics/rate-limits"
+          - "https://github.com/discordjs/discord.js/blob/main/packages/rest/src/lib/errors/RateLimitError.ts"
+
+  - name: Webhook.editMessage
+    import_path: "discord.js"
+    description: "Edits a previously sent webhook message"
+    postconditions:
+      # Evidence: @discordjs/rest source confirms DiscordAPIError on unknown message
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/Webhook:Class#editMessage
+      - id: discord-webhook-editmessage-no-try-catch
+        condition: "Webhook.editMessage() called without try-catch"
+        throws: "DiscordAPIError (10008 Unknown Message, 10015 Unknown Webhook) or network errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Webhook.editMessage() throws DiscordAPIError 10008 if the message was deleted between send
+          and edit (common in cleanup flows), or 10015 if the webhook token expired. Bots that send
+          then edit (e.g., progress updates) will crash if the original message was deleted by moderation.
+        detector: "If webhook.editMessage() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap await webhook.editMessage() in try-catch; handle 10008 gracefully as message may be deleted"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/Webhook:Class#editMessage"
+          - "https://discord.com/developers/docs/resources/webhook#edit-webhook-message"
+
+  # ============================================================================
+  # DM CHANNEL OPERATIONS
+  # ============================================================================
+
+  - name: GuildMember.createDM
+    import_path: "discord.js"
+    description: "Opens or fetches a DM channel with a guild member"
+    postconditions:
+      # Evidence: discord.js source delegates to user.createDM() → client.users.createDM()
+      # Source: /node_modules/discord.js/src/structures/GuildMember.js line 439-440
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/GuildMember:Class#createDM
+      - id: discord-guildmember-createdm-no-try-catch
+        condition: "GuildMember.createDM() called without try-catch"
+        throws: "DiscordAPIError (50007 Cannot send messages to this user — DMs disabled) or network errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildMember.createDM() throws DiscordAPIError 50007 when the target user has DMs disabled
+          (privacy settings block messages from server members). This is extremely common — users
+          routinely disable DMs from server members. Moderation bots that DM users before banning
+          will crash if the user's DMs are closed.
+        detector: "If member.createDM() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; catch error code 50007 and proceed without DM notification when DMs disabled"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildMember:Class#createDM"
+          - "https://discord.com/developers/docs/resources/user#create-dm"
+
+  - name: User.createDM
+    import_path: "discord.js"
+    description: "Opens or fetches a DM channel with a user"
+    postconditions:
+      # Evidence: discord.js source: client.users.createDM() → REST createDM endpoint
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/User:Class#createDM
+      - id: discord-user-createdm-no-try-catch
+        condition: "User.createDM() called without try-catch"
+        throws: "DiscordAPIError (50007 Cannot send messages to this user) or network errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          User.createDM() throws DiscordAPIError 50007 when the target user has disabled DMs from
+          non-friends or non-mutual-server members. Cannot be caught at the type level — requires
+          runtime try-catch. Notification systems and moderation bots that DM arbitrary users
+          will crash without this handling.
+        detector: "If user.createDM() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; catch code 50007 to gracefully skip DM and continue operation"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/User:Class#createDM"
+          - "https://discord.com/developers/docs/resources/user#create-dm"
+
+  # ============================================================================
+  # CHANNEL MANAGEMENT OPERATIONS
+  # ============================================================================
+
+  - name: GuildChannel.delete
+    import_path: "discord.js"
+    description: "Deletes a guild channel"
+    postconditions:
+      # Evidence: discord.js source delegates to guild.channels.delete() → REST DELETE channel
+      # Source: /node_modules/discord.js/src/structures/GuildChannel.js line 470-472
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/GuildChannel:Class#delete
+      - id: discord-guildchannel-delete-no-try-catch
+        condition: "GuildChannel.delete() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing MANAGE_CHANNELS permission, 10003 Unknown Channel)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildChannel.delete() throws DiscordAPIError 50013 if bot lacks MANAGE_CHANNELS permission,
+          or 10003 if the channel was already deleted (race condition with other bots/admins). Channel
+          management commands that delete channels without error handling will crash the bot.
+        detector: "If channel.delete() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; handle 10003 gracefully as channel may already be deleted"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildChannel:Class#delete"
+          - "https://discord.com/developers/docs/resources/channel#deleteclose-channel"
+
+  - name: GuildChannel.edit
+    import_path: "discord.js"
+    description: "Edits a guild channel's properties (name, topic, permissions, etc.)"
+    postconditions:
+      # Evidence: @discordjs/rest source confirms DiscordAPIError on permission/validation failures
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/GuildChannel:Class#edit
+      - id: discord-guildchannel-edit-no-try-catch
+        condition: "GuildChannel.edit() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing MANAGE_CHANNELS permission, 50035 Invalid Form Body)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildChannel.edit() throws DiscordAPIError 50013 if bot lacks MANAGE_CHANNELS permission,
+          or 50035 if edit options are invalid (e.g., name >100 chars, topic >1024 chars). Setup
+          wizards and permission management flows that edit channels will crash on invalid input.
+        detector: "If channel.edit() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; validate field lengths before calling"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildChannel:Class#edit"
+          - "https://discord.com/developers/docs/resources/channel#modify-channel"
+
+  # ============================================================================
+  # MEMBER MANAGEMENT OPERATIONS
+  # ============================================================================
+
+  - name: GuildMember.setNickname
+    import_path: "discord.js"
+    description: "Sets or clears a member's server nickname"
+    postconditions:
+      # Evidence: discord.js source: setNickname calls this.edit({nick})
+      # Source: /node_modules/discord.js/src/structures/GuildMember.js line 428-436
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/GuildMember:Class#setNickname
+      - id: discord-guildmember-setnickname-no-try-catch
+        condition: "GuildMember.setNickname() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing MANAGE_NICKNAMES permission, role hierarchy violation)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildMember.setNickname() throws DiscordAPIError 50013 if bot lacks MANAGE_NICKNAMES
+          permission. Fails with hierarchy error if trying to nickname a member with equal/higher
+          roles than the bot. Onboarding bots and verification systems that assign nicknames will
+          crash when attempting to nickname admins.
+        detector: "If member.setNickname() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; check role hierarchy before setting nickname on high-role members"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildMember:Class#setNickname"
+          - "https://discord.com/developers/docs/resources/guild-member#modify-current-member"
+
+  # ============================================================================
+  # BAN MANAGEMENT OPERATIONS
+  # ============================================================================
+
+  - name: GuildBanManager.remove
+    import_path: "discord.js"
+    description: "Removes a ban (unbans) a user from a guild"
+    postconditions:
+      # Evidence: discord.js source: guild.bans.remove() → REST DELETE /guilds/{guild}/bans/{user}
+      # Source: /node_modules/discord.js/src/managers/GuildBanManager.js line 196-202
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/GuildBanManager:Class#remove
+      - id: discord-guildbanmanager-remove-no-try-catch
+        condition: "GuildBanManager.remove() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing BAN_MEMBERS permission, 10026 Unknown Ban)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildBanManager.remove() throws DiscordAPIError 50013 if bot lacks BAN_MEMBERS permission,
+          or 10026 Unknown Ban if the user is not actually banned (common in race conditions when
+          moderation commands are double-submitted). Ban management UIs that unban users will crash
+          on double-unban attempts.
+        detector: "If guild.bans.remove() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; handle 10026 gracefully as user may already be unbanned"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildBanManager:Class#remove"
+          - "https://discord.com/developers/docs/resources/guild#remove-guild-ban"
+
+  # ============================================================================
+  # THREAD MANAGEMENT OPERATIONS
+  # ============================================================================
+
+  - name: ThreadChannel.setArchived
+    import_path: "discord.js"
+    description: "Archives or unarchives a thread channel"
+    postconditions:
+      # Evidence: discord.js ThreadChannel.setArchived calls this.edit({archived})
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/ThreadChannel:Class#setArchived
+      - id: discord-threadchannel-setarchived-no-try-catch
+        condition: "ThreadChannel.setArchived() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing MANAGE_THREADS permission, 40060 Thread already locked)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          ThreadChannel.setArchived() throws DiscordAPIError 50013 if bot lacks MANAGE_THREADS
+          permission. Throws 40060 when attempting to unarchive a locked thread (locked threads can
+          only be unarchived by moderators with MANAGE_THREADS). Thread cleanup and auto-archiving
+          bots will crash on locked threads.
+        detector: "If thread.setArchived() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; check thread.locked before attempting to unarchive"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/ThreadChannel:Class#setArchived"
+          - "https://discord.com/developers/docs/resources/channel#modify-channel"
+
+  - name: ThreadChannel.delete
+    import_path: "discord.js"
+    description: "Deletes a thread channel permanently"
+    postconditions:
+      # Evidence: ThreadChannel.delete() → REST DELETE /channels/{id}
+      # Reference: https://discord.js.org/docs/packages/discord.js/main/ThreadChannel:Class#delete
+      - id: discord-threadchannel-delete-no-try-catch
+        condition: "ThreadChannel.delete() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing MANAGE_THREADS permission, 10003 Unknown Channel)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          ThreadChannel.delete() throws DiscordAPIError 50013 if bot lacks MANAGE_THREADS permission,
+          or 10003 if the thread was already deleted. Thread cleanup systems that process threads
+          in bulk may encounter race conditions where threads are deleted by other processes first.
+        detector: "If thread.delete() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; handle 10003 as thread may already be deleted"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/ThreadChannel:Class#delete"
+          - "https://discord.com/developers/docs/resources/channel#deleteclose-channel"
