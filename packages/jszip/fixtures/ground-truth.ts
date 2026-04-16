@@ -7,6 +7,8 @@
  * Postcondition IDs from contract.yaml:
  *   load-invalid-zip          — loadAsync without try-catch
  *   generate-unsupported-type — generateAsync without try-catch
+ *   file-async-no-try-catch   — JSZipObject.async() without try-catch (decompression errors)
+ *   file-async-unsupported-type — JSZipObject.async() with unsupported output type
  */
 import JSZip from 'jszip';
 
@@ -63,6 +65,55 @@ async function processUserUpload(file: File): Promise<string[]> {
   return names;
 }
 
+// JSZipObject.async() with try-catch — proper error handling
+async function fileAsync_withTryCatch(zip: JSZip): Promise<string | null> {
+  try {
+    // SHOULD_NOT_FIRE: .async() inside try-catch is properly handled
+    const content = await zip.files['readme.txt'].async('string');
+    return content;
+  } catch (error) {
+    console.error('Failed to read file from zip:', error);
+    return null;
+  }
+}
+
+// JSZipObject.async() without try-catch — missing error handling
+async function fileAsync_withoutTryCatch(zip: JSZip): Promise<string> {
+  // SHOULD_FIRE: file-async-no-try-catch — .async() without try-catch throws on decompression errors
+  const content = await zip.files['readme.txt'].async('string');
+  return content;
+}
+
+// JSZipObject.async() without try-catch — real-world document processing antipattern
+async function extractDocumentContents(zip: JSZip, filename: string): Promise<Buffer> {
+  // SHOULD_FIRE: file-async-no-try-catch — file content could be individually corrupted
+  // even if the zip container loads successfully
+  const buffer = await zip.files[filename].async('nodebuffer');
+  return buffer;
+}
+
+// JSZipObject.async() in loop without try-catch — high-risk antipattern
+async function extractAllFiles(zip: JSZip): Promise<Record<string, string>> {
+  const results: Record<string, string> = {};
+  for (const [name, file] of Object.entries(zip.files)) {
+    if (!file.dir) {
+      // SHOULD_FIRE: file-async-no-try-catch — any file in the loop could fail decompression
+      results[name] = await file.async('string');
+    }
+  }
+  return results;
+}
+
+// JSZipObject.async() with re-throw — still handled
+async function fileAsync_withRethrow(zip: JSZip): Promise<Uint8Array> {
+  try {
+    // SHOULD_NOT_FIRE: .async() inside try-catch with re-throw is handled
+    return await zip.files['data.bin'].async('uint8array');
+  } catch (error) {
+    throw new Error(`Decompression failed: ${error}`);
+  }
+}
+
 export {
   loadAsync_withTryCatch,
   loadAsync_withoutTryCatch,
@@ -70,4 +121,9 @@ export {
   generateAsync_withoutTryCatch,
   loadAsync_withRethrow,
   processUserUpload,
+  fileAsync_withTryCatch,
+  fileAsync_withoutTryCatch,
+  extractDocumentContents,
+  extractAllFiles,
+  fileAsync_withRethrow,
 };
