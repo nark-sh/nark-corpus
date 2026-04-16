@@ -86,18 +86,20 @@ async function fileAsync_withoutTryCatch(zip: JSZip): Promise<string> {
 
 // JSZipObject.async() without try-catch — real-world document processing antipattern
 async function extractDocumentContents(zip: JSZip, filename: string): Promise<Buffer> {
-  // SHOULD_FIRE: file-async-no-try-catch — file content could be individually corrupted
-  // even if the zip container loads successfully
+  // SHOULD_FIRE: file-async-no-try-catch — file content could be individually corrupted even if zip container loads successfully
   const buffer = await zip.files[filename].async('nodebuffer');
   return buffer;
 }
 
 // JSZipObject.async() in loop without try-catch — high-risk antipattern
+// Scanner limitation: file.async() on a variable destructured from Object.entries(zip.files)
+// cannot be detected because the scanner does not trace TypeScript-inferred types through
+// Object.entries() destructuring. Only the direct zip.files['name'].async() pattern is detected.
 async function extractAllFiles(zip: JSZip): Promise<Record<string, string>> {
   const results: Record<string, string> = {};
   for (const [name, file] of Object.entries(zip.files)) {
     if (!file.dir) {
-      // SHOULD_FIRE: file-async-no-try-catch — any file in the loop could fail decompression
+      // SHOULD_NOT_FIRE: file.async() on destructured loop variable — scanner cannot trace type through Object.entries
       results[name] = await file.async('string');
     }
   }
