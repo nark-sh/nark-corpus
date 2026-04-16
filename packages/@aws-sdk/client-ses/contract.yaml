@@ -1,19 +1,23 @@
 package: "@aws-sdk/client-ses"
 semver: "^3.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-15"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.65
-# coverage_score = 13 contracted / 20 total relevant API functions (13 contracted + 7 intentionally omitted)
+coverage_score: 0.71
+# coverage_score = 17 contracted / 24 total relevant API functions (17 contracted + 7 intentionally omitted)
 # Previously contracted (7): send, SendTemplatedEmailCommand, SendBulkTemplatedEmailCommand,
 #   SendRawEmailCommand, SendCustomVerificationEmailCommand, CreateTemplateCommand, UpdateTemplateCommand
-# Newly contracted this pass (6): SendEmailCommand, TestRenderTemplateCommand,
+# Previously contracted pass 2 (6): SendEmailCommand, TestRenderTemplateCommand,
 #   CreateConfigurationSetCommand, CreateConfigurationSetEventDestinationCommand,
 #   CreateCustomVerificationEmailTemplateCommand, UpdateCustomVerificationEmailTemplateCommand
-# Intentionally omitted (7): VerifyEmailIdentityCommand, VerifyDomainIdentityCommand, DeleteTemplateCommand,
-#   GetTemplateCommand, ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
+# Newly contracted this pass (4): SendBounceCommand, UpdateConfigurationSetEventDestinationCommand,
+#   PutConfigurationSetDeliveryOptionsCommand, DeleteConfigurationSetCommand
+# (PutIdentityPolicyCommand covered via send() generic postcondition - InvalidPolicy maps to SESServiceException)
+# Intentionally omitted (3): VerifyEmailIdentityCommand, VerifyDomainIdentityCommand,
+#   DeleteTemplateCommand (only SESServiceException generic), GetTemplateCommand,
+#   ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
 # All omitted functions are either read-only GETs, idempotent deletes, or have no distinct errors
 #   beyond generic SESServiceException already covered by the generic send() postcondition.
 # Note: The full SDK has 72 commands; the above counts only those relevant for SaaS app runtime code.
@@ -954,6 +958,255 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: SendBounceCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Generates and sends a bounce message back to the sender of an email received
+      through Amazon SES. Used in inbound email processing pipelines to notify
+      senders that their message could not be delivered (e.g., invalid recipient,
+      policy violation, content rejection). Can only be called on messages received
+      within the last 24 hours. Rate-limited to 1 call per second. The BounceSender
+      must be a verified SES identity.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendBounceCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBounce.html
+      # Error types confirmed from dist-types/commands/SendBounceCommand.d.ts: MessageRejected
+      - id: ses-send-bounce-no-try-catch
+        condition: >-
+          sesClient.send(new SendBounceCommand(...)) called without try-catch in an
+          inbound email processing handler
+        throws: MessageRejected
+        required_handling: >-
+          MUST wrap in try-catch. MessageRejected is thrown when the bounce cannot be
+          sent — e.g., the BounceSender is not a verified SES identity, the OriginalMessageId
+          is invalid or older than 24 hours, or the request fails validation.
+          Bounce pipelines commonly omit error handling because SendBounce is a "fire
+          and forget" side effect — but an unhandled MessageRejected will crash the
+          inbound email handler and stop processing subsequent messages.
+          Catch block SHOULD log the failed bounce and continue processing other messages.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendBounceCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBounce.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-send-bounce-stale-message-id
+        condition: >-
+          sesClient.send(new SendBounceCommand({ OriginalMessageId: staleId, ... }))
+          where staleId refers to a message received more than 24 hours ago
+        throws: MessageRejected
+        required_handling: >-
+          MUST validate message age before calling SendBounceCommand. The 24-hour
+          constraint is strict — SES rejects bounce requests for messages older than
+          24 hours with MessageRejected. Queued bounce jobs that are delayed (e.g.,
+          by a slow SQS consumer) will silently lose the ability to send compliant DSNs.
+          Catch block SHOULD distinguish stale-message rejections from sender-not-verified
+          rejections. Log with the original message timestamp for debugging.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendBounce.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: UpdateConfigurationSetEventDestinationCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Updates the event destination of an existing SES configuration set. Event
+      destinations route sending events (bounces, complaints, deliveries, opens,
+      clicks) to CloudWatch, Kinesis Firehose, or SNS. Used in monitoring setup
+      flows and when rotating event tracking infrastructure. Rate-limited to 1 call
+      per second. Exactly one destination type must be configured per call.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetEventDestinationCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateConfigurationSetEventDestination.html
+      # Error types confirmed from dist-types/commands/UpdateConfigurationSetEventDestinationCommand.d.ts:
+      # ConfigurationSetDoesNotExistException, EventDestinationDoesNotExistException,
+      # InvalidCloudWatchDestinationException, InvalidFirehoseDestinationException, InvalidSNSDestinationException
+      - id: ses-update-event-dest-config-set-not-found
+        condition: >-
+          sesClient.send(new UpdateConfigurationSetEventDestinationCommand({ ConfigurationSetName: name, ... }))
+          where name references a configuration set that does not exist
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown when
+          the named configuration set has been deleted or was never created. Infrastructure
+          provisioning scripts that update event destinations without verifying config
+          set existence will crash on first run in a fresh environment.
+          Catch block SHOULD attempt to create the configuration set first, then retry.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateConfigurationSetEventDestination.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-update-event-dest-not-found
+        condition: >-
+          sesClient.send(new UpdateConfigurationSetEventDestinationCommand({ ..., EventDestination: { Name: destName } }))
+          where destName references an event destination that does not exist in the config set
+        throws: EventDestinationDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. EventDestinationDoesNotExistException is thrown when
+          attempting to update a named event destination that doesn't exist in the
+          configuration set. Idempotent infrastructure scripts must catch this and
+          switch to CreateConfigurationSetEventDestinationCommand.
+          Pattern: try { update } catch(EventDestinationDoesNotExist) { create instead }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetEventDestinationCommand/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-update-event-dest-invalid-destination
+        condition: >-
+          sesClient.send(new UpdateConfigurationSetEventDestinationCommand({ ..., EventDestination: { CloudWatchDestination: invalidConfig } }))
+          or similar with an invalid Firehose or SNS destination configuration
+        throws: InvalidCloudWatchDestinationException
+        also_throws:
+          - InvalidFirehoseDestinationException
+          - InvalidSNSDestinationException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidCloudWatchDestinationException,
+          InvalidFirehoseDestinationException, or InvalidSNSDestinationException are
+          thrown when the destination configuration is structurally invalid (wrong ARN
+          format, missing required fields, insufficient IAM permissions for SES to
+          write to the destination). Exactly one destination type must be configured.
+          Catch block SHOULD log the specific error type and the destination ARN
+          that was invalid to aid debugging.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateConfigurationSetEventDestination.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: PutConfigurationSetDeliveryOptionsCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Adds or updates delivery options for an SES configuration set, specifically
+      the TLS policy controlling whether messages sent with this configuration set
+      require TLS encryption ("Require") or allow unencrypted delivery ("Optional").
+      Used in security hardening flows and compliance configuration. Rate-limited
+      to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/PutConfigurationSetDeliveryOptionsCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_PutConfigurationSetDeliveryOptions.html
+      # Error types confirmed from dist-types/commands/PutConfigurationSetDeliveryOptionsCommand.d.ts:
+      # ConfigurationSetDoesNotExistException, InvalidDeliveryOptionsException
+      - id: ses-put-delivery-options-config-set-not-found
+        condition: >-
+          sesClient.send(new PutConfigurationSetDeliveryOptionsCommand({ ConfigurationSetName: name, ... }))
+          where name references a configuration set that does not exist
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown
+          when the named configuration set has been deleted or never created.
+          Security hardening scripts that configure TLS policies during deployment
+          will crash if the configuration set was not provisioned first.
+          Catch block SHOULD first create the configuration set, then retry
+          PutConfigurationSetDeliveryOptionsCommand.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/PutConfigurationSetDeliveryOptionsCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_PutConfigurationSetDeliveryOptions.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-put-delivery-options-invalid
+        condition: >-
+          sesClient.send(new PutConfigurationSetDeliveryOptionsCommand({ ..., DeliveryOptions: { TlsPolicy: invalidValue } }))
+          with an invalid TlsPolicy value or malformed DeliveryOptions
+        throws: InvalidDeliveryOptionsException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidDeliveryOptionsException is thrown when the
+          provided TlsPolicy value is not one of "Require" or "Optional", or when
+          the DeliveryOptions object is otherwise malformed. TypeScript types prevent
+          this at compile time, but runtime-constructed inputs (e.g., from environment
+          variables or API parameters) can still trigger this.
+          Catch block SHOULD validate TlsPolicy against the known enum values before
+          calling the command.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/PutConfigurationSetDeliveryOptionsCommand/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: DeleteConfigurationSetCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Deletes an SES configuration set and all its associated event destinations
+      and tracking options. Typically called in cleanup scripts, test teardown,
+      or when rotating configuration sets. This operation is not idempotent —
+      deleting a non-existent configuration set throws an exception.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_DeleteConfigurationSet.html
+      # Error types confirmed from dist-types/commands/DeleteConfigurationSetCommand.d.ts:
+      # ConfigurationSetDoesNotExistException
+      - id: ses-delete-config-set-not-found
+        condition: >-
+          sesClient.send(new DeleteConfigurationSetCommand({ ConfigurationSetName: name }))
+          where name references a configuration set that does not exist
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown when
+          attempting to delete a configuration set that was already deleted or never
+          created. Unlike S3 object deletion, SES config set deletion is NOT idempotent
+          — calling it twice throws on the second call.
+          Cleanup scripts and test teardown code that unconditionally call
+          DeleteConfigurationSetCommand will throw on re-runs.
+          Catch block SHOULD either check existence first with DescribeConfigurationSet,
+          or catch ConfigurationSetDoesNotExistException and treat it as a success
+          (already deleted).
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/DeleteConfigurationSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_DeleteConfigurationSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
         evidence_quality: confirmed
 
 tags:

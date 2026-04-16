@@ -28,6 +28,12 @@
  *       ses-create-cve-template-invalid-content, ses-create-cve-template-from-not-verified
  *   - UpdateCustomVerificationEmailTemplateCommand  postconditions: ses-update-cve-template-not-found,
  *       ses-update-cve-template-invalid-content, ses-update-cve-template-from-not-verified
+ *   - SendBounceCommand  postconditions: ses-send-bounce-no-try-catch, ses-send-bounce-stale-message-id
+ *   - UpdateConfigurationSetEventDestinationCommand  postconditions: ses-update-event-dest-config-set-not-found,
+ *       ses-update-event-dest-not-found, ses-update-event-dest-invalid-destination
+ *   - PutConfigurationSetDeliveryOptionsCommand  postconditions: ses-put-delivery-options-config-set-not-found,
+ *       ses-put-delivery-options-invalid
+ *   - DeleteConfigurationSetCommand  postconditions: ses-delete-config-set-not-found
  *
  * Detection pattern:
  *   - SESClient is imported from @aws-sdk/client-ses
@@ -50,6 +56,10 @@ import {
   CreateConfigurationSetEventDestinationCommand,
   CreateCustomVerificationEmailTemplateCommand,
   UpdateCustomVerificationEmailTemplateCommand,
+  SendBounceCommand,
+  UpdateConfigurationSetEventDestinationCommand,
+  PutConfigurationSetDeliveryOptionsCommand,
+  DeleteConfigurationSetCommand,
 } from '@aws-sdk/client-ses';
 
 const sesClient = new SESClient({ region: 'us-east-1' });
@@ -579,3 +589,154 @@ export async function updateCveTemplateWithFallback(name: string, fromEmail: str
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. SendBounceCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-send-bounce-no-try-catch
+// @expect-violation: ses-send-bounce-stale-message-id
+export async function sendBounceNoCatch(originalMessageId: string, bounceSender: string) {
+  // SHOULD_FIRE: ses-send-bounce-no-try-catch — SendBounceCommand throws MessageRejected,
+  //   no try-catch. Inbound email handlers commonly omit error handling on SendBounce.
+  await sesClient.send(new SendBounceCommand({
+    OriginalMessageId: originalMessageId,
+    BounceSender: bounceSender,
+    BouncedRecipientInfoList: [
+      { Recipient: 'unknown@example.com', BounceType: 'DoesNotExist' },
+    ],
+  }));
+}
+
+// @expect-clean
+export async function sendBounceWithErrorHandling(originalMessageId: string, bounceSender: string) {
+  try {
+    // SHOULD_NOT_FIRE: SendBounceCommand inside try-catch
+    await sesClient.send(new SendBounceCommand({
+      OriginalMessageId: originalMessageId,
+      BounceSender: bounceSender,
+      BouncedRecipientInfoList: [
+        { Recipient: 'unknown@example.com', BounceType: 'DoesNotExist' },
+      ],
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'MessageRejected') {
+      // Bounce failed — log and continue processing other messages
+      console.error('Failed to send bounce for message:', originalMessageId, err.message);
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. UpdateConfigurationSetEventDestinationCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-update-event-dest-config-set-not-found
+// @expect-violation: ses-update-event-dest-not-found
+// @expect-violation: ses-update-event-dest-invalid-destination
+export async function updateEventDestinationNoCatch(configSetName: string, snsTopic: string) {
+  // SHOULD_FIRE: ses-update-event-dest-* — UpdateConfigurationSetEventDestinationCommand throws
+  //   multiple errors (ConfigurationSetDoesNotExist, EventDestinationDoesNotExist, InvalidSNSDestination),
+  //   no try-catch
+  await sesClient.send(new UpdateConfigurationSetEventDestinationCommand({
+    ConfigurationSetName: configSetName,
+    EventDestination: {
+      Name: 'my-sns-destination',
+      Enabled: true,
+      MatchingEventTypes: ['send', 'bounce', 'complaint'],
+      SNSDestination: { TopicARN: snsTopic },
+    },
+  }));
+}
+
+// @expect-clean
+export async function updateEventDestinationWithFallback(configSetName: string, snsTopic: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateConfigurationSetEventDestinationCommand inside try-catch
+    await sesClient.send(new UpdateConfigurationSetEventDestinationCommand({
+      ConfigurationSetName: configSetName,
+      EventDestination: {
+        Name: 'my-sns-destination',
+        Enabled: true,
+        MatchingEventTypes: ['send', 'bounce', 'complaint'],
+        SNSDestination: { TopicARN: snsTopic },
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'EventDestinationDoesNotExistException') {
+      console.log('Event destination does not exist, cannot update');
+    } else if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      console.error('Configuration set does not exist:', configSetName);
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. PutConfigurationSetDeliveryOptionsCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-put-delivery-options-config-set-not-found
+// @expect-violation: ses-put-delivery-options-invalid
+export async function putDeliveryOptionsNoCatch(configSetName: string) {
+  // SHOULD_FIRE: ses-put-delivery-options-* — PutConfigurationSetDeliveryOptionsCommand throws
+  //   ConfigurationSetDoesNotExistException and InvalidDeliveryOptionsException, no try-catch
+  await sesClient.send(new PutConfigurationSetDeliveryOptionsCommand({
+    ConfigurationSetName: configSetName,
+    DeliveryOptions: { TlsPolicy: 'Require' },
+  }));
+}
+
+// @expect-clean
+export async function putDeliveryOptionsWithErrorHandling(configSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: PutConfigurationSetDeliveryOptionsCommand inside try-catch
+    await sesClient.send(new PutConfigurationSetDeliveryOptionsCommand({
+      ConfigurationSetName: configSetName,
+      DeliveryOptions: { TlsPolicy: 'Require' },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      console.error('Configuration set does not exist:', configSetName);
+      throw err;
+    } else if (err instanceof Error && err.name === 'InvalidDeliveryOptionsException') {
+      console.error('Invalid delivery options for config set:', configSetName);
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. DeleteConfigurationSetCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-delete-config-set-not-found
+export async function deleteConfigurationSetNoCatch(configSetName: string) {
+  // SHOULD_FIRE: ses-delete-config-set-not-found — DeleteConfigurationSetCommand throws
+  //   ConfigurationSetDoesNotExistException (not idempotent), no try-catch
+  await sesClient.send(new DeleteConfigurationSetCommand({
+    ConfigurationSetName: configSetName,
+  }));
+}
+
+// @expect-clean
+export async function deleteConfigurationSetIdempotent(configSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: DeleteConfigurationSetCommand inside try-catch with idempotent handling
+    await sesClient.send(new DeleteConfigurationSetCommand({
+      ConfigurationSetName: configSetName,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      // Already deleted — treat as success
+      console.log('Configuration set already deleted:', configSetName);
+    } else {
+      throw err;
+    }
+  }
+}
