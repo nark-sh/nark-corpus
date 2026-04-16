@@ -2,11 +2,14 @@ package: tar
 semver: ">=6.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.86
 # Audit 2026-04-13: 17 repos scanned, 10 violations across 7 repos (x: 5, extract: 3, create: 1, c: 1).
 # scan-tar-2026-04-13.json. FP check: 0/20 type-A FPs (0% rate). Confirmed.
+# Deepen 2026-04-16: Added list/t, replace/r, update/u. Coverage 40% → 86%.
+# API surface: 7 callable async file-mode functions. 6 contracted, 1 intentionally omitted.
 
 # tar for Node.js — extract and create tar archives.
 # Both extract() and create() return Promise<void> when called with a file: option.
@@ -159,3 +162,309 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: list
+    import_path: "tar"
+    description: >
+      List the contents of a tar archive. When called with a file: option in async mode,
+      returns Promise<void> that rejects on filesystem errors (ENOENT if the archive file
+      does not exist, EACCES for permission errors), stream read errors, gzip/brotli/zstd
+      decompression errors (TAR_ABORT), and corrupt archive errors (TAR_BAD_ARCHIVE).
+      Use the onReadEntry callback option to receive each archive entry.
+
+    postconditions:
+      # Evidence: source-confirmed from list.js — Promise rejects via parse.on('error', reject)
+      # and fs.stat() rejection, and stream.on('error', reject).
+      # Source: https://github.com/isaacs/node-tar#readme — "Warnings and Errors" section
+      # Source: nark-corpus deepen pass 2026-04-16, list.js lines 120-137
+      - id: list-error-handling
+        condition: >
+          async call to tar.list() with a file: option is awaited without a try-catch block.
+          The Promise rejects when: the archive file does not exist (ENOENT), a permission
+          error prevents reading (EACCES), the archive is corrupt (TAR_BAD_ARCHIVE emitted
+          by Parser), or gzip/brotli decompression fails (TAR_ABORT). These are unrecoverable
+          errors per tar's "Warnings and Errors" classification.
+        throws: "Error (code: ENOENT | EACCES | TAR_BAD_ARCHIVE | TAR_ABORT)"
+        required_handling: >
+          Caller MUST wrap tar.list() in try-catch when using the file: option.
+
+          Minimum handling:
+            try {
+              const entries: string[] = [];
+              await tar.list({
+                file: archivePath,
+                onReadEntry: entry => entries.push(entry.path),
+              });
+              return entries;
+            } catch (error) {
+              console.error('Failed to list archive:', error.message, error.code);
+              throw error;
+            }
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: t
+    import_path: "tar"
+    description: >
+      Alias for tar.list. Used as tar.t({file, onReadEntry, ...}) in namespace imports.
+      Same error contract as list: rejects on ENOENT, EACCES, TAR_BAD_ARCHIVE, TAR_ABORT.
+
+    postconditions:
+      # Evidence: source-confirmed — tar.t is the same command as tar.list (make-command.js)
+      # Source: https://github.com/isaacs/node-tar#readme
+      - id: list-error-handling
+        condition: >
+          async call to tar.t() with a file: option is awaited without a try-catch block.
+          Rejects with ENOENT (missing file), EACCES (permission error), TAR_BAD_ARCHIVE
+          (corrupt archive), or TAR_ABORT (decompression failure).
+        throws: "Error (code: ENOENT | EACCES | TAR_BAD_ARCHIVE | TAR_ABORT)"
+        required_handling: >
+          Caller MUST wrap tar.t() in try-catch when using the file: option.
+
+          Minimum handling:
+            try {
+              await tar.t({ file: archivePath, onReadEntry: entry => process(entry) });
+            } catch (error) {
+              console.error('Failed to list archive:', error.message, error.code);
+              throw error;
+            }
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: replace
+    import_path: "tar"
+    description: >
+      Append entries to an existing tar archive. Always requires a file: option (cannot
+      operate on streams). Returns Promise<void> that rejects or throws synchronously for:
+      compressed archives (TypeError: 'cannot append to compressed archives' — detected
+      immediately from options or by reading the first 2 bytes of the file), no paths
+      specified (TypeError: 'no paths specified to add/replace'), and filesystem errors
+      (EACCES on open failure). Unlike create/extract, missing archive is NOT an error —
+      tar will create a new archive if the file does not exist.
+
+    postconditions:
+      # Evidence: source-confirmed from replace.js
+      # Validate function throws TypeError synchronously before any Promise is created:
+      #   - if gzip/brotli/zstd options set → TypeError('cannot append to compressed archives')
+      #   - if file ends in .br or .tbr → TypeError('cannot append to compressed archives')
+      #   - if entries array is empty → TypeError('no paths specified to add/replace')
+      # Async path: Promise rejects if fs.open fails (EACCES) or Pack emits error
+      # Source: https://github.com/isaacs/node-tar#readme
+      # Source: nark-corpus deepen pass 2026-04-16, replace.js lines 100-115
+      - id: replace-compressed-archive-error
+        condition: >
+          Call to tar.replace() or tar.r() where gzip: true, brotli: true, or zstd: true
+          options are set, or where the file path ends with .gz, .tgz, .br, .tbr, .zst, .tzst.
+          The validate function throws TypeError synchronously before any I/O: "cannot append
+          to compressed archives". This throws before any Promise is created, so try-catch
+          (not .catch()) must be used.
+        throws: "TypeError('cannot append to compressed archives')"
+        required_handling: >
+          Never call tar.replace() on compressed archives (.tgz, .tar.gz, .tar.br, .tar.zst).
+          Decompress first, then work with the uncompressed .tar, then recompress if needed.
+          If the compression state is unknown at call time, wrap in try-catch:
+
+            try {
+              await tar.replace({ file: archivePath }, newFiles);
+            } catch (error) {
+              if (error instanceof TypeError && error.message.includes('compressed')) {
+                throw new Error('Cannot modify compressed archive: decompress first');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: replace-error-handling
+        condition: >
+          async call to tar.replace() with a file: option is awaited without a try-catch
+          block. Can reject with filesystem errors (EACCES if archive file cannot be opened
+          for writing), or errors from the Pack stream writing to the archive.
+        throws: "Error (code: EACCES | ENOENT | TAR_ENTRY_ERROR)"
+        required_handling: >
+          Caller MUST wrap tar.replace() in try-catch to handle I/O errors.
+
+          Minimum handling:
+            try {
+              await tar.replace({ file: archivePath }, ['newfile.txt']);
+            } catch (error) {
+              console.error('Failed to update archive:', error.message, error.code);
+              throw error;
+            }
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: r
+    import_path: "tar"
+    description: >
+      Alias for tar.replace. Used as tar.r({file, ...}, files) in namespace imports.
+      Same error contract as replace: throws TypeError for compressed archives, rejects
+      on filesystem errors. Cannot be used on gzip/brotli/zstd-compressed archives.
+
+    postconditions:
+      # Evidence: source-confirmed — tar.r is the same command as tar.replace (index.d.ts exports)
+      # Source: https://github.com/isaacs/node-tar#readme
+      - id: replace-compressed-archive-error
+        condition: >
+          Call to tar.r() where gzip/brotli/zstd options are set or file is compressed.
+          Throws TypeError synchronously.
+        throws: "TypeError('cannot append to compressed archives')"
+        required_handling: >
+          Never call tar.r() on compressed archives. If compression state is unknown, use try-catch.
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: replace-error-handling
+        condition: >
+          async call to tar.r() with a file: option is awaited without a try-catch block.
+          Rejects with filesystem errors (EACCES, ENOENT on open), or Pack stream errors.
+        throws: "Error (code: EACCES | ENOENT | TAR_ENTRY_ERROR)"
+        required_handling: >
+          Wrap tar.r() in try-catch to handle I/O errors.
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: update
+    import_path: "tar"
+    description: >
+      Append entries to an existing archive only if they are newer than the existing
+      entries (by mtime). Internally delegates to tar.replace() with an mtime filter.
+      Requires a file: option. Returns Promise<void>. Same compression restriction as
+      replace: cannot be used on gzip/brotli/zstd-compressed archives. Rejects on
+      filesystem errors (EACCES, ENOENT on open failure) or Pack stream errors.
+
+    postconditions:
+      # Evidence: source-confirmed from update.js — delegates entirely to replace.js
+      # with an mtime filter. All error codes come from replace.js.
+      # Source: https://github.com/isaacs/node-tar#readme
+      # Source: nark-corpus deepen pass 2026-04-16, update.js
+      - id: update-compressed-archive-error
+        condition: >
+          Call to tar.update() or tar.u() where gzip: true, brotli: true, or zstd: true
+          options are set, or where the file ends with a compressed extension. Throws
+          TypeError synchronously (same as tar.replace).
+        throws: "TypeError('cannot append to compressed archives')"
+        required_handling: >
+          Never call tar.update() on compressed archives. Use uncompressed .tar files for
+          archives that need incremental updates. If compression state is unknown, use try-catch.
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: update-error-handling
+        condition: >
+          async call to tar.update() with a file: option is awaited without a try-catch
+          block. Rejects with filesystem errors (EACCES if archive cannot be opened, ENOENT
+          on fs operations), or errors from the underlying Pack stream.
+        throws: "Error (code: EACCES | ENOENT | TAR_ENTRY_ERROR)"
+        required_handling: >
+          Caller MUST wrap tar.update() in try-catch to handle I/O errors.
+
+          Minimum handling:
+            try {
+              await tar.update({ file: archivePath }, ['updatedfile.txt']);
+            } catch (error) {
+              console.error('Failed to update archive:', error.message, error.code);
+              throw error;
+            }
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: u
+    import_path: "tar"
+    description: >
+      Alias for tar.update. Used as tar.u({file, ...}, files) in namespace imports.
+      Same error contract as update: throws TypeError for compressed archives, rejects
+      on filesystem errors.
+
+    postconditions:
+      # Evidence: source-confirmed — tar.u is the same command as tar.update (index.d.ts exports)
+      # Source: https://github.com/isaacs/node-tar#readme
+      - id: update-compressed-archive-error
+        condition: >
+          Call to tar.u() where gzip/brotli/zstd options are set or file is compressed.
+          Throws TypeError synchronously.
+        throws: "TypeError('cannot append to compressed archives')"
+        required_handling: >
+          Never call tar.u() on compressed archives. Use try-catch if compression state is unknown.
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: update-error-handling
+        condition: >
+          async call to tar.u() with a file: option is awaited without a try-catch block.
+          Rejects with filesystem errors (EACCES, ENOENT), or Pack stream errors.
+        throws: "Error (code: EACCES | ENOENT | TAR_ENTRY_ERROR)"
+        required_handling: >
+          Wrap tar.u() in try-catch to handle I/O errors.
+        sources:
+          - "https://github.com/isaacs/node-tar#readme"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low

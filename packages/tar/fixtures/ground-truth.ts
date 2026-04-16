@@ -7,11 +7,15 @@
  * Key contract rules:
  *   - tar.extract() / tar.x() return Promise<void> when file: option is set
  *   - tar.create() / tar.c() return Promise<void> when file: option is set
+ *   - tar.list() / tar.t() return Promise<void> when file: option is set
+ *   - tar.replace() / tar.r() require file: option, throw TypeError for compressed archives
+ *   - tar.update() / tar.u() require file: option, throw TypeError for compressed archives
  *   - All async tar calls MUST be wrapped in try-catch
  *   - Can throw: TAR_BAD_ARCHIVE, TAR_ENTRY_ERROR, TAR_ABORT, CwdError, SymlinkError, ENOENT, EACCES
+ *   - replace/update/r/u also throw: TypeError('cannot append to compressed archives')
  */
 
-import { extract, create } from 'tar';
+import { extract, create, list, replace, update } from 'tar';
 import * as tar from 'tar';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +79,109 @@ export async function createWithCatch(outputPath: string, files: string[]): Prom
     await create({ file: outputPath }, files);
   } catch (error) {
     console.error('Failed to create archive:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. list() — bare calls without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: list-error-handling
+export async function listNoCatch(archivePath: string): Promise<string[]> {
+  // SHOULD_FIRE: list-error-handling — tar.list with file: returns Promise that rejects, no try-catch
+  const entries: string[] = [];
+  await list({
+    file: archivePath,
+    onReadEntry: (entry) => entries.push(entry.path),
+  });
+  return entries;
+}
+
+// @expect-violation: list-error-handling
+export async function listAliasNoCatch(archivePath: string): Promise<void> {
+  // SHOULD_FIRE: list-error-handling — tar.t (alias for list) with file:, no try-catch
+  await tar.t({ file: archivePath, onReadEntry: (e) => console.log(e.path) });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. list() — with try-catch (should not fire)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function listWithCatch(archivePath: string): Promise<string[]> {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    const entries: string[] = [];
+    await list({
+      file: archivePath,
+      onReadEntry: (entry) => entries.push(entry.path),
+    });
+    return entries;
+  } catch (error) {
+    console.error('Failed to list archive:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. replace() — bare calls without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: replace-error-handling
+export async function replaceNoCatch(archivePath: string, files: string[]): Promise<void> {
+  // SHOULD_FIRE: replace-error-handling — tar.replace with file: returns Promise that rejects, no try-catch
+  await replace({ file: archivePath }, files);
+}
+
+// @expect-violation: replace-error-handling
+export async function replaceAliasNoCatch(archivePath: string, files: string[]): Promise<void> {
+  // SHOULD_FIRE: replace-error-handling — tar.r (alias) with file:, no try-catch
+  await tar.r({ file: archivePath }, files);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. replace() — with try-catch (should not fire)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function replaceWithCatch(archivePath: string, files: string[]): Promise<void> {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await replace({ file: archivePath }, files);
+  } catch (error) {
+    console.error('Failed to replace archive entry:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. update() — bare calls without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: update-error-handling
+export async function updateNoCatch(archivePath: string, files: string[]): Promise<void> {
+  // SHOULD_FIRE: update-error-handling — tar.update with file: returns Promise that rejects, no try-catch
+  await update({ file: archivePath }, files);
+}
+
+// @expect-violation: update-error-handling
+export async function updateAliasNoCatch(archivePath: string, files: string[]): Promise<void> {
+  // SHOULD_FIRE: update-error-handling — tar.u (alias) with file:, no try-catch
+  await tar.u({ file: archivePath }, files);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. update() — with try-catch (should not fire)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function updateWithCatch(archivePath: string, files: string[]): Promise<void> {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await update({ file: archivePath }, files);
+  } catch (error) {
+    console.error('Failed to update archive:', error);
     throw error;
   }
 }
