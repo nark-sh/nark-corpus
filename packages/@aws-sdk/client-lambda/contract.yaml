@@ -42,7 +42,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71  # 5 contracted / 7 runtime-relevant (2 omitted: InvokeAsyncCommand deprecated, DeleteFunctionCommand admin-only)
+coverage_score: 0.82  # 9 contracted / 11 runtime-relevant (2 omitted: InvokeAsyncCommand deprecated, DeleteFunctionCommand admin-only)
 
 detection:
   class_names:
@@ -379,6 +379,288 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: send (UpdateFunctionCodeCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Updates a Lambda function's deployment package (.zip or container image). Used in
+      deployment automation, CI/CD pipelines, and multi-tenant systems that provision
+      per-customer Lambda functions. After updating code, the function remains in
+      LastUpdateStatus=InProgress — use waitUntilFunctionUpdated before re-invoking.
+      Supports inline ZipFile, S3 bucket/key, or ECR ImageUri. When Publish=true,
+      also publishes a new version atomically.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionCode.html
+      # @throws annotation confirmed from dist-types/commands/UpdateFunctionCodeCommand.d.ts
+      # PreconditionFailedException confirmed in dist-es/models/errors.js: class with $fault="client"
+      - id: aws-lambda-update-code-no-error-handling
+        condition: >
+          UpdateFunctionCodeCommand sent via lambdaClient.send() without try-catch.
+          Throws ResourceConflictException (409) when another update is already in progress
+          (UpdateFunctionConfiguration or another UpdateFunctionCode overlapping),
+          PreconditionFailedException (412) when RevisionId parameter doesn't match the
+          current function revision (concurrent deployment race), CodeStorageExceededException
+          (400) when 75 GB account Lambda storage quota is exceeded, ResourceNotFoundException
+          (404) when the function does not exist, TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (409, update in progress),
+          PreconditionFailedException (412, RevisionId mismatch — concurrent deploy race),
+          CodeStorageExceededException (400, account quota exceeded),
+          ResourceNotFoundException (404, function not found),
+          TooManyRequestsException (429, rate limited).
+          Network errors throw SdkClientError.
+        required_handling: >
+          Wrap in try-catch. Handle ResourceConflictException with retry after waitUntilFunctionUpdated.
+          PreconditionFailedException requires fetching the current RevisionId from GetFunction
+          before retrying. CodeStorageExceededException requires deleting unused versions:
+
+          try {
+            await lambdaClient.send(new UpdateFunctionCodeCommand({
+              FunctionName: functionName,
+              ZipFile: zipBuffer,
+            }));
+            await waitUntilFunctionUpdatedV2(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName }
+            );
+          } catch (error) {
+            if (error.name === 'ResourceConflictException') {
+              await waitUntilFunctionUpdatedV2({ client: lambdaClient, maxWaitTime: 300 }, { FunctionName: functionName });
+              // Retry update
+            } else if (error.name === 'PreconditionFailedException') {
+              throw new Error(`Deployment race condition — another process is deploying ${functionName}`);
+            } else if (error.name === 'CodeStorageExceededException') {
+              throw new Error('Lambda code storage quota exceeded — delete old function versions');
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionCode.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionCode.html
+      # PreconditionFailedException is unique to Update operations — not present in generic send postcondition
+      # RevisionId pattern documented: "Use GetFunction or GetAlias to retrieve the latest RevisionId"
+      - id: aws-lambda-update-code-precondition-failed
+        condition: >
+          UpdateFunctionCodeCommand called with RevisionId parameter that does not match the
+          function's current RevisionId. This is a silent data integrity issue — a concurrent
+          deployment completed between when the RevisionId was fetched and when the update
+          was sent, meaning the caller's deployment would overwrite newer code if allowed.
+          Lambda rejects with PreconditionFailedException to prevent this.
+        throws: >
+          PreconditionFailedException (HTTP 412) with message "The Revision Id provided does not
+          match the latest Revision Id for the Lambda function or alias." error.name is
+          "PreconditionFailedException", $fault is "client".
+        required_handling: >
+          When using RevisionId for safe deployments, catch PreconditionFailedException
+          and re-fetch the current RevisionId before retrying:
+
+          const fn = await lambdaClient.send(new GetFunctionCommand({ FunctionName: name }));
+          await lambdaClient.send(new UpdateFunctionCodeCommand({
+            FunctionName: name,
+            ZipFile: zipBuffer,
+            RevisionId: fn.Configuration!.RevisionId,
+          }));
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionCode.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: send (UpdateFunctionConfigurationCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Updates a Lambda function's configuration — timeout, memory, environment variables,
+      handler, runtime, VPC settings, layers, and other settings. Does NOT update code.
+      Used in deployment automation to update env vars, adjust memory/timeout, or change
+      layers. When updating VPC settings, AWS may take a minute to provision resources;
+      the function enters LastUpdateStatus=InProgress during this time and cannot be
+      re-configured until update completes.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionConfiguration.html
+      # @throws annotation confirmed from dist-types/commands/UpdateFunctionConfigurationCommand.d.ts
+      # ResourceConflictException specifically noted: "When updating VPC config, provisioning can take a minute"
+      - id: aws-lambda-update-config-no-error-handling
+        condition: >
+          UpdateFunctionConfigurationCommand sent via lambdaClient.send() without try-catch.
+          Throws ResourceConflictException (409) when another configuration update is already
+          in progress (common during VPC provisioning which can take over a minute),
+          PreconditionFailedException (412) on RevisionId mismatch,
+          ResourceNotFoundException (404) when function not found,
+          InvalidParameterValueException (400) for bad handler/runtime/role/VPC settings,
+          TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (409, update in
+          progress — VPC changes take 60+ seconds), PreconditionFailedException (412,
+          concurrent update race), ResourceNotFoundException (404, function not found),
+          InvalidParameterValueException (400, invalid settings),
+          TooManyRequestsException (429, rate limited). Network errors throw SdkClientError.
+        required_handling: >
+          Wrap in try-catch. Always wait for completion with waitUntilFunctionUpdated before
+          chaining another config or code update. ResourceConflictException means another
+          update (possibly VPC provisioning) is still in progress:
+
+          try {
+            await lambdaClient.send(new UpdateFunctionConfigurationCommand({
+              FunctionName: functionName,
+              Timeout: 30,
+              MemorySize: 512,
+              Environment: { Variables: { KEY: 'value' } },
+            }));
+            // Wait for update to complete before invoking or re-updating
+            await waitUntilFunctionUpdatedV2(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName }
+            );
+          } catch (error) {
+            if (error.name === 'ResourceConflictException') {
+              // Another update in progress — wait then retry
+              await waitUntilFunctionUpdatedV2({ client: lambdaClient, maxWaitTime: 300 }, { FunctionName: functionName });
+            } else if (error.name === 'InvalidParameterValueException') {
+              throw new Error(`Invalid Lambda config: ${error.message}`);
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionConfiguration.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: waitUntilPublishedVersionActive
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Waits for a newly-published Lambda function version to reach Active state by polling
+      GetFunctionConfiguration. Used after PublishVersionCommand in blue/green deployment
+      workflows and alias-based traffic shifting. Published versions go through Pending state
+      while resources (VPC, EFS) are provisioned — invoking a Pending version causes errors.
+      waitUntilPublishedVersionActive uses GetFunctionConfiguration API (same as waitUntilFunctionActive).
+    postconditions:
+      # Evidence: node_modules/@aws-sdk/client-lambda/dist-es/waiters/waitForPublishedVersionActive.js
+      # Source confirmed: same checkExceptions pattern as waitForFunctionActiveV2.js
+      # WaiterState.FAILURE triggered when State === "Failed" (resource provisioning failed)
+      # WaiterState.RETRY triggered when State === "Pending"
+      # checkExceptions from @smithy/util-waiter throws TimeoutError on maxWaitTime exceeded
+      - id: aws-lambda-published-version-waiter-no-error-handling
+        condition: >
+          waitUntilPublishedVersionActive() called without try-catch after PublishVersionCommand.
+          Throws Error with name "TimeoutError" when maxWaitTime exceeded and the published
+          version has not reached Active state. Throws generic Error when the version reaches
+          Failed state (VPC/EFS provisioning failure). Throws LambdaServiceException if
+          underlying GetFunctionConfiguration polls fail.
+        throws: >
+          Error with name "TimeoutError" (from @smithy/util-waiter checkExceptions) when
+          maxWaitTime exceeded. Generic Error with WaiterResult JSON payload when published
+          version reaches Failed state (resource provisioning failed). LambdaServiceException
+          if underlying GetFunctionConfiguration calls fail (permissions, function not found).
+        required_handling: >
+          Always wrap in try-catch after PublishVersionCommand in blue/green deploy workflows:
+
+          try {
+            const published = await lambdaClient.send(new PublishVersionCommand({
+              FunctionName: functionName,
+              Description: 'v2.0.0 release',
+            }));
+            await waitUntilPublishedVersionActive(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName, Qualifier: published.Version }
+            );
+            // Now safe to update alias to point to published.Version
+          } catch (error) {
+            if (error.name === 'TimeoutError') {
+              throw new Error(`Version ${functionName} stuck in Pending state after 5 minutes`);
+            }
+            throw new Error(`Version activation failed: ${error.message}`);
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_PublishVersion.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/functions-states.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: send (CreateEventSourceMappingCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Creates a mapping between an event source (SQS queue, DynamoDB stream, Kinesis stream,
+      MSK, Amazon MQ, or self-managed Kafka) and a Lambda function. Lambda polls the event
+      source and invokes the function in batches. Commonly used in SaaS apps to set up
+      SQS-triggered background job processing. Operation is idempotent only if the mapping
+      already exists with the same ARN — attempting to create a duplicate mapping throws
+      ResourceConflictException.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_CreateEventSourceMapping.html
+      # @throws annotation confirmed from dist-types/commands/CreateEventSourceMappingCommand.d.ts
+      # ResourceConflictException documented: "The resource already exists, or another operation is in progress"
+      - id: aws-lambda-event-source-mapping-no-error-handling
+        condition: >
+          CreateEventSourceMappingCommand sent via lambdaClient.send() without try-catch.
+          Throws ResourceConflictException (409) when an event source mapping already exists
+          for the same function and event source ARN (not idempotent — repeated calls fail),
+          ResourceNotFoundException (404) when the Lambda function or event source ARN does
+          not exist, InvalidParameterValueException (400) for bad StartingPosition, filter
+          criteria, or batch size, TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (409, mapping already
+          exists — use UpdateEventSourceMappingCommand to modify), ResourceNotFoundException
+          (404, function or event source not found), InvalidParameterValueException (400,
+          bad StartingPosition/batch size/filter), TooManyRequestsException (429, throttled).
+          Network errors throw SdkClientError.
+        required_handling: >
+          Wrap in try-catch and handle ResourceConflictException as idempotency signal
+          (mapping already exists — may be safe to continue):
+
+          try {
+            await lambdaClient.send(new CreateEventSourceMappingCommand({
+              FunctionName: functionName,
+              EventSourceArn: sqsQueueArn,
+              BatchSize: 10,
+              FunctionResponseTypes: ['ReportBatchItemFailures'],
+            }));
+          } catch (error) {
+            if (error.name === 'ResourceConflictException') {
+              // Mapping already exists — idempotent, safe to continue
+              console.info(`Event source mapping already exists for ${functionName}`);
+            } else if (error.name === 'ResourceNotFoundException') {
+              throw new Error(`Function ${functionName} or event source not found`);
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_CreateEventSourceMapping.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'ResourceNotFoundException', 'TooManyRequestsException')"
@@ -390,4 +672,8 @@ notes:
   - "waitUntilFunctionActiveV2 uses GetFunction API; waitUntilFunctionActive uses GetFunctionConfiguration — both call checkExceptions which throws TimeoutError"
   - "InvokeWithResponseStream: pre-stream errors throw LambdaServiceException; post-stream function errors are in InvokeComplete.ErrorCode"
   - "Functions go through Pending->Active or Pending->Failed on creation; always use waitUntilFunctionActive before first invoke"
-  - "Coverage: 5 contracted functions out of 7 runtime-relevant. Omitted: InvokeAsyncCommand (deprecated), DeleteFunctionCommand (admin-only)."
+  - "UpdateFunctionCode/Configuration: ResourceConflictException means another update is in progress — always waitUntilFunctionUpdated before chaining updates"
+  - "PreconditionFailedException (412): RevisionId mismatch — use GetFunction to fetch current RevisionId before retrying concurrent deployments"
+  - "CreateEventSourceMappingCommand: ResourceConflictException is idempotency signal — mapping already exists, safe to continue"
+  - "waitUntilPublishedVersionActive: use after PublishVersionCommand in blue/green deploys before shifting traffic via UpdateAlias"
+  - "Coverage: 9 contracted functions out of 11 runtime-relevant. Omitted: InvokeAsyncCommand (deprecated), DeleteFunctionCommand (admin-only)."

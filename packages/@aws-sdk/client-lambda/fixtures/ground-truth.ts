@@ -12,13 +12,20 @@
  *   aws-lambda-waiter-no-error-handling               (waitUntilFunctionActive — no try-catch)
  *   aws-lambda-update-waiter-no-error-handling        (waitUntilFunctionUpdated — no try-catch)
  *   aws-lambda-create-no-error-handling               (CreateFunctionCommand — no try-catch)
+ *   aws-lambda-update-code-no-error-handling          (UpdateFunctionCodeCommand — no try-catch)
+ *   aws-lambda-update-code-precondition-failed        (UpdateFunctionCodeCommand — RevisionId race)
+ *   aws-lambda-update-config-no-error-handling        (UpdateFunctionConfigurationCommand — no try-catch)
+ *   aws-lambda-published-version-waiter-no-error-handling (waitUntilPublishedVersionActive — no try-catch)
+ *   aws-lambda-event-source-mapping-no-error-handling (CreateEventSourceMappingCommand — no try-catch)
  */
 import {
   LambdaClient,
   InvokeCommand,
   InvokeWithResponseStreamCommand,
   UpdateFunctionCodeCommand,
+  UpdateFunctionConfigurationCommand,
   CreateFunctionCommand,
+  CreateEventSourceMappingCommand,
   DeleteFunctionCommand,
   LambdaServiceException,
 } from '@aws-sdk/client-lambda';
@@ -27,6 +34,7 @@ import {
   waitUntilFunctionActiveV2,
   waitUntilFunctionUpdated,
   waitUntilFunctionUpdatedV2,
+  waitUntilPublishedVersionActive,
 } from '@aws-sdk/client-lambda';
 
 const lambdaClient = new LambdaClient({ region: 'us-east-1' });
@@ -328,6 +336,122 @@ async function gt_create_function_safe(
       }));
     } else if (error.name === 'CodeStorageExceededException') {
       throw new Error('Lambda code storage quota exceeded — delete old function versions');
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 9. UpdateFunctionConfigurationCommand — no try/catch (SHOULD_FIRE)
+// Covers: aws-lambda-update-config-no-error-handling
+// ResourceConflictException when another update is in progress (VPC provisioning takes 60+ seconds)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: aws-lambda-service-error
+async function gt_update_config_missing(functionName: string) {
+  // aws-lambda-update-config-no-error-handling (scanner concern queued for command-specific rule)
+  await lambdaClient.send(new UpdateFunctionConfigurationCommand({
+    FunctionName: functionName,
+    Timeout: 30,
+    MemorySize: 512,
+    Environment: { Variables: { KEY: 'value' } },
+  }));
+}
+
+// 9. UpdateFunctionConfigurationCommand — with try/catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_update_config_safe(functionName: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateFunctionConfigurationCommand has try-catch
+    await lambdaClient.send(new UpdateFunctionConfigurationCommand({
+      FunctionName: functionName,
+      Timeout: 30,
+      MemorySize: 512,
+      Environment: { Variables: { KEY: 'value' } },
+    }));
+    await waitUntilFunctionUpdatedV2(
+      { client: lambdaClient, maxWaitTime: 300 },
+      { FunctionName: functionName }
+    );
+  } catch (error: any) {
+    if (error.name === 'ResourceConflictException') {
+      // Another update in progress — wait then retry
+      await waitUntilFunctionUpdatedV2({ client: lambdaClient, maxWaitTime: 300 }, { FunctionName: functionName });
+    } else if (error.name === 'InvalidParameterValueException') {
+      throw new Error(`Invalid Lambda config: ${error.message}`);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 10. waitUntilPublishedVersionActive — no try/catch
+// Covers: aws-lambda-published-version-waiter-no-error-handling
+// NOTE: scanner detection for waiter calls is a pending concern — these document correct/incorrect patterns.
+// ──────────────────────────────────────────────────
+
+async function gt_wait_published_version_missing(functionName: string, version: string) {
+  // Missing try-catch — TimeoutError when published version stays in Pending state
+  // Detection gap: scanner doesn't yet detect missing try-catch on waiter calls.
+  await waitUntilPublishedVersionActive(
+    { client: lambdaClient, maxWaitTime: 300 },
+    { FunctionName: functionName, Qualifier: version }
+  );
+}
+
+// 10. waitUntilPublishedVersionActive — with try/catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_wait_published_version_safe(functionName: string, version: string) {
+  try {
+    // SHOULD_NOT_FIRE: waiter has try-catch — correct pattern for blue/green deploys
+    await waitUntilPublishedVersionActive(
+      { client: lambdaClient, maxWaitTime: 300 },
+      { FunctionName: functionName, Qualifier: version }
+    );
+  } catch (error: any) {
+    if (error.name === 'TimeoutError') {
+      throw new Error(`Published version ${version} of ${functionName} did not become active within 5 minutes`);
+    }
+    throw new Error(`Version activation failed: ${error.message}`);
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 11. CreateEventSourceMappingCommand — no try/catch (SHOULD_FIRE)
+// Covers: aws-lambda-event-source-mapping-no-error-handling
+// ResourceConflictException when mapping already exists (not idempotent)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: aws-lambda-service-error
+async function gt_create_event_source_mapping_missing(functionName: string, sqsQueueArn: string) {
+  // aws-lambda-event-source-mapping-no-error-handling (scanner concern queued for command-specific rule)
+  await lambdaClient.send(new CreateEventSourceMappingCommand({
+    FunctionName: functionName,
+    EventSourceArn: sqsQueueArn,
+    BatchSize: 10,
+    FunctionResponseTypes: ['ReportBatchItemFailures'],
+  }));
+}
+
+// 11. CreateEventSourceMappingCommand — with try/catch + idempotency handling (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_create_event_source_mapping_safe(functionName: string, sqsQueueArn: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateEventSourceMappingCommand has try-catch
+    await lambdaClient.send(new CreateEventSourceMappingCommand({
+      FunctionName: functionName,
+      EventSourceArn: sqsQueueArn,
+      BatchSize: 10,
+      FunctionResponseTypes: ['ReportBatchItemFailures'],
+    }));
+  } catch (error: any) {
+    if (error.name === 'ResourceConflictException') {
+      // Mapping already exists — idempotent, safe to continue
+      console.info(`Event source mapping already exists for ${functionName}`);
+    } else if (error.name === 'ResourceNotFoundException') {
+      throw new Error(`Function ${functionName} or event source ${sqsQueueArn} not found`);
     } else {
       throw error;
     }
