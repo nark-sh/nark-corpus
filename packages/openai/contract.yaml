@@ -1,11 +1,31 @@
 package: openai
-semver: ">=4.0.0 <5.0.0"
-contract_version: "1.1.0"
+semver: ">=4.0.0 <7.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.50  # 9 contracted functions / 18 async-callable functions (9 omitted as read-only or experimental)
+# Depth pass 2026-04-16 (deepen-stream-2 pass 6):
+# Expanded coverage from 9→16 contracted functions (+7 this pass).
+# API surface total: 27 async-callable (full enumeration from openai@6.34.0 TypeScript declarations)
+# Contracted: 16; omitted: 11; coverage_score: ~0.59 (contracted / (total - omitted))
+# New omissions: images.createVariation/edit (same error surface as generate),
+#   fine_tuning.jobs.cancel/pause/resume (lifecycle management, no novel error contracts),
+#   batches.retrieve/cancel (management ops), vector_stores CRUD/retrieve/list/delete/search,
+#   uploads.cancel (cleanup), beta.assistants/threads (deprecated Assistants API),
+#   conversations/containers/videos/skills/evals (new/experimental, limited SaaS adoption),
+#   responses.cancel/compact/retrieve (cleanup/management), chat.completions CRUD,
+#   models.list/retrieve (read-only), fine_tuning.graders (beta).
+# Evidence from openai-node@6.x source:
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/files.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/file-batches.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/translations.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+coverage_score: 0.59  # 16 contracted / 27 total async-callable functions (11 intentionally omitted)
 
 functions:
   - name: create
@@ -636,4 +656,452 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: lost_transaction
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # files.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Used before fine-tuning (purpose='fine-tune'), batch processing (purpose='batch'),
+  # and assistants (purpose='assistants'). Limits: 512 MB per file, 2.5 TB total project storage.
+  # Fine-tune files must be JSONL; batch files must be JSONL up to 200 MB.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: files.create
+    import_path: "openai"
+    description: >
+      Uploads a file for use across OpenAI endpoints via openai.files.create().
+      Purpose must be one of: fine-tune, batch, assistants, vision.
+      Max file size: 512 MB. Fine-tune and batch files must be JSONL format.
+      File processing is asynchronous — status must be 'processed' before use.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # Files source confirms 512 MB limit and JSONL format requirement
+      - id: files-invalid-format-or-size-error
+        condition: >
+          File exceeds 512 MB, uses invalid format for purpose (e.g., non-JSONL for fine-tune/batch),
+          or has malformed content (400)
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate file format and size before uploading.
+          Fine-tuning files: JSONL with prompt/completion or messages format required.
+          Batch files: JSONL up to 200 MB, with specific per-request structure.
+          Max individual file size: 512 MB.
+          DO NOT retry with the same file without fixing the format or size.
+          After upload, poll file.status until 'processed' before referencing the file ID.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: waitForProcessing() confirmed in files.ts source —
+      # throws APIConnectionTimeoutError after 30 minutes default wait
+      - id: files-processing-timeout-error
+        condition: >
+          File processing exceeds the maximum wait time (default 30 minutes) when using
+          waitForProcessing() before fine-tuning or batch submission
+        throws: "APIConnectionTimeoutError from files.waitForProcessing()"
+        required_handling: >
+          Caller MUST handle timeout when polling file status via waitForProcessing().
+          Timeout does not mean the file failed — check file.status manually.
+          Implement retry logic with a longer timeout or manual polling loop.
+          Submitting a file ID before status='processed' causes downstream failures
+          (fine-tuning and batch jobs reject unprocessed files).
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: files-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # chat.completions.parse()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Structured outputs helper — calls completions.create() then parses the response.
+  # Throws LengthFinishReasonError and ContentFilterFinishReasonError on non-'stop' finish reasons.
+  # These are thrown BEFORE any parsing happens, as guards on finish_reason.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: chat.completions.parse
+    import_path: "openai"
+    description: >
+      Creates a structured-output chat completion via openai.chat.completions.parse().
+      Internally calls completions.create() then parses the response via parseChatCompletion().
+      Throws LengthFinishReasonError if response was truncated due to token limit,
+      and ContentFilterFinishReasonError if response was filtered by content policy.
+      These are checked per-choice before any JSON parsing.
+
+    postconditions:
+      # Evidence: LengthFinishReasonError confirmed in parser.ts source —
+      # thrown when choice.finish_reason === 'length' (token limit truncation)
+      - id: parse-length-finish-reason-error
+        condition: "Response truncated due to max_tokens limit (finish_reason === 'length')"
+        throws: "LengthFinishReasonError (extends OpenAIError)"
+        required_handling: >
+          Caller MUST catch LengthFinishReasonError when using chat.completions.parse().
+          This is thrown for EVERY choice with finish_reason 'length' — not just the last.
+          Unlike completions.create() which silently returns truncated output, parse()
+          makes truncation a hard error because JSON schema validation will fail anyway.
+          Fix: increase max_tokens, reduce prompt size, or use a model with larger context.
+          DO NOT retry with same parameters — the response will be truncated again.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: ContentFilterFinishReasonError confirmed in parser.ts source —
+      # thrown when choice.finish_reason === 'content_filter'
+      - id: parse-content-filter-finish-reason-error
+        condition: "Response blocked by content filter (finish_reason === 'content_filter')"
+        throws: "ContentFilterFinishReasonError (extends OpenAIError)"
+        required_handling: >
+          Caller MUST catch ContentFilterFinishReasonError when using chat.completions.parse().
+          Thrown before any JSON parsing — the structured output is not available.
+          Return a user-friendly error indicating the request was blocked by content policy.
+          DO NOT retry with the same prompt without modifying content.
+          Log occurrences for compliance and monitoring purposes.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: parse-rate-limit-error
+        condition: "Rate limit exceeded (429)"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Same handling as chat.completions.create() — implement exponential backoff.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # audio.translations.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/translations.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Translates non-English audio into English text.
+  # Same format/size constraints as audio.transcriptions.create() — 25 MB limit,
+  # supported formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+  # Only whisper-1 model is currently supported.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: audio.translations.create
+    import_path: "openai"
+    description: >
+      Translates audio in any supported language to English text via
+      openai.audio.translations.create(). Only whisper-1 model supported.
+      Max file size 25 MB. Accepted formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+      No internal SDK error handling — errors bubble to caller.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # Same format/size constraints as transcriptions.ts — 25 MB limit
+      - id: translation-invalid-file-error
+        condition: "Unsupported audio format, file exceeds 25 MB, or corrupted file (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST validate file format and size before upload.
+          Supported formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
+          Maximum file size: 25 MB.
+          DO NOT retry with the same file without fixing the issue.
+          Return user-friendly error about file format or size constraint.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/translations.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: translation-rate-limit-error
+        condition: "Rate limit exceeded (429) — audio translation shares rate limits with transcription"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff for batch translation workflows.
+          Audio endpoints have separate rate limits measured in audio minutes/day.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # vector_stores.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Creates a vector store for use with file_search tool in Assistants/Responses API.
+  # Used in RAG pipelines to store and query document embeddings.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: vector_stores.create
+    import_path: "openai"
+    description: >
+      Creates a vector store via openai.vectorStores.create().
+      Used to set up document stores for file_search tool in Responses/Assistants API.
+      Accepts up to 10,000 files; supports auto-chunking or static chunking configuration.
+      Metadata limited to 16 key-value pairs (keys ≤64 chars, values ≤512 chars).
+
+    postconditions:
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: vector-stores-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Vector store creation failures in background pipelines are silently swallowed,
+          blocking all downstream file attachment operations.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      - id: vector-stores-rate-limit-error
+        condition: "Rate limit exceeded (429) — vector store operations have separate rate limits"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff.
+          SDK automatically retries 2 times with exponential backoff.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # vector_stores.files.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/files.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Attaches an already-uploaded file to a vector store.
+  # File processing is ASYNCHRONOUS — status may still be 'in_progress' after return.
+  # Critical: MUST check file.status and file.last_error — method returns even on failure.
+  # last_error.code values: 'server_error', 'unsupported_file', 'invalid_file'
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: vector_stores.files.create
+    import_path: "openai"
+    description: >
+      Attaches a file to a vector store via openai.vectorStores.files.create().
+      File processing is asynchronous — the method returns immediately with status 'in_progress'.
+      CRITICAL: Must check file.status and file.last_error after processing completes.
+      Method returns even if the file failed to process — callers who skip the status check
+      silently add no content to the vector store.
+
+    postconditions:
+      # Evidence: last_error.code values confirmed in vector-stores/files.ts source:
+      # 'server_error', 'unsupported_file', 'invalid_file'
+      # Method returns even if file failed — this is a SILENT failure pattern.
+      - id: vector-store-file-processing-failure
+        condition: >
+          File processing fails after attachment (file.status becomes 'failed');
+          file.last_error.code is one of: 'server_error', 'unsupported_file', 'invalid_file'
+        throws: >
+          Does not throw — file.status becomes 'failed' and file.last_error is populated.
+          Must be detected by checking file.status after polling or using createAndPoll().
+        required_handling: >
+          Caller MUST use createAndPoll() or poll() to wait for processing completion,
+          then check file.status === 'failed' and inspect file.last_error.code.
+          'unsupported_file': file type not supported — convert to supported format (PDF, DOCX, TXT, etc.).
+          'invalid_file': file content is corrupt or empty — re-upload the source file.
+          'server_error': transient failure — retry the attachment.
+          Skipping the status check means the vector store appears to contain the file
+          but search results return no content from it — a silent data loss.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/files.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: vector-store-file-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # vector_stores.fileBatches.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/file-batches.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Batch-attaches multiple files to a vector store.
+  # Critical: Returns even if SOME files fail — must check batch.file_counts.failed_count.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: vector_stores.fileBatches.create
+    import_path: "openai"
+    description: >
+      Batch-attaches multiple files to a vector store via openai.vectorStores.fileBatches.create().
+      Processing is asynchronous. CRITICAL: the method returns even if individual files fail.
+      batch.file_counts.failed_count must be checked after processing — partial failures
+      are not thrown as exceptions.
+
+    postconditions:
+      # Evidence: file_counts.failed_count confirmed in file-batches.ts source.
+      # "this will return even if one of the files failed to process,
+      # you need to check batch.file_counts.failed_count to handle this case."
+      - id: vector-store-file-batch-partial-failure
+        condition: >
+          One or more files in the batch fail to process (batch.file_counts.failed_count > 0);
+          batch.status may still be 'completed' even with failures
+        throws: >
+          Does not throw — batch.status is 'completed' but batch.file_counts.failed_count > 0.
+          Per-file failure details available via listFiles() filtered to status='failed'.
+        required_handling: >
+          Caller MUST use createAndPoll() to wait for processing, then check:
+          1. batch.status === 'failed' (entire batch failed)
+          2. batch.file_counts.failed_count > 0 (partial failure — some files missing from store)
+          For failed files: call listFiles() filtered to status='failed', inspect each
+          file's last_error to determine cause (unsupported_file, invalid_file, server_error).
+          Partial failure means the vector store has incomplete content — search results
+          will miss chunks from failed files without any user-visible error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/file-batches.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # uploads.create() + uploads.complete()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Multipart upload API for files >25 MB (up to 8 GB). Upload expires after 1 hour.
+  # Workflow: create() → parts.create() (×N) → complete(partIds, md5).
+  # complete() validates MD5 checksum (optional but recommended).
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: uploads.create
+    import_path: "openai"
+    description: >
+      Initializes a multipart file upload via openai.uploads.create().
+      Used for files up to 8 GB (above the 512 MB files.create() limit).
+      Upload expires 1 hour after creation. Parts are added via uploads.parts.create().
+      Completed by calling uploads.complete() with ordered part IDs and optional MD5.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # uploads.ts source confirms 8 GB limit, 1 hour expiry
+      - id: uploads-expired-or-size-exceeded
+        condition: >
+          Upload expires after 1 hour without completion, or total size exceeds 8 GB (400/404)
+        throws: "NotFoundError (404) for expired upload; BadRequestError (400) for size exceeded"
+        required_handling: >
+          Caller MUST complete the multipart upload within 1 hour of calling uploads.create().
+          For large files: start parts.create() calls immediately after create().
+          If upload expires, call uploads.create() again and restart from the beginning —
+          previously uploaded parts are lost.
+          Track the uploadID and byte count; verify total matches declared bytes on complete().
+          Max upload size: 8 GB. Use uploads.complete() with md5 checksum for integrity.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: uploads-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: high

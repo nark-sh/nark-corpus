@@ -322,7 +322,206 @@ export async function batchesCreateWithCatch(fileId: string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 12. Multiple calls — each fires independently
+// 12. files.create — missing try-catch  (NEW: bc-deepen-contract pass 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: files-invalid-format-or-size-error
+export async function filesCreateNoCatch(file: File) {
+  // SHOULD_FIRE: files-invalid-format-or-size-error — files.create throws BadRequestError on invalid format/size, no try-catch
+  const uploadedFile = await openai.files.create({
+    file,
+    purpose: 'fine-tune',
+  });
+  return uploadedFile;
+}
+
+// @expect-clean
+export async function filesCreateWithCatch(file: File) {
+  try {
+    // SHOULD_NOT_FIRE: files.create inside try-catch is safe
+    const uploadedFile = await openai.files.create({
+      file,
+      purpose: 'fine-tune',
+    });
+    return uploadedFile;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. chat.completions.parse — missing try-catch  (NEW: bc-deepen-contract pass 6)
+// Throws LengthFinishReasonError and ContentFilterFinishReasonError in addition
+// to standard APIError types — these are unique to the parse() method.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: parse-length-finish-reason-error
+// @expect-violation: parse-content-filter-finish-reason-error
+export async function chatParseNoCatch(prompt: string) {
+  // SHOULD_FIRE: parse-length-finish-reason-error — chat.completions.parse throws LengthFinishReasonError, no try-catch
+  const result = await openai.chat.completions.parse({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' } as any,
+  });
+  return result;
+}
+
+// @expect-clean
+export async function chatParseWithCatch(prompt: string) {
+  try {
+    // SHOULD_NOT_FIRE: chat.completions.parse inside try-catch is safe
+    const result = await openai.chat.completions.parse({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: prompt }],
+      response_format: { type: 'json_object' } as any,
+    });
+    return result;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. audio.translations.create — missing try-catch  (NEW: bc-deepen-contract pass 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: translation-invalid-file-error
+// @expect-violation: translation-rate-limit-error
+export async function audioTranslationNoCatch(audioFile: File) {
+  // SHOULD_FIRE: translation-invalid-file-error — audio.translations.create throws BadRequestError, no try-catch
+  const translation = await openai.audio.translations.create({
+    model: 'whisper-1',
+    file: audioFile,
+  });
+  return translation;
+}
+
+// @expect-clean
+export async function audioTranslationWithCatch(audioFile: File) {
+  try {
+    // SHOULD_NOT_FIRE: audio.translations.create inside try-catch is safe
+    const translation = await openai.audio.translations.create({
+      model: 'whisper-1',
+      file: audioFile,
+    });
+    return translation;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. vectorStores.create — missing try-catch  (NEW: bc-deepen-contract pass 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: vector-stores-authentication-error
+export async function vectorStoresCreateNoCatch(name: string) {
+  // SHOULD_FIRE: vector-stores-authentication-error — vectorStores.create throws AuthenticationError, no try-catch
+  const store = await openai.vectorStores.create({ name });
+  return store;
+}
+
+// @expect-clean
+export async function vectorStoresCreateWithCatch(name: string) {
+  try {
+    // SHOULD_NOT_FIRE: vectorStores.create inside try-catch is safe
+    const store = await openai.vectorStores.create({ name });
+    return store;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. vectorStores.files.create — missing try-catch + no status check
+// (NEW: bc-deepen-contract pass 6)
+// Critical: method returns even if file failed — must check file.status
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: vector-store-file-processing-failure
+export async function vectorStoreFilesCreateNoCatch(vectorStoreId: string, fileId: string) {
+  // SHOULD_FIRE: vector-store-file-processing-failure — no status check after return (silent failure)
+  const vsFile = await openai.vectorStores.files.create(vectorStoreId, { file_id: fileId });
+  // Missing: check vsFile.status and vsFile.last_error
+  return vsFile;
+}
+
+// @expect-clean
+export async function vectorStoreFilesCreateWithCatch(vectorStoreId: string, fileId: string) {
+  try {
+    // SHOULD_NOT_FIRE: uses createAndPoll() which handles status checking
+    const vsFile = await openai.vectorStores.files.createAndPoll(vectorStoreId, { file_id: fileId });
+    if (vsFile.status === 'failed') {
+      throw new Error(`File processing failed: ${vsFile.last_error?.code}`);
+    }
+    return vsFile;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. vectorStores.fileBatches.create — missing try-catch + no failed_count check
+// (NEW: bc-deepen-contract pass 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: vector-store-file-batch-partial-failure
+export async function vectorStoreFileBatchesNoCatch(vectorStoreId: string, fileIds: string[]) {
+  // SHOULD_FIRE: vector-store-file-batch-partial-failure — no failed_count check
+  const batch = await openai.vectorStores.fileBatches.create(vectorStoreId, { file_ids: fileIds });
+  // Missing: check batch.file_counts.failed_count
+  return batch;
+}
+
+// @expect-clean
+export async function vectorStoreFileBatchesWithCatch(vectorStoreId: string, fileIds: string[]) {
+  try {
+    // SHOULD_NOT_FIRE: uses createAndPoll() and checks failed_count
+    const batch = await openai.vectorStores.fileBatches.createAndPoll(vectorStoreId, { file_ids: fileIds });
+    if (batch.file_counts.failed > 0) {
+      throw new Error(`${batch.file_counts.failed} files failed to process`);
+    }
+    return batch;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. uploads.create — missing try-catch  (NEW: bc-deepen-contract pass 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: uploads-expired-or-size-exceeded
+export async function uploadsCreateNoCatch(filename: string, bytes: number) {
+  // SHOULD_FIRE: uploads-expired-or-size-exceeded — uploads.create throws on expiry/size, no try-catch
+  const upload = await openai.uploads.create({
+    filename,
+    purpose: 'fine-tune',
+    bytes,
+    mime_type: 'application/jsonl',
+  });
+  return upload;
+}
+
+// @expect-clean
+export async function uploadsCreateWithCatch(filename: string, bytes: number) {
+  try {
+    // SHOULD_NOT_FIRE: uploads.create inside try-catch is safe
+    const upload = await openai.uploads.create({
+      filename,
+      purpose: 'fine-tune',
+      bytes,
+      mime_type: 'application/jsonl',
+    });
+    return upload;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. Multiple calls — each fires independently
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function multipleCallsNoCatch(text: string) {
