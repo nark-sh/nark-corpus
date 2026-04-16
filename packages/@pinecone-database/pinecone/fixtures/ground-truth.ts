@@ -22,6 +22,15 @@
  *   upsertrecords-no-error-handling
  *   searchrecords-no-error-handling
  *   startimport-no-error-handling
+ *
+ * Postcondition IDs (added by deepen-stream-1 pass-5 2026-04-16):
+ *   deleteall-no-error-handling
+ *   createindexformodel-no-error-handling
+ *   deletenamespace-no-error-handling
+ *   fetchbymetadata-no-error-handling
+ *   cancelimport-no-error-handling
+ *   createnamespace-no-error-handling
+ *   listimports-no-error-handling
  */
 import { Pinecone } from '@pinecone-database/pinecone';
 
@@ -360,6 +369,160 @@ async function gt_startImport_with_try_catch() {
     return result.id;
   } catch (error) {
     console.error('startImport failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 15. deleteAll — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_deleteAll_missing() {
+  // SHOULD_FIRE: deleteall-no-error-handling — deleteAll without try-catch
+  await index.deleteAll();
+}
+
+// 15. deleteAll — with try-catch (SHOULD_NOT_FIRE)
+async function gt_deleteAll_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: deleteAll has try-catch
+    await index.deleteAll();
+  } catch (error) {
+    console.error('deleteAll failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 16. createIndexForModel — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createIndexForModel_missing() {
+  // SHOULD_FIRE: createindexformodel-no-error-handling — createIndexForModel without try-catch
+  await pinecone.createIndexForModel({
+    name: 'my-rag-index',
+    cloud: 'aws',
+    region: 'us-east-1',
+    embed: { model: 'llama-text-embed-v2', fieldMap: { text: 'chunk_text' } },
+  });
+}
+
+// 16. createIndexForModel — with try-catch (SHOULD_NOT_FIRE)
+async function gt_createIndexForModel_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: createIndexForModel has try-catch
+    await pinecone.createIndexForModel({
+      name: 'my-rag-index',
+      cloud: 'aws',
+      region: 'us-east-1',
+      embed: { model: 'llama-text-embed-v2', fieldMap: { text: 'chunk_text' } },
+    });
+  } catch (error) {
+    console.error('createIndexForModel failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 17. deleteNamespace — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_deleteNamespace_missing() {
+  // SHOULD_FIRE: deletenamespace-no-error-handling — deleteNamespace without try-catch
+  await index.deleteNamespace('tenant-123');
+}
+
+// 17. deleteNamespace — with try-catch (SHOULD_NOT_FIRE)
+async function gt_deleteNamespace_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: deleteNamespace has try-catch
+    await index.deleteNamespace('tenant-123');
+  } catch (error) {
+    console.error('deleteNamespace failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 18. fetchByMetadata — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_fetchByMetadata_missing() {
+  // SHOULD_FIRE: fetchbymetadata-no-error-handling — fetchByMetadata without try-catch
+  const result = await index.fetchByMetadata({ filter: { status: { $eq: 'active' } } });
+  return result.records;
+}
+
+// 18. fetchByMetadata — with try-catch (SHOULD_NOT_FIRE)
+async function gt_fetchByMetadata_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: fetchByMetadata has try-catch
+    const result = await index.fetchByMetadata({ filter: { status: { $eq: 'active' } } });
+    return result.records;
+  } catch (error) {
+    console.error('fetchByMetadata failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 19. cancelImport — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_cancelImport_missing(importId: string) {
+  // SHOULD_FIRE: cancelimport-no-error-handling — cancelImport without try-catch
+  await index.cancelImport(importId);
+}
+
+// 19. cancelImport — with try-catch (SHOULD_NOT_FIRE)
+async function gt_cancelImport_with_try_catch(importId: string) {
+  try {
+    // SHOULD_NOT_FIRE: cancelImport has try-catch
+    await index.cancelImport(importId);
+  } catch (error) {
+    console.error('cancelImport failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 20. createNamespace — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_createNamespace_missing() {
+  // SHOULD_FIRE: createnamespace-no-error-handling — createNamespace without try-catch
+  await index.createNamespace({ name: 'tenant-456' });
+}
+
+// 20. createNamespace — with try-catch (SHOULD_NOT_FIRE)
+async function gt_createNamespace_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: createNamespace has try-catch
+    await index.createNamespace({ name: 'tenant-456' });
+  } catch (error) {
+    console.error('createNamespace failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 21. listImports — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_listImports_missing() {
+  // SHOULD_FIRE: listimports-no-error-handling — listImports without try-catch
+  const result = await index.listImports(10);
+  return result.data ?? [];
+}
+
+// 21. listImports — with try-catch (SHOULD_NOT_FIRE)
+async function gt_listImports_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: listImports has try-catch
+    const result = await index.listImports(10);
+    return result.data ?? [];
+  } catch (error) {
+    console.error('listImports failed:', error);
     throw error;
   }
 }

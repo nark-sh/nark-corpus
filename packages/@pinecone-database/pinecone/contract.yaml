@@ -25,7 +25,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.73  # 11 contracted / 15 non-omitted async-callable functions
+coverage_score: 1.0  # 21 contracted / 21 non-omitted async-callable functions (pass-5 2026-04-16)
 
 detection:
   class_names:
@@ -649,6 +649,370 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: deleteAll
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Deletes ALL vectors from a namespace (default namespace if none specified).
+      This is a DESTRUCTIVE, irreversible operation — all vector data and metadata
+      in the targeted namespace is permanently gone. Used in test teardown, data
+      reset workflows, and admin cleanup scripts. Makes an HTTPS DELETE request
+      using deleteAll: true in the payload.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/data-plane/delete
+      # SDK source: dist/data/vectors/deleteAll.js — calls api.deleteVectors({ deleteRequest: { deleteAll: true } })
+      # HTTP error mapping: dist/errors/http.js — 400→PineconeBadRequestError, 401→PineconeAuthorizationError, 403→PineconeBadRequestError
+      - id: deleteall-no-error-handling
+        condition: >
+          index.deleteAll() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid namespace or bad request params;
+            HTTP 403 — quota exceeded or forbidden).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+          PineconeUnavailableError (HTTP 503 — Pinecone service down).
+        required_handling: >
+          Caller MUST wrap await index.deleteAll() in try-catch.
+          This is the highest-stakes Pinecone operation — a single uncaught error
+          during a namespace wipe can leave the application in an inconsistent state
+          or silently prevent a reset from completing. In production reset flows,
+          always verify the delete succeeded.
+
+          try {
+            await index.deleteAll();
+          } catch (error) {
+            console.error('Failed to delete all vectors:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/reference/api/data-plane/delete"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/vectors/deleteAll.js)"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: createIndexForModel
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Creates a Pinecone serverless index with an integrated embedding model
+      (Pinecone Inference). Unlike createIndex(), this method configures the index
+      to automatically embed upserted text using Pinecone's hosted models (e.g.,
+      "llama-text-embed-v2"), enabling upsertRecords() and searchRecords() workflows.
+      Used when building RAG pipelines with Pinecone's integrated inference.
+      Makes an HTTPS POST request to the control-plane API.
+      Has the same error contract as createIndex() since it uses the same underlying
+      endpoint with additional embedding model configuration.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/guides/inference/integrated-inference
+      # SDK source: dist/control/createIndexForModel.d.ts — returns Promise<void | IndexModel>
+      # Same HTTP error mapping as createIndex: 400/403→PineconeBadRequestError, 409→PineconeConflictError
+      - id: createindexformodel-no-error-handling
+        condition: >
+          pinecone.createIndexForModel() called without try-catch or .catch() handler
+        throws: >
+          PineconeBadRequestError (HTTP 400 — invalid params: unknown embed model name,
+            unsupported cloud/region, invalid index name;
+            HTTP 403 — project quota exceeded, "Increase your quota or upgrade plan").
+          PineconeConflictError (HTTP 409 — index name already exists in project).
+          PineconeNotFoundError (HTTP 404 — invalid cloud/region combination).
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeConnectionError (network failures).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await pinecone.createIndexForModel() in try-catch.
+          Quota errors (403→PineconeBadRequestError) require account upgrade.
+          Conflict errors (409) can be suppressed with suppressConflicts: true option.
+          Provisioning code that fails to handle these errors leaves the application
+          in a half-initialized state where upsertRecords/searchRecords fail.
+
+          try {
+            await pinecone.createIndexForModel({
+              name: 'my-rag-index',
+              cloud: 'aws',
+              region: 'us-east-1',
+              embed: { model: 'llama-text-embed-v2', fieldMap: { text: 'chunk_text' } },
+              suppressConflicts: true,
+            });
+          } catch (error) {
+            if (error instanceof Errors.PineconeBadRequestError) {
+              console.error('Index creation failed (quota or bad params):', error.message);
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/inference/integrated-inference"
+          - "https://docs.pinecone.io/reference/api/control-plane/create_index"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/control/createIndexForModel.d.ts)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: deleteNamespace
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Deletes a named namespace from an index, including ALL records within it.
+      This is a DESTRUCTIVE, irreversible operation — every vector and its metadata
+      in the namespace is permanently deleted. Used in multi-tenant applications to
+      remove tenant data, or in cleanup workflows to retire namespaces.
+      Makes an HTTPS DELETE request to the data-plane API.
+      Note: Only available on the 2025-10 API version (serverless indexes).
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/2025-10/data-plane/deletenamespace
+      # SDK source: dist/data/namespaces/deleteNamespace.d.ts
+      # HTTP 400 → PineconeBadRequestError, 401 → PineconeAuthorizationError, 404 → PineconeNotFoundError
+      - id: deletenamespace-no-error-handling
+        condition: >
+          index.deleteNamespace() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — bad request params or HTTP 403 — forbidden).
+          PineconeNotFoundError (HTTP 404 — namespace does not exist in the index).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.deleteNamespace() in try-catch.
+          In multi-tenant apps that delete a tenant's namespace on offboarding,
+          an uncaught error leaves stale tenant data in the index and the offboarding
+          flow appears to succeed to the caller.
+          PineconeNotFoundError (namespace already gone) is often acceptable and
+          should be handled separately for idempotent deletion flows.
+
+          try {
+            await index.deleteNamespace('tenant-123');
+          } catch (error) {
+            if (error instanceof Errors.PineconeNotFoundError) {
+              // Namespace already deleted — idempotent, continue
+              return;
+            }
+            console.error('Failed to delete namespace:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/manage-data/manage-namespaces"
+          - "https://docs.pinecone.io/reference/api/2025-10/data-plane/deletenamespace"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/namespaces/deleteNamespace.d.ts)"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: fetchByMetadata
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Fetches vectors from the index by metadata filter instead of by IDs.
+      Returns all records matching the metadata filter, with optional pagination.
+      Makes an HTTPS GET request to the data-plane API.
+      This is a newer SDK method (added in v5+) that enables metadata-driven
+      record retrieval without knowing specific vector IDs. Useful for bulk
+      export, audit, and cleanup workflows based on metadata attributes.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/2025-10/data-plane/fetch_by_metadata
+      # SDK source: dist/data/vectors/fetchByMetadata.d.ts — FetchByMetadataCommand.run()
+      # Same HTTP error mapping as fetch: 400→PineconeBadRequestError, 401→PineconeAuthorizationError
+      - id: fetchbymetadata-no-error-handling
+        condition: >
+          index.fetchByMetadata() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid filter syntax or bad params;
+            HTTP 403 — quota exceeded).
+          PineconeArgumentError (runtime validation — missing required filter parameter).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.fetchByMetadata() in try-catch.
+          Metadata filter syntax errors throw PineconeBadRequestError at runtime —
+          invalid filter objects are not caught at compile time. Callers must validate
+          filter structure before calling or catch PineconeBadRequestError to handle
+          malformed filters.
+
+          try {
+            const result = await index.fetchByMetadata({
+              filter: { status: { '$eq': 'active' } },
+              limit: 100,
+            });
+            return result.records;
+          } catch (error) {
+            console.error('fetchByMetadata failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/manage-data/fetch-data#fetch-records-by-metadata"
+          - "https://docs.pinecone.io/reference/api/2025-10/data-plane/fetch_by_metadata"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/vectors/fetchByMetadata.d.ts)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: cancelImport
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Cancels an in-progress bulk import operation started by startImport().
+      Idempotent: if the import has already completed or does not exist, no error
+      is thrown — the operation returns an empty success response.
+      Used in cleanup flows, error recovery, and to stop runaway imports.
+      Makes an HTTPS DELETE request to the data-plane API with the import ID.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/2025-10/data-plane/cancel_import
+      # SDK source: dist/data/bulk/cancelImport.d.ts — CancelImportCommand.run(id)
+      # Cancel is idempotent: finished imports return 200 (no error). 404 = import ID not found.
+      - id: cancelimport-no-error-handling
+        condition: >
+          index.cancelImport() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — bad request params).
+          PineconeNotFoundError (HTTP 404 — import ID does not exist or has expired).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+          Note: Attempting to cancel an already-finished import returns HTTP 200 (no error).
+        required_handling: >
+          Caller MUST wrap await index.cancelImport() in try-catch.
+          PineconeNotFoundError means the import ID is invalid or expired — handle
+          separately in cleanup flows where the import may have already completed.
+
+          try {
+            await index.cancelImport(importId);
+          } catch (error) {
+            if (error instanceof Errors.PineconeNotFoundError) {
+              // Import already complete or ID expired — acceptable in cleanup flows
+              return;
+            }
+            console.error('cancelImport failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/data-management/import-data"
+          - "https://docs.pinecone.io/reference/api/2025-10/data-plane/cancel_import"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/bulk/cancelImport.d.ts)"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: createNamespace
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Creates a named namespace within a serverless index, optionally with a
+      metadata schema specifying which fields are filterable. Namespaces are also
+      created automatically on first upsert — this method is used when pre-creating
+      namespaces ahead of time, especially to configure metadata indexing schemas.
+      Only available on serverless indexes (API version 2025-10+).
+      Makes an HTTPS POST request to the data-plane API.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/2025-10/data-plane/createnamespace
+      # SDK source: dist/data/namespaces/createNamespace.d.ts
+      # HTTP 400 → PineconeBadRequestError, 409 → PineconeConflictError (name already exists)
+      - id: createnamespace-no-error-handling
+        condition: >
+          index.createNamespace() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid namespace name or bad params).
+          PineconeConflictError (HTTP 409 — namespace name already exists on the index).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.createNamespace() in try-catch.
+          PineconeConflictError (409) is the most common error in provisioning code —
+          the namespace may already exist from a previous run. Handle idempotently by
+          catching PineconeConflictError and continuing.
+
+          try {
+            await index.createNamespace({
+              name: 'tenant-123',
+              schema: { fields: { category: { filterable: true } } },
+            });
+          } catch (error) {
+            if (error instanceof Errors.PineconeConflictError) {
+              // Namespace already exists — idempotent, continue
+              return;
+            }
+            console.error('createNamespace failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/manage-data/manage-namespaces"
+          - "https://docs.pinecone.io/reference/api/2025-10/data-plane/createnamespace"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/namespaces/createNamespace.d.ts)"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: listImports
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Lists all recent and ongoing bulk import operations for the index.
+      Returns paginated import status records. Used to monitor active imports
+      and retrieve import history. Makes an HTTPS GET request to the data-plane API.
+      Although read-only, it makes a network call and can fail on auth or network
+      errors like any other API call.
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/reference/api/2025-10/data-plane/list_imports
+      # SDK source: dist/data/bulk/listImports.d.ts — ListImportsCommand.run()
+      # HTTP 400 → PineconeBadRequestError, 401 → PineconeAuthorizationError
+      - id: listimports-no-error-handling
+        condition: >
+          index.listImports() called without try-catch or .catch() handler
+        throws: >
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — invalid params).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeInternalServerError (HTTP 500 — Pinecone server error).
+        required_handling: >
+          Caller MUST wrap await index.listImports() in try-catch.
+          Called in import monitoring dashboards or polling loops; an uncaught error
+          crashes the monitoring flow. Auth failures here indicate the same key used
+          for startImport() is now invalid.
+
+          try {
+            const { data } = await index.listImports(10);
+            return data ?? [];
+          } catch (error) {
+            console.error('listImports failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/data-management/import-data"
+          - "https://docs.pinecone.io/reference/api/2025-10/data-plane/list_imports"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/data/bulk/listImports.d.ts)"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "Pinecone client (new Pinecone({apiKey})) constructor does NOT make network calls — no try-catch needed there"
   - "pinecone.index('name') does NOT make a network call — returns a local Index client object"
@@ -666,3 +1030,8 @@ notes:
   - "createAssistant(), listAssistants() etc. intentionally omitted — assistant feature, separate from core vector ops"
   - "pc.inference.rerank() omitted — less adoption than embed, same error contract as embed"
   - "pc.inference.listModels(), pc.inference.getModel() omitted — read-only, no write or destructive behavior"
+  - "describeIndexStats() omitted — read-only stats query, no destructive behavior, same error contract as fetch()"
+  - "describeImport() omitted — read-only GET polling, documented in startImport() notes, same error contract"
+  - "listNamespaces() omitted — read-only listing, same error contract as listIndexes()"
+  - "describeNamespace() omitted — read-only GET, same error contract as listIndexes()"
+  - "createBackup(), createIndexFromBackup(), describeBackup(), deleteBackup(), listBackups(), describeRestoreJob(), listRestoreJobs() omitted — admin/infrastructure backup and restore ops, not typical SaaS app code"
