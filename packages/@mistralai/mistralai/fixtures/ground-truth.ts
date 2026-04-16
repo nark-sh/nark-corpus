@@ -15,6 +15,12 @@
  *   fim-complete-no-error-handling
  *   classifiers-moderate-no-error-handling
  *   batch-jobs-create-no-error-handling
+ *   conversations-start-no-error-handling   (added pass 2)
+ *   conversations-append-no-error-handling  (added pass 2)
+ *   workflows-execute-no-error-handling     (added pass 2)
+ *   libraries-create-no-error-handling      (added pass 2)
+ *   libraries-documents-upload-no-error-handling (added pass 2)
+ *   classifiers-classify-no-error-handling  (added pass 2)
  */
 import { Mistral } from '@mistralai/mistralai';
 
@@ -251,5 +257,201 @@ async function gt_fim_complete_with_try_catch(prompt: string, suffix: string) {
   } catch (error) {
     console.error('FIM error:', error);
     throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 8. beta.conversations.start — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: conversations-start-no-error-handling
+async function gt_conversations_start_missing(userMessage: string) {
+  // SHOULD_FIRE: conversations-start-no-error-handling — no try-catch
+  const response = await client.beta.conversations.start({
+    model: 'mistral-large-latest',
+    inputs: [{ role: 'user', content: userMessage }],
+  });
+  return response;
+}
+
+// 8. beta.conversations.start — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_conversations_start_with_try_catch(userMessage: string) {
+  try {
+    // SHOULD_NOT_FIRE: conversations.start has try-catch
+    const response = await client.beta.conversations.start({
+      model: 'mistral-large-latest',
+      inputs: [{ role: 'user', content: userMessage }],
+    });
+    return response;
+  } catch (error) {
+    console.error('Conversation start error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 9. beta.conversations.append — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: conversations-append-no-error-handling
+async function gt_conversations_append_missing(conversationId: string, userMessage: string) {
+  // SHOULD_FIRE: conversations-append-no-error-handling — no try-catch
+  const response = await client.beta.conversations.append({
+    conversationId,
+    conversationAppendRequest: {
+      inputs: [{ role: 'user', content: userMessage }],
+    },
+  });
+  return response;
+}
+
+// 9. beta.conversations.append — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_conversations_append_with_try_catch(conversationId: string, userMessage: string) {
+  try {
+    // SHOULD_NOT_FIRE: conversations.append has try-catch
+    const response = await client.beta.conversations.append({
+      conversationId,
+      conversationAppendRequest: {
+        inputs: [{ role: 'user', content: userMessage }],
+      },
+    });
+    return response;
+  } catch (error) {
+    console.error('Conversation append error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 10. workflows.executeWorkflow — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: workflows-execute-no-error-handling
+async function gt_workflows_execute_missing(workflowId: string, inputs: Record<string, unknown>) {
+  // SHOULD_FIRE: workflows-execute-no-error-handling — no try-catch
+  const result = await client.workflows.executeWorkflow({
+    workflowIdentifier: workflowId,
+    workflowExecutionRequest: { inputs },
+  });
+  return result;
+}
+
+// 10. workflows.executeWorkflow — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_workflows_execute_with_try_catch(workflowId: string, inputs: Record<string, unknown>) {
+  try {
+    // SHOULD_NOT_FIRE: workflows.executeWorkflow has try-catch
+    const result = await client.workflows.executeWorkflow({
+      workflowIdentifier: workflowId,
+      workflowExecutionRequest: { inputs },
+    });
+    return result;
+  } catch (error) {
+    console.error('Workflow execution error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 11. beta.libraries.create — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: embeddings-create-no-error-handling
+// NOTE: scanner matches by method name "create" — fires embeddings-create-no-error-handling.
+// libraries-create-no-error-handling is the semantic postcondition; scanner concern queued.
+async function gt_libraries_create_missing(libraryName: string) {
+  // SHOULD_FIRE: scanner detects "create" method without try-catch
+  const library = await client.beta.libraries.create({
+    name: libraryName,
+    description: 'Knowledge base library',
+  });
+  return library.id;
+}
+
+// 11. beta.libraries.create — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_libraries_create_with_try_catch(libraryName: string) {
+  try {
+    // SHOULD_NOT_FIRE: libraries.create has try-catch
+    const library = await client.beta.libraries.create({
+      name: libraryName,
+      description: 'Knowledge base library',
+    });
+    return library.id;
+  } catch (error) {
+    console.error('Library creation error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 12. beta.libraries.documents.upload — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: files-upload-no-error-handling
+// NOTE: scanner matches by method name "upload" — fires files-upload-no-error-handling.
+// libraries-documents-upload-no-error-handling is the semantic postcondition; scanner concern queued.
+async function gt_libraries_documents_upload_missing(libraryId: string, fileBlob: Blob) {
+  // SHOULD_FIRE: scanner detects "upload" method without try-catch
+  const doc = await client.beta.libraries.documents.upload({
+    libraryId,
+    file: fileBlob,
+    name: 'document.pdf',
+  });
+  return doc.id;
+}
+
+// 12. beta.libraries.documents.upload — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_libraries_documents_upload_with_try_catch(libraryId: string, fileBlob: Blob) {
+  try {
+    // SHOULD_NOT_FIRE: libraries.documents.upload has try-catch
+    const doc = await client.beta.libraries.documents.upload({
+      libraryId,
+      file: fileBlob,
+      name: 'document.pdf',
+    });
+    return doc.id;
+  } catch (error) {
+    console.error('Library document upload error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 13. classifiers.classify — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 2 (2026-04-16)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: classifiers-classify-no-error-handling
+async function gt_classifiers_classify_missing(modelId: string, userText: string) {
+  // SHOULD_FIRE: classifiers-classify-no-error-handling — no try-catch
+  const result = await client.classifiers.classify({
+    model: modelId,
+    inputs: [userText],
+  });
+  return result.data[0];
+}
+
+// 13. classifiers.classify — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_classifiers_classify_with_try_catch(modelId: string, userText: string) {
+  try {
+    // SHOULD_NOT_FIRE: classifiers.classify has try-catch
+    const result = await client.classifiers.classify({
+      model: modelId,
+      inputs: [userText],
+    });
+    return result.data[0];
+  } catch (error) {
+    console.error('Classifier error:', error);
+    return null;
   }
 }

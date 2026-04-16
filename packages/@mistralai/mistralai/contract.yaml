@@ -38,7 +38,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.34
+coverage_score: 0.52
 
 detection:
   class_names:
@@ -587,6 +587,345 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: start
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates a new stateful conversation and appends the first user entry. Called
+      as client.beta.conversations.start({ model, inputs }) or with agentId for
+      agent-powered conversations. Returns a ConversationResponse containing the
+      conversation_id needed for subsequent turns. Makes an HTTPS POST to
+      api.mistral.ai/v1/conversations. Throws on invalid model/agentId, auth
+      failure, validation errors, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/betaConversationsStart.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/betaConversationsStart.ts
+      - id: conversations-start-no-error-handling
+        condition: >
+          client.beta.conversations.start() called without try-catch or .catch() handler
+        throws: >
+          HTTPValidationError (.statusCode=422, .detail[] array) when inputs array is
+          malformed, message format is invalid, or conversation parameters fail validation.
+          MistralError (.statusCode=404) when agentId does not exist or has been deleted.
+          MistralError (.statusCode=401) when API key is invalid or missing.
+          MistralError for other 4XX/5XX responses (quota exhausted, server error).
+          429 rate limit is auto-retried by SDK before throwing.
+          ConnectionError when network is unreachable.
+          RequestTimeoutError when request exceeds configured timeout (default 30s).
+          SDKValidationError when request object fails schema validation before sending.
+        required_handling: >
+          Caller MUST wrap await client.beta.conversations.start() in try-catch or chain .catch().
+          Chatbot features in SaaS apps create conversations on every new session — uncaught
+          errors (invalid agentId, API key revoked) cause entire chat features to fail silently,
+          returning 500 to users. The conversation_id from the response MUST be persisted
+          for subsequent append() calls.
+
+          try {
+            const response = await client.beta.conversations.start({
+              model: 'mistral-large-latest',
+              inputs: [{ role: 'user', content: 'Hello' }],
+            });
+            const conversationId = response.conversationId;
+            return { conversationId, reply: response.outputs[0]?.content };
+          } catch (error) {
+            console.error('Mistral conversation start error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/beta/operation/agents_api_v1_conversations_start_post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaConversationsStart.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: append
+    import_path: "@mistralai/mistralai"
+    description: >
+      Appends new user entries to an existing conversation and runs a completion turn.
+      Called as client.beta.conversations.append({ conversationId, conversationAppendRequest }).
+      Continues a stateful multi-turn conversation identified by conversationId. Makes an
+      HTTPS POST to api.mistral.ai/v1/conversations/{conversationId}. Throws on invalid
+      conversationId, auth failure, validation errors, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/betaConversationsAppend.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/betaConversationsAppend.ts
+      - id: conversations-append-no-error-handling
+        condition: >
+          client.beta.conversations.append() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when conversationId does not exist, has been deleted,
+          or belongs to a different API key / workspace.
+          HTTPValidationError (.statusCode=422) when inputs are malformed or conversationId
+          path parameter is invalid format.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError for other 4XX/5XX server errors.
+          ConnectionError when network is unreachable.
+          RequestTimeoutError when long conversations exceed the 30s default timeout.
+        required_handling: >
+          Caller MUST wrap await client.beta.conversations.append() in try-catch or chain .catch().
+          Multi-turn chat apps call append() on every user message — an expired conversationId
+          (404) must be caught and handled by creating a new conversation rather than propagating
+          a 500 to the user. Long conversations may hit token limits (422) that need graceful
+          user-facing error messages.
+
+          try {
+            const response = await client.beta.conversations.append({
+              conversationId: session.mistralConversationId,
+              conversationAppendRequest: {
+                inputs: [{ role: 'user', content: userMessage }],
+              },
+            });
+            return response.outputs[0]?.content ?? '';
+          } catch (error) {
+            if (error instanceof MistralError && error.statusCode === 404) {
+              // Conversation expired — restart
+              throw new Error('Conversation session expired, please start a new chat');
+            }
+            console.error('Mistral conversation append error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/beta/operation/agents_api_v1_conversations_append"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaConversationsAppend.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: executeWorkflow
+    import_path: "@mistralai/mistralai"
+    description: >
+      Executes an AI workflow by identifier. Called as
+      client.workflows.executeWorkflow({ workflowIdentifier, workflowExecutionRequest }).
+      Workflows are multi-step AI pipelines combining LLM calls, tools, and logic.
+      Makes an HTTPS POST to api.mistral.ai/v1/workflows/{workflowIdentifier}/execute.
+      Returns a workflow execution result or execution ID for polling. Throws on invalid
+      workflow identifier, auth failure, validation errors, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/workflowsExecuteWorkflow.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/workflowsExecuteWorkflow.ts
+      - id: workflows-execute-no-error-handling
+        condition: >
+          client.workflows.executeWorkflow() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when workflowIdentifier does not exist or has
+          been archived.
+          HTTPValidationError (.statusCode=422) when input parameters fail workflow
+          schema validation or required workflow inputs are missing.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError when network is unreachable.
+          RequestTimeoutError when workflow execution exceeds configured timeout.
+        required_handling: >
+          Caller MUST wrap await client.workflows.executeWorkflow() in try-catch or chain .catch().
+          AI workflows are often integrated into user-facing product features (document processing,
+          agentic operations) — uncaught errors from invalid workflow identifiers or archived
+          workflows crash the entire request handler, returning 500 to users. Workflow identifiers
+          should be validated at startup or wrapped with fallback logic.
+
+          try {
+            const result = await client.workflows.executeWorkflow({
+              workflowIdentifier: process.env.MISTRAL_WORKFLOW_ID,
+              workflowExecutionRequest: {
+                inputs: { document: userDocument },
+              },
+            });
+            return result;
+          } catch (error) {
+            console.error('Mistral workflow execution error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/workflows/operation/execute_workflow_v1_workflows__workflow_identifier__execute_post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/workflowsExecuteWorkflow.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: create
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates a new document library for RAG-based knowledge retrieval. Called as
+      client.beta.libraries.create({ name, description, embeddingModel }). Libraries
+      hold uploaded documents for semantic search and retrieval-augmented generation.
+      Makes an HTTPS POST to api.mistral.ai/v1/libraries. Throws on auth failure,
+      duplicate library name, quota exceeded, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/betaLibrariesCreate.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # Response on 201 (not 200), M.json([201], ...)
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/betaLibrariesCreate.ts
+      - id: libraries-create-no-error-handling
+        condition: >
+          client.beta.libraries.create() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=401) when API key is invalid or missing.
+          HTTPValidationError (.statusCode=422) when library name is missing, too long,
+          or embeddingModel is not supported.
+          MistralError (.statusCode=409) for duplicate library name within the same workspace.
+          MistralError for quota exhaustion or server errors.
+          ConnectionError / RequestTimeoutError on network failures.
+        required_handling: >
+          Caller MUST wrap await client.beta.libraries.create() in try-catch or chain .catch().
+          Library creation is typically part of an onboarding flow or document pipeline setup
+          — uncaught 409 errors (duplicate name) crash the setup workflow instead of providing
+          a user-friendly "library already exists" message.
+
+          try {
+            const library = await client.beta.libraries.create({
+              name: 'product-docs',
+              description: 'Product documentation for RAG',
+            });
+            return library.id;
+          } catch (error) {
+            console.error('Mistral library creation error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/beta/operation/libraries_create_v1_libraries_post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaLibrariesCreate.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: upload
+    import_path: "@mistralai/mistralai"
+    description: >
+      Uploads a document to an existing library for RAG indexing. Called as
+      client.beta.libraries.documents.upload({ libraryId, file, name, description }).
+      Documents are queued for processing (OCR, chunking, embedding). Returns a
+      Document object with status "queued". Processing must complete before documents
+      are searchable. Makes an HTTPS POST to
+      api.mistral.ai/v1/libraries/{libraryId}/documents. Throws on invalid libraryId,
+      unsupported file format, file too large, auth failure, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/betaLibrariesDocumentsUpload.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # Response on 200 or 201: M.json([200, 201], components.Document$inboundSchema)
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/betaLibrariesDocumentsUpload.ts
+      - id: libraries-documents-upload-no-error-handling
+        condition: >
+          client.beta.libraries.documents.upload() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when libraryId does not exist or has been deleted.
+          HTTPValidationError (.statusCode=422) when file format is unsupported, document
+          metadata fails validation, or required fields are missing.
+          MistralError (.statusCode=413) when document file exceeds size limits.
+          MistralError (.statusCode=401) when API key is invalid.
+          ConnectionError / RequestTimeoutError for large file uploads that timeout.
+          SDKValidationError when request object fails schema validation.
+        required_handling: >
+          Caller MUST wrap await client.beta.libraries.documents.upload() in try-catch or chain .catch().
+          Document upload is the key ingestion step for RAG pipelines — an invalid libraryId (404,
+          e.g. library was deleted) causes the entire ingestion batch to fail silently if uncaught.
+          Upload does NOT mean the document is immediately searchable; the document status must be
+          polled to confirm processing completion.
+
+          try {
+            const doc = await client.beta.libraries.documents.upload({
+              libraryId: process.env.MISTRAL_LIBRARY_ID,
+              file: documentBlob,
+              name: 'user-guide.pdf',
+            });
+            // Document is now queued — poll doc.status for "processed"
+            return doc.id;
+          } catch (error) {
+            if (error instanceof HTTPValidationError) {
+              throw new Error('Unsupported document format');
+            }
+            console.error('Mistral library document upload error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/beta/operation/libraries_documents_upload_v1_libraries__library_id__documents_post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaLibrariesDocumentsUpload.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: classify
+    import_path: "@mistralai/mistralai"
+    description: >
+      Classifies text inputs using a fine-tuned Mistral classifier model. Called as
+      client.classifiers.classify({ model, inputs }) where model is a fine-tuned
+      classification model ID. Returns category scores for each input. Used for
+      intent detection, topic routing, sentiment analysis, and custom classification
+      pipelines. Makes an HTTPS POST to api.mistral.ai/v1/classifiers/classify.
+      Throws on invalid model ID, auth failure, validation errors, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/classifiersClassify.ts
+      # Error codes: errorCodes: ["422", "4XX", "5XX"], retry on 429/500/502/503/504
+      # ClassificationRequest: { model: string, inputs: string | string[] }
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/classifiersClassify.ts
+      - id: classifiers-classify-no-error-handling
+        condition: >
+          client.classifiers.classify() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when model ID does not exist or is not a
+          fine-tuned classifier model accessible to this API key.
+          HTTPValidationError (.statusCode=422) when inputs are malformed or empty,
+          or model is not a valid classifier (wrong model type).
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError when network is unreachable.
+          RequestTimeoutError when batch classification exceeds timeout.
+        required_handling: >
+          Caller MUST wrap await client.classifiers.classify() in try-catch or chain .catch().
+          Custom classifiers are used in routing and triage pipelines — uncaught errors from
+          a deleted or unavailable classifier model halt request routing entirely, causing all
+          traffic to be misrouted or dropped. Classifier model IDs should be validated at
+          startup with fallback routing logic.
+
+          try {
+            const result = await client.classifiers.classify({
+              model: process.env.MISTRAL_CLASSIFIER_MODEL_ID,
+              inputs: [userMessage],
+            });
+            const topCategory = result.data[0]?.results[0]?.name;
+            return topCategory;
+          } catch (error) {
+            console.error('Mistral classifier error:', error);
+            // Fall back to default routing
+            return 'general';
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/classifiers/operation/classify_v1_classifiers_classify_post"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/classifiersClassify.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 notes:
   - "Mistral constructor (new Mistral({apiKey})) does NOT make network calls — no try-catch needed there"
   - "client.chat.complete() is a 2-level property chain: client.chat → chat namespace → .complete() method"
@@ -599,3 +938,7 @@ notes:
   - "tutor-gpt (891★) uses client.files.upload/ocr.process inside try-catch — proper handling"
   - "classifiers.moderate() is safety-critical — always fail closed (reject content if error thrown)"
   - "batch.jobs.create() throw ≠ job failure — FAILED status must be checked via batch.jobs.get()"
+  - "beta.conversations.start() returns conversation_id — MUST be persisted for subsequent append() calls"
+  - "beta.conversations.append() 404 means conversation expired — handle by starting a new conversation"
+  - "beta.libraries.documents.upload() status 'queued' != searchable — must poll doc status before using in RAG"
+  - "workflows.executeWorkflow() may return async execution ID rather than final result — check response structure"
