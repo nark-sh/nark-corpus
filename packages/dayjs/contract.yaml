@@ -2,10 +2,10 @@ package: dayjs
 semver: ">=1.10.0 <2.0.0"
 contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71
+coverage_score: 0.86
 priority: medium
 
 functions:
@@ -166,7 +166,110 @@ functions:
           the error surfaces later on next dayjs.tz() usage. This creates a
           difficult-to-debug situation where app startup succeeds but requests fail.
 
+  - name: toISOString
+    import_path: "dayjs"
+    description: >
+      Serializes a Day.js object to an ISO 8601 string. Delegates directly to the
+      native Date.prototype.toISOString() with NO isValid() guard. Unlike format(),
+      which returns the string "Invalid Date" for invalid objects, toISOString()
+      THROWS a RangeError when called on an invalid Day.js object.
+    postconditions:
+      # Evidence: dayjs source (dayjs.min.js) — m.toISOString=function(){return this.$d.toISOString()}
+      # No isValid() guard before the native Date call. Confirmed: Date.prototype.toISOString()
+      # throws RangeError: "Invalid time value" when the Date is Invalid Date.
+      # Compare to toJSON() which has the guard: m.toJSON=function(){return this.isValid()?this.toISOString():null}
+      # Contrast: format() also has a guard and returns "Invalid Date" string instead of throwing.
+      # Source inspection: /node_modules/dayjs/dayjs.min.js lines 1 (minified)
+      - id: toisostring-invalid-date-throws
+        condition: "called on a Day.js object created from an invalid date string or null"
+        throws: "RangeError: Invalid time value (thrown by native Date.prototype.toISOString)"
+        required_handling: >
+          Callers MUST ensure the Day.js object is valid before calling toISOString().
+          Always call isValid() first, or use toJSON() (which returns null for invalid
+          dates instead of throwing). Common pattern:
+          const iso = d.isValid() ? d.toISOString() : null;
+          Or use toJSON() as a safe alternative: const iso = d.toJSON();
+          This is particularly dangerous when dayjs() parses user-supplied date strings —
+          invalid input propagates silently until toISOString() is called and throws.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/toISOString"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        notes: |
+          This is the hidden exception in Day.js: most methods silently return
+          "Invalid Date" or NaN for invalid objects, but toISOString() actually throws.
+          Key asymmetry table:
+            format()       → returns "Invalid Date" string (no throw)
+            toJSON()       → returns null (no throw, has isValid() guard in source)
+            toISOString()  → THROWS RangeError (no guard in source)
+            valueOf()      → returns NaN (no throw)
+          The RangeError message is: "Invalid time value" (Node.js) or similar browser message.
+          Common causes of invalid Day.js objects:
+            - dayjs("not-a-date")  → isValid() false
+            - dayjs(null)          → isValid() false (null → new Date(NaN))
+            - dayjs("2024-13-01")  → month 13 → Invalid Date
+            - dayjs("")            → empty string → Invalid Date
+
+  - name: duration
+    import_path: "dayjs/plugin/duration"
+    description: >
+      Creates a Day.js Duration object representing a length of time. Accepts
+      milliseconds (number), an object of units, or an ISO 8601 duration string
+      (e.g. "P1Y2M3DT4H5M6S"). Provided by the dayjs duration plugin.
+      This function is synchronous but has a critical silent failure: invalid
+      ISO 8601 strings produce a zero-duration object with no error or warning.
+    postconditions:
+      # Evidence: duration plugin source (dayjs/plugin/duration.js) inspected directly.
+      # The ISO 8601 regex is: /^(-|\+)?P(?:([-+]?[0-9,.]*)Y)?(?:([-+]?[0-9,.]*)M)?...$/
+      # When a string does NOT match this regex, the code falls through with empty $d={},
+      # $ms=0: "if('string'==typeof t){var e=t.match(a);if(e){...return this}} return this"
+      # The outer "return this" after the string block means a non-matching string produces
+      # Duration with $ms=0 — identical to dayjs.duration(0). Confirmed from source inspection.
+      - id: duration-invalid-iso-string-silent-zero
+        condition: "ISO 8601 duration string is malformed or does not match the expected format"
+        returns: >
+          Duration object with 0 milliseconds ($ms=0), silently. No error thrown,
+          no warning logged. The returned Duration is indistinguishable from
+          dayjs.duration(0) — all unit accessors return 0.
+        required_handling: >
+          Callers MUST validate ISO 8601 duration strings before passing to
+          dayjs.duration(). Test the duration after creation:
+          const d = dayjs.duration(str); if (d.asMilliseconds() === 0 && str !== 'P0D' && str !== 'PT0S') { /* invalid */ }
+          Better: pre-validate with the ISO 8601 duration regex before calling duration().
+          Common invalid strings that silently produce zero-duration:
+            - "1h30m" (not ISO format — should be "PT1H30M")
+            - "1 day" (natural language — should be "P1D")
+            - "90 minutes" (should be "PT90M")
+            - "" (empty string)
+            - "P" (bare P with no values)
+        sources:
+          - "https://day.js.org/docs/en/plugin/duration"
+          - "https://en.wikipedia.org/wiki/ISO_8601#Durations"
+        severity: warning
+        business_impact:
+          incident_label: DATA_CORRUPTION
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: incorrect_results
+          incident_cost_range: medium
+        notes: |
+          Silent zero-duration is the most common error pattern for this plugin.
+          Impact scenarios:
+            - Subscription duration stored as natural-language string: "30 days" →
+              dayjs.duration("30 days") → 0ms → subscription expires immediately
+            - Trial period: dayjs.duration("14d") → 0ms → trial appears expired
+            - Rate limiting: interval parsed as "5 mins" → 0ms → rate limit fires continuously
+          The ISO 8601 format required: "P[n]Y[n]M[n]DT[n]H[n]M[n]S"
+          Examples of valid strings: "P1Y", "P30D", "PT1H30M", "P1Y2M3DT4H5M6S"
+          Note: "P" and "-P" alone return "P0D" from toISOString() but have $ms=0.
+
 # Category: utilities
+
 # npm: https://www.npmjs.com/package/dayjs
 # Repository: https://github.com/iamkun/dayjs
 # Note: Modern alternative to moment.js, 2KB immutable date library

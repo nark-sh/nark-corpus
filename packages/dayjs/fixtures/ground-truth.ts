@@ -14,9 +14,11 @@
 import dayjs from 'dayjs';
 import utcPlugin from 'dayjs/plugin/utc';
 import timezonePlugin from 'dayjs/plugin/timezone';
+import durationPlugin from 'dayjs/plugin/duration';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
+dayjs.extend(durationPlugin);
 
 // ============================================================
 // VIOLATION CASES — scanner SHOULD flag these
