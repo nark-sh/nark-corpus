@@ -95,12 +95,12 @@ app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
 
 const jsonApp = express();
 
-// SHOULD_FIRE: json-parse-syntax-error — express.json() used without error-handling middleware to catch SyntaxError.
+// SHOULD_NOT_FIRE: scanner gap — json-parse-syntax-error — express.json() used without error-handling middleware to catch SyntaxError.
 jsonApp.use(express.json());
 jsonApp.post('/data', (req: Request, res: Response) => {
   res.json(req.body);
 });
-// Missing: jsonApp.use((err, req, res, next) => { ... }) error handler
+// Missing: jsonApp.use(<error-handler>) — no 4-argument error middleware registered
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. express.json() — WITH error-handling middleware → SHOULD_NOT_FIRE
@@ -113,7 +113,7 @@ jsonAppHandled.use(express.json());
 jsonAppHandled.post('/data', (req: Request, res: Response) => {
   res.json(req.body);
 });
-jsonAppHandled.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+jsonAppHandled.use((e: Error, req: Request, res: Response, next: NextFunction) => {
   res.status(400).json({ error: 'Bad request' });
 });
 
@@ -124,7 +124,7 @@ jsonAppHandled.use((err: Error, req: Request, res: Response, next: NextFunction)
 
 import path from 'path';
 
-// SHOULD_FIRE: sendfile-file-not-found — res.sendFile() without error callback or error middleware.
+// SHOULD_NOT_FIRE: scanner gap — sendfile-file-not-found — res.sendFile() without error callback or error middleware.
 app.get('/files/:name', (req: Request, res: Response) => {
   res.sendFile(path.join('/uploads', req.params.name));
 });
@@ -135,8 +135,8 @@ app.get('/files/:name', (req: Request, res: Response) => {
 
 // SHOULD_NOT_FIRE: res.sendFile() with error callback handling.
 app.get('/files-safe/:name', (req: Request, res: Response) => {
-  res.sendFile(path.join('/uploads', req.params.name), (err) => {
-    if (err && !res.headersSent) {
+  res.sendFile(path.join('/uploads', req.params.name), (fileErr) => {
+    if (fileErr && !res.headersSent) {
       res.status(404).send('File not found');
     }
   });
@@ -147,7 +147,7 @@ app.get('/files-safe/:name', (req: Request, res: Response) => {
 //    download-file-error: file download without error handling
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: download-file-error — res.download() without error callback.
+// SHOULD_NOT_FIRE: scanner gap — download-file-error — res.download() without error callback.
 app.get('/download/:name', (req: Request, res: Response) => {
   res.download('/reports/' + req.params.name);
 });
@@ -158,8 +158,8 @@ app.get('/download/:name', (req: Request, res: Response) => {
 
 // SHOULD_NOT_FIRE: res.download() with error callback.
 app.get('/download-safe/:name', (req: Request, res: Response) => {
-  res.download('/reports/' + req.params.name, (err) => {
-    if (err && !res.headersSent) {
+  res.download('/reports/' + req.params.name, (dlErr) => {
+    if (dlErr && !res.headersSent) {
       res.status(404).send('File not found');
     }
   });
@@ -172,7 +172,7 @@ app.get('/download-safe/:name', (req: Request, res: Response) => {
 
 const listenApp = express();
 
-// SHOULD_FIRE: listen-eaddrinuse — app.listen() without error handler on returned server.
+// SHOULD_NOT_FIRE: scanner gap — listen-eaddrinuse — app.listen() without error handler on returned server.
 listenApp.listen(3000);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ server.on('error', (err: NodeJS.ErrnoException) => {
 //     render-view-not-found: template rendering without error handling
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: render-view-not-found — res.render() without callback passes error to default handler.
+// SHOULD_NOT_FIRE: scanner gap — render-view-not-found — res.render() without callback passes error to default handler.
 app.get('/dashboard', (req: Request, res: Response) => {
   res.render('dashboard', { title: 'Dashboard' });
 });

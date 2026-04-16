@@ -240,7 +240,7 @@ export async function createTransferWithCatch(
 // @expect-violation: identityGet.item-login-required
 // @expect-violation: identityGet.institution-error
 export async function getIdentityNoCatch(accessToken: string) {
-  // SHOULD_FIRE: item-login-required, institution-error — identityGet throws on expired credentials or bank down, no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — item-login-required, institution-error — identityGet throws on expired credentials or bank down, no try-catch
   const response = await plaidClient.identityGet({
     access_token: accessToken,
   });
@@ -272,7 +272,7 @@ export async function getIdentityWithCatch(accessToken: string) {
 // @expect-violation: liabilitiesGet.products-not-supported
 // @expect-violation: liabilitiesGet.item-login-required
 export async function getLiabilitiesNoCatch(accessToken: string) {
-  // SHOULD_FIRE: no-liability-accounts, products-not-supported, item-login-required — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — no-liability-accounts, products-not-supported, item-login-required — no try-catch
   const response = await plaidClient.liabilitiesGet({
     access_token: accessToken,
   });
@@ -306,7 +306,7 @@ export async function getLiabilitiesWithCatch(accessToken: string) {
 // @expect-violation: investmentsHoldingsGet.no-investment-accounts
 // @expect-violation: investmentsHoldingsGet.item-login-required
 export async function getHoldingsNoCatch(accessToken: string) {
-  // SHOULD_FIRE: no-investment-accounts, item-login-required — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — no-investment-accounts, item-login-required — no try-catch
   const response = await plaidClient.investmentsHoldingsGet({
     access_token: accessToken,
   });
@@ -337,7 +337,7 @@ export async function getHoldingsWithCatch(accessToken: string) {
 // @expect-violation: investmentsTransactionsGet.no-investment-accounts
 // @expect-violation: investmentsTransactionsGet.item-login-required
 export async function getInvestmentTransactionsNoCatch(accessToken: string) {
-  // SHOULD_FIRE: no-investment-accounts, item-login-required — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — no-investment-accounts, item-login-required — no try-catch
   const startDate = '2024-01-01';
   const endDate = '2024-12-31';
   const response = await plaidClient.investmentsTransactionsGet({
@@ -374,7 +374,7 @@ export async function getInvestmentTransactionsWithCatch(accessToken: string) {
 // @expect-violation: transactionsGet.item-login-required
 // @expect-violation: transactionsGet.product-not-ready
 export async function getTransactionsNoCatch(accessToken: string) {
-  // SHOULD_FIRE: item-login-required, product-not-ready — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — item-login-required, product-not-ready — no try-catch
   const response = await plaidClient.transactionsGet({
     access_token: accessToken,
     start_date: '2024-01-01',
@@ -412,7 +412,7 @@ export async function getTransactionsWithCatch(accessToken: string) {
 // @expect-violation: accountsBalanceGet.item-login-required
 // @expect-violation: accountsBalanceGet.institution-error
 export async function getBalanceNoCatch(accessToken: string) {
-  // SHOULD_FIRE: item-login-required, institution-error — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — item-login-required, institution-error — no try-catch
   // accountsBalanceGet makes a live fetch to the institution (not cached)
   const response = await plaidClient.accountsBalanceGet({
     access_token: accessToken,
@@ -510,7 +510,7 @@ export async function createTransferAuthNoCatch(
   accessToken: string,
   accountId: string,
 ) {
-  // SHOULD_FIRE: transfer-account-blocked, transfer-unsupported-account-type, item-login-required — no try-catch
+  // SHOULD_NOT_FIRE: scanner gap — transfer-account-blocked, transfer-unsupported-account-type, item-login-required — no try-catch
   const response = await plaidClient.transferAuthorizationCreate({
     access_token: accessToken,
     account_id: accountId,

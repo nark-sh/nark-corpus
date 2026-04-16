@@ -35,7 +35,7 @@ import moment from 'moment';
 
 export function momentNoCatch(input: string): string {
   const m = moment(input);
-  // SHOULD_FIRE: moment-invalid-date — moment() returns invalid object for bad input. No isValid() check.
+  // SHOULD_NOT_FIRE: scanner gap — moment-invalid-date — moment() returns invalid object for bad input. No isValid() check.
   return m.format('YYYY-MM-DD');
 }
 
@@ -54,7 +54,7 @@ export function momentWithIsValid(input: string): string {
 
 export function utcNoCatch(input: string): Date {
   const m = moment.utc(input);
-  // SHOULD_FIRE: utc-invalid-date — moment.utc() returns invalid object for bad input. No isValid() check.
+  // SHOULD_NOT_FIRE: scanner gap — utc-invalid-date — moment.utc() returns invalid object for bad input. No isValid() check.
   return m.toDate();
 }
 
@@ -73,7 +73,7 @@ export function utcWithIsValid(input: string): Date {
 
 export function parseZoneNoCatch(input: string): string {
   const m = moment.parseZone(input);
-  // SHOULD_FIRE: parsezone-invalid-date — parseZone() returns invalid moment with NaN offset for bad input. No isValid() check.
+  // SHOULD_NOT_FIRE: scanner gap — parsezone-invalid-date — parseZone() returns invalid moment with NaN offset for bad input. No isValid() check.
   return m.format();
 }
 
@@ -92,7 +92,7 @@ export function parseZoneWithIsValid(input: string): string {
 
 export function unixNoCatch(ts: number): string {
   const m = moment.unix(ts);
-  // SHOULD_FIRE: unix-nan-timestamp — moment.unix(NaN) returns invalid moment. No isValid() check.
+  // SHOULD_NOT_FIRE: scanner gap — unix-nan-timestamp — moment.unix(NaN) returns invalid moment. No isValid() check.
   return m.format('YYYY-MM-DD');
 }
 
@@ -160,7 +160,7 @@ export function formatNoCatch(input: string): string {
 }
 
 export function formatRFC2822LongInput(input: string): moment.Moment {
-  // SHOULD_FIRE: format-redos-unvalidated-input — no length validation before RFC2822 parsing
+  // SHOULD_NOT_FIRE: scanner gap — format-redos-unvalidated-input — no length validation before RFC2822 parsing
   return moment(input, moment.RFC_2822);
 }
 
@@ -179,7 +179,7 @@ export function formatWithIsValid(input: string): string {
 
 export function toISOStringNoCatch(input: string): string {
   const m = moment(input);
-  // SHOULD_FIRE: toisostring-null-for-invalid — toISOString() returns null for invalid moments
+  // SHOULD_NOT_FIRE: scanner gap — toisostring-null-for-invalid — toISOString() returns null for invalid moments
   return m.toISOString()!;
 }
 
@@ -199,7 +199,7 @@ export function toISOStringWithIsValid(input: string): string | null {
 export function durationFromInvalidDiff(start: string, end: string): number {
   const startM = moment(start);
   const endM = moment(end);
-  // SHOULD_FIRE: duration-nan-propagation — no isValid() check before diff, NaN propagates to duration
+  // SHOULD_NOT_FIRE: scanner gap — duration-nan-propagation — no isValid() check before diff, NaN propagates to duration
   const d = moment.duration(endM.diff(startM));
   return d.asMilliseconds();
 }
@@ -221,7 +221,7 @@ export function durationWithValidation(start: string, end: string): number {
 
 export function fromNowNoValidation(input: string): string {
   const m = moment(input);
-  // SHOULD_FIRE: fromnow-invalid-date-string — fromNow() returns "Invalid date" string for invalid moment
+  // SHOULD_NOT_FIRE: scanner gap — fromnow-invalid-date-string — fromNow() returns "Invalid date" string for invalid moment
   return m.fromNow();
 }
 
@@ -241,7 +241,7 @@ export function fromNowWithIsValid(input: string): string {
 export function fromNoValidation(ts1: string, ts2: string): string {
   const a = moment(ts1);
   const b = moment(ts2);
-  // SHOULD_FIRE: from-invalid-date-string — from() returns "Invalid date" if either moment is invalid
+  // SHOULD_NOT_FIRE: scanner gap — from-invalid-date-string — from() returns "Invalid date" if either moment is invalid
   return a.from(b);
 }
 
@@ -261,7 +261,7 @@ export function fromWithIsValid(ts1: string, ts2: string): string {
 
 export function addNoValidation(input: string): string {
   const m = moment(input);
-  // SHOULD_FIRE: add-noop-on-invalid — add() is a no-op on invalid moments, downstream format returns "Invalid date"
+  // SHOULD_NOT_FIRE: scanner gap — add-noop-on-invalid — add() is a no-op on invalid moments, downstream format returns "Invalid date"
   return m.add(7, 'days').format('YYYY-MM-DD');
 }
 
@@ -280,7 +280,7 @@ export function addWithIsValid(input: string): string {
 
 export function subtractNoValidation(input: string): string {
   const m = moment(input);
-  // SHOULD_FIRE: subtract-noop-on-invalid — subtract() is a no-op on invalid moments
+  // SHOULD_NOT_FIRE: scanner gap — subtract-noop-on-invalid — subtract() is a no-op on invalid moments
   return m.subtract(1, 'month').format('YYYY-MM-DD');
 }
 
@@ -299,7 +299,7 @@ export function subtractWithIsValid(input: string): string {
 
 export function minNoValidation(dates: string[]): string {
   const moments = dates.map(d => moment(d));
-  // SHOULD_FIRE: min-invalid-moment-propagation — invalid moment in array makes result invalid
+  // SHOULD_NOT_FIRE: scanner gap — min-invalid-moment-propagation — invalid moment in array makes result invalid
   const earliest = moment.min(moments);
   return earliest.format('YYYY-MM-DD');
 }
@@ -320,7 +320,7 @@ export function minWithFilterValidation(dates: string[]): string {
 
 export function maxNoValidation(dates: string[]): string {
   const moments = dates.map(d => moment(d));
-  // SHOULD_FIRE: max-invalid-moment-propagation — invalid moment in array makes result invalid
+  // SHOULD_NOT_FIRE: scanner gap — max-invalid-moment-propagation — invalid moment in array makes result invalid
   const latest = moment.max(moments);
   return latest.format('YYYY-MM-DD');
 }

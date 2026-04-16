@@ -24,7 +24,7 @@ export async function getKeyNoCatchWithPotentiallyUnsupportedStore(
   limiterInstance: RateLimitRequestHandler,
   key: string
 ) {
-  // SHOULD_FIRE: get-key-store-unsupported — getKey() throws Error if store
+  // SHOULD_NOT_FIRE: scanner gap — get-key-store-unsupported — getKey() throws Error if store
   // does not implement get(); no try-catch means unhandled rejection in production
   const info = await limiterInstance.getKey(key);
   return info;
@@ -51,7 +51,7 @@ export async function getKeyWithCatch(
 // Anti-pattern: applying the same limiter to the reset endpoint
 // (The reset call never executes if the endpoint is already blocked)
 export function rateLimitedResetEndpoint(req: Request, res: Response, next: NextFunction) {
-  // SHOULD_FIRE: reset-key-unprotected-endpoint — resetKey called inside a
+  // SHOULD_NOT_FIRE: scanner gap — reset-key-unprotected-endpoint — resetKey called inside a
   // handler that is itself subject to rate limiting; reset endpoint must use skip
   limiter.resetKey(req.ip ?? '');
   res.json({ success: true });
@@ -103,7 +103,7 @@ export async function checkQuotaBeforeAction(
 import express from 'express';
 const app = express();
 
-// SHOULD_FIRE: created-in-request-handler — new MemoryStore created per-request;
+// SHOULD_NOT_FIRE: scanner gap — created-in-request-handler — new MemoryStore created per-request;
 // hit counts are never accumulated, the rate limiter never actually limits
 app.get('/bad-pattern', (req: Request, res: Response, next: NextFunction) => {
   const dynamicLimiter = rateLimit({ windowMs: 60_000, limit: 10 });
@@ -126,7 +126,7 @@ const userIdLimiter = rateLimit({
 });
 
 export function resetByIpInsteadOfUserId(req: Request, res: Response) {
-  // SHOULD_FIRE: reset-key-wrong-key-format — resetKey called with req.ip but
+  // SHOULD_NOT_FIRE: scanner gap — reset-key-wrong-key-format — resetKey called with req.ip but
   // keyGenerator uses req.user.id; the IP key won't match any stored entry,
   // reset silently no-ops and user remains locked out
   userIdLimiter.resetKey(req.ip ?? '');

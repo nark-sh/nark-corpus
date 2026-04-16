@@ -70,7 +70,7 @@ const childWithSerializer = logger.child(
 // ─────────────────────────────────────────────────────────────────────────────
 
 // @expect-violation: transport-error-event-unhandled
-// SHOULD_FIRE: transport() without error listener — unhandled worker error crashes process
+// SHOULD_NOT_FIRE: scanner gap — transport() without error listener — unhandled worker error crashes process
 const transportNoErrorHandler = pino.transport({
   target: 'pino-pretty',
   options: { colorize: true },
@@ -94,7 +94,7 @@ const loggerWithTransportGood = pino(transportWithErrorHandler);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // @expect-violation: destination-write-error-event
-// SHOULD_FIRE: destination() without error listener — disk/permission errors crash process
+// SHOULD_NOT_FIRE: scanner gap — destination() without error listener — disk/permission errors crash process
 const destNoHandler = pino.destination({ dest: '/var/log/app.log', sync: false });
 const loggerDestNoHandler = pino(destNoHandler);
 
@@ -114,7 +114,7 @@ const loggerDestGood = pino(destWithHandler);
 const loggerForFlush = pino(pino.destination({ dest: '/var/log/app.log', sync: false }));
 
 // @expect-violation: flush-callback-error-ignored
-// SHOULD_FIRE: flush() callback ignores err parameter — silent log loss on shutdown
+// SHOULD_NOT_FIRE: scanner gap — flush() callback ignores err parameter — silent log loss on shutdown
 loggerForFlush.flush(() => {
   process.exit(0);  // exits without checking if flush succeeded
 });

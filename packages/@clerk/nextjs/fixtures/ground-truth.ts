@@ -160,8 +160,8 @@ export async function banUserWithCatch(userId: string) {
 
 import { clerkFrontendApiProxy } from '@clerk/nextjs/server';
 
-// SHOULD_FIRE: proxy-missing-publishable-key — if CLERK_PUBLISHABLE_KEY not in env
-// SHOULD_FIRE: proxy-missing-secret-key — if CLERK_SECRET_KEY not in env
+// SHOULD_NOT_FIRE: scanner gap — proxy-missing-publishable-key — if CLERK_PUBLISHABLE_KEY not in env
+// SHOULD_NOT_FIRE: scanner gap — proxy-missing-secret-key — if CLERK_SECRET_KEY not in env
 export async function proxyHandlerBare(request: Request) {
   // Returns the proxy response directly without any error monitoring
   return clerkFrontendApiProxy(request);

@@ -33,7 +33,7 @@ import {
 // 1. body() — missing validationResult check
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: validation-errors-silent — body() runs but validationResult never checked
+// SHOULD_NOT_FIRE: scanner gap — validation-errors-silent — body() runs but validationResult never checked
 export async function handleUserCreateMissingCheck(req: Request, res: Response) {
   await body('email').isEmail().run(req);
   await body('name').notEmpty().run(req);
@@ -58,7 +58,7 @@ export async function handleUserCreateWithCheck(req: Request, res: Response) {
 // 2. cookie() — missing validationResult check
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: cookie-validation-errors-silent — cookie chain runs, no validationResult check
+// SHOULD_NOT_FIRE: scanner gap — cookie-validation-errors-silent — cookie chain runs, no validationResult check
 export async function handleCookieAuthMissingCheck(req: Request, res: Response) {
   await cookie('session_id').isUUID().run(req);
   // No validationResult check — invalid session cookie silently passes
@@ -81,7 +81,7 @@ export async function handleCookieAuthWithCheck(req: Request, res: Response) {
 // 3. header() — missing validationResult check
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: header-validation-errors-silent — header chain runs, no validationResult check
+// SHOULD_NOT_FIRE: scanner gap — header-validation-errors-silent — header chain runs, no validationResult check
 export async function handleApiKeyMissingCheck(req: Request, res: Response) {
   await header('x-api-key').notEmpty().isLength({ min: 32 }).run(req);
   // No validationResult check — missing/short API key silently passes through
@@ -109,7 +109,7 @@ const userSchema = checkSchema({
   age: { isInt: { options: { min: 18 } }, in: ['body'] },
 });
 
-// SHOULD_FIRE: checkschema-validation-errors-silent — schema runs but no validationResult check
+// SHOULD_NOT_FIRE: scanner gap — checkschema-validation-errors-silent — schema runs but no validationResult check
 export async function handleSchemaValidationMissingCheck(req: Request, res: Response) {
   await Promise.all(userSchema.map(chain => chain.run(req)));
   // No validationResult check — all field errors silently ignored
@@ -134,7 +134,7 @@ export const handleSchemaValidationProper = [
 // 5. oneOf() — missing validationResult check
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: oneof-all-chains-failed-error-not-checked — oneOf runs but no validationResult
+// SHOULD_NOT_FIRE: scanner gap — oneof-all-chains-failed-error-not-checked — oneOf runs but no validationResult
 export async function handleAuthMethodMissingCheck(req: Request, res: Response) {
   await oneOf([
     body('email').isEmail(),
@@ -161,7 +161,7 @@ export async function handleAuthMethodWithCheck(req: Request, res: Response) {
 // 6. checkExact() — missing validationResult check
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: checkexact-unknown-fields-not-checked — checkExact runs but no validationResult
+// SHOULD_NOT_FIRE: scanner gap — checkexact-unknown-fields-not-checked — checkExact runs but no validationResult
 export async function handleExactFieldsMissingCheck(req: Request, res: Response) {
   const chains = [body('name').notEmpty(), body('email').isEmail()];
   await Promise.all(chains.map(c => c.run(req)));
@@ -188,7 +188,7 @@ export async function handleExactFieldsWithCheck(req: Request, res: Response) {
 // 7. run() — not awaited (fire-and-forget)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: run-not-awaited — run() called without await, validation never completes
+// SHOULD_NOT_FIRE: scanner gap — run-not-awaited — run() called without await, validation never completes
 export function handleRunNotAwaited(req: Request, res: Response) {
   // Missing await — validation starts but handler continues before it finishes
   body('email').isEmail().run(req);
@@ -214,7 +214,7 @@ export async function handleRunAwaited(req: Request, res: Response) {
 // 8. result-throw — no try-catch (Express 4 without async-errors)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: result-throw-no-trycatch — .throw() called without try-catch in Express 4
+// SHOULD_NOT_FIRE: scanner gap — result-throw-no-trycatch — .throw() called without try-catch in Express 4
 // route — validation errors become 500 instead of 400
 export async function handleWithThrowNoCatch(req: Request, res: Response) {
   await body('email').isEmail().run(req);

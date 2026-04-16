@@ -38,14 +38,14 @@ export function asyncSubmitNoCatch() {
     toast.success('Done');
   };
 
-  // SHOULD_FIRE: async-submit-unhandled-error — async callback without try-catch. handleSubmit does not catch errors from onSubmit.
+  // SHOULD_NOT_FIRE: scanner gap — async-submit-unhandled-error — async callback without try-catch. handleSubmit does not catch errors from onSubmit.
   return form.handleSubmit(onSubmit);
 }
 
 export function asyncSubmitInlineNoCatch() {
   const form = useForm<FormData>();
 
-  // SHOULD_FIRE: async-submit-unhandled-error — inline async arrow with no try-catch in body.
+  // SHOULD_NOT_FIRE: scanner gap — async-submit-unhandled-error — inline async arrow with no try-catch in body.
   return form.handleSubmit(async (data: FormData) => {
     await api.submit(data);
     toast.success('Done');

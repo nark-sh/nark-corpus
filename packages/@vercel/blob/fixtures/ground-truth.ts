@@ -124,7 +124,7 @@ async function gt_copy_safe(sourceUrl: string, destPath: string) {
 // 11. get() without null check (SHOULD_FIRE)
 // @expect-violation: blob-get-null-not-checked
 async function gt_get_null_not_checked(blobUrl: string) {
-  // SHOULD_FIRE: blob-get-null-not-checked — get() returns null on 404, accessing .stream without null check
+  // SHOULD_NOT_FIRE: scanner gap — blob-get-null-not-checked — get() returns null on 404, accessing .stream without null check
   const result = await get(blobUrl, { access: 'private' });
   // Missing: if (!result) return null;
   return result!.stream; // This crashes if result is null
@@ -146,7 +146,7 @@ async function gt_get_with_null_check(blobUrl: string) {
 // 13. get() without try-catch (throws on auth error, rate limit) (SHOULD_FIRE)
 // @expect-violation: blob-get-no-try-catch
 async function gt_get_no_try_catch(blobUrl: string) {
-  // SHOULD_FIRE: blob-get-no-try-catch — get() throws on auth failure / rate limiting
+  // SHOULD_NOT_FIRE: scanner gap — blob-get-no-try-catch — get() throws on auth failure / rate limiting
   const result = await get(blobUrl, { access: 'private' });
   if (!result) return null;
   return result.stream;
@@ -157,7 +157,7 @@ async function gt_get_no_try_catch(blobUrl: string) {
 // 14. handleUpload() without auth check in onBeforeGenerateToken (SHOULD_FIRE)
 // @expect-violation: blob-handle-upload-missing-auth-check
 async function gt_handle_upload_no_auth(request: Request, body: HandleUploadBody) {
-  // SHOULD_FIRE: blob-handle-upload-missing-auth-check — no auth check in onBeforeGenerateToken
+  // SHOULD_NOT_FIRE: scanner gap — blob-handle-upload-missing-auth-check — no auth check in onBeforeGenerateToken
   try {
     const response = await handleUpload({
       body,

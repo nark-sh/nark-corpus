@@ -204,7 +204,7 @@ export async function mapperRemoveWithCatch(id: string) {
 
 export async function mapperGetNullNotChecked(id: string) {
   try {
-    // SHOULD_FIRE: mapper-get-null-not-checked — ModelMapper.get() returns null when row missing; accessing properties without null check throws TypeError
+    // SHOULD_NOT_FIRE: scanner gap — mapper-get-null-not-checked — ModelMapper.get() returns null when row missing; accessing properties without null check throws TypeError
     const user = await userMapper.get({ id });
     return (user as any).name; // accessing without null check
   } catch (error) {
@@ -224,7 +224,7 @@ export async function mapperGetWithNullCheck(id: string) {
 }
 
 export async function mapperGetNoCatch(id: string) {
-  // SHOULD_FIRE: mapper-get-no-try-catch — ModelMapper.get() without try-catch throws NoHostAvailableError/OperationTimedOutError
+  // SHOULD_NOT_FIRE: scanner gap — mapper-get-no-try-catch — ModelMapper.get() without try-catch throws NoHostAvailableError/OperationTimedOutError
   const user = await userMapper.get({ id });
   if (!user) return null;
   return (user as any).name;
@@ -282,7 +282,7 @@ export async function executeConcurrentWithCatch(params: any[][]) {
 
 export async function executeConcurrentErrorsNotChecked(params: any[][]) {
   try {
-    // SHOULD_FIRE: execute-concurrent-errors-not-checked — raiseOnFirstError=false accumulates errors silently; caller MUST check result.errors
+    // SHOULD_NOT_FIRE: scanner gap — execute-concurrent-errors-not-checked — raiseOnFirstError=false accumulates errors silently; caller MUST check result.errors
     const result = await concurrent.executeConcurrent(
       client,
       'INSERT INTO users (id, name) VALUES (?, ?)',

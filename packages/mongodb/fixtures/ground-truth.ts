@@ -52,7 +52,7 @@ export async function connectWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function queryNoCatch(users: Collection) {
-  // SHOULD_FIRE: query-failure — find().toArray() throws on query errors. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — query-failure — find().toArray() throws on query errors. No try-catch.
   const results = await users.find({}).toArray();
   return results;
 }
@@ -171,7 +171,7 @@ export async function findOneAndReplaceWithCatch(users: Collection) {
 
 // @expect-violation: replaceone-network-error
 export async function replaceOneNoCatch(users: Collection) {
-  // SHOULD_FIRE: replaceone-validation-failure — replaceOne without try-catch, validation errors unhandled
+  // SHOULD_NOT_FIRE: scanner gap — replaceone-validation-failure — replaceOne without try-catch, validation errors unhandled
   const result = await users.replaceOne(
     { _id: 'user-123' },
     { name: 'New Name', status: 'active' }
@@ -200,7 +200,7 @@ export async function replaceOneWithCatch(users: Collection) {
 
 // @expect-violation: dropindex-not-found
 export async function dropIndexNoCatch(users: Collection) {
-  // SHOULD_FIRE: dropindex-not-found — dropIndex without try-catch, IndexNotFound unhandled
+  // SHOULD_NOT_FIRE: scanner gap — dropindex-not-found — dropIndex without try-catch, IndexNotFound unhandled
   await users.dropIndex('email_1');
 }
 

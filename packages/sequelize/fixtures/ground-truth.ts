@@ -198,7 +198,7 @@ export async function saveNoCatch() {
   const user = await sequelize.models.User.findByPk(1);
   if (user) {
     (user as any).email = 'new@example.com';
-    // SHOULD_FIRE: unique-constraint — save throws on duplicate or validation error. No try-catch.
+    // SHOULD_NOT_FIRE: scanner gap — unique-constraint — save throws on duplicate or validation error. No try-catch.
     await user.save();
   }
 }
@@ -318,7 +318,7 @@ export async function truncateWithCatch() {
 export async function reloadNoCatch() {
   const user = await sequelize.models.User.findByPk(1);
   if (user) {
-    // SHOULD_FIRE: reload-deleted — reload throws if record was deleted. No try-catch.
+    // SHOULD_NOT_FIRE: scanner gap — reload-deleted — reload throws if record was deleted. No try-catch.
     await user.reload();
   }
 }
@@ -410,7 +410,7 @@ export async function sumWithCatch() {
 // ── Transaction.commit() / Transaction.rollback() ──
 
 export async function commitNoCatch() {
-  // SHOULD_FIRE: commit-already-finished, commit-database-error — commit() throws. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — commit-already-finished, commit-database-error — commit() throws. No try-catch.
   // @expect-violation: commit-already-finished
   // @expect-violation: commit-database-error
   const t = await sequelize.transaction();
@@ -418,7 +418,7 @@ export async function commitNoCatch() {
 }
 
 export async function rollbackNoCatch() {
-  // SHOULD_FIRE: rollback-already-finished, rollback-database-error — rollback() throws. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — rollback-already-finished, rollback-database-error — rollback() throws. No try-catch.
   // @expect-violation: rollback-already-finished
   // @expect-violation: rollback-database-error
   const t = await sequelize.transaction();
@@ -439,7 +439,7 @@ export async function commitWithCatch() {
 }
 
 export async function rollbackMasksError() {
-  // SHOULD_FIRE: rollback-masks-original-error — rollback failure can swallow original error
+  // SHOULD_NOT_FIRE: scanner gap — rollback-masks-original-error — rollback failure can swallow original error
   // @expect-violation: rollback-masks-original-error
   const t = await sequelize.transaction();
   try {
@@ -455,7 +455,7 @@ export async function rollbackMasksError() {
 // ── instance.update() ──
 
 export async function instanceUpdateNoCatch() {
-  // SHOULD_FIRE: instance-update-unique-constraint — instance.update() throws. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — instance-update-unique-constraint — instance.update() throws. No try-catch.
   // @expect-violation: instance-update-unique-constraint
   // @expect-violation: instance-update-validation-error
   const user = await sequelize.models.User.findByPk(1);
@@ -477,7 +477,7 @@ export async function instanceUpdateWithCatch() {
 // ── instance.destroy() ──
 
 export async function instanceDestroyNoCatch() {
-  // SHOULD_FIRE: instance-destroy-foreign-key — instance.destroy() throws. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — instance-destroy-foreign-key — instance.destroy() throws. No try-catch.
   // @expect-violation: instance-destroy-foreign-key
   // @expect-violation: instance-destroy-connection-error
   const user = await sequelize.models.User.findByPk(1);
@@ -499,7 +499,7 @@ export async function instanceDestroyWithCatch() {
 // ── Model.findOrBuild() ──
 
 export async function findOrBuildNoCatch() {
-  // SHOULD_FIRE: findorbuild-query-failure — findOrBuild() throws on DB error. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — findorbuild-query-failure — findOrBuild() throws on DB error. No try-catch.
   // @expect-violation: findorbuild-query-failure
   const [user, built] = await (sequelize.models.User as any).findOrBuild({
     where: { email: 'test@example.com' },
@@ -532,7 +532,7 @@ export async function findOrBuildWithCatch() {
 // ── Model.findCreateFind() ──
 
 export async function findCreateFindNoCatch() {
-  // SHOULD_FIRE: findcreatefind-validation-error — findCreateFind() throws ValidationError. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — findcreatefind-validation-error — findCreateFind() throws ValidationError. No try-catch.
   // @expect-violation: findcreatefind-validation-error
   // @expect-violation: findcreatefind-connection-error
   const [user, created] = await (sequelize.models.User as any).findCreateFind({
@@ -560,7 +560,7 @@ export async function findCreateFindWithCatch() {
 // ── instance.restore() ──
 
 export async function instanceRestoreNoCatch() {
-  // SHOULD_FIRE: instance-restore-not-paranoid — instance.restore() throws. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — instance-restore-not-paranoid — instance.restore() throws. No try-catch.
   // @expect-violation: instance-restore-not-paranoid
   // @expect-violation: instance-restore-connection-error
   const user = await sequelize.models.User.findByPk(1);

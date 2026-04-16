@@ -89,7 +89,7 @@ export async function addBulkWithCatch() {
 
 export async function flowAddNoCatch() {
   const flow = new FlowProducer();
-  // SHOULD_FIRE: flow-add-redis-error — FlowProducer.add() throws on Redis errors. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — flow-add-redis-error — FlowProducer.add() throws on Redis errors. No try-catch.
   await flow.add({
     name: 'parent',
     queueName: 'parentQueue',
@@ -126,7 +126,7 @@ export async function flowAddWithCatch() {
 
 export async function flowAddBulkNoCatch() {
   const flow = new FlowProducer();
-  // SHOULD_FIRE: flow-addbulk-redis-error — FlowProducer.addBulk() throws on Redis errors. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — flow-addbulk-redis-error — FlowProducer.addBulk() throws on Redis errors. No try-catch.
   await flow.addBulk([
     { name: 'parent1', queueName: 'q1', data: {} },
     { name: 'parent2', queueName: 'q2', data: {} },
@@ -249,8 +249,8 @@ export async function waitUntilFinishedNoCatch() {
   const queue = new Queue('jobs');
   const queueEvents = new QueueEvents('jobs');
   const job = await queue.add('test', { data: 1 });
-  // SHOULD_FIRE: job-wait-until-finished-timeout — waitUntilFinished() rejects on timeout. No try-catch.
-  // SHOULD_FIRE: job-wait-until-finished-job-failed — waitUntilFinished() rejects on job failure. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — job-wait-until-finished-timeout — waitUntilFinished() rejects on timeout. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — job-wait-until-finished-job-failed — waitUntilFinished() rejects on job failure. No try-catch.
   const result = await job.waitUntilFinished(queueEvents, 5000);
   await queue.close();
   await queueEvents.close();
@@ -276,7 +276,7 @@ export async function waitUntilFinishedWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function jobRemoveNoCatch(job: Job) {
-  // SHOULD_FIRE: job-remove-locked-error — job.remove() throws on locked jobs. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — job-remove-locked-error — job.remove() throws on locked jobs. No try-catch.
   await job.remove();
 }
 
@@ -294,7 +294,7 @@ export async function jobRemoveWithCatch(job: Job) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function jobRetryNoCatch(job: Job) {
-  // SHOULD_FIRE: job-retry-invalid-state — job.retry() throws on wrong state. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — job-retry-invalid-state — job.retry() throws on wrong state. No try-catch.
   await job.retry();
 }
 

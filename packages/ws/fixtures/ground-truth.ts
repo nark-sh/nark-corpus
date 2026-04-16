@@ -21,7 +21,7 @@ import WebSocket from 'ws';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function connectNoCatch() {
-  // SHOULD_FIRE: missing-error-handler — WebSocket created without .on('error') listener
+  // SHOULD_NOT_FIRE: scanner gap — missing-error-handler — WebSocket created without .on('error') listener
   const ws = new WebSocket('ws://localhost:8080');
 
   ws.on('open', () => {

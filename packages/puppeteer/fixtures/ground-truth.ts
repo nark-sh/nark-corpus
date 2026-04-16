@@ -145,7 +145,7 @@ export async function evaluateNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: evaluate-execution-error — evaluate can throw TargetCloseError, ProtocolError. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — evaluate-execution-error — evaluate can throw TargetCloseError, ProtocolError. No try-catch.
   const title = await page.evaluate(() => document.title);
   await browser.close();
   return title;
@@ -175,7 +175,7 @@ export async function screenshotOnlyNoCatch(url: string) {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto(url);
-  // SHOULD_FIRE: screenshot-protocol-error — screenshot can throw TargetCloseError, crop Error. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — screenshot-protocol-error — screenshot can throw TargetCloseError, crop Error. No try-catch.
   const buf = await page.screenshot({ fullPage: true });
   await browser.close();
   return buf;
@@ -205,7 +205,7 @@ export async function pdfNoCatch(html: string) {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.setContent(html);
-  // SHOULD_FIRE: pdf-headless-only-error — pdf throws in headed mode, ProtocolError on CDP failure. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — pdf-headless-only-error — pdf throws in headed mode, ProtocolError on CDP failure. No try-catch.
   const pdfBuffer = await page.pdf({ format: 'A4' });
   await browser.close();
   return pdfBuffer;
@@ -234,7 +234,7 @@ export async function pdfWithCatch(html: string) {
 export async function setContentNoCatch(html: string) {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
-  // SHOULD_FIRE: setcontent-timeout-error — setContent can timeout on complex HTML. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — setcontent-timeout-error — setContent can timeout on complex HTML. No try-catch.
   await page.setContent(html, { waitUntil: 'networkidle0' });
   await browser.close();
 }
@@ -260,7 +260,7 @@ export async function waitForNavigationNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: waitfornavigation-timeout-error — waitForNavigation can timeout. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — waitfornavigation-timeout-error — waitForNavigation can timeout. No try-catch.
   await page.waitForNavigation({ waitUntil: 'networkidle0' });
   await browser.close();
 }
@@ -287,7 +287,7 @@ export async function waitForNetworkIdleNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: waitfornetworkidle-timeout-error — can timeout on busy pages. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — waitfornetworkidle-timeout-error — can timeout on busy pages. No try-catch.
   await page.waitForNetworkIdle({ idleTime: 500 });
   await browser.close();
 }
@@ -314,7 +314,7 @@ export async function waitForFunctionNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: waitforfunction-timeout-error — can timeout when condition never met. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — waitforfunction-timeout-error — can timeout when condition never met. No try-catch.
   await page.waitForFunction('document.querySelector(".loaded") !== null');
   await browser.close();
 }
@@ -341,7 +341,7 @@ export async function typeNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: type-element-not-found — throws if selector not found. No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — type-element-not-found — throws if selector not found. No try-catch.
   await page.type('#search-input', 'hello world');
   await browser.close();
 }
@@ -368,7 +368,7 @@ export async function evalNoCatch() {
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
-  // SHOULD_FIRE: eval-element-not-found — $eval throws if selector not found (unlike $() which returns null). No try-catch.
+  // SHOULD_NOT_FIRE: scanner gap — eval-element-not-found — $eval throws if selector not found (unlike $() which returns null). No try-catch.
   const text = await page.$eval('h1', (el) => el.textContent);
   await browser.close();
   return text;

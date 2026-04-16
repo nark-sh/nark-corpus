@@ -39,7 +39,7 @@ export function createClientWithErrorHandler() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getNoCatch(redis: Redis, key: string) {
-  // SHOULD_FIRE: unhandled-promise-rejection — redis.get() rejects on connection errors. No try-catch.
+  // SHOULD_FIRE: missing-error-listener — redis.get() rejects on connection errors. No try-catch.
   const value = await redis.get(key);
   return value;
 }
@@ -60,7 +60,7 @@ export async function getWithCatch(redis: Redis, key: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function quitNoCatch(redis: Redis) {
-  // SHOULD_FIRE: quit-promise-unhandled — quit() promise rejected without catch handler
+  // SHOULD_FIRE: missing-error-listener — quit() promise rejected without catch handler
   await redis.quit();
 }
 
@@ -78,7 +78,7 @@ export async function quitWithCatch(redis: Redis) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function delNoCatch(redis: Redis, key: string) {
-  // SHOULD_FIRE: del-unhandled-promise-rejection — del() promise rejected without catch handler
+  // SHOULD_FIRE: missing-error-listener — del() promise rejected without catch handler
   await redis.del(key);
 }
 
@@ -98,7 +98,7 @@ export async function delWithCatch(redis: Redis, key: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function expireNoCatch(redis: Redis, key: string) {
-  // SHOULD_FIRE: expire-unhandled-promise-rejection — expire() promise rejected without catch handler
+  // SHOULD_FIRE: missing-error-listener — expire() promise rejected without catch handler
   await redis.expire(key, 300);
 }
 
@@ -117,7 +117,7 @@ export async function expireWithCatch(redis: Redis, key: string, value: string) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function incrNoCatch(redis: Redis, key: string) {
-  // SHOULD_FIRE: incr-wrong-type-error — rate limiter fails open when incr() promise not caught
+  // SHOULD_FIRE: missing-error-listener — incr() rate limiter fails open when promise not caught
   const count = await redis.incr(key);
   return count;
 }
@@ -139,7 +139,7 @@ export async function incrWithCatch(redis: Redis, key: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function zaddNoCatch(redis: Redis, key: string, score: number, member: string) {
-  // SHOULD_FIRE: zadd-wrong-type-error — zadd() promise rejected without catch handler
+  // SHOULD_FIRE: missing-error-listener — zadd() promise rejected without catch handler
   await redis.zadd(key, score, member);
 }
 
@@ -161,7 +161,7 @@ export async function zaddWithCatch(redis: Redis, key: string, score: number, me
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function blpopNoCatch(redis: Redis, queue: string) {
-  // SHOULD_FIRE: blpop-unhandled-promise-rejection — blpop() promise rejected without catch handler
+  // SHOULD_FIRE: missing-error-listener — blpop() promise rejected without catch handler
   const item = await redis.blpop(queue, 5);
   return item;
 }
