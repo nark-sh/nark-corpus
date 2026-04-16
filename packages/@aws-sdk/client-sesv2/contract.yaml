@@ -3,18 +3,20 @@ semver: ">=3.0.0 <4.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-16"
+# Depth pass 2 (deepen-stream-2): added UpdateEmailTemplateCommand, PutSuppressedDestinationCommand, CreateContactCommand
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75
-# coverage_score = 6 contracted / 8 total relevant API functions (6 contracted + 2 intentionally omitted)
-# Previously contracted (1): send (generic)
-# Newly contracted this pass (5): SendEmailCommand, SendBulkEmailCommand,
+coverage_score: 0.82
+# coverage_score = 9 contracted / 11 total relevant API functions (9 contracted + 2 intentionally omitted)
+# Previously contracted (6): send (generic), SendEmailCommand, SendBulkEmailCommand,
 #   CreateEmailIdentityCommand, SendCustomVerificationEmailCommand,
-#   CreateEmailTemplateCommand+UpdateEmailTemplateCommand (combined), CreateImportJobCommand
+#   CreateEmailTemplateCommand, CreateImportJobCommand
+# Newly contracted this pass (3): UpdateEmailTemplateCommand, PutSuppressedDestinationCommand,
+#   CreateContactCommand
 # Intentionally omitted (2):
 #   TestRenderEmailTemplateCommand (dev/preview utility, not production code path)
 #   CreateConfigurationSetCommand (infrastructure management, not SaaS app runtime)
-# Admin/read-only omitted (not counted): Get*, List*, Delete* commands
+# Admin/read-only omitted (not counted): Get*, List*, Delete*, Put*Identity*, BatchGetMetricData
 
 functions:
   - name: send
@@ -428,6 +430,182 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: UpdateEmailTemplateCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Updates the content of an existing email template (subject, HTML body, or text body).
+      Companion to CreateEmailTemplateCommand — used when a template already exists and
+      needs updated content, subject line, or layout. Rate-limited to 1 request per second.
+      Throws NotFoundException when the template name does not exist.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_UpdateEmailTemplate.html
+      # Error types confirmed from AWS SES V2 API Reference documentation
+      - id: sesv2-update-template-no-try-catch
+        condition: >
+          UpdateEmailTemplateCommand can fail with:
+          NotFoundException (template with this name does not exist — must use CreateEmailTemplateCommand first),
+          BadRequestException (invalid template syntax — malformed Handlebars variables or HTML),
+          TooManyRequestsException (API rate limit: max 1 request/second for template operations).
+        throws: >
+          SESv2ServiceException subclass. NotFoundException (HTTP 404) is the primary concern:
+          if the template was deleted externally (via console, another deploy, or cleanup script)
+          while application code still calls UpdateEmailTemplateCommand, the update silently fails
+          in a broad catch handler. BadRequestException for malformed Handlebars syntax in subject
+          or body fields. TooManyRequestsException at > 1 req/sec — common in template sync jobs.
+        required_handling: >
+          Caller MUST wrap in try-catch. NotFoundException means the template no longer exists
+          and must be recreated with CreateEmailTemplateCommand. BadRequestException indicates
+          a template content bug — log the template name for debugging.
+
+          Minimum handling:
+            try {
+              await sesv2Client.send(new UpdateEmailTemplateCommand({
+                TemplateName: templateName,
+                TemplateContent: { Subject: subject, Html: htmlBody },
+              }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'NotFoundException') {
+                  // Template deleted — recreate with CreateEmailTemplateCommand
+                  await sesv2Client.send(new CreateEmailTemplateCommand({ ... }));
+                }
+                if (err.name === 'TooManyRequestsException') {
+                  // Rate limit — add delay between template sync operations
+                }
+                console.error(`SES template update failed [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_UpdateEmailTemplate.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: PutSuppressedDestinationCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Adds an email address to the account-level suppression list, preventing future email
+      delivery to that address. MUST be called when processing bounce or complaint webhooks
+      to maintain sender reputation. Required for CAN-SPAM and GDPR compliance workflows.
+      Reason must be BOUNCE or COMPLAINT. The operation is effectively idempotent —
+      calling it multiple times with the same address results in the same suppressed state.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_PutSuppressedDestination.html
+      # Error types confirmed from AWS SES V2 API Reference documentation
+      - id: sesv2-suppressed-destination-no-try-catch
+        condition: >
+          PutSuppressedDestinationCommand can fail with:
+          BadRequestException (invalid EmailAddress format or invalid Reason value — must be BOUNCE or COMPLAINT),
+          TooManyRequestsException (API rate limit exceeded — common when processing large bounce batches).
+        throws: >
+          SESv2ServiceException subclass. BadRequestException (HTTP 400) when Reason is not
+          "BOUNCE" or "COMPLAINT", or when EmailAddress is malformed. TooManyRequestsException
+          (HTTP 429) when suppression calls are batched too quickly after processing a large
+          bounce or complaint batch from SES event webhooks.
+        required_handling: >
+          Caller MUST wrap in try-catch. This is typically called inside bounce/complaint
+          webhook handlers — an unhandled exception here causes the webhook to return 5xx,
+          which triggers SES retry storms. BadRequestException should log the address for
+          manual review. TooManyRequestsException requires backoff between batch operations.
+
+          Minimum handling:
+            try {
+              await sesv2Client.send(new PutSuppressedDestinationCommand({
+                EmailAddress: bouncedAddress,
+                Reason: 'BOUNCE', // or 'COMPLAINT'
+              }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'TooManyRequestsException') {
+                  // Rate limited — retry with exponential backoff
+                }
+                console.error(`Suppression failed [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_PutSuppressedDestination.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: CreateContactCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Adds a new contact to a SES v2 contact list. Used in marketing/newsletter subscription
+      flows to track opted-in email addresses with topic preferences. Throws AlreadyExistsException
+      if the contact already exists in the list (not idempotent). Throws NotFoundException
+      if the contact list itself does not exist. Setting UnsubscribeAll=true immediately opts
+      the contact out of all topics despite any TopicPreferences provided.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateContact.html
+      # Error types confirmed from AWS SES V2 API Reference documentation
+      - id: sesv2-create-contact-no-try-catch
+        condition: >
+          CreateContactCommand can fail with:
+          AlreadyExistsException (contact with this email already exists in the contact list),
+          NotFoundException (contact list specified in ContactListName does not exist),
+          BadRequestException (invalid email address format or malformed TopicPreferences),
+          TooManyRequestsException (rate limit exceeded).
+        throws: >
+          SESv2ServiceException subclass. AlreadyExistsException (HTTP 400) is the most
+          common: any subscription flow where users can resubscribe will hit this. Unlike
+          CreateEmailIdentityCommand, treating AlreadyExistsException as success is the
+          typical correct pattern for resubscription flows.
+          NotFoundException (HTTP 404) means the contact list was deleted — the entire
+          subscription flow is broken until the list is recreated.
+          BadRequestException for invalid email format (e.g. addresses not meeting RFC 5321).
+        required_handling: >
+          Caller MUST wrap in try-catch. AlreadyExistsException should typically update the
+          contact's subscription status using UpdateContactCommand rather than failing silently.
+          NotFoundException requires immediate alerting — all new subscriptions are failing.
+
+          Minimum handling:
+            try {
+              await sesv2Client.send(new CreateContactCommand({
+                ContactListName: 'MyNewsletter',
+                EmailAddress: userEmail,
+                TopicPreferences: [{ TopicName: 'updates', SubscriptionStatus: 'OPT_IN' }],
+              }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'AlreadyExistsException') {
+                  // Contact exists — update subscription preferences instead
+                  await sesv2Client.send(new UpdateContactCommand({ ... }));
+                  return;
+                }
+                if (err.name === 'NotFoundException') {
+                  // Contact list missing — alert ops team
+                }
+                console.error(`SES contact creation failed [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateContact.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
 tags:
   - aws
   - email
@@ -448,6 +626,11 @@ notes:
   - "TooManyRequestsException: implement exponential backoff for high-volume sending"
   - "SendBulkEmailCommand: CRITICAL silent failure — HTTP 200 with per-recipient status in BulkEmailEntryResults"
   - "CreateImportJobCommand: async job pattern — always poll GetImportJobCommand for COMPLETED/FAILED status"
+  - "Depth pass 2 (2026-04-16): 3 new command-specific function entries added (UpdateEmailTemplateCommand, PutSuppressedDestinationCommand, CreateContactCommand). Coverage 75%→82%."
+  - "UpdateEmailTemplateCommand: rate-limited to 1 req/sec — common in template sync deployment scripts"
+  - "PutSuppressedDestinationCommand: MUST be called in bounce/complaint webhook handlers — failure causes webhook 5xx retry storms"
+  - "CreateContactCommand: AlreadyExistsException is expected in resubscription flows — treat as UpdateContactCommand trigger, not fatal error"
+  - "CreateContactCommand: NotFoundException means contact list missing — all new subscriptions failing, requires immediate ops alert"
 
 related_packages:
   - "@aws-sdk/client-ses"

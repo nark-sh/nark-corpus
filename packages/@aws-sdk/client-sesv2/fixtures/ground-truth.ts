@@ -12,6 +12,9 @@
  *   - SendCustomVerificationEmailCommand  postcondition: sesv2-custom-verification-no-try-catch
  *   - CreateEmailTemplateCommand  postcondition: sesv2-create-template-no-try-catch
  *   - CreateImportJobCommand  postconditions: sesv2-import-job-result-not-polled, sesv2-import-job-no-try-catch
+ *   - UpdateEmailTemplateCommand  postcondition: sesv2-update-template-no-try-catch  [ADDED pass 2]
+ *   - PutSuppressedDestinationCommand  postcondition: sesv2-suppressed-destination-no-try-catch  [ADDED pass 2]
+ *   - CreateContactCommand  postcondition: sesv2-create-contact-no-try-catch  [ADDED pass 2]
  *
  * Postcondition IDs:
  *   sesv2-send-no-try-catch                (generic SESv2Client.send())
@@ -23,10 +26,14 @@
  *   sesv2-create-template-no-try-catch     (CreateEmailTemplateCommand)
  *   sesv2-import-job-result-not-polled     (CreateImportJobCommand async job not polled)
  *   sesv2-import-job-no-try-catch          (CreateImportJobCommand request errors)
+ *   sesv2-update-template-no-try-catch     (UpdateEmailTemplateCommand) [pass 2]
+ *   sesv2-suppressed-destination-no-try-catch (PutSuppressedDestinationCommand) [pass 2]
+ *   sesv2-create-contact-no-try-catch      (CreateContactCommand) [pass 2]
  */
 
 import {
   SESv2Client,
+  SESv2ServiceException,
   SendEmailCommand,
   SendBulkEmailCommand,
   CreateEmailIdentityCommand,
@@ -35,6 +42,9 @@ import {
   UpdateEmailTemplateCommand,
   CreateImportJobCommand,
   GetImportJobCommand,
+  PutSuppressedDestinationCommand,
+  CreateContactCommand,
+  UpdateContactCommand,
 } from '@aws-sdk/client-sesv2';
 
 const sesv2Client = new SESv2Client({ region: 'us-east-1' });
@@ -341,6 +351,124 @@ export async function gt_importJob_polled() {
     }
   } catch (err) {
     console.error('Import job failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. UpdateEmailTemplateCommand (added pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function gt_updateTemplate_missing(name: string, subject: string, html: string) {
+  // @expect-violation: sesv2-update-template-no-try-catch
+  // SHOULD_FIRE: UpdateEmailTemplateCommand without try-catch
+  // NotFoundException when template was deleted, TooManyRequestsException at >1 req/sec
+  await sesv2Client.send(new UpdateEmailTemplateCommand({
+    TemplateName: name,
+    TemplateContent: { Subject: subject, Html: html },
+  }));
+}
+
+export async function gt_updateTemplate_safe(name: string, subject: string, html: string) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: handles NotFoundException (template deleted) and TooManyRequestsException
+  try {
+    await sesv2Client.send(new UpdateEmailTemplateCommand({
+      TemplateName: name,
+      TemplateContent: { Subject: subject, Html: html },
+    }));
+  } catch (err: any) {
+    if (err instanceof SESv2ServiceException) {
+      if (err.name === 'NotFoundException') {
+        // Template was deleted — recreate it
+        await sesv2Client.send(new CreateEmailTemplateCommand({
+          TemplateName: name,
+          TemplateContent: { Subject: subject, Html: html },
+        }));
+        return;
+      }
+      console.error(`SES template update failed [${err.name}]: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. PutSuppressedDestinationCommand (added pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function gt_suppressedDestination_missing(bouncedEmail: string) {
+  // @expect-violation: sesv2-suppressed-destination-no-try-catch
+  // SHOULD_FIRE: PutSuppressedDestinationCommand without try-catch in bounce webhook handler
+  // Unhandled exception causes webhook to return 5xx → SES retry storm
+  await sesv2Client.send(new PutSuppressedDestinationCommand({
+    EmailAddress: bouncedEmail,
+    Reason: 'BOUNCE',
+  }));
+}
+
+export async function gt_suppressedDestination_safe(bouncedEmail: string) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: handles rate limiting and bad request errors in bounce webhook
+  try {
+    await sesv2Client.send(new PutSuppressedDestinationCommand({
+      EmailAddress: bouncedEmail,
+      Reason: 'BOUNCE',
+    }));
+  } catch (err: any) {
+    if (err instanceof SESv2ServiceException) {
+      if (err.name === 'TooManyRequestsException') {
+        // Rate limited — retry with exponential backoff
+        console.error('Suppression rate limited — retry after delay');
+        return;
+      }
+      console.error(`Suppression failed [${err.name}]: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. CreateContactCommand (added pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function gt_createContact_missing(listName: string, email: string) {
+  // @expect-violation: sesv2-create-contact-no-try-catch
+  // SHOULD_FIRE: CreateContactCommand without try-catch
+  // AlreadyExistsException on resubscription, NotFoundException if list deleted
+  await sesv2Client.send(new CreateContactCommand({
+    ContactListName: listName,
+    EmailAddress: email,
+    TopicPreferences: [{ TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' }],
+  }));
+}
+
+export async function gt_createContact_safe(listName: string, email: string) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: handles AlreadyExistsException (update instead) and NotFoundException (alert ops)
+  try {
+    await sesv2Client.send(new CreateContactCommand({
+      ContactListName: listName,
+      EmailAddress: email,
+      TopicPreferences: [{ TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' }],
+    }));
+  } catch (err: any) {
+    if (err instanceof SESv2ServiceException) {
+      if (err.name === 'AlreadyExistsException') {
+        // Contact exists — update their subscription preferences instead
+        await sesv2Client.send(new UpdateContactCommand({
+          ContactListName: listName,
+          EmailAddress: email,
+          TopicPreferences: [{ TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' }],
+        }));
+        return;
+      }
+      if (err.name === 'NotFoundException') {
+        // Contact list deleted — alert ops team, all subscriptions failing
+        console.error(`Contact list '${listName}' not found — all subscriptions failing`);
+      }
+      console.error(`SES contact creation failed [${err.name}]: ${err.message}`);
+    }
     throw err;
   }
 }
