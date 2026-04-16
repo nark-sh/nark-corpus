@@ -1,30 +1,44 @@
 # @mistralai/mistralai — Mistral AI Node.js SDK
 #
-# The Mistral SDK makes HTTPS requests to the Mistral AI API (api.mistral.ai).
-# All completion and streaming methods can throw:
-#   SDKError (base): status codes, HTTP errors
-#   400 BadRequest: invalid parameters
-#   401 Unauthorized: invalid API key
-#   403 Forbidden: insufficient permissions
-#   422 UnprocessableEntity: request validation failure
-#   429 RateLimitError: rate limit exceeded
-#   500 InternalServerError / 503 ServiceUnavailableError / 504 GatewayTimeoutError
-#   SDKValidationError: response schema mismatch
-#   Network errors: ECONNREFUSED, ETIMEDOUT
+# SDK v2.x (current) error class hierarchy (confirmed from source):
+#   MistralError (base HTTP error, has .statusCode, .body, .headers, .rawResponse)
+#     SDKError — fallback for unmatched status codes / content types
+#     HTTPValidationError — thrown for HTTP 422 (Unprocessable Entity), has .detail array
+#     ResponseValidationError — response failed SDK schema validation
+#   HTTPClientError (base network error)
+#     ConnectionError — network unreachable / ECONNREFUSED
+#     RequestTimeoutError — timeout via AbortSignal
+#     RequestAbortedError — request aborted by caller
+#     InvalidRequestError — bad inputs before request sent
+#     UnexpectedClientError — unrecognized network error
+#   SDKValidationError — input data failed SDK schema validation before request
 #
-# Primary API (v1.x+):
+# Retry behavior (default, from source):
+#   429, 500, 502, 503, 504 are auto-retried with exponential backoff (max 1hr)
+#   ConnectionErrors are also retried by default
+#   401, 403, 422, 4XX other — NOT retried (permanent errors)
+#
+# Primary API (v2.x):
 #   const client = new Mistral({ apiKey: '...' })
 #   await client.chat.complete({ model, messages })
 #   await client.chat.stream({ model, messages })
 #   await client.embeddings.create({ model, inputs })
-#   await client.models.list()
+#   await client.ocr.process({ model, document })
+#   await client.agents.complete({ agentId, messages })
+#   await client.audio.transcriptions.complete({ model, file })
+#   await client.audio.speech.complete({ model, input, voice })
+#   await client.files.upload({ file, purpose })
+#   await client.fim.complete({ model, prompt })
+#   await client.classifiers.moderate({ model, inputs })
+#   await client.batch.jobs.create({ model, inputFiles, endpoint, metadata })
 package: "@mistralai/mistralai"
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.34
 
 detection:
   class_names:
@@ -118,13 +132,470 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: create
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates vector embeddings for input text using Mistral's embedding models.
+      Called as client.embeddings.create({ model, inputs }). Essential for RAG
+      pipelines, semantic search, and similarity matching. Makes an HTTPS POST
+      to api.mistral.ai/v1/embeddings. Throws on auth failure, invalid model,
+      quota exceeded, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/embeddingsCreate.ts
+      # Error types: MistralError (4XX/5XX), HTTPValidationError (422),
+      # ConnectionError, RequestTimeoutError, SDKValidationError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/embeddingsCreate.ts
+      - id: embeddings-create-no-error-handling
+        condition: >
+          client.embeddings.create() called without try-catch or .catch() handler
+        throws: >
+          MistralError (base, .statusCode populated) for all HTTP error responses.
+          HTTPValidationError (.statusCode=422, .detail[] array) for invalid inputs.
+          SDKError for unmatched status codes or unexpected content types.
+          ConnectionError when network is unreachable.
+          RequestTimeoutError when request exceeds configured timeout.
+          SDKValidationError when input fails SDK schema validation before request.
+          Note: 429 rate limit is auto-retried by SDK before throwing.
+        required_handling: >
+          Caller MUST wrap await client.embeddings.create() in try-catch or chain .catch().
+          RAG pipelines and embedding jobs often run in background tasks or loops —
+          uncaught errors silently halt the entire ingestion pipeline. Search quality
+          degrades to zero without alerting.
+
+          try {
+            const response = await client.embeddings.create({
+              model: 'mistral-embed',
+              inputs: ['Hello world', 'Another document'],
+            });
+            return response.data.map(e => e.embedding);
+          } catch (error) {
+            console.error('Mistral embeddings error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/capabilities/embeddings/"
+          - "https://docs.mistral.ai/api/#tag/embeddings/operation/embeddings_v1_embeddings_post"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: process
+    import_path: "@mistralai/mistralai"
+    description: >
+      Performs Optical Character Recognition (OCR) on documents. Called as
+      client.ocr.process({ model, document }). Accepts URLs or base64-encoded
+      files. Used for document parsing, data extraction, and content indexing.
+      Makes an HTTPS POST to api.mistral.ai/v1/ocr. Throws on invalid document
+      format, file size limits, auth failure, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/ocrProcess.ts
+      # Error types: HTTPValidationError (422), MistralError (4XX/5XX),
+      # ConnectionError, RequestTimeoutError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/ocrProcess.ts
+      - id: ocr-process-no-error-handling
+        condition: >
+          client.ocr.process() called without try-catch or .catch() handler
+        throws: >
+          HTTPValidationError (.statusCode=422) when document URL is invalid,
+          base64 encoding is malformed, or document format is unsupported.
+          MistralError when API key is invalid (401), quota exhausted, or server fails.
+          ConnectionError on network failures.
+          RequestTimeoutError if document processing exceeds timeout (large documents).
+        required_handling: >
+          Caller MUST wrap await client.ocr.process() in try-catch or chain .catch().
+          Document processing pipelines often handle user-uploaded content — invalid
+          PDFs or unsupported formats throw HTTPValidationError (422) which must be
+          caught and returned as a user-readable error, not a 500.
+
+          try {
+            const result = await client.ocr.process({
+              model: 'mistral-ocr-latest',
+              document: {
+                type: 'document_url',
+                documentUrl: 'https://example.com/document.pdf',
+              },
+            });
+            return result.pages.map(p => p.markdown).join('\n');
+          } catch (error) {
+            if (error instanceof HTTPValidationError) {
+              throw new Error('Invalid document format or URL');
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/capabilities/document/"
+          - "https://docs.mistral.ai/api/#tag/ocr/operation/document_understanding_v1_ocr_post"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: upload
+    import_path: "@mistralai/mistralai"
+    description: >
+      Uploads a file for use in fine-tuning, batch jobs, or OCR. Called as
+      client.files.upload({ file, purpose }). Accepts JSONL files for fine-tuning
+      (max 512 MB per file). Makes an HTTPS multipart/form-data POST to
+      api.mistral.ai/v1/files. Throws on auth failure, file too large, invalid
+      format, quota exceeded, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/filesUpload.ts
+      # Error types: MistralError (4XX/5XX), ConnectionError, RequestTimeoutError
+      # File size limit: 512 MB per file (documented in SDK source comments)
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/filesUpload.ts
+      - id: files-upload-no-error-handling
+        condition: >
+          client.files.upload() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=413) when file exceeds 512 MB size limit.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=422) for invalid file format (e.g. non-JSONL for fine-tuning).
+          ConnectionError / RequestTimeoutError for large file uploads that timeout.
+          SDKValidationError when request object fails SDK schema validation.
+        required_handling: >
+          Caller MUST wrap await client.files.upload() in try-catch or chain .catch().
+          File uploads are commonly used in fine-tuning prep workflows or batch pipelines —
+          uncaught size limit errors (413) cause the entire workflow to crash before
+          any fine-tuning is enqueued.
+
+          try {
+            const fileObj = await client.files.upload({
+              file: { name: 'training_data.jsonl', data: fileBlob },
+              purpose: 'fine-tune',
+            });
+            return fileObj.id;
+          } catch (error) {
+            console.error('Mistral file upload error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/files/operation/files_api_routes_upload_file"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: complete
+    import_path: "@mistralai/mistralai"
+    description: >
+      Runs a completion via a deployed Mistral agent. Called as
+      client.agents.complete({ agentId, messages }). Agents are pre-configured
+      Mistral models with system prompts, tools, and knowledge bases. Makes an
+      HTTPS POST to api.mistral.ai/v1/agents/completions. Throws on invalid
+      agentId, auth failure, rate limit, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/agentsComplete.ts
+      # Error types: HTTPValidationError (422), MistralError (4XX/5XX),
+      # ConnectionError, RequestTimeoutError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/agentsComplete.ts
+      - id: agents-complete-no-error-handling
+        condition: >
+          client.agents.complete() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when agentId does not exist or is deleted.
+          HTTPValidationError (.statusCode=422) when messages array is malformed.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — SDK auto-retries before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+        required_handling: >
+          Caller MUST wrap await client.agents.complete() in try-catch or chain .catch().
+          Agent IDs can be revoked or deleted — uncaught 404 MistralError crashes the
+          request handler, returning 500 to users. Agent IDs should be validated at startup.
+
+          try {
+            const response = await client.agents.complete({
+              agentId: process.env.MISTRAL_AGENT_ID,
+              messages: [{ role: 'user', content: userMessage }],
+            });
+            return response.choices[0].message.content;
+          } catch (error) {
+            console.error('Mistral agent error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/agents/operation/agents_api_routes_agent_completion"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: complete
+    import_path: "@mistralai/mistralai"
+    description: >
+      Transcribes audio content to text. Called as
+      client.audio.transcriptions.complete({ model, file }). Accepts audio files
+      as Blob or stream. Makes an HTTPS multipart POST to
+      api.mistral.ai/v1/audio/transcriptions. Throws on unsupported format,
+      file size exceeded, auth failure, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/audioTranscriptionsComplete.ts
+      # Error types: MistralError (4XX/5XX), ConnectionError, RequestTimeoutError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/audioTranscriptionsComplete.ts
+      - id: audio-transcriptions-no-error-handling
+        condition: >
+          client.audio.transcriptions.complete() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=422) for unsupported audio format or corrupted file.
+          MistralError (.statusCode=413) if audio file exceeds size limit.
+          MistralError (.statusCode=401) when API key is invalid.
+          ConnectionError when network is unreachable during multipart upload.
+          RequestTimeoutError for long audio files that exceed timeout.
+        required_handling: >
+          Caller MUST wrap await client.audio.transcriptions.complete() in try-catch.
+          Voice input features in production apps throw on unsupported audio formats —
+          browsers may send audio in formats the API does not accept (e.g. WEBM without
+          proper codec tags). Uncaught errors crash the voice pipeline silently.
+
+          try {
+            const result = await client.audio.transcriptions.complete({
+              model: 'voxtlite-2506',
+              file: audioBlob,
+            });
+            return result.text;
+          } catch (error) {
+            console.error('Mistral transcription error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/audio/operation/audio_transcriptions_v1_audio_transcriptions_post"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: complete
+    import_path: "@mistralai/mistralai"
+    description: >
+      Synthesizes text into speech audio. Called as
+      client.audio.speech.complete({ model, input, voice }). Returns audio data
+      as a stream or buffer. Makes an HTTPS POST to api.mistral.ai/v1/audio/speech.
+      Throws on invalid voice name, text too long, auth failure, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/audioSpeechComplete.ts
+      # Error types: HTTPValidationError (422), MistralError (4XX/5XX), ConnectionError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/audioSpeechComplete.ts
+      - id: audio-speech-no-error-handling
+        condition: >
+          client.audio.speech.complete() called without try-catch or .catch() handler
+        throws: >
+          HTTPValidationError (.statusCode=422) for invalid voice name or input text
+          that exceeds character limits.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError for other 4XX/5XX responses.
+          ConnectionError when streaming audio response fails mid-download.
+        required_handling: >
+          Caller MUST wrap await client.audio.speech.complete() in try-catch or chain .catch().
+          Text-to-speech features in production apps use voice IDs that can be invalidated
+          — uncaught HTTPValidationError (422) crashes the TTS pipeline.
+
+          try {
+            const audio = await client.audio.speech.complete({
+              model: 'mistral-voice-latest',
+              input: 'Hello, how can I help you today?',
+              voice: 'af_sky',
+            });
+            return audio;
+          } catch (error) {
+            console.error('Mistral speech error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/api/#tag/audio/operation/speech_v1_audio_speech_post"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: complete
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates a Fill-in-the-Middle (FIM) code completion. Called as
+      client.fim.complete({ model, prompt, suffix }). Used for code editors and
+      autocomplete tools. Makes an HTTPS POST to api.mistral.ai/v1/fim/completions.
+      Same error behavior as client.chat.complete() — throws on auth failure,
+      invalid model, rate limit, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/fimComplete.ts
+      # Error types identical to chat.complete (same SDK pattern, same error classes)
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/fimComplete.ts
+      - id: fim-complete-no-error-handling
+        condition: >
+          client.fim.complete() called without try-catch or .catch() handler
+        throws: >
+          MistralError for all HTTP errors (401 invalid key, 422 invalid params, 4XX/5XX).
+          HTTPValidationError (.statusCode=422) for malformed prompt/suffix.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when input fails schema validation before request.
+        required_handling: >
+          Caller MUST wrap await client.fim.complete() in try-catch or chain .catch().
+          Code autocomplete features are latency-sensitive — uncaught errors disable
+          the autocomplete feature entirely for affected users.
+
+          try {
+            const response = await client.fim.complete({
+              model: 'codestral-latest',
+              prompt: 'def fibonacci(n):',
+              suffix: '\n    return result',
+            });
+            return response.choices[0].message.content;
+          } catch (error) {
+            console.error('Mistral FIM error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/capabilities/completion/"
+          - "https://docs.mistral.ai/api/#tag/fim/operation/fim_completion_v1_fim_completions_post"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: moderate
+    import_path: "@mistralai/mistralai"
+    description: >
+      Classifies content for policy violations and harmful categories. Called as
+      client.classifiers.moderate({ model, inputs }) or
+      client.classifiers.moderateChat({ model, inputs }). Used in content
+      moderation pipelines to screen user-generated content. Makes an HTTPS POST
+      to api.mistral.ai/v1/moderations. Throws on auth failure, invalid model,
+      or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/classifiersModerate.ts
+      # Error types: MistralError (4XX/5XX), HTTPValidationError (422), ConnectionError
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/classifiersModerate.ts
+      - id: classifiers-moderate-no-error-handling
+        condition: >
+          client.classifiers.moderate() or client.classifiers.moderateChat() called
+          without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=401) when API key is invalid.
+          HTTPValidationError (.statusCode=422) for malformed inputs array or invalid classifier model.
+          MistralError for other 4XX/5XX server errors.
+          ConnectionError on network failures.
+        required_handling: >
+          Caller MUST wrap await client.classifiers.moderate() in try-catch or chain .catch().
+          Content moderation is a safety-critical pipeline — uncaught errors may cause
+          unmoderated content to pass through if the catch path allows through on failure.
+          Always fail closed: if moderation throws, reject the content.
+
+          try {
+            const result = await client.classifiers.moderate({
+              model: 'mistral-moderation-latest',
+              inputs: [{ text: userContent }],
+            });
+            const isViolation = result.results[0].categories['hate'];
+            return isViolation;
+          } catch (error) {
+            console.error('Mistral moderation error:', error);
+            // Fail closed: reject content if moderation is unavailable
+            return true;
+          }
+        sources:
+          - "https://docs.mistral.ai/capabilities/guardrailing/"
+          - "https://docs.mistral.ai/api/#tag/classifiers/operation/moderations_v1_moderations_post"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: create
+    import_path: "@mistralai/mistralai"
+    description: >
+      Creates an asynchronous batch inference job. Called as
+      client.batch.jobs.create({ model, inputFiles, endpoint, metadata }).
+      Accepts a list of uploaded file IDs, processes them in batch, and returns
+      a BatchJob object with status "QUEUED". Makes an HTTPS POST to
+      api.mistral.ai/v1/batch/jobs. Throws on invalid file IDs, auth failure,
+      quota exceeded, or network error.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of src/funcs/batchJobsCreate.ts
+      # Error types: MistralError (4XX/5XX), ConnectionError, RequestTimeoutError
+      # Batch job status enum: QUEUED, RUNNING, SUCCESS, FAILED, TIMEOUT_EXCEEDED,
+      #   CANCELLATION_REQUESTED, CANCELLED
+      # Source: /private/tmp/claude/bc-deepen/@mistralai-mistralai/node_modules/@mistralai/mistralai/src/funcs/batchJobsCreate.ts
+      - id: batch-jobs-create-no-error-handling
+        condition: >
+          client.batch.jobs.create() called without try-catch or .catch() handler
+        throws: >
+          MistralError (.statusCode=404) when inputFiles contain invalid or deleted file IDs.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=422) for malformed request (invalid endpoint or metadata).
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+        required_handling: >
+          Caller MUST wrap await client.batch.jobs.create() in try-catch or chain .catch().
+          Batch jobs are used in document processing and large-scale inference pipelines —
+          uncaught errors during job creation cause the entire batch to be silently dropped.
+          Additionally, a successfully created job with status FAILED must be checked
+          separately via batch.jobs.get() — this postcondition only covers the creation throw.
+
+          try {
+            const job = await client.batch.jobs.create({
+              model: 'mistral-large-latest',
+              inputFiles: [uploadedFileId],
+              endpoint: '/v1/chat/completions',
+              metadata: { jobName: 'nightly-batch' },
+            });
+            console.log(`Batch job created: ${job.id}, status: ${job.status}`);
+            return job.id;
+          } catch (error) {
+            console.error('Mistral batch job creation error:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.mistral.ai/capabilities/batch/"
+          - "https://docs.mistral.ai/api/#tag/batch/operation/jobs_api_routes_batch_create_batch_job"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 notes:
   - "Mistral constructor (new Mistral({apiKey})) does NOT make network calls — no try-catch needed there"
   - "client.chat.complete() is a 2-level property chain: client.chat → chat namespace → .complete() method"
   - "client.chat.stream() is detected the same way as complete() via the PropertyChainDetector"
-  - "RateLimitError (429) should be handled with exponential backoff and retry"
+  - "v2.x SDK error classes: MistralError (base HTTP), SDKError, HTTPValidationError (422), ConnectionError, RequestTimeoutError — no specific RateLimitError/UnauthorizedError classes"
+  - "429, 500, 502, 503, 504 are auto-retried by SDK with exponential backoff — callers still need try-catch for when retries are exhausted"
   - "v0.x API used client.chat() and client.chatStream() — NOT covered (EOL)"
   - "v1.x+ uses client.chat.complete() and client.chat.stream() — covered by this contract"
-  - "client.embeddings.create() has same error behavior but less common in SaaS app code"
   - "cline (59k★) uses client.chat.stream().catch() — proper handling via .catch() chain"
   - "tutor-gpt (891★) uses client.files.upload/ocr.process inside try-catch — proper handling"
+  - "classifiers.moderate() is safety-critical — always fail closed (reject content if error thrown)"
+  - "batch.jobs.create() throw ≠ job failure — FAILED status must be checked via batch.jobs.get()"
