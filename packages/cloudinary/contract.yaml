@@ -1,11 +1,19 @@
 package: cloudinary
 semver: ">=1.0.0 <3.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-04-15"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 intentionally omitted)
+coverage_score: 0.82  # 14 contracted / 17 total async-callable (3 intentionally omitted)
+# Intentionally omitted (read-only / narrow-adoption / utility):
+#   api.resources, api.resources_by_tag, api.resources_by_ids, api.usage, api.resource_types,
+#   api.root_folders, api.sub_folders, api.search_folders, api.create_folder, api.rename_folder,
+#   multi(), explode(), generate_sprite(), upload_tag_params, upload_url, image_upload_tag,
+#   api.resources_by_context, api.resources_by_asset_folder, api.resources_by_moderation,
+#   api.list_streaming_profiles, api.get_streaming_profile
+# Reason: read-only list/GET operations with no distinct error contracts beyond generic HTTP
+#   errors, or niche media-processing functions with minimal SaaS adoption
 
 functions:
   - name: upload
@@ -409,6 +417,216 @@ functions:
         sources:
           - "https://cloudinary.com/documentation/admin_api"
         severity: error
+        evidence_quality: confirmed
+
+  - name: update_metadata
+    import_path: "cloudinary"
+    description: >
+      Batch-updates structured metadata field values on one or more existing assets
+      identified by their public_ids. Used after upload to attach categorization,
+      workflow status, or custom business fields. Distinct from api.update() (which
+      updates tags, context, and moderation) — this targets custom structured metadata
+      fields created via the Cloudinary structured metadata API.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # Source: lib/uploader.js exports.update_metadata — calls call_api("metadata", ...)
+      # Same execute_request.js error shape as all Upload API methods
+      # HTTP codes confirmed: 400 (invalid field_external_id or value), 401 (auth), 403 (permission)
+      - id: update-metadata-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), invalid metadata field ID (HTTP 400),
+          permission denied (HTTP 403), or network failure
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects when authentication fails (HTTP 401), when a metadata field
+          external_id doesn't exist (HTTP 400), or when the caller lacks permission
+          (HTTP 403). The most common failure in production: passing a metadata
+          field external_id that was renamed or deleted in the Cloudinary dashboard,
+          causing the entire batch update to reject with HTTP 400.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 400: Bad request (invalid metadata field external_id, value type mismatch,
+          or pipe-encoded metadata string is malformed).
+          HTTP 401: Authorization required (invalid api_key/api_secret).
+          HTTP 403: Not allowed (insufficient permissions for metadata operations).
+          Node.js Error: network failure (ECONNREFUSED, ETIMEDOUT).
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.update_metadata() in try-catch.
+          Check error.http_code === 400 to detect field ID mismatches (field was renamed/deleted).
+          Note: partial success is NOT reported — if any field is invalid, the entire batch rejects.
+          Validate metadata field external_ids against your Cloudinary dashboard before batch updates.
+        evidence_quality: confirmed
+
+      - id: update-metadata-silent-partial-failure
+        severity: warning
+        condition: >
+          non-existent public_ids silently succeed — update_metadata does NOT throw 404 for
+          missing assets but silently omits them from the result
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          When one or more public_ids in the batch do not exist, update_metadata()
+          does NOT throw an error — it resolves successfully and silently skips the
+          missing assets. The response contains only the public_ids that were actually
+          updated. Callers that don't check response.public_ids against their input
+          will silently lose metadata updates for deleted or misnamed assets.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        throws: >
+          Resolves (does NOT reject) when assets don't exist.
+          Response: { public_ids: string[] } — only lists public_ids that were updated.
+          Missing assets are silently omitted from response.public_ids.
+        required_handling: >
+          After awaiting update_metadata(), compare response.public_ids against your input
+          public_ids array. If any are missing, log a warning — those assets don't exist
+          and their metadata was not updated.
+          Example: const missing = input.filter(id => !result.public_ids.includes(id))
+        evidence_quality: confirmed
+
+  - name: api.update
+    import_path: "cloudinary"
+    description: >
+      Updates one or more attributes of an existing asset identified by public_id:
+      tags, context (key-value metadata), structured metadata, moderation status,
+      and access control. This is the Admin API equivalent for post-upload asset
+      management, frequently used in content moderation workflows and CMS integrations.
+      Requires Admin API credentials (api_key + api_secret).
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/admin_api#update_details_of_an_existing_resource
+      # Source: lib/v2/api.js — calls execute_request via same shared adapter
+      # HTTP codes confirmed: 400, 401, 403, 404, 409, 420 from admin_api docs
+      - id: api-update-missing-error-handling
+        severity: error
+        condition: >
+          asset not found (HTTP 404), invalid metadata field or value (HTTP 400),
+          authentication failure (HTTP 401), permission denied (HTTP 403),
+          or Admin API rate limit exceeded (HTTP 420)
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        description: >
+          Rejects when the target asset doesn't exist (HTTP 404), when metadata field
+          external_ids are invalid (HTTP 400), when credentials are missing (HTTP 401),
+          when permissions are insufficient (HTTP 403), or when the Admin API rate
+          limit is exceeded (HTTP 420). In CMS workflows that call api.update() in
+          background jobs, all four failure modes are silently swallowed when
+          try-catch is missing — moderation decisions or tag updates are lost.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 404: Asset not found (public_id does not exist or was deleted).
+          HTTP 400: Invalid metadata field external_id, tag format, or context syntax.
+          HTTP 401: Authorization required (Admin API key + secret required).
+          HTTP 403: Not allowed (insufficient plan or resource-type permission).
+          HTTP 409: Conflict (trying to set access_mode to its current value).
+          HTTP 420: Rate limited (Admin API hourly quota exceeded).
+          Node.js Error: network failure (ECONNREFUSED, ETIMEDOUT).
+        required_handling: >
+          MUST wrap cloudinary.v2.api.update() in try-catch.
+          Check error.http_code === 404 to handle deleted assets gracefully.
+          Check error.http_code === 420 to implement exponential backoff.
+          Monitor X-FeatureRateLimit-Remaining in response for proactive throttling.
+          Note: unlike delete_resources, api.update() updates a single asset atomically.
+        evidence_quality: confirmed
+
+  - name: api.delete_resources_by_tag
+    import_path: "cloudinary"
+    description: >
+      Permanently deletes ALL assets that have a given tag across the entire Cloudinary
+      account. This is an irreversible bulk delete operation — there is no recycle bin
+      unless Cloudinary backup is explicitly enabled. Commonly used for cleanup
+      pipelines, expired content removal, and test environment teardown. A single
+      wrong tag value can wipe production media assets.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/admin_api#delete_resources_by_tag
+      # Source: lib/v2/api.js — calls execute_request via Admin API
+      # Admin API rate limited (HTTP 420) — same limit as all other admin calls
+      # NOTE: deleted assets go to backup only if Cloudinary backup feature is enabled on the plan
+      - id: delete-resources-by-tag-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), Admin API rate limit
+          exceeded (HTTP 420), or network failure during bulk tag-based deletion
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        description: >
+          Rejects when authentication fails (HTTP 401), when the caller lacks
+          permission to delete (HTTP 403), or when the Admin API rate limit is
+          exceeded (HTTP 420). The operation is fire-and-forget for the matching
+          set — all assets with the tag are queued for deletion. If the call itself
+          throws (rate limit, auth failure), the deletion is NOT applied. But if
+          it resolves, all matching assets are permanently deleted with no asset-level
+          confirmation in the response.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 401: Authorization required (Admin API credentials required).
+          HTTP 403: Not allowed (insufficient permissions for bulk delete).
+          HTTP 420: Rate limited (Admin API quota exceeded — operation NOT applied).
+          Node.js Error: network failure.
+        required_handling: >
+          MUST wrap cloudinary.v2.api.delete_resources_by_tag() in try-catch.
+          CRITICAL: Verify tag scope before calling — this deletes ALL assets with that tag.
+          Use api.resources_by_tag() first to preview what will be deleted.
+          Check error.http_code === 420 for rate limit and implement exponential backoff.
+          Enable Cloudinary backup feature in account settings if data recovery is required.
+          Consider using delete_resources() with explicit public_ids for safer targeted deletion.
+        evidence_quality: confirmed
+
+      - id: delete-resources-by-tag-catastrophic-misuse
+        severity: error
+        condition: >
+          bulk tag-based deletion applied without prior scope verification — resolves
+          successfully but deletes more assets than intended due to shared or generic tag name
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        description: >
+          When the supplied tag is broad or shared across unintended assets (e.g.,
+          a generic tag like "upload" or "temp" that was also applied to production
+          assets), delete_resources_by_tag() will permanently delete ALL matching
+          assets without confirmation. The response does not list which assets were
+          deleted — only the count. This pattern is particularly dangerous when tag
+          values are constructed from user input or environment variables without
+          validation.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+        throws: >
+          Resolves (does NOT reject) when the deletion succeeds — even if it deleted
+          more assets than intended.
+          Response: { deleted: {}, deleted_counts: {}, partial: boolean, rate_limit_... }
+          No per-asset confirmation — only aggregate counts.
+        required_handling: >
+          ALWAYS call api.resources_by_tag(tag) first to preview the asset count and
+          verify the tag scope before deletion.
+          Use a dedicated deletion-scoped tag (e.g., "to-delete-YYYY-MM-DD") to avoid
+          accidental scope bleed.
+          Store the list of deleted public_ids from resources_by_tag() before calling
+          delete_resources_by_tag() for audit logging.
         evidence_quality: confirmed
 
   - name: search.execute
