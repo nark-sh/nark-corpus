@@ -355,6 +355,845 @@ functions:
         source: https://docs.github.com/en/rest/repos/contents#get-repository-content
         sources:
           - https://docs.github.com/en/rest/repos/contents#get-repository-content
+  - name: search.repos
+    import_path: "@octokit/rest"
+    description: >
+      Searches GitHub repositories by query string. Rate-limited to 30 requests/min
+      (authenticated) or 10/min (unauthenticated). Returns up to 1000 results total
+      (100 per page). Very commonly called in GitHub Apps, analytics tools, and
+      repository discovery features.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/search/search — confirmed rate limits, 422/503 status codes
+      # RequestError from @octokit/request-error: .status, .message, .request, .response
+      - id: search-repos-rate-limit
+        condition: >
+          octokit.search.repos() called without try-catch and rate limit (HTTP 403/429)
+          is hit from exceeding 30 authenticated or 10 unauthenticated requests/minute
+        throws: >
+          RequestError with status 403 (rate limit exceeded) or 429 (secondary rate limit).
+          Response headers include x-ratelimit-remaining: 0 and x-ratelimit-reset.
+          Secondary rate limits are undocumented but trigger at rapid burst patterns.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Search API has custom rate limits separate from the core API (30/min vs 5000/min).
+          Apps that search repos in response to user actions easily hit this limit.
+          Without try-catch, unhandled promise rejections crash the request handler.
+        detector: >
+          If octokit.search.repos() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap await octokit.search.repos() in try-catch. Check error.status === 403
+          and error.response?.headers['x-ratelimit-remaining'] === '0' for rate limit.
+          Implement exponential backoff. Consider @octokit/plugin-throttling plugin.
+        source: https://docs.github.com/en/rest/search/search
+        sources:
+          - https://docs.github.com/en/rest/search/search
+
+      - id: search-repos-validation-error
+        condition: >
+          octokit.search.repos() called with query exceeding 256 characters or more
+          than 5 AND/OR/NOT operators, or querying inaccessible resources
+        throws: >
+          RequestError with status 422 (Validation failed). Also 503 (Service Unavailable)
+          when query times out server-side.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Search queries with invalid syntax, overly complex operators, or access to
+          private resources the token cannot read return 422. Server-side timeouts
+          return 503 with partial results flag. User-supplied search terms can trigger
+          these errors unexpectedly.
+        detector: >
+          If octokit.search.repos() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Validate query length (<256 chars) before calling.
+          Handle 422 (invalid query — show user a helpful error), 503 (search timeout
+          — retry with simpler query).
+        source: https://docs.github.com/en/rest/search/search
+        sources:
+          - https://docs.github.com/en/rest/search/search
+
+  - name: search.code
+    import_path: "@octokit/rest"
+    description: >
+      Searches code across GitHub repositories. Most restrictive rate limit: 9 requests/min
+      (requires authentication — unauthenticated requests are blocked entirely).
+      Returns up to 1000 results. Used in code analysis tools, dependency scanners,
+      and GitHub integrations.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/search/search — 9/min limit, auth required, 401 on unauth
+      - id: search-code-auth-required
+        condition: >
+          octokit.search.code() called without authentication or with invalid token
+        throws: >
+          RequestError with status 401 (Requires authentication) for unauthenticated requests.
+          Code search requires authentication — unlike other search endpoints.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Code search is authentication-required. If the Octokit instance is created
+          without a valid token, every search.code() call fails with 401. This often
+          happens in misconfigured GitHub Apps or when tokens are not injected correctly.
+        detector: >
+          If octokit.search.code() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 401 (missing/invalid auth — check token configuration),
+          403 (rate limit — 9/min limit is easy to hit), 422 (invalid query syntax).
+          Verify octokit instance has auth token before calling.
+        source: https://docs.github.com/en/rest/search/search
+        sources:
+          - https://docs.github.com/en/rest/search/search
+
+  - name: search.issuesAndPullRequests
+    import_path: "@octokit/rest"
+    description: >
+      Searches issues and pull requests across GitHub. Rate-limited to 30/min (authenticated).
+      Supports semantic/hybrid search (10/min limit). Used in issue tracking integrations,
+      automation tools, and GitHub Apps for cross-repository issue management.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/search/search — confirmed rate limit, 422/503 status
+      - id: search-issues-rate-limit
+        condition: >
+          octokit.search.issuesAndPullRequests() called without try-catch and hits
+          30/min rate limit or 10/min semantic search limit
+        throws: >
+          RequestError with status 403 or 429 (rate limit exceeded).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Issue/PR search shares the 30/min rate limit pool with other search endpoints.
+          Apps that poll for issues or sync state frequently hit this limit. Without
+          error handling, unhandled rejections crash the calling function.
+        detector: >
+          If octokit.search.issuesAndPullRequests() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Implement exponential backoff on 403/429. Check
+          x-ratelimit-remaining headers. Consider using octokit.paginate() with
+          throttling plugin for bulk operations.
+        source: https://docs.github.com/en/rest/search/search
+        sources:
+          - https://docs.github.com/en/rest/search/search
+
+  - name: git.createCommit
+    import_path: "@octokit/rest"
+    description: >
+      Creates a git commit object in a repository. Used in GitHub Apps and automation
+      that programmatically push changes (bots, CI tools, file editors). Requires a
+      valid tree SHA and parent commit SHAs. Fundamental step in the "git commit flow":
+      createBlob → createTree → createCommit → updateRef.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/commits — confirmed 404, 409, 422 status codes
+      - id: git-create-commit-not-found
+        condition: >
+          octokit.git.createCommit() called without try-catch and the repo, tree SHA,
+          or parent commit SHA does not exist
+        throws: >
+          RequestError with status 404 (Not Found) when owner/repo does not exist or
+          the token lacks access. RequestError with status 409 (Conflict) when parent
+          commit references are invalid or SHA collision.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Creating a commit in the wrong repo, with an invalid tree SHA, or with
+          non-existent parent SHAs fails with 404 or 409. GitHub Apps that perform
+          automated commits crash without error handling when repository state changes
+          concurrently (another commit pushed between tree creation and commit creation).
+        detector: >
+          If octokit.git.createCommit() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 404 (repo not found or no access), 409 (conflict
+          — re-fetch latest commit SHA and retry), 422 (validation — check tree SHA is valid).
+          Always use the latest commit SHA as parent to avoid conflicts.
+        source: https://docs.github.com/en/rest/git/commits
+        sources:
+          - https://docs.github.com/en/rest/git/commits
+
+  - name: git.createTree
+    import_path: "@octokit/rest"
+    description: >
+      Creates a git tree object, which defines the file structure for a commit.
+      Used in automated commit flows alongside createBlob and createCommit. Must
+      reference valid blob SHAs returned by createBlob(). Part of every programmatic
+      commit workflow in GitHub Apps.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/trees — confirmed 404, 409, 422 status codes
+      - id: git-create-tree-invalid-sha
+        condition: >
+          octokit.git.createTree() called without try-catch when base_tree SHA or
+          blob SHAs in tree items are invalid or not found in the repository
+        throws: >
+          RequestError with status 404 (Not Found) when repo or base_tree SHA not found.
+          RequestError with status 422 (Validation Failed) when tree items contain
+          invalid modes, invalid SHAs, or exceed GitHub's file size limits.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Tree creation with invalid blob SHAs (e.g., blobs from a different repo),
+          invalid file modes, or invalid base_tree references fails silently unless
+          errors are caught. Common failure in automated file update pipelines.
+        detector: >
+          If octokit.git.createTree() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Validate blob SHAs come from the same repository.
+          Handle 404 (base_tree not found — use current HEAD SHA), 422 (invalid tree
+          items — check file modes: 100644, 100755, 040000, 160000, 120000).
+        source: https://docs.github.com/en/rest/git/trees
+        sources:
+          - https://docs.github.com/en/rest/git/trees
+
+  - name: git.createBlob
+    import_path: "@octokit/rest"
+    description: >
+      Creates a git blob object (file content) in a repository. First step in
+      programmatic commit flow. Content can be base64-encoded or utf-8. Returns
+      SHA for use in createTree(). Used in every GitHub App that writes files.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/blobs — confirmed 403, 404, 409, 422 codes
+      - id: git-create-blob-error
+        condition: >
+          octokit.git.createBlob() called without try-catch when repo not found,
+          token lacks write access, or content exceeds file size limits
+        throws: >
+          RequestError with status 403 (Forbidden — no write access or file too large
+          for blob API — use uploads for files > 100MB). Status 404 (Not Found — repo
+          or owner not found). Status 422 (Validation Failed).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Blob creation fails if the token lacks write access (contents:write permission),
+          if the repo doesn't exist, or if base64 encoding is invalid. GitHub limits
+          blobs to 100MB — larger files must use the Git LFS or uploads API. Uncaught
+          errors halt the entire automated commit pipeline.
+        detector: >
+          If octokit.git.createBlob() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (check token has contents:write scope),
+          404 (verify repo owner/name), 422 (validate base64 encoding and file size).
+        source: https://docs.github.com/en/rest/git/blobs
+        sources:
+          - https://docs.github.com/en/rest/git/blobs
+
+  - name: git.updateRef
+    import_path: "@octokit/rest"
+    description: >
+      Updates a git reference (branch HEAD) to point to a new commit SHA. Final step
+      in the programmatic commit flow. By default, requires the update to be a
+      fast-forward (non-force). Used in all GitHub Apps that push commits programmatically.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/git/refs — confirmed 404, 422, 409 codes
+      - id: git-update-ref-non-fast-forward
+        condition: >
+          octokit.git.updateRef() called without try-catch when the ref has been
+          updated by another process (non-fast-forward update) or ref doesn't exist
+        throws: >
+          RequestError with status 422 (Unprocessable Entity) for non-fast-forward
+          updates when force is not set. Status 404 (Not Found) when ref doesn't exist.
+          Status 409 (Conflict) in some concurrency scenarios.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          The most common failure in automated commit flows: another commit is pushed
+          between createCommit() and updateRef() calls, making the update non-fast-forward.
+          Without error handling, the commit object is created but the branch is not
+          updated — leaving orphaned objects and silently failing the operation.
+        detector: >
+          If octokit.git.updateRef() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 422 (non-fast-forward — re-fetch HEAD,
+          re-create tree/commit on top of new HEAD, retry). Handle 404 (ref not found
+          — check branch name). This function MUST be wrapped or commit pipelines lose data.
+        source: https://docs.github.com/en/rest/git/refs
+        sources:
+          - https://docs.github.com/en/rest/git/refs
+
+  - name: checks.create
+    import_path: "@octokit/rest"
+    description: >
+      Creates a check run for a commit. Used exclusively by GitHub Apps (not OAuth apps
+      or PATs — they cannot use this endpoint). Fundamental for CI/CD integrations
+      that report build status via GitHub's Checks API. Requires checks:write permission.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/checks/runs — confirmed 403 for non-Apps, 201 success
+      - id: checks-create-not-github-app
+        condition: >
+          octokit.checks.create() called without try-catch and the octokit instance
+          uses OAuth token or PAT instead of GitHub App authentication
+        throws: >
+          RequestError with status 403 (Forbidden). OAuth apps and personal access
+          tokens (classic) cannot use this endpoint — only GitHub App installations
+          can create check runs. GitHub Apps need the checks:write permission.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          The Checks API is GitHub App-only. Calling checks.create() with a PAT or
+          OAuth token fails with 403. This is a common mistake when migrating from
+          Status API (repos.createCommitStatus) to Checks API. The error is not
+          obvious from the 403 message alone.
+        detector: >
+          If octokit.checks.create() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (verify using GitHub App installation token,
+          not PAT/OAuth — check authentication method and checks:write permission).
+          Handle 404 (repo not found), 422 (invalid check run parameters: invalid
+          conclusion value, missing name/head_sha).
+        source: https://docs.github.com/en/rest/checks/runs
+        sources:
+          - https://docs.github.com/en/rest/checks/runs
+
+  - name: checks.update
+    import_path: "@octokit/rest"
+    description: >
+      Updates an existing check run (status, conclusion, output). Used by GitHub Apps
+      to report CI progress: in_progress → completed with success/failure conclusion.
+      Requires checks:write permission and GitHub App authentication.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/checks/runs — same auth restriction as create
+      - id: checks-update-invalid-transition
+        condition: >
+          octokit.checks.update() called without try-catch with an invalid status
+          transition or conclusion value, or non-App authentication
+        throws: >
+          RequestError with status 403 (non-App auth) or 422 (invalid conclusion/status
+          combination — e.g., setting status to "waiting"/"pending"/"requested" which
+          is only allowed for GitHub Actions, not Apps).
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          GitHub limits certain status values (waiting, pending, requested) to GitHub
+          Actions only. GitHub Apps trying to set these statuses receive 422. Also,
+          updating a completed check run's conclusion is restricted. Missing try-catch
+          prevents CI pipelines from reporting completion status.
+        detector: >
+          If octokit.checks.update() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (App auth required), 404 (check run not found
+          — verify check_run_id), 422 (invalid status for App context — only use queued/
+          in_progress/completed with valid conclusion values like success/failure/neutral).
+        source: https://docs.github.com/en/rest/checks/runs
+        sources:
+          - https://docs.github.com/en/rest/checks/runs
+
+  - name: actions.createWorkflowDispatch
+    import_path: "@octokit/rest"
+    description: >
+      Triggers a workflow_dispatch event to manually run a GitHub Actions workflow.
+      Requires the workflow to have a workflow_dispatch trigger. Used in release
+      automation, deployment pipelines, and any tool that triggers GitHub Actions
+      workflows programmatically. Requires actions:write permission.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/actions/workflows — 404 when workflow lacks dispatch trigger
+      - id: workflow-dispatch-no-trigger
+        condition: >
+          octokit.actions.createWorkflowDispatch() called without try-catch when the
+          workflow file lacks a workflow_dispatch: trigger or when repo/workflow not found
+        throws: >
+          RequestError with status 404 (Not Found) when the workflow file does not
+          exist or does not have a workflow_dispatch trigger defined. Also 422 when
+          the ref (branch/tag) does not exist.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Workflow dispatch fails silently without error handling. The most common case:
+          workflow_dispatch trigger is missing from the workflow YAML (404), or the
+          target branch doesn't contain the workflow (404), or the inputs object
+          has keys not defined in the workflow's inputs schema (422). Deployment
+          automation that relies on this fails completely.
+        detector: >
+          If octokit.actions.createWorkflowDispatch() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 404 (workflow not found or lacks workflow_dispatch
+          trigger — verify .github/workflows/<file>.yml has workflow_dispatch: trigger),
+          422 (invalid ref or input keys not defined in workflow), 403 (no actions:write
+          permission).
+        source: https://docs.github.com/en/rest/actions/workflows
+        sources:
+          - https://docs.github.com/en/rest/actions/workflows
+
+  - name: repos.createRelease
+    import_path: "@octokit/rest"
+    description: >
+      Creates a GitHub Release for a tag. Can create the tag if it doesn't exist.
+      Used in release automation tools, changelog generators, and deployment pipelines.
+      Returns release ID and upload_url for attaching release assets.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/releases/releases — 404/422 confirmed, secondary rate limit note
+      - id: create-release-tag-not-found
+        condition: >
+          octokit.repos.createRelease() called without try-catch when tag doesn't exist,
+          discussion_category_name is invalid, or secondary rate limit triggered
+        throws: >
+          RequestError with status 404 (Not Found) when discussion_category_name is
+          invalid. Status 422 (Validation Failed) when tag_name conflicts or validation
+          fails. Secondary rate limit (403) from creating content too quickly.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Release creation fails when the discussion category doesn't exist (404),
+          or when tag names conflict with existing releases (422). Release automation
+          pipelines that create releases rapidly hit secondary rate limits (403).
+          Without error handling, release artifacts are not published.
+        detector: >
+          If octokit.repos.createRelease() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 404 (invalid discussion category — validate or
+          omit discussion_category_name), 422 (tag conflict — check if release already
+          exists for tag), 403 secondary rate limit (add delay between release creation
+          and asset upload steps).
+        source: https://docs.github.com/en/rest/releases/releases
+        sources:
+          - https://docs.github.com/en/rest/releases/releases
+
+  - name: repos.createDeployment
+    import_path: "@octokit/rest"
+    description: >
+      Creates a deployment record for a ref (branch, tag, or SHA). Used in
+      deployment pipeline automation. GitHub may auto-merge the base branch first.
+      Returns 202 when auto-merge is triggered instead of 201.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/deployments/deployments — 409 confirmed (merge conflict/status checks)
+      - id: create-deployment-conflict
+        condition: >
+          octokit.repos.createDeployment() called without try-catch when required
+          status checks have not passed or a merge conflict exists
+        throws: >
+          RequestError with status 409 (Conflict) when required status check contexts
+          haven't succeeded or there's a merge conflict preventing the deployment.
+          Status 422 (Validation Failed) when endpoint is spammed.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >
+          The most critical deployment failure: required_contexts (CI checks) haven't
+          passed and the deployment is blocked (409). Deployment pipelines that don't
+          handle this crash without reporting the failure reason. The 409 status is
+          counterintuitive — it means "deployment blocked by status checks" not a
+          data conflict. Deployment automation must handle this gracefully.
+        detector: >
+          If octokit.repos.createDeployment() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 409 (check error.message — "required contexts"
+          haven't passed: either set required_contexts: [] to bypass or wait for CI),
+          422 (validation), 202 response (not an error — auto-merge in progress, poll
+          for completion). Always check error.message for actionable info on 409.
+        source: https://docs.github.com/en/rest/deployments/deployments
+        sources:
+          - https://docs.github.com/en/rest/deployments/deployments
+
+  - name: repos.createDeploymentStatus
+    import_path: "@octokit/rest"
+    description: >
+      Creates a status update for an existing deployment. Used to transition
+      deployment state: pending → in_progress → success/failure/error. Required
+      by deployment pipelines to report outcome back to GitHub and external services.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/deployments/statuses — 404 when deployment not found
+      - id: create-deployment-status-not-found
+        condition: >
+          octokit.repos.createDeploymentStatus() called without try-catch when the
+          deployment_id doesn't exist in the repository
+        throws: >
+          RequestError with status 404 (Not Found) when deployment_id is invalid,
+          or the deployment was deleted. Status 422 (Validation Failed) for invalid
+          state values.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Deployment status updates fail if the deployment was already deleted, or if
+          deployment_id came from a different repository. Invalid state values (only
+          error/failure/inactive/in_progress/queued/pending/success are valid) cause
+          422. Without error handling, deployment state tracking breaks silently.
+        detector: >
+          If octokit.repos.createDeploymentStatus() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Store deployment_id immediately after createDeployment().
+          Handle 404 (deployment deleted — log and skip status update), 422 (invalid state
+          — only use: error/failure/inactive/in_progress/queued/pending/success).
+        source: https://docs.github.com/en/rest/deployments/statuses
+        sources:
+          - https://docs.github.com/en/rest/deployments/statuses
+
+  - name: repos.createCommitStatus
+    import_path: "@octokit/rest"
+    description: >
+      Creates a commit status (legacy Status API, predates Checks API). Sets
+      pending/success/failure/error status on a commit SHA with optional target_url.
+      Still widely used despite Checks API — simpler to use with PATs/OAuth tokens
+      because it doesn't require GitHub App. Used in CI integrations and deployment gates.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/commits/statuses — 404 on sha not found, 422 validation
+      - id: create-commit-status-not-found
+        condition: >
+          octokit.repos.createCommitStatus() called without try-catch when the commit
+          SHA doesn't exist or token lacks repo:status scope
+        throws: >
+          RequestError with status 404 (Not Found) when owner/repo doesn't exist or
+          commit SHA is not found. Status 422 (Validation Failed) when state is not
+          one of pending/success/failure/error.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Status creation with an invalid SHA (truncated, wrong repo, not pushed yet)
+          fails with 404. Token must have repo:status scope (not just repo). Status
+          value must be exactly one of pending/success/failure/error. Without error
+          handling, CI integrations silently fail to report build status.
+        detector: >
+          If octokit.repos.createCommitStatus() is awaited without try-catch wrapping
+        required_handling: >
+          SHOULD wrap in try-catch. Handle 404 (invalid SHA — use full 40-char SHA,
+          verify commit exists), 422 (invalid state — only use pending/success/failure/error),
+          403 (token lacks repo:status scope).
+        source: https://docs.github.com/en/rest/commits/statuses
+        sources:
+          - https://docs.github.com/en/rest/commits/statuses
+
+  - name: pulls.get
+    import_path: "@octokit/rest"
+    description: >
+      Fetches details of a single pull request by number. Extremely common in
+      GitHub Apps and CI tools — used to check PR state (open/closed/merged),
+      merge status, labels, and review requirements before taking action.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/pulls — 404 on not found
+      - id: pulls-get-not-found
+        condition: >
+          octokit.pulls.get() called without try-catch when pull_number doesn't
+          exist or token lacks repo access
+        throws: >
+          RequestError with status 404 (Not Found) when PR doesn't exist, was
+          converted to draft, or token lacks access to the private repository.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          PR lookup by number fails when the PR has been deleted (rare but possible)
+          or when the PR belongs to a private fork. Common in webhook handlers that
+          process PR events — the PR may have been deleted between event dispatch and
+          the API call. Without error handling, webhook handlers crash.
+        detector: >
+          If octokit.pulls.get() is awaited without try-catch wrapping
+        required_handling: >
+          SHOULD wrap in try-catch. Handle 404 (PR not found — may be normal in
+          webhook processors if PR was deleted), 403 (no access to private repo).
+        source: https://docs.github.com/en/rest/pulls/pulls
+        sources:
+          - https://docs.github.com/en/rest/pulls/pulls
+
+  - name: pulls.requestReviewers
+    import_path: "@octokit/rest"
+    description: >
+      Requests specific reviewers or teams for a pull request. Used in review
+      automation, code ownership enforcement, and automated PR triage workflows.
+      Commonly fails when reviewers are not repo collaborators.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/review-requests — 422 for invalid reviewers confirmed
+      - id: pulls-request-reviewers-invalid
+        condition: >
+          octokit.pulls.requestReviewers() called without try-catch when reviewers
+          are not collaborators, team doesn't exist, or PR is already closed/merged
+        throws: >
+          RequestError with status 422 (Unprocessable Entity) when a requested reviewer
+          is not a collaborator on the repo, or team_slugs contains a non-existent team.
+          Also 422 when requesting review from the PR author.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Review requests fail silently when reviewer usernames come from user-supplied
+          data or when team membership has changed. The 422 error message identifies
+          which reviewer is invalid. Without error handling, PR automation crashes
+          and review assignments are never made.
+        detector: >
+          If octokit.pulls.requestReviewers() is awaited without try-catch wrapping
+        required_handling: >
+          SHOULD wrap in try-catch. Handle 422 (invalid reviewer — check error.message
+          for which user/team is invalid, verify collaborator status before requesting),
+          404 (PR not found), 403 (no write access).
+        source: https://docs.github.com/en/rest/pulls/review-requests
+        sources:
+          - https://docs.github.com/en/rest/pulls/review-requests
+
+  - name: issues.createComment
+    import_path: "@octokit/rest"
+    description: >
+      Creates a comment on an issue or pull request. Extremely common in GitHub
+      Apps that provide automated feedback, code review bots, and CI status reporters.
+      Also used for PR/issue bots. Issues and PRs share the same comment API.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/issues/comments — 404/410/403 confirmed
+      - id: issues-create-comment-not-found
+        condition: >
+          octokit.issues.createComment() called without try-catch when issue/PR doesn't
+          exist, is locked, or issues are disabled for the repository
+        throws: >
+          RequestError with status 404 (Not Found) when issue_number doesn't exist.
+          Status 403 (Forbidden) when issue is locked. Status 410 (Gone) when
+          issues are disabled for the repository.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          The most common failure for comment bots: trying to comment on a locked issue
+          (403) or one in a repo with issues disabled (410). PR-triggered bots receive
+          webhook events but may try to comment on issues that were locked by maintainers.
+          Without error handling, the bot crashes and the comment is never posted.
+        detector: >
+          If octokit.issues.createComment() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 403 (issue locked — log and skip silently),
+          404 (issue/PR not found — may have been deleted), 410 (issues disabled for
+          repo — fallback to PR comment API for PRs). Check error.status and handle
+          each case gracefully.
+        source: https://docs.github.com/en/rest/issues/comments
+        sources:
+          - https://docs.github.com/en/rest/issues/comments
+
+  - name: issues.addLabels
+    import_path: "@octokit/rest"
+    description: >
+      Adds labels to an issue or pull request. Used in triage automation, CI bots,
+      and issue management workflows. Labels must already exist in the repository
+      before they can be applied — this is a common source of failures.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/issues/labels — 404 on missing labels/issue confirmed
+      - id: issues-add-labels-not-found
+        condition: >
+          octokit.issues.addLabels() called without try-catch when a label doesn't
+          exist in the repository or the issue doesn't exist
+        throws: >
+          RequestError with status 404 (Not Found) when the issue_number doesn't exist
+          or when a label in the labels array doesn't exist in the repository.
+          Status 410 (Gone) when issues are disabled.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Label automation fails when label names are wrong or the repository doesn't
+          have the label pre-created. This is very common when deploying bots to new
+          repositories that don't have the expected label set up yet. Without error
+          handling, the entire label assignment step crashes silently.
+        detector: >
+          If octokit.issues.addLabels() is awaited without try-catch wrapping
+        required_handling: >
+          SHOULD wrap in try-catch. Handle 404 (label not found — create the label first
+          with issues.createLabel(), or verify label exists), 410 (issues disabled),
+          403 (no write access). Consider creating required labels as part of repo setup.
+        source: https://docs.github.com/en/rest/issues/labels
+        sources:
+          - https://docs.github.com/en/rest/issues/labels
+
+  - name: users.getAuthenticated
+    import_path: "@octokit/rest"
+    description: >
+      Fetches the authenticated user's profile. Used to verify token validity,
+      get the authenticated user's login (for PR/issue ownership checks), and
+      validate GitHub App installation token permissions. Commonly called at
+      startup to validate credentials.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/users/users — 401 on invalid auth confirmed
+      - id: users-get-authenticated-no-auth
+        condition: >
+          octokit.users.getAuthenticated() called without try-catch when the token
+          is invalid, expired, or revoked
+        throws: >
+          RequestError with status 401 (Requires authentication) when called without
+          an auth token. Status 403 (Forbidden) when the token has insufficient scope
+          (fine-grained tokens without user read permission).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Token validation at startup fails if the token is expired or revoked. Applications
+          that call users.getAuthenticated() to "validate" their token at boot will crash
+          without error handling when the token has been rotated or revoked. This is
+          the intended use case — but requires robust error handling.
+        detector: >
+          If octokit.users.getAuthenticated() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 401 (no/invalid token — check GITHUB_TOKEN
+          env var or token rotation), 403 (insufficient scope — verify token has
+          required scopes for your use case). Log the error and exit gracefully.
+        source: https://docs.github.com/en/rest/users/users
+        sources:
+          - https://docs.github.com/en/rest/users/users
+
+  - name: orgs.getMembershipForUser
+    import_path: "@octokit/rest"
+    description: >
+      Checks a user's membership status in an organization. Used for authorization
+      gates in GitHub Apps — verifying a user is an org member before granting
+      access to private resources. Returns membership state: active/pending.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/orgs/members — 404/403 confirmed
+      - id: org-membership-not-found
+        condition: >
+          octokit.orgs.getMembershipForUser() called without try-catch when the user
+          is not a member, org doesn't exist, or token lacks org:read permission
+        throws: >
+          RequestError with status 404 (Not Found) when the user is not a member of
+          the organization. Status 403 (Forbidden) when the token lacks permission
+          to view organization membership.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Org membership checks crash authorization flows without error handling. The
+          404 status means "user is not a member" — this is the expected result for
+          non-members, not an error. Apps that use this as an authorization gate
+          must treat 404 as "access denied" not "something broke".
+        detector: >
+          If octokit.orgs.getMembershipForUser() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Treat 404 as "user is not a member" (not an error).
+          Handle 403 (token lacks org read permission — request read:org scope), 404
+          (not a member — return false/deny access). Do NOT re-throw 404 errors from
+          membership checks — they are expected non-member responses.
+        source: https://docs.github.com/en/rest/orgs/members
+        sources:
+          - https://docs.github.com/en/rest/orgs/members
+
+  - name: paginate
+    import_path: "@octokit/rest"
+    description: >
+      The paginate plugin method that wraps any list endpoint and automatically
+      fetches all pages. Used with repos.listForOrg, issues.listForRepo, pulls.list,
+      etc. Returns all results as a flat array. Can make dozens of API requests for
+      large repositories.
+    postconditions:
+      # Evidence: https://github.com/octokit/plugin-paginate-rest.js — rate limit on pagination confirmed
+      - id: paginate-rate-limit
+        condition: >
+          octokit.paginate() called without try-catch on a large list that requires
+          many pages, hitting the rate limit mid-pagination
+        throws: >
+          RequestError with status 403 (Forbidden) or 429 (Too Many Requests) when
+          the pagination exceeds the rate limit mid-traversal. The partial results
+          accumulated so far are lost when the error is thrown.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Paginating large organizations (1000+ repos, 10000+ issues) makes many
+          API requests and will hit rate limits. The error is thrown mid-pagination,
+          losing all previously fetched pages. Without error handling, the entire
+          operation fails and the calling code receives no data.
+        detector: >
+          If octokit.paginate() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Use @octokit/plugin-throttling to automatically
+          handle rate limits during pagination. Handle 403 (rate limit — check
+          x-ratelimit-remaining, back off and resume). Consider using
+          octokit.paginate.iterator() for streaming to process pages as they arrive.
+        source: https://github.com/octokit/plugin-paginate-rest.js
+        sources:
+          - https://github.com/octokit/plugin-paginate-rest.js
+
+metadata:
+  last_verified: "2026-04-16"
+  evidence_quality: confirmed
+  coverage_score: 0.62
+
 tags:
   - github
   - api-client
