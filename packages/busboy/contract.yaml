@@ -2,10 +2,10 @@ package: "busboy"
 semver: ">=1.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71
+coverage_score: 0.90
 # description: "A streaming parser for HTML form data for Node.js"
 
 functions:
@@ -141,3 +141,119 @@ functions:
         sources:
           - "https://github.com/mscdex/busboy#api"
           - "https://bytearcher.com/articles/terminate-busboy/"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/README.md
+      # Source confirms: field event info.valueTruncated is true when limits.fieldSize is exceeded.
+      # Default fieldSize limit is 1MB (1048576 bytes). The field value is silently truncated
+      # without any error or event — the field 'info.valueTruncated' flag is the only signal.
+      - id: busboy-006
+        condition: "field value exceeds limits.fieldSize (default 1MB) without checking info.valueTruncated"
+        throws: "No error — field event fires with truncated value and info.valueTruncated = true"
+        required_handling: >
+          When handling the 'field' event, the caller SHOULD check info.valueTruncated to detect
+          silently truncated field values. The default limit is 1MB (1048576 bytes) which can
+          be easily exceeded by textarea inputs, JSON blobs, or base64-encoded data submitted
+          as form fields. Busboy does not emit any error or event when fieldSize is exceeded —
+          the truncated value is delivered to the 'field' callback as if it were complete.
+          Applications that store field values without checking info.valueTruncated will
+          silently persist corrupt, incomplete data to their database.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy#api"
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js
+      # Source confirms: _final() calls checkEndState() which returns Error('Unexpected end of form')
+      # when this._complete is false (boundary terminator never received). Also: when a file stream
+      # is still active at cleanup, fileStream.destroy(new Error('Unexpected end of file')) is called.
+      # Both cause the 'error' event to be emitted on the busboy stream.
+      # GitHub issue #171 confirms this is the most common production error pattern.
+      - id: busboy-007
+        condition: "client disconnects or aborts upload before multipart data is fully received"
+        throws: "Error emitted via 'error' event: 'Unexpected end of form' or 'Unexpected end of file'"
+        required_handling: >
+          Caller MUST attach an 'error' event listener to the Busboy instance (covered by busboy-001)
+          AND should handle the specific 'Unexpected end of form' and 'Unexpected end of file' error
+          messages gracefully. These errors occur when:
+          (1) the client drops the connection mid-upload (mobile network switch, browser tab closed),
+          (2) a proxy or load balancer times out the request body,
+          (3) the multipart data is malformed and missing the final boundary terminator.
+          Without an error listener, Node.js throws an unhandled error event crashing the server.
+          With a listener, the handler should clean up any partially-written files and return 400/499.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js"
+          - "https://github.com/mscdex/busboy/issues/171"
+          - "https://github.com/mscdex/busboy/issues/44"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js (line 232)
+      # Source confirms: Multipart constructor throws 'Multipart: Boundary not found' synchronously
+      # when the Content-Type header is 'multipart/form-data' but has no 'boundary' parameter.
+      # This is distinct from busboy-002 which covers the outer validation (missing Content-Type,
+      # malformed content type, unsupported type). This error fires after the outer check passes
+      # (valid multipart/form-data content type is present) but the boundary is absent.
+      # Reproduces with: Content-Type: multipart/form-data (no ;boundary=...)
+      - id: busboy-008
+        condition: "Content-Type is multipart/form-data but boundary parameter is missing"
+        throws: "Error (synchronous throw): 'Multipart: Boundary not found'"
+        required_handling: >
+          Caller MUST wrap busboy() constructor in try/catch (see busboy-002) to also catch this
+          specific throw. This error occurs when a client sends 'Content-Type: multipart/form-data'
+          without the required ';boundary=<token>' parameter. This can happen with:
+          (1) programmatic HTTP clients that set the Content-Type manually without generating a boundary,
+          (2) curl requests where --form sets the boundary but manual -H 'Content-Type: ...' overrides it,
+          (3) proxies or middleware that strip or rewrite Content-Type headers.
+          The try/catch from busboy-002 is sufficient to catch this — no separate handler needed.
+          Returning HTTP 400 is the correct response.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js"
+          - "https://github.com/mscdex/busboy/issues/140"
+
+      # Evidence: https://github.com/mscdex/busboy/blob/master/README.md
+      # Source confirms: field event info.nameTruncated is true when limits.fieldNameSize (default 100 bytes)
+      # is exceeded. Like valueTruncated, this is silent — no error, no separate event.
+      # The field name is silently truncated to 100 bytes in the emitted 'field' callback.
+      - id: busboy-009
+        condition: "form field name exceeds limits.fieldNameSize (default 100 bytes) without checking info.nameTruncated"
+        throws: "No error — field event fires with truncated name and info.nameTruncated = true"
+        required_handling: >
+          When handling the 'field' event, the caller SHOULD check info.nameTruncated to detect
+          truncated field names. The default limit is 100 bytes. While most static form field
+          names are short and will never hit this limit, dynamic field names from JSON→FormData
+          conversions or array-style field names (e.g. 'items[0][metadata][description]') can
+          exceed 100 bytes. A truncated field name will silently mismatch the application's
+          expected field name, causing the data to be silently ignored or stored under an
+          unexpected key.
+        severity: info
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://github.com/mscdex/busboy#api"
+          - "https://github.com/mscdex/busboy/blob/master/lib/types/urlencoded.js"
