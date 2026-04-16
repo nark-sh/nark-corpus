@@ -5,7 +5,9 @@
  * Derived from the contract spec, NOT V1 behavior.
  *
  * Contracted functions (from import "@azure/identity"):
- *   - credential.getToken()  postcondition: get-token-no-try-catch
+ *   - credential.getToken()         postcondition: get-token-no-try-catch
+ *   - getBearerTokenProvider()      postcondition: bearer-token-provider-no-try-catch
+ *   - credential.authenticate()     postcondition: interactive-authenticate-no-try-catch
  *
  * Detection pattern:
  *   - Credential class imported from @azure/identity
@@ -19,8 +21,11 @@ import {
   ClientSecretCredential,
   ManagedIdentityCredential,
   WorkloadIdentityCredential,
+  InteractiveBrowserCredential,
   CredentialUnavailableError,
   AuthenticationError,
+  getBearerTokenProvider,
+  serializeAuthenticationRecord,
 } from '@azure/identity';
 
 const defaultCredential = new DefaultAzureCredential();
@@ -188,5 +193,90 @@ class AzureTokenManager {
       console.error('Token error in class method:', err);
       throw err;
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. getBearerTokenProvider — callback error handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+const credential = new DefaultAzureCredential();
+const scope = 'https://cognitiveservices.azure.com/.default';
+
+export async function bearerTokenProviderNoCatch(): Promise<string> {
+  // SHOULD_FIRE: bearer-token-provider-no-try-catch
+  // getBearerTokenProvider() callback called without try-catch
+  // throws Error("Failed to get access token") when credential fails
+  const getToken = getBearerTokenProvider(credential, scope);
+  const token = await getToken();
+  return token;
+}
+
+export async function bearerTokenProviderWithCatch(): Promise<string> {
+  const getToken = getBearerTokenProvider(credential, scope);
+  try {
+    // SHOULD_NOT_FIRE: getBearerTokenProvider callback wrapped in try-catch
+    const token = await getToken();
+    return token;
+  } catch (err) {
+    if (err instanceof CredentialUnavailableError) {
+      console.error('Azure credential not available:', err.message);
+    } else {
+      console.error('Failed to get bearer token:', err);
+    }
+    throw err;
+  }
+}
+
+export async function bearerTokenProviderInlineNoCatch(): Promise<void> {
+  // SHOULD_FIRE: bearer-token-provider-no-try-catch
+  // Inline usage: callback created and immediately awaited, no try-catch
+  const token = await getBearerTokenProvider(credential, scope)();
+  console.log('token:', token);
+}
+
+export async function bearerTokenProviderInlineWithCatch(): Promise<void> {
+  try {
+    // SHOULD_NOT_FIRE: inline getBearerTokenProvider call wrapped in try-catch
+    const token = await getBearerTokenProvider(credential, scope)();
+    console.log('token:', token);
+  } catch (err) {
+    console.error('Token acquisition failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. InteractiveBrowserCredential.authenticate() — interactive OAuth flow
+// ─────────────────────────────────────────────────────────────────────────────
+
+const interactiveCredential = new InteractiveBrowserCredential({
+  clientId: process.env.AZURE_CLIENT_ID ?? 'mock-client-id',
+  redirectUri: 'http://localhost:3000/auth/callback',
+});
+
+export async function interactiveAuthNoCatch(): Promise<string | undefined> {
+  // SHOULD_FIRE: interactive-authenticate-no-try-catch
+  // authenticate() can throw CredentialUnavailableError or AuthenticationError
+  const record = await interactiveCredential.authenticate(['User.Read']);
+  // Also SHOULD_FIRE if record is used with non-null assertion without null check
+  return record ? serializeAuthenticationRecord(record) : undefined;
+}
+
+export async function interactiveAuthWithCatch(): Promise<string | undefined> {
+  try {
+    // SHOULD_NOT_FIRE: authenticate() wrapped in try-catch with null check
+    const record = await interactiveCredential.authenticate(['User.Read']);
+    if (record) {
+      return serializeAuthenticationRecord(record);
+    }
+    return undefined;
+  } catch (err) {
+    if (err instanceof CredentialUnavailableError) {
+      console.error('Interactive auth failed:', err.message);
+    } else if (err instanceof AuthenticationError) {
+      console.error('Auth rejected:', err.errorResponse.error, err.errorResponse.errorDescription);
+    }
+    throw err;
   }
 }

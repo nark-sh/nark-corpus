@@ -2,9 +2,10 @@ package: "@azure/identity"
 semver: "^3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 functions:
   - name: getToken
@@ -97,6 +98,178 @@ functions:
           - "https://learn.microsoft.com/en-us/javascript/api/overview/azure/identity-readme"
           - "https://learn.microsoft.com/en-us/azure/developer/javascript/sdk/authentication/overview"
           - "https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/TROUBLESHOOTING.md"
+          - "https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/identity/identity"
+
+  - name: getBearerTokenProvider
+    import_path: "@azure/identity"
+    description: >
+      Returns a callback function `() => Promise<string>` that acquires a bearer
+      token using the provided credential. Used to obtain tokens for non-Azure-SDK
+      HTTP clients — for example, passing tokens to the OpenAI SDK, fetch(), or
+      custom REST clients. The returned async callback internally calls
+      credential.getToken() via a pipeline and extracts the token string from
+      the Authorization header. Throws `Error("Failed to get access token")` when
+      the credential cannot produce a token.
+
+    postconditions:
+      # Evidence: https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/src/tokenProvider.ts
+      # Source confirmed: throws new Error("Failed to get access token") when res.headers.get("authorization")?.split(" ")[1] is undefined
+      # Pattern: const getToken = getBearerTokenProvider(credential, scope); const token = await getToken();
+      - id: bearer-token-provider-no-try-catch
+        condition: >
+          The callback returned by getBearerTokenProvider() is called with `await`
+          but is not wrapped in a try-catch block. This includes patterns like:
+          `const token = await getToken()` or `headers.Authorization = 'Bearer ' + await getToken()`
+          where getToken is the callback from getBearerTokenProvider().
+        throws: >
+          Error("Failed to get access token") — thrown by the callback when the
+          underlying credential.getToken() fails to produce a valid token.
+          Internally, the callback pipes through a bearer token policy and reads
+          the Authorization header. If the credential throws (CredentialUnavailableError,
+          AuthenticationError) or returns null, the header is empty and the callback
+          throws this generic Error.
+
+          CredentialUnavailableError — propagates from the underlying credential
+          (DefaultAzureCredential, ManagedIdentityCredential) when no credential
+          source is configured or when not running in a valid Azure environment.
+
+          AuthenticationError — propagates from ClientSecretCredential or
+          ClientCertificateCredential when the credential configuration is wrong
+          (invalid tenant ID, expired secret, certificate mismatch).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          getBearerTokenProvider() is commonly used to pass Azure AD tokens to
+          third-party AI service clients (OpenAI SDK, custom fetch clients). The
+          returned callback acquires tokens on each call (with caching handled by
+          the MSAL layer). When the credential fails — due to misconfiguration,
+          expired secrets, or missing managed identity — the callback throws
+          `Error("Failed to get access token")`.
+
+          This is especially dangerous in API route handlers and background workers
+          where the token callback is called per-request. An unhandled rejection
+          crashes the handler for every user request until the auth issue is resolved.
+
+          Example dangerous pattern:
+            const getToken = getBearerTokenProvider(credential, 'https://cognitiveservices.azure.com/.default');
+            async function callOpenAI() {
+              const token = await getToken(); // ❌ throws if credential misconfigured
+              return openaiClient.chat.completions.create({...});
+            }
+
+          Correct pattern:
+            const getToken = getBearerTokenProvider(credential, scope);
+            async function callOpenAI() {
+              try {
+                const token = await getToken();
+                return await openaiClient.chat.completions.create({...});
+              } catch (err) {
+                if (err instanceof CredentialUnavailableError) {
+                  logger.error('Azure credential not available', err);
+                } else {
+                  logger.error('Failed to get bearer token', err);
+                }
+                throw err;
+              }
+            }
+        required_handling: >
+          MUST wrap calls to the getBearerTokenProvider() callback in try-catch.
+          Log the specific error type — CredentialUnavailableError indicates
+          configuration/environment issues; AuthenticationError indicates
+          credential validity issues (rotate secrets, check certificate).
+        source: "https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/src/tokenProvider.ts"
+        sources:
+          - "https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/src/tokenProvider.ts"
+          - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/getbearertokenprovider?view=azure-node-latest"
+          - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/?view=azure-node-latest"
+
+  - name: InteractiveBrowserCredential.authenticate
+    import_path: "@azure/identity"
+    description: >
+      Authenticates with Microsoft Entra ID using the interactive browser flow
+      (Authorization Code + PKCE on Node.js; popup/redirect in browsers).
+      Unlike getToken(), which silently retrieves cached tokens, authenticate()
+      always prompts the user interactively. Returns an `AuthenticationRecord`
+      (or `undefined` if authentication was silent and no record is available).
+      The returned record can be serialized and reused across sessions via
+      serializeAuthenticationRecord(). Used in OAuth 2.0 Authorization Code
+      flows in desktop apps, Electron apps, and server-side OAuth callback handlers.
+
+    postconditions:
+      # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/identity/interactivebrowsercredential?view=azure-node-preview
+      # Source: authenticate() throws CredentialUnavailableError on authentication failure
+      # Evidence: InteractiveBrowserCredential.authenticate() method signature confirmed from dist/commonjs/credentials/interactiveBrowserCredential.d.ts
+      - id: interactive-authenticate-no-try-catch
+        condition: >
+          InteractiveBrowserCredential.authenticate() is called with `await`
+          but is not wrapped in a try-catch block. Pattern:
+          `const record = await credential.authenticate(scopes)` where credential
+          is an instance of InteractiveBrowserCredential.
+        throws: >
+          CredentialUnavailableError — thrown with details of the failure when
+          authentication fails (browser popup blocked, user cancelled, redirect
+          misconfigured, Azure App Registration missing "Mobile and desktop
+          applications" redirect URI for Node.js use).
+
+          AuthenticationError — thrown when the OAuth 2.0 flow completes but
+          Azure AD rejects the authorization (consent not granted, conditional
+          access policy blocking, MFA required but not completed).
+
+          AuthenticationRequiredError — thrown when the token cannot be retrieved
+          silently and user interaction is required but has been disabled via
+          disableAutomaticAuthentication option.
+        severity: warning
+        business_impact:
+          incident_label: AUTHENTICATION_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+        description: >
+          InteractiveBrowserCredential.authenticate() forces an interactive
+          browser flow even when a cached token exists. Used in initial login
+          flows, token refresh scenarios, and OAuth callback handlers.
+
+          The critical distinction from getToken(): authenticate() returns
+          `AuthenticationRecord | undefined` — never throws on "no token",
+          but DOES throw on infrastructure failures (redirect misconfiguration,
+          consent rejection, network failures reaching the Azure AD endpoint).
+
+          Additionally, callers frequently fail to check if the return value is
+          undefined before serializing — `serializeAuthenticationRecord(record!)`
+          with a non-null assertion crashes if the user cancels the flow.
+
+          Common dangerous pattern in Electron apps:
+            const credential = new InteractiveBrowserCredential({clientId, redirectUri});
+            const record = await credential.authenticate(['User.Read']); // ❌ no try-catch
+            const savedRecord = serializeAuthenticationRecord(record!);  // ❌ crashes if undefined
+
+          Correct pattern:
+            try {
+              const record = await credential.authenticate(['User.Read']);
+              if (record) {
+                localStorage.setItem('authRecord', serializeAuthenticationRecord(record));
+              }
+            } catch (err) {
+              if (err instanceof CredentialUnavailableError) {
+                logger.error('Interactive auth failed', err);
+              }
+              throw err;
+            }
+        required_handling: >
+          MUST wrap await credential.authenticate() in try-catch.
+          MUST check if the returned AuthenticationRecord is defined before using
+          it (the return type is `AuthenticationRecord | undefined`).
+          Do not use non-null assertion (!) on the return value.
+        source: "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/interactivebrowsercredential?view=azure-node-latest"
+        sources:
+          - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/interactivebrowsercredential?view=azure-node-preview"
+          - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/?view=azure-node-latest"
           - "https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/identity/identity"
 
 tags:
