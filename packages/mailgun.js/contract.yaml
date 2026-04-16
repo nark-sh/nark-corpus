@@ -2,9 +2,10 @@ package: "mailgun.js"
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-15"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.57
 
 detection:
   class_names:
@@ -61,9 +62,445 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: validate.get
+    import_path: "mailgun.js"
+    description: >
+      Validates a single email address via the Mailgun Email Validation API.
+      Called as mg.validate.get('address@example.com'). Makes an HTTP GET request
+      to Mailgun's validation API and returns deliverability, syntax, MX, and spam-trap signals.
+      Throws on authentication failure (401), quota exhaustion (402/429), invalid request (400),
+      or network/service errors. Commonly used in signup forms to reduce bounce rates.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError") with fields { status, message, details }
+      # Source: mailgun.js ESM/mailgun.node.js — APIError constructor from HTTP response
+      - id: validate-authentication-error
+        condition: >
+          API key is missing, invalid, or revoked. HTTP 401 response from Mailgun.
+          Also occurs when using a private API key for a restricted endpoint.
+        throws: >
+          APIError with { status: 401, message: 'Forbidden', type: 'MailgunAPIError' }.
+          Check via: err?.type === 'MailgunAPIError' && err.status === 401.
+        required_handling: >
+          Caller MUST wrap mg.validate.get() in try-catch. Authentication failures in signup
+          flows silently pass unvalidated emails downstream or crash the signup endpoint.
+
+          Minimum handling:
+            try {
+              const result = await mg.validate.get(email);
+              return result;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Email validation failed', { status: error.status, details: error.details });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+          - "https://github.com/mailgun/mailgun.js/issues/411"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: validate-quota-exceeded
+        condition: >
+          Email validation quota exhausted (HTTP 402 PaymentRequired or 429 TooManyRequests).
+          Mailgun enforces per-plan validation quotas; exceeding them causes all subsequent
+          validate.get() calls to fail for the billing period or until the rate window resets.
+        throws: >
+          APIError with { status: 402, type: 'MailgunAPIError' } for quota exhaustion,
+          or { status: 429 } for rate limiting. Check via err?.type === 'MailgunAPIError'.
+        required_handling: >
+          Quota exhaustion must be caught and handled gracefully — treat validation as
+          optional when quota is exceeded rather than blocking registration entirely.
+
+          Minimum handling:
+            try {
+              const result = await mg.validate.get(email);
+              return result;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError' && (error.status === 402 || error.status === 429)) {
+                // Degrade gracefully — allow signup to proceed without validation
+                return { is_valid: true, degraded: true };
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: suppressions.create
+    import_path: "mailgun.js"
+    description: >
+      Adds one or more email addresses to a suppression list (bounces, unsubscribes, or complaints).
+      Called as mg.suppressions.create(domain, 'bounces'|'unsubscribes'|'complaints', data).
+      Critical for email compliance: adding addresses to suppression lists prevents re-sending
+      to opted-out, bounced, or complaining recipients. Throws on authentication failure,
+      unknown domain, invalid address format, or network errors.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError") with { status, message, details }
+      - id: suppressions-create-auth-error
+        condition: >
+          API key is invalid or missing. HTTP 401 from Mailgun. Also occurs when the API
+          key lacks permission for the domain.
+        throws: >
+          APIError with { status: 401, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap mg.suppressions.create() in try-catch. Suppression failures
+          are a compliance risk — if an unsubscribe cannot be recorded, subsequent sends
+          to that address may violate CAN-SPAM/GDPR and trigger spam complaints.
+
+          Minimum handling:
+            try {
+              await mg.suppressions.create(domain, 'unsubscribes', { address: email });
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Failed to add suppression', { status: error.status, email });
+                // Must retry or alert — failing to record unsubscribe is a compliance violation
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/openapi-final/tag/Messages/"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: suppressions-create-domain-not-found
+        condition: >
+          Domain passed to suppressions.create() does not exist in the Mailgun account.
+          HTTP 404 from Mailgun. Common when using the wrong domain string or a domain
+          that has been removed from the account.
+        throws: >
+          APIError with { status: 404, type: 'MailgunAPIError' }.
+        required_handling: >
+          Log and alert on 404 — it indicates a misconfiguration. The domain should be
+          verified before attempting to add suppressions.
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: suppressions.upload
+    import_path: "mailgun.js"
+    description: >
+      Bulk-uploads a suppression list (bounces, unsubscribes, complaints, or whitelist) from
+      a file (CSV or JSON). Called as mg.suppressions.upload(domain, type, fileData).
+      Added in mailgun.js v12.7.0 (2026-01-20). Used for one-time migrations or bulk imports
+      of suppression data. Throws on authentication failure, unknown domain, malformed file
+      format, or network errors.
+
+    postconditions:
+      # Evidence: CHANGELOG.md v12.7.0, README, source inspection
+      # Error class: APIError (type: "MailgunAPIError")
+      - id: suppressions-upload-auth-error
+        condition: >
+          API key is invalid or missing. HTTP 401 from Mailgun.
+        throws: >
+          APIError with { status: 401, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap mg.suppressions.upload() in try-catch. Bulk suppression
+          import failures should be logged and the operation retried or flagged for
+          manual review to avoid compliance violations.
+
+          Minimum handling:
+            try {
+              await mg.suppressions.upload(domain, 'bounces', fileData);
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Suppression upload failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: suppressions-upload-invalid-format
+        condition: >
+          File data is malformed, wrong MIME type, or the file content does not match
+          the expected format for the suppression type. HTTP 400 from Mailgun.
+        throws: >
+          APIError with { status: 400, type: 'MailgunAPIError', details: string }.
+        required_handling: >
+          Validate file format before uploading. On 400 errors, log the details field
+          for debugging — it typically contains the format validation message.
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: validate.multipleValidation.create
+    import_path: "mailgun.js"
+    description: >
+      Creates a bulk email validation job. Called as mg.validate.multipleValidation.create(listId, data).
+      Submits an address list for asynchronous batch validation. Throws on authentication failure,
+      invalid list reference, quota exhaustion, or malformed request data.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError")
+      - id: bulk-validate-create-auth-error
+        condition: >
+          API key is invalid, or the plan does not include bulk validation features.
+          HTTP 401 or 403 from Mailgun.
+        throws: >
+          APIError with { status: 401 | 403, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap in try-catch. Bulk validation job creation failures should
+          be handled by retrying with exponential backoff or alerting the operator.
+
+          Minimum handling:
+            try {
+              const job = await mg.validate.multipleValidation.create(listId, data);
+              return job;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Bulk validation create failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: bulk-validate-create-quota-exceeded
+        condition: >
+          Bulk validation quota exhausted for the plan. HTTP 402 or 429 from Mailgun.
+          Different from single-address validation quota.
+        throws: >
+          APIError with { status: 402 | 429, type: 'MailgunAPIError' }.
+        required_handling: >
+          Must handle quota exhaustion gracefully — log the error and defer the batch
+          job rather than retrying immediately.
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: lists.create
+    import_path: "mailgun.js"
+    description: >
+      Creates a new mailing list. Called as mg.lists.create({ address, name, description, access_level }).
+      Throws on authentication failure, duplicate address (409), invalid address format (400),
+      or network errors. Used in applications that manage mailing lists programmatically.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError")
+      - id: lists-create-auth-error
+        condition: >
+          API key is invalid or missing. HTTP 401 from Mailgun.
+        throws: >
+          APIError with { status: 401, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap mg.lists.create() in try-catch.
+
+          Minimum handling:
+            try {
+              const list = await mg.lists.create({ address: 'news@example.com' });
+              return list;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Mailing list create failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: lists-create-duplicate-address
+        condition: >
+          A mailing list with the same address already exists. HTTP 400 from Mailgun
+          with message indicating the list already exists.
+        throws: >
+          APIError with { status: 400, type: 'MailgunAPIError', details: 'Duplicate list address' }.
+        required_handling: >
+          Check for existing list before creating, or handle the 400 error by treating
+          it as a no-op (idempotent creation).
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: lists.members.createMember
+    import_path: "mailgun.js"
+    description: >
+      Adds a single member to a mailing list. Called as mg.lists.members.createMember(listAddress, { address, name, vars, subscribed }).
+      Throws on authentication failure, list not found (404), duplicate member (400),
+      invalid email format, or network errors. Used for newsletter subscription workflows.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError")
+      - id: list-member-create-auth-error
+        condition: >
+          API key is invalid or missing. HTTP 401 from Mailgun.
+        throws: >
+          APIError with { status: 401, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap mg.lists.members.createMember() in try-catch. Subscription
+          failures must be logged — a silent failure means the user believes they subscribed
+          but never receives any emails.
+
+          Minimum handling:
+            try {
+              await mg.lists.members.createMember(listAddress, { address: email });
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('List member add failed', { status: error.status });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: list-member-create-list-not-found
+        condition: >
+          The mailing list address does not exist. HTTP 404 from Mailgun. Common when
+          using incorrect list address or after a list has been deleted.
+        throws: >
+          APIError with { status: 404, type: 'MailgunAPIError' }.
+        required_handling: >
+          Log 404 and alert — indicates list misconfiguration. Should not retry without
+          creating the list first.
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: lists.members.createMembers
+    import_path: "mailgun.js"
+    description: >
+      Bulk-adds multiple members to a mailing list. Called as mg.lists.members.createMembers(listAddress, { members, upsert }).
+      Used for importing subscriber lists. Throws on authentication failure, list not found (404),
+      payload too large, or network errors. With upsert=true, existing members are updated.
+
+    postconditions:
+      # Evidence: https://github.com/mailgun/mailgun.js (README + source inspection)
+      # Error class: APIError (type: "MailgunAPIError")
+      - id: bulk-member-create-auth-error
+        condition: >
+          API key is invalid or missing. HTTP 401 from Mailgun.
+        throws: >
+          APIError with { status: 401, type: 'MailgunAPIError' }.
+        required_handling: >
+          Caller MUST wrap mg.lists.members.createMembers() in try-catch. Bulk import
+          failures should trigger a retry mechanism or alert the operator.
+
+          Minimum handling:
+            try {
+              await mg.lists.members.createMembers(listAddress, { members, upsert: true });
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                logger.error('Bulk member import failed', { status: error.status, count: members.length });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: bulk-member-create-payload-too-large
+        condition: >
+          Members array is too large for a single request. HTTP 400 or 413 from Mailgun.
+          Mailgun has per-request limits for bulk member imports.
+        throws: >
+          APIError with { status: 400 | 413, type: 'MailgunAPIError' }.
+        required_handling: >
+          Chunk large imports into batches of 1000 members or fewer. Handle the error
+          by splitting the members array and retrying each chunk.
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/v10.2.3/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
 notes:
   - "Initialization: const mailgun = new Mailgun(FormData); const mg = mailgun.client({username: 'api', key: API_KEY});"
   - "Type mg as IMailgunClient for static type annotation tracking: const mg: IMailgunClient = mailgun.client({...})"
   - "messages.create() is the primary email-sending entry point — all email delivery errors surface here"
   - "Error object has { status: number, details: string } for API errors"
   - "Requires Node.js >= 18.x; for EU, add url: 'https://api.eu.mailgun.net' to client config"
+  - "APIError type field: err?.type === 'MailgunAPIError' — use this for instanceof-style checking"
+  - "validate.get() requires a Private API Key (not Public), check Mailgun dashboard permissions"
+  - "suppressions.create() is a compliance-critical operation — failures must never be swallowed silently"
