@@ -24,6 +24,8 @@
  *   fine-tuning-jobs-create-no-error-handling (added pass 3)
  *   fine-tuning-jobs-start-no-error-handling  (added pass 3)
  *   connectors-call-tool-no-error-handling    (added pass 3)
+ *   judge-conversation-no-error-handling      (added pass 6)
+ *   judge-event-no-error-handling             (added pass 6)
  */
 import { Mistral } from '@mistralai/mistralai';
 
@@ -546,6 +548,100 @@ async function gt_connectors_call_tool_with_try_catch(connectorId: string, query
     return result.content;
   } catch (error) {
     console.error('MCP connector tool call error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 17. beta.observability.judges.judgeConversation — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 4 (2026-04-16, deepen-stream-2 pass 6)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: judge-conversation-no-error-handling
+async function gt_judge_conversation_missing(judgeId: string, userMsg: string, assistantMsg: string) {
+  // SHOULD_FIRE: judge-conversation-no-error-handling — no try-catch
+  // Throws ObservabilityError (JUDGE_NOT_FOUND, JUDGE_CONVERSATION_FORMAT_ERROR,
+  // JUDGE_MISTRAL_API_ERROR, JUDGE_MISTRAL_API_TIMEOUT) or MistralError
+  const result = await client.beta.observability.judges.judgeConversation({
+    judgeId,
+    judgeConversationRequest: {
+      messages: [
+        { role: 'user', content: userMsg },
+        { role: 'assistant', content: assistantMsg },
+      ],
+    },
+  });
+  return result.answer;
+}
+
+// 17. beta.observability.judges.judgeConversation — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_judge_conversation_with_try_catch(judgeId: string, userMsg: string, assistantMsg: string) {
+  try {
+    // SHOULD_NOT_FIRE: judgeConversation has try-catch
+    const result = await client.beta.observability.judges.judgeConversation({
+      judgeId,
+      judgeConversationRequest: {
+        messages: [
+          { role: 'user', content: userMsg },
+          { role: 'assistant', content: assistantMsg },
+        ],
+      },
+    });
+    return result.answer;
+  } catch (error) {
+    console.error('Judge conversation error:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// 18. beta.observability.chatCompletionEvents.judge — missing try-catch (SHOULD_FIRE)
+// Added in depth pass 4 (2026-04-16, deepen-stream-2 pass 6)
+// ──────────────────────────────────────────────────────────
+
+// @expect-violation: judge-event-no-error-handling
+async function gt_judge_event_missing(eventId: string) {
+  // SHOULD_FIRE: judge-event-no-error-handling — no try-catch
+  // Throws ObservabilityError (JUDGE_NOT_FOUND, SEARCH_NOT_FOUND,
+  // JUDGE_MISTRAL_API_ERROR, JUDGE_MISTRAL_API_TIMEOUT) or MistralError
+  const result = await client.beta.observability.chatCompletionEvents.judge({
+    eventId,
+    judgeChatCompletionEventRequest: {
+      judgeDefinition: {
+        name: 'quality-judge',
+        description: 'Rates response quality',
+        modelName: 'mistral-large-latest',
+        output: { type: 'REGRESSION' as const, min: 0, minDescription: 'Poor', max: 10, maxDescription: 'Excellent' },
+        instructions: 'Rate the quality of the response from 0 to 10',
+        tools: [],
+      },
+    },
+  });
+  return result.answer;
+}
+
+// 18. beta.observability.chatCompletionEvents.judge — with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_judge_event_with_try_catch(eventId: string) {
+  try {
+    // SHOULD_NOT_FIRE: chatCompletionEvents.judge has try-catch
+    const result = await client.beta.observability.chatCompletionEvents.judge({
+      eventId,
+      judgeChatCompletionEventRequest: {
+        judgeDefinition: {
+          name: 'quality-judge',
+          description: 'Rates response quality',
+          modelName: 'mistral-large-latest',
+          output: { type: 'REGRESSION' as const, min: 0, minDescription: 'Poor', max: 10, maxDescription: 'Excellent' },
+          instructions: 'Rate the quality of the response from 0 to 10',
+          tools: [],
+        },
+      },
+    });
+    return result.answer;
+  } catch (error) {
+    console.error('Judge event error:', error);
     throw error;
   }
 }

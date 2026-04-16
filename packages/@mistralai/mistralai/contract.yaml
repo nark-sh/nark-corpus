@@ -38,7 +38,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.61
+coverage_score: 0.67  # 22 contracted / 33 total (11 omitted)
 
 detection:
   class_names:
@@ -1108,6 +1108,164 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: judgeConversation
+    import_path: "@mistralai/mistralai"
+    description: >
+      Runs a saved LLM judge on a conversation payload. Called as
+      client.beta.observability.judges.judgeConversation({ judgeId, judgeConversationRequest }).
+      Used by SaaS apps that implement LLM-as-judge quality evaluation pipelines — e.g.
+      scoring chatbot responses, checking factual consistency, or rating helpfulness at runtime.
+      Posts messages to /v1/observability/judges/{judge_id}/live-judging.
+      Throws ObservabilityError (distinct from MistralError) for 400/404/408/409/422 responses
+      with specific ObservabilityErrorCode values. Returns JudgeOutput { analysis: string, answer: string | number }.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of
+      #   src/funcs/betaObservabilityJudgesJudgeConversation.ts
+      # Error type: ObservabilityError (extends MistralError) with ObservabilityErrorCode enum
+      #   confirmed from src/models/errors/observabilityerror.ts
+      # ObservabilityErrorCode values confirmed from
+      #   src/models/components/observabilityerrorcode.ts
+      # Error HTTP codes: 400, 404, 408, 409, 422 → ObservabilityError; 4XX/5XX → MistralError
+      - id: judge-conversation-no-error-handling
+        condition: >
+          client.beta.observability.judges.judgeConversation() called without try-catch or .catch() handler
+        throws: >
+          ObservabilityError (.detail.errorCode === 'JUDGE_NOT_FOUND', HTTP 404) when the
+          judgeId does not exist or was deleted after the evaluation pipeline was configured.
+          ObservabilityError (.detail.errorCode === 'JUDGE_CONVERSATION_FORMAT_ERROR', HTTP 422)
+          when the messages array structure does not match the judge's expected conversation format.
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_ERROR', HTTP 400)
+          when the underlying Mistral model call within the judge fails (e.g. model unavailable,
+          invalid messages content, context length exceeded for the judge's model).
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_TIMEOUT', HTTP 408)
+          when the underlying Mistral model call exceeds the configured timeout.
+          MistralError (.statusCode=401) when API key is invalid or revoked.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when request fails schema validation before sending.
+          Note: ObservabilityError has a .detail field with { message: string, errorCode: string }
+          for structured error handling — catch separately from generic MistralError.
+        required_handling: >
+          Caller MUST wrap await client.beta.observability.judges.judgeConversation() in
+          try-catch or chain .catch(). LLM-as-judge pipelines that score responses at inference
+          time will throw ObservabilityError when the judge model times out or the conversation
+          format is wrong — uncaught errors abort the entire scoring batch.
+          ObservabilityError must be caught separately from MistralError because its .detail
+          field provides structured error codes that allow differentiated handling.
+
+          try {
+            const result = await client.beta.observability.judges.judgeConversation({
+              judgeId: process.env.MISTRAL_JUDGE_ID,
+              judgeConversationRequest: {
+                messages: [
+                  { role: 'user', content: userQuery },
+                  { role: 'assistant', content: modelResponse },
+                ],
+                properties: { expectedAnswer: groundTruth },
+              },
+            });
+            // answer is string | number — check type before using
+            const score = typeof result.answer === 'number' ? result.answer : parseFloat(result.answer);
+            return { score, analysis: result.analysis };
+          } catch (error) {
+            if (error instanceof ObservabilityError) {
+              if (error.detail?.errorCode === 'JUDGE_NOT_FOUND') {
+                throw new Error(`Judge ${judgeId} not found — check judge ID configuration`);
+              }
+              if (error.detail?.errorCode === 'JUDGE_MISTRAL_API_TIMEOUT') {
+                throw new Error(`Judge timed out — retry or use a faster judge model`);
+              }
+              throw new Error(`Judge error: ${error.detail?.message}`);
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaObservabilityJudgesJudgeConversation.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/errors/observabilityerror.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/components/observabilityerrorcode.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: judgeEvent
+    import_path: "@mistralai/mistralai"
+    description: >
+      Runs a saved LLM judge on a stored chat completion event in the observability store.
+      Called as client.beta.observability.chatCompletionEvents.judge({ eventId, judgeId, ... }).
+      Used by SaaS apps that do post-hoc quality scoring of stored AI interactions —
+      e.g. automated review pipelines that evaluate recorded conversations for compliance,
+      quality, or safety. Posts to /v1/observability/chat-completion-events/{event_id}/live-judging.
+      Throws ObservabilityError (distinct from MistralError) for 400/404/408/409/422 responses.
+      Returns JudgeOutput { analysis: string, answer: string | number }.
+
+    postconditions:
+      # Evidence: confirmed from source inspection of
+      #   src/funcs/betaObservabilityChatCompletionEventsJudge.ts
+      # Error type: ObservabilityError with ObservabilityErrorCode enum (same as judgeConversation)
+      # Error HTTP codes: 400, 404, 408, 409, 422 → ObservabilityError; 4XX/5XX → MistralError
+      # Confirmed from: src/funcs/betaObservabilityChatCompletionEventsJudge.ts
+      #   errorCodes: ["400", "404", "408", "409", "422", "4XX", "5XX"]
+      - id: judge-event-no-error-handling
+        condition: >
+          client.beta.observability.chatCompletionEvents.judge() called without try-catch or .catch() handler
+        throws: >
+          ObservabilityError (.detail.errorCode === 'JUDGE_NOT_FOUND', HTTP 404) when judgeId
+          does not exist or was deleted after the evaluation pipeline was configured.
+          ObservabilityError (.detail.errorCode === 'SEARCH_NOT_FOUND' or HTTP 404) when the
+          eventId does not exist in the observability store (event expired or never logged).
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_ERROR', HTTP 400)
+          when the underlying Mistral model call within the judge fails.
+          ObservabilityError (.detail.errorCode === 'JUDGE_MISTRAL_API_TIMEOUT', HTTP 408)
+          when the judge model call exceeds timeout.
+          MistralError (.statusCode=401) when API key is invalid.
+          MistralError (.statusCode=429) rate limit — auto-retried by SDK before throwing.
+          ConnectionError / RequestTimeoutError on network failures.
+          SDKValidationError when request fails schema validation.
+        required_handling: >
+          Caller MUST wrap await client.beta.observability.chatCompletionEvents.judge() in
+          try-catch or chain .catch(). Automated evaluation pipelines that process stored
+          events in batches will throw ObservabilityError when any event is not found or
+          the judge model times out — uncaught errors abort the entire batch, losing scoring
+          progress for previously processed events in the same run.
+
+          try {
+            const result = await client.beta.observability.chatCompletionEvents.judge({
+              eventId: chatEventId,
+              judgeId: process.env.MISTRAL_JUDGE_ID,
+            });
+            return { score: result.answer, analysis: result.analysis };
+          } catch (error) {
+            if (error instanceof ObservabilityError) {
+              const code = error.detail?.errorCode;
+              if (code === 'JUDGE_NOT_FOUND') {
+                throw new Error(`Judge not found — check judge configuration`);
+              }
+              if (code === 'JUDGE_MISTRAL_API_TIMEOUT') {
+                // Retry with backoff or skip this event
+                console.warn(`Judge timed out for event ${eventId}`);
+                return null;
+              }
+              throw new Error(`Observability error: ${error.detail?.message}`);
+            }
+            throw error;
+          }
+        sources:
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/funcs/betaObservabilityChatCompletionEventsJudge.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/errors/observabilityerror.ts"
+          - "https://github.com/mistralai/client-ts/blob/main/packages/mistralai/src/models/components/observabilityerrorcode.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "Mistral constructor (new Mistral({apiKey})) does NOT make network calls — no try-catch needed there"
   - "client.chat.complete() is a 2-level property chain: client.chat → chat namespace → .complete() method"
@@ -1124,3 +1282,6 @@ notes:
   - "beta.conversations.append() 404 means conversation expired — handle by starting a new conversation"
   - "beta.libraries.documents.upload() status 'queued' != searchable — must poll doc status before using in RAG"
   - "workflows.executeWorkflow() may return async execution ID rather than final result — check response structure"
+  - "ObservabilityError (extends MistralError) is thrown by all beta.observability.* endpoints — has .detail.errorCode (ObservabilityErrorCode enum) and .detail.message fields"
+  - "beta.observability.judges.judgeConversation() and chatCompletionEvents.judge() are runtime judging calls — distinct from admin CRUD operations on judges/campaigns/datasets"
+  - "JudgeOutput.answer is string | number union type — always check type before numeric operations"
