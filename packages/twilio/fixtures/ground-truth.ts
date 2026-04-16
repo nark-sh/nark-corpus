@@ -51,8 +51,7 @@ export async function sendSmsWithCatch(to: string, body: string) {
 // @expect-violation: calls-update-no-try-catch
 export async function cancelCallNoCatch(callSid: string) {
   const client = twilio(accountSid, authToken);
-  // SHOULD_FIRE: calls-update-no-try-catch — update() throws RestException 21220 when call
-  // is no longer in-progress. No try-catch.
+  // SHOULD_FIRE: calls-update-no-try-catch — update() throws RestException 21220 when call is no longer in-progress. No try-catch.
   const call = await client.calls(callSid).update({ status: 'canceled' });
   return call.sid;
 }
