@@ -534,3 +534,150 @@ export async function multipleCallsNoCatch(text: string) {
   const moderation = await openai.moderations.create({ input: text });
   return { embedding, moderation };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. uploads.complete — missing try-catch (NEW: bc-deepen-contract stream-1 pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: uploads-complete-byte-count-mismatch
+// @expect-violation: uploads-complete-expired-upload
+export async function uploadsCompleteNoCatch(uploadId: string, partIds: string[]) {
+  // SHOULD_FIRE: uploads-complete-byte-count-mismatch — uploads.complete throws on mismatch, no try-catch
+  // SHOULD_FIRE: uploads-complete-expired-upload — uploads.complete throws NotFoundError on expired upload
+  const upload = await openai.uploads.complete(uploadId, {
+    part_ids: partIds,
+  });
+  return upload.id;
+}
+
+// @expect-clean
+export async function uploadsCompleteWithCatch(uploadId: string, partIds: string[], md5?: string) {
+  try {
+    // SHOULD_NOT_FIRE: uploads.complete inside try-catch is safe
+    const upload = await openai.uploads.complete(uploadId, {
+      part_ids: partIds,
+      md5,
+    });
+    return upload.id;
+  } catch (error) {
+    if (error instanceof OpenAI.NotFoundError) {
+      throw new Error('Upload expired or not found — restart from uploads.create()');
+    }
+    if (error instanceof OpenAI.BadRequestError) {
+      throw new Error('Upload byte count mismatch or MD5 checksum failed — check part assembly');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. uploads.parts.create — missing try-catch (NEW: bc-deepen-contract stream-1 pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: uploads-parts-size-exceeded
+// @expect-violation: uploads-parts-invalid-upload-state
+export async function uploadsPartsCreateNoCatch(uploadId: string, chunk: Blob) {
+  // SHOULD_FIRE: uploads-parts-size-exceeded — parts.create throws on >64 MB chunks, no try-catch
+  // SHOULD_FIRE: uploads-parts-invalid-upload-state — parts.create throws on expired upload, no try-catch
+  const part = await openai.uploads.parts.create(uploadId, { data: chunk });
+  return part.id;
+}
+
+// @expect-clean
+export async function uploadsPartsCreateWithCatch(uploadId: string, chunk: Blob) {
+  try {
+    // SHOULD_NOT_FIRE: uploads.parts.create inside try-catch is safe
+    const part = await openai.uploads.parts.create(uploadId, { data: chunk });
+    return part.id;
+  } catch (error) {
+    if (error instanceof OpenAI.NotFoundError) {
+      throw new Error('Upload expired, cancelled, or completed — cannot add more parts');
+    }
+    if (error instanceof OpenAI.BadRequestError) {
+      throw new Error('Part exceeds 64 MB limit — split chunk before uploading');
+    }
+    if (error instanceof OpenAI.RateLimitError) {
+      throw new Error('Rate limit exceeded during part upload — reduce concurrency');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. responses.parse — missing try-catch (NEW: bc-deepen-contract stream-1 pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: responses-parse-non-strict-tool-error
+// @expect-violation: responses-parse-malformed-json-output
+export async function responsesParseNoCatch(prompt: string) {
+  // SHOULD_FIRE: responses-parse-non-strict-tool-error — throws OpenAIError before API call for non-strict tools
+  // SHOULD_FIRE: responses-parse-malformed-json-output — JSON.parse throws SyntaxError if model output is malformed
+  const response = await openai.responses.parse({
+    model: 'gpt-4o',
+    input: [{ role: 'user', content: prompt }],
+    text: { format: { type: 'json_schema', name: 'result', schema: { type: 'object' }, strict: true } },
+  });
+  return response.output_parsed;
+}
+
+// @expect-clean
+export async function responsesParseWithCatch(prompt: string) {
+  try {
+    // SHOULD_NOT_FIRE: responses.parse inside try-catch that handles both APIError and SyntaxError
+    const response = await openai.responses.parse({
+      model: 'gpt-4o',
+      input: [{ role: 'user', content: prompt }],
+      text: { format: { type: 'json_schema', name: 'result', schema: { type: 'object' }, strict: true } },
+    });
+    if (response.status !== 'completed') {
+      throw new Error(`Response incomplete: ${response.status} — ${JSON.stringify(response.incomplete_details)}`);
+    }
+    return response.output_parsed;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Model returned malformed JSON — check max_output_tokens and truncation strategy');
+    }
+    if (error instanceof OpenAI.APIError) {
+      throw new Error(`OpenAI API error: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. realtime.sessions.create — missing try-catch (NEW: bc-deepen-contract stream-1 pass 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: realtime-sessions-authentication-error
+// @expect-violation: realtime-sessions-permission-denied
+export async function realtimeSessionsCreateNoCatch() {
+  // SHOULD_FIRE: realtime-sessions-authentication-error — throws AuthenticationError, no try-catch
+  // SHOULD_FIRE: realtime-sessions-permission-denied — throws PermissionDeniedError if Realtime not enabled
+  const session = await (openai as any).beta?.realtime?.sessions?.create({
+    model: 'gpt-4o-realtime-preview',
+  });
+  return session?.client_secret?.value;
+}
+
+// @expect-clean
+export async function realtimeSessionsCreateWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: realtime.sessions.create inside try-catch with proper error differentiation
+    const session = await (openai as any).beta?.realtime?.sessions?.create({
+      model: 'gpt-4o-realtime-preview',
+      expires_after: { anchor: 'created_at', seconds: 300 },
+    });
+    if (!session?.client_secret?.value) {
+      throw new Error('Realtime session creation returned empty token');
+    }
+    return session.client_secret.value;
+  } catch (error) {
+    if (error instanceof OpenAI.AuthenticationError) {
+      throw new Error('Invalid API key — cannot generate Realtime session token');
+    }
+    if (error instanceof OpenAI.PermissionDeniedError) {
+      throw new Error('Realtime API not enabled on this account — check OpenAI dashboard');
+    }
+    throw error;
+  }
+}

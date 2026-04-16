@@ -1,31 +1,33 @@
 package: openai
 semver: ">=4.0.0 <7.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-# Depth pass 2026-04-16 (deepen-stream-2 pass 6):
-# Expanded coverage from 9→16 contracted functions (+7 this pass).
-# API surface total: 27 async-callable (full enumeration from openai@6.34.0 TypeScript declarations)
-# Contracted: 16; omitted: 11; coverage_score: ~0.59 (contracted / (total - omitted))
-# New omissions: images.createVariation/edit (same error surface as generate),
-#   fine_tuning.jobs.cancel/pause/resume (lifecycle management, no novel error contracts),
-#   batches.retrieve/cancel (management ops), vector_stores CRUD/retrieve/list/delete/search,
-#   uploads.cancel (cleanup), beta.assistants/threads (deprecated Assistants API),
-#   conversations/containers/videos/skills/evals (new/experimental, limited SaaS adoption),
-#   responses.cancel/compact/retrieve (cleanup/management), chat.completions CRUD,
-#   models.list/retrieve (read-only), fine_tuning.graders (beta).
+# Depth pass 2026-04-16 (deepen-stream-1 pass 2):
+# Expanded coverage from 16→20 contracted functions (+4 this pass).
+# API surface total: 31 async-callable (updated from 27 — discovered 4 missed in prior pass:
+#   responses.parse, uploads.complete, uploads.parts.create, realtime.sessions.create)
+# Contracted: 20; omitted: 11; coverage_score: ~0.65 (contracted / total)
+# New functions added:
+#   responses.parse() — throws OpenAIError for non-strict tools; JSON.SyntaxError for malformed JSON schema output
+#   uploads.complete() — throws BadRequestError for byte count mismatch; md5 checksum failure; expired upload
+#   uploads.parts.create() — throws BadRequestError for parts >64 MB; NotFoundError for expired/cancelled upload
+#   realtime.sessions.create() — throws AuthenticationError; PermissionDeniedError if Realtime API not enabled
 # Evidence from openai-node@6.x source:
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/files.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/parts.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/vector-stores.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/files.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/vector-stores/file-batches.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/audio/translations.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/realtime/client-secrets.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
+#   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.59  # 16 contracted / 27 total async-callable functions (11 intentionally omitted)
+coverage_score: 0.65  # 20 contracted / 31 total async-callable functions (11 intentionally omitted)
 
 functions:
   - name: create
@@ -1105,3 +1107,364 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # uploads.complete()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Finalizes a multipart upload by assembling ordered parts into a single File object.
+  # Required step after all uploads.parts.create() calls. Returns a File object usable
+  # in fine-tuning and assistant file APIs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: uploads.complete
+    import_path: "openai"
+    description: >
+      Finalizes a multipart upload via openai.uploads.complete(uploadID, { part_ids, md5? }).
+      Assembles ordered parts into a completed File object. The upload must not be expired
+      (1-hour window from creation). Total bytes of all parts must match the byte_count
+      declared in uploads.create(). Optionally verifies MD5 checksum for integrity.
+      Returns a completed Upload object whose file.id can be used in fine-tuning and file APIs.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # uploads.ts source confirms byte count must match declared size; md5 optional but checked
+      - id: uploads-complete-byte-count-mismatch
+        condition: >
+          Total bytes across all uploaded parts does not match the byte_count declared in
+          uploads.create(), OR md5 checksum provided but does not match assembled content (400)
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST track total bytes uploaded across all parts and verify they match
+          the declared byte_count before calling complete().
+          If md5 is provided (recommended for integrity): compute MD5 of the full file
+          before splitting and pass it in; mismatch means a part was corrupted in transit.
+          DO NOT call complete() with mismatched bytes — the upload cannot be repaired,
+          caller must restart from uploads.create() with fresh parameters.
+          Log the part count, part IDs, and byte totals for debugging corrupted uploads.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: NotFoundError confirmed in error.ts (status 404)
+      # Expired upload (>1h since creation) or cancelled upload → 404
+      - id: uploads-complete-expired-upload
+        condition: >
+          Upload was not completed within 1 hour of creation (expired), or upload was
+          previously cancelled. NotFoundError thrown (404).
+        throws: "NotFoundError with status 404"
+        required_handling: >
+          Caller MUST call uploads.complete() within 1 hour of uploads.create().
+          For large files with many parts: start parts.create() calls immediately after create()
+          and track time remaining in the 1-hour window.
+          If expired: entire upload is lost — restart from uploads.create() with fresh bytes.
+          Implement a deadline guard: if time elapsed > 50 minutes, cancel and restart rather
+          than risk partial completion failure.
+          Track upload creation timestamp alongside uploadID.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/uploads.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      - id: uploads-complete-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key.
+          Alert operations team — this is a configuration error.
+          The upload cannot be recovered without a valid API key.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # uploads.parts.create()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/parts.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Uploads a single chunk of a multipart upload. Must be called after uploads.create()
+  # and before uploads.complete(). Chunks can be uploaded in parallel. Each part ≤64 MB.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: uploads.parts.create
+    import_path: "openai"
+    description: >
+      Uploads a single chunk of bytes via openai.uploads.parts.create(uploadID, { data }).
+      Must be called after uploads.create() and before uploads.complete().
+      Each individual part must be ≤64 MB. Parts can be uploaded in parallel.
+      Returns an UploadPart with a part_id used in uploads.complete({ part_ids }).
+      Upload must not be expired, cancelled, or already completed.
+
+    postconditions:
+      # Evidence: BadRequestError confirmed in error.ts (status 400)
+      # parts.ts confirms 64 MB per-part limit
+      - id: uploads-parts-size-exceeded
+        condition: "Individual part exceeds 64 MB limit (400)"
+        throws: "BadRequestError with status 400"
+        required_handling: >
+          Caller MUST split file into chunks of ≤64 MB before calling parts.create().
+          Recommended chunk size: 32–50 MB for reliable uploads with retry headroom.
+          Track part size before upload; reject oversized chunks without calling API.
+          Total upload may be up to 8 GB across all parts.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/parts.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: NotFoundError confirmed in error.ts (status 404)
+      # Adding parts to an expired, cancelled, or completed upload → 404
+      - id: uploads-parts-invalid-upload-state
+        condition: >
+          Upload is expired (>1h since creation), cancelled, or already completed.
+          NotFoundError (404) thrown when attempting to add parts.
+        throws: "NotFoundError with status 404"
+        required_handling: >
+          Caller MUST verify uploadID is valid and upload is in 'pending' state before
+          calling parts.create(). Store upload creation timestamp; abort parallel part
+          uploads if the 1-hour deadline is approaching.
+          When running parts in parallel: if any part returns NotFoundError, cancel all
+          remaining in-flight part uploads immediately to avoid wasted API calls.
+          On expiry: restart from uploads.create() — all previously uploaded parts are lost.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/uploads/parts.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      # Parallel part uploads can hit rate limits more easily than sequential uploads
+      - id: uploads-parts-rate-limit-error
+        condition: "Rate limit exceeded during parallel part uploads (429)"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller MUST implement concurrency limits when uploading parts in parallel.
+          Recommended: limit to 3-5 concurrent part uploads with exponential backoff on 429.
+          SDK retries automatically (2 retries with exponential backoff) but application-level
+          concurrency control prevents cascading rate limit failures.
+          Track failed part IDs; retry only failed parts (completed parts need not be re-uploaded).
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # responses.parse()
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/responses/responses.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Structured output version of responses.create() — calls create() then parses the response
+  # output using zodResponseFormat or json_schema. Throws OpenAIError for configuration
+  # errors (non-strict tools) before making any API call.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: responses.parse
+    import_path: "openai"
+    description: >
+      Structured-output version of responses.create() via openai.responses.parse().
+      Calls responses.create() then runs parseResponse() to map output into typed objects.
+      For text format: parses output_text as JSON using json_schema or zodResponseFormat.
+      For tool calls: parses arguments of strict-mode function tools.
+      Throws OpenAIError immediately (before API call) if tools are not configured with strict: true.
+      If the API response status is 'incomplete' or 'failed', the response is returned as-is
+      (no exception) — caller must check response.status.
+
+    postconditions:
+      # Evidence: OpenAIError thrown by validateInputTools() in ResponsesParser.ts (confirmed in built JS)
+      # Throw happens client-side before any network call when tools lack strict: true
+      - id: responses-parse-non-strict-tool-error
+        condition: >
+          Any tool in the request is not of type 'function', or a function tool does not have
+          strict: true set. OpenAIError thrown client-side before any API call is made.
+        throws: "OpenAIError (not an HTTP error class) with message about strict: true requirement"
+        required_handling: >
+          Caller MUST set strict: true on all function tools passed to responses.parse().
+          Prefer zodResponseFormat() or explicitly constructed json_schema with strict: true.
+          Use responses.create() instead if tools do not support strict mode.
+          This error is configuration-only — fix the tool definition, not the runtime logic.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: JSON.parse() throws SyntaxError if model produces malformed JSON
+      # parseTextFormat() calls JSON.parse(content) directly with no try-catch
+      - id: responses-parse-malformed-json-output
+        condition: >
+          Model returns output that does not conform to the requested json_schema format.
+          JSON.parse() throws SyntaxError inside parseTextFormat() — not caught by the SDK.
+          Can occur when model generates partial JSON (e.g. context-length truncation),
+          or when response.status is 'incomplete' due to max_output_tokens limit.
+        throws: "SyntaxError: Unexpected token ... (from JSON.parse inside ResponsesParser)"
+        required_handling: >
+          Caller MUST wrap responses.parse() in try-catch that handles both APIError
+          and SyntaxError separately.
+          Check response.status before trusting output_parsed — if status is 'incomplete',
+          the model ran out of tokens and the JSON may be truncated.
+          Use response.incomplete_details to understand why generation stopped.
+          Consider increasing max_output_tokens or chunking the prompt for long outputs.
+          DO NOT assume output_parsed is populated when status !== 'completed'.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: RateLimitError confirmed in error.ts (status 429)
+      # responses.parse() delegates to responses.create() which throws RateLimitError
+      - id: responses-parse-rate-limit-error
+        condition: "Rate limit exceeded (429) — same limits as responses.create()"
+        throws: "RateLimitError with status 429"
+        required_handling: >
+          Caller SHOULD implement exponential backoff for batch structured-output workflows.
+          SDK automatically retries 2 times with exponential backoff.
+          Structured output workflows often run in tight loops (e.g. document extraction pipelines)
+          where rate limiting is more likely than in interactive chat flows.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # realtime.sessions.create()  (via openai.beta.realtime.sessions.create())
+  # Evidence source: openai-node SDK source at
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/realtime/client-secrets.ts
+  #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
+  # Generates ephemeral client secret tokens for Realtime API WebRTC sessions.
+  # Tokens expire in 1-60 min (default 10 min). Used in web/mobile apps to grant
+  # Realtime API access without exposing the main API key.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: realtime.sessions.create
+    import_path: "openai"
+    description: >
+      Generates an ephemeral client secret token via openai.beta.realtime.sessions.create()
+      or openai.realtime.clientSecrets.create(). Tokens are short-lived (default 10 min,
+      configurable 10 sec–2 hours via expires_after.seconds). Token format: 'ek_...'.
+      A single secret can create multiple sessions until it expires.
+      Used in WebRTC voice applications to pass Realtime API access to browser clients
+      without embedding the main API key in client code.
+
+    postconditions:
+      # Evidence: AuthenticationError confirmed in error.ts (status 401)
+      # Ephemeral tokens generated on server side — API key must be valid
+      - id: realtime-sessions-authentication-error
+        condition: "Invalid or missing API key (401)"
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT pass the ephemeral token to the client if token generation fails.
+          The client-side WebRTC connection will fail silently if given an invalid token.
+          Server MUST handle AuthenticationError and return 500 to the client rather than
+          passing through a null/undefined token.
+          Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: PermissionDeniedError confirmed in error.ts (status 403)
+      # Realtime API access requires specific tier or API plan enablement
+      - id: realtime-sessions-permission-denied
+        condition: >
+          Account does not have Realtime API access enabled, or the requested model
+          is not available on the account's tier. PermissionDeniedError (403).
+        throws: "PermissionDeniedError with status 403"
+        required_handling: >
+          Caller MUST check for PermissionDeniedError separately from AuthenticationError.
+          This is NOT a transient error — retrying will not help.
+          Return a clear error to the client: "Voice features are not available on this plan."
+          Check OpenAI account dashboard to enable Realtime API access.
+          Log error.code from the response for support escalation.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: Token expiry behavior from realtime/client-secrets.ts source
+      # Ephemeral tokens expire and the client connection silently fails with no error surfaced
+      - id: realtime-sessions-token-expiry-silent-failure
+        condition: >
+          Ephemeral client secret expires (default 10 minutes) before the client uses it
+          to establish a WebRTC session. No error is thrown at token creation — the failure
+          is silent and deferred to WebRTC connection establishment on the client side.
+        throws: "No exception at token creation; WebRTC connection fails silently on client"
+        required_handling: >
+          Caller MUST generate ephemeral tokens as close to client usage as possible.
+          DO NOT pre-generate tokens and cache them for reuse across multiple client sessions.
+          If token TTL must be extended: set expires_after.seconds to match expected client
+          wait time (max 7200 seconds / 2 hours).
+          Front-end clients MUST implement reconnection logic that requests a new token
+          from the server when the WebRTC connection fails — token expiry looks identical
+          to a network error from the client's perspective.
+          Server MUST log the token's expires_at timestamp alongside the session to
+          diagnose client-side reconnection failures.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/resources/realtime/client-secrets.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
