@@ -1,10 +1,11 @@
 package: googleapis
 semver: ">=39.1.0 <200.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.77  # 10 contracted functions / 13 meaningful async-callable API groups (3 intentionally omitted)
 
 # Detection rules for analyzer integration
 detection:
@@ -141,4 +142,438 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ─── Gmail API ────────────────────────────────────────────────────────────────
+
+  - name: messages.send
+    import_path: "googleapis"
+    description: >
+      Sends an email message via Gmail API. Called as gmail.users.messages.send().
+      Makes an authenticated HTTP request to the Gmail API. Throws GaxiosError on
+      auth failure, quota exhaustion, send limit, or invalid recipient. Unlike
+      generic GaxiosError, Gmail send has specific quota errors (dailyLimitExceeded)
+      and per-user rate limits that differ from the project-level quota.
+    patterns:
+      - '.messages.send('
+      - 'gmail.users.messages.send('
+
+    postconditions:
+      # Evidence: https://developers.google.com/gmail/api/guides/handle-errors
+      # Error types confirmed: authError (401), dailyLimitExceeded/rateLimitExceeded (403),
+      # userRateLimitExceeded (403), sendingLimitExceeded (429), backendError (500)
+      - id: gmail-messages-send-auth-error
+        condition: >
+          gmail.users.messages.send() is called without try-catch and the OAuth
+          token is expired, invalid, or missing the gmail.send scope.
+        throws: "GaxiosError with status 401, error.code === 'authError'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 401 and refresh the OAuth token.
+          Verify the token has the gmail.send scope (https://mail.google.com/).
+          Re-authenticate the user if the refresh token is also invalid.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: gmail-messages-send-quota-exceeded
+        condition: >
+          gmail.users.messages.send() is called without try-catch and the project
+          or user has exhausted the Gmail API daily quota. Common in email automation
+          services, bulk notification senders, or apps that send per-user emails
+          without rate limiting.
+        throws: "GaxiosError with status 403, error.code === 'dailyLimitExceeded' or 'rateLimitExceeded' or 'userRateLimitExceeded'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 403.
+          For dailyLimitExceeded: queue messages for the next day or upgrade quota.
+          For userRateLimitExceeded (100 requests/user/100s): implement exponential
+          backoff and queue unsent messages.
+          For rateLimitExceeded (project-level): use exponential backoff.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: messages.list
+    import_path: "googleapis"
+    description: >
+      Lists Gmail messages matching a query. Called as gmail.users.messages.list().
+      Commonly used by email-linked SaaS apps for inbox sync, CRM email tracking,
+      or sales automation. Returns a page of message IDs with optional metadata.
+    patterns:
+      - '.messages.list('
+      - 'gmail.users.messages.list('
+
+    postconditions:
+      # Evidence: https://developers.google.com/gmail/api/guides/handle-errors
+      # authError (401), rateLimitExceeded (403/429) confirmed from docs
+      - id: gmail-messages-list-auth-error
+        condition: >
+          gmail.users.messages.list() called without try-catch and the OAuth access
+          token has expired. Very common in CRM integrations where tokens expire
+          between sync cycles.
+        throws: "GaxiosError with status 401, error.code === 'authError'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 401. Trigger OAuth token refresh
+          flow. If refresh fails (refresh token revoked), mark the inbox connection
+          as disconnected and notify the user.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: gmail-messages-list-rate-limit
+        condition: >
+          gmail.users.messages.list() called without try-catch and rate limit
+          exceeded. Common when syncing large inboxes or polling too frequently.
+        throws: "GaxiosError with status 429 or 403 with rateLimitExceeded reason"
+        required_handling: >
+          Wrap in try-catch. Implement exponential backoff for 429/403 errors.
+          Respect the Retry-After header if present. For inbox sync use cases,
+          use Gmail Push Notifications (watch) instead of polling.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/handle-errors"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # ─── Google Drive API ─────────────────────────────────────────────────────────
+
+  - name: files.create
+    import_path: "googleapis"
+    description: >
+      Creates or uploads a file in Google Drive. Called as drive.files.create().
+      Distinct from files.list — create is a mutating write operation with unique
+      storage quota and permission errors not present in list operations. Often
+      used in document generation, export, or file-sharing workflows.
+    patterns:
+      - 'drive.files.create('
+      - '.files.create('
+
+    postconditions:
+      # Evidence: https://developers.google.com/drive/api/guides/handle-errors
+      # storageQuotaExceeded (403), rateLimitExceeded (403/429), authError (401),
+      # notFound (404), insufficientFilePermissions (403) confirmed from docs
+      - id: drive-files-create-storage-quota-exceeded
+        condition: >
+          drive.files.create() called without try-catch and the target user's Google
+          Drive storage is full. Critical for apps that write files to user-owned
+          drives — e.g., document export features, automated report delivery to Drive.
+        throws: "GaxiosError with status 403, error.code === 'storageQuotaExceeded'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 403 and inspect error.response.data
+          for 'storageQuotaExceeded'. Notify the user that their Drive storage is full.
+          Do NOT silently retry — the operation will continue to fail until the user
+          frees storage space.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: drive-files-create-insufficient-permissions
+        condition: >
+          drive.files.create() called without try-catch when the authenticated user
+          lacks write access to the target parent folder (Shared Drive or shared folder).
+          Common when apps try to create files in a workspace folder the user can only read.
+        throws: "GaxiosError with status 403, error.code === 'insufficientFilePermissions'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 403. Distinguish from quota errors
+          by reading error.response.data.error.errors[0].reason. Display a clear
+          permission error message — silently ignoring causes data loss.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: drive-files-create-rate-limit
+        condition: >
+          drive.files.create() called in a tight loop without try-catch. Apps that
+          upload many files in batches (e.g., bulk document generation) easily hit
+          the Drive API rate limits (userRateLimitExceeded: 10 req/s/user).
+        throws: "GaxiosError with status 403 with rateLimitExceeded or userRateLimitExceeded reason, or status 429"
+        required_handling: >
+          Wrap in try-catch. Implement exponential backoff for all 403 rate-limit and
+          429 errors. For bulk uploads, use a queue with rate limiting (e.g., p-limit,
+          p-queue) rather than Promise.all().
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  # ─── Google Calendar API ──────────────────────────────────────────────────────
+
+  - name: events.insert
+    import_path: "googleapis"
+    description: >
+      Creates a new calendar event. Called as calendar.events.insert().
+      Used in scheduling apps, meeting automation, and booking systems that
+      create events on behalf of users via OAuth. Unique errors: duplicate event
+      (409 conflict on idempotency key), quota exceeded (403), and auth failure.
+    patterns:
+      - 'calendar.events.insert('
+      - '.events.insert('
+
+    postconditions:
+      # Evidence: https://developers.google.com/calendar/api/guides/errors
+      # authError (401), quotaExceeded/rateLimitExceeded (403), notFound (404 - calendar not found),
+      # duplicate (409), backendError (500) all confirmed from docs
+      - id: calendar-events-insert-auth-error
+        condition: >
+          calendar.events.insert() called without try-catch and the OAuth token
+          is expired or lacks the calendar write scope. Common in booking systems
+          where the token expires between user authentication and event creation.
+        throws: "GaxiosError with status 401, error.code === 'authError'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 401. Trigger OAuth token refresh.
+          Required scope for creating events: https://www.googleapis.com/auth/calendar
+          or https://www.googleapis.com/auth/calendar.events
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: calendar-events-insert-quota-exceeded
+        condition: >
+          calendar.events.insert() called without try-catch and the project quota
+          or per-user rate limit is exceeded. Calendar API has lower quotas than
+          other Google APIs — 10,000 req/day/user for write operations.
+        throws: "GaxiosError with status 403, error.code === 'quotaExceeded' or 'rateLimitExceeded' or 'userRateLimitExceeded'"
+        required_handling: >
+          Wrap in try-catch. Implement exponential backoff for 403 quota errors.
+          For high-volume scheduling, use batched requests or the Calendar Batch API.
+          Check error.response.data.error.errors[0].reason for exact quota type.
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: calendar-events-insert-calendar-not-found
+        condition: >
+          calendar.events.insert() called without try-catch with a calendarId that
+          does not exist or to which the user no longer has access. Common when a
+          user deletes or unshares a calendar that the app stored the ID of.
+        throws: "GaxiosError with status 404, error.code === 'notFound'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 404. Fall back to the primary
+          calendar ('primary') or prompt the user to re-select a calendar.
+          Do not cache calendarIds permanently — they can be deleted.
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: events.list
+    import_path: "googleapis"
+    description: >
+      Lists calendar events in a time range. Called as calendar.events.list().
+      Used in scheduling dashboards, availability checks, and sync features.
+      Unique error: sync token invalidation (410 Gone) — incremental sync tokens
+      expire and require a full re-sync. This is a Calendar-specific behavior not
+      present in Drive or Gmail.
+    patterns:
+      - 'calendar.events.list('
+      - '.events.list('
+
+    postconditions:
+      # Evidence: https://developers.google.com/calendar/api/guides/errors
+      # fullSyncRequired (410), updatedMinTooLongAgo (410), authError (401),
+      # rateLimitExceeded (403), notFound (404) confirmed from docs
+      - id: calendar-events-list-sync-token-invalid
+        condition: >
+          calendar.events.list() called without try-catch using a stored syncToken
+          parameter for incremental sync, and the token has expired. This is a
+          Calendar-specific behavior: syncTokens expire after roughly 6 months of
+          inactivity or on some structural changes to the calendar.
+        throws: "GaxiosError with status 410, error.code === 'fullSyncRequired' or 'updatedMinTooLongAgo'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 410. Discard the stored syncToken
+          and perform a full re-sync (call events.list without syncToken to get a
+          fresh token). Apps that use incremental sync MUST handle 410 Gone explicitly
+          — omitting this handler causes permanent sync failure after token expiry.
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: calendar-events-list-auth-error
+        condition: >
+          calendar.events.list() called without try-catch and the OAuth access token
+          has expired. Very common in background jobs that poll for calendar changes.
+        throws: "GaxiosError with status 401, error.code === 'authError'"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 401. Trigger OAuth token refresh.
+          If the refresh token has been revoked, notify the user and mark the calendar
+          connection as disconnected.
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ─── Google Sheets API ────────────────────────────────────────────────────────
+
+  - name: values.update
+    import_path: "googleapis"
+    description: >
+      Writes values to a Google Sheets range. Called as
+      sheets.spreadsheets.values.update(). Used in SaaS apps for writing
+      data exports, dashboards, or reports to user-owned spreadsheets.
+      Key risk: the Sheets API has strict per-minute quotas (60 write req/min/user,
+      300 write req/min/project) and atomicity guarantees only within batchUpdate.
+    patterns:
+      - 'sheets.spreadsheets.values.update('
+      - '.values.update('
+
+    postconditions:
+      # Evidence: https://developers.google.com/sheets/api/limits
+      # 429 rateLimitExceeded, 401 authError confirmed; batchUpdate atomicity from docs
+      - id: sheets-values-update-rate-limit
+        condition: >
+          sheets.spreadsheets.values.update() called without try-catch in a loop
+          or rapid succession. The Sheets API enforces 60 write requests/user/min
+          and 300 write requests/project/min. Apps that write many cells in a loop
+          (e.g., syncing CRM data to a spreadsheet row by row) will hit this quickly.
+        throws: "GaxiosError with status 429"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 429. Use batchUpdate (writes to
+          multiple ranges in one request) instead of repeated values.update calls.
+          Implement exponential backoff. Per-minute quotas reset every 60 seconds.
+        sources:
+          - "https://developers.google.com/sheets/api/limits"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: sheets-values-update-not-found
+        condition: >
+          sheets.spreadsheets.values.update() called without try-catch with a
+          spreadsheetId or range that does not exist or is inaccessible. Common
+          when apps store a spreadsheet ID from OAuth setup that the user later
+          deletes or stops sharing.
+        throws: "GaxiosError with status 404"
+        required_handling: >
+          Wrap in try-catch. Check error.status === 404. Prompt the user to reconnect
+          their spreadsheet. Do not silently retry — the spreadsheet is gone.
+        sources:
+          - "https://developers.google.com/sheets/api/limits"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: spreadsheets.batchUpdate
+    import_path: "googleapis"
+    description: >
+      Applies multiple structured updates to a Google Sheet atomically. Called as
+      sheets.spreadsheets.batchUpdate(). Unique behavior: if any sub-request is
+      invalid, the ENTIRE batch fails atomically — no partial writes. Used for
+      formatting, adding sheets, or structural changes. Distinct from values.update
+      in that it uses Request objects, not raw cell data.
+    patterns:
+      - 'sheets.spreadsheets.batchUpdate('
+      - '.spreadsheets.batchUpdate('
+
+    postconditions:
+      # Evidence: https://developers.google.com/sheets/api/limits
+      # Atomic failure behavior, 429 rate limits, 401 auth errors confirmed from docs
+      - id: sheets-batch-update-atomic-failure
+        condition: >
+          sheets.spreadsheets.batchUpdate() called without try-catch with a batch
+          containing one or more invalid requests. batchUpdate is atomic: if any
+          single sub-request fails validation or execution, the entire batch is rolled
+          back. No partial writes occur. Common error source: invalid range notation,
+          out-of-bounds sheet indices, or conflicting formatting requests.
+        throws: "GaxiosError with status 400, containing details of the first invalid request"
+        required_handling: >
+          Wrap in try-catch. For 400 errors, inspect error.response.data.error.message
+          to identify which sub-request failed. Validate all requests before submission.
+          Consider splitting large batches to isolate failures.
+        sources:
+          - "https://developers.google.com/sheets/api/limits"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
           incident_cost_range: medium
