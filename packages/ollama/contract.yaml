@@ -1,11 +1,11 @@
 package: ollama
 semver: ">=0.1.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80
+coverage_score: 0.67
 
 functions:
   - name: chat
@@ -81,4 +81,293 @@ functions:
           production_behavior: immediate_exception
           visibility: silent
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pull
+    import_path: "ollama"
+    description: >
+      Downloads a model from the Ollama registry to the local server. Returns a
+      ProgressResponse stream or final status. Commonly used in agent setups and
+      model management workflows to ensure models are available before use.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      # and https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+      # Error type: ResponseError (extends Error) with .error: string and .status_code: number
+      - id: pull-no-try-catch
+        condition: "awaited ollama.pull() call is not wrapped in try/catch"
+        throws: "ResponseError"
+        required_handling: >
+          Caller MUST wrap ollama.pull() in try/catch. The call makes an HTTP request
+          to the Ollama server (local or remote). Common failure modes: ECONNREFUSED
+          when the Ollama server is not running, ResponseError with status_code 404
+          when the model name does not exist in the registry, and network errors during
+          large model downloads. The ResponseError has .error (message string) and
+          .status_code (HTTP integer) properties. In streaming mode, an AbortError is
+          thrown if abort() is called mid-download.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+          - https://github.com/ollama/ollama-js/blob/main/README.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: pull-model-not-found
+        condition: "ollama.pull() called with a model name that does not exist in the registry"
+        throws: "ResponseError"
+        required_handling: >
+          ResponseError with status_code 404 is thrown when the model name is invalid
+          or does not exist in the Ollama registry. Callers that pull models dynamically
+          based on user input or configuration must handle 404 separately from network
+          errors. Checking error.status_code === 404 distinguishes "model name typo"
+          from "server unavailable" (ECONNREFUSED does not have a status_code property).
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: create
+    import_path: "ollama"
+    description: >
+      Creates a custom model on the Ollama server from a base model with custom
+      configuration (system prompt, template, quantization, adapters). Used in
+      workflows that build fine-tuned or specialized model variants.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/index.ts
+      # and https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      - id: create-no-try-catch
+        condition: "awaited ollama.create() call is not wrapped in try/catch"
+        throws: "ResponseError | Error"
+        required_handling: >
+          Caller MUST wrap ollama.create() in try/catch. Two distinct error types:
+          (1) Error("Creating with a local path is not currently supported from
+          ollama-js") — thrown immediately when request.from is a local filesystem
+          path (starts with '.' or '/'); (2) ResponseError — thrown when the base
+          model named in request.from does not exist on the server (404), server
+          error during creation (500), or ECONNREFUSED. The local-path error is
+          thrown synchronously before any network call.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/index.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: create-local-path-unsupported
+        condition: "ollama.create() called with request.from pointing to a local filesystem path"
+        throws: "Error"
+        required_handling: >
+          The Node.js ollama-js client throws Error("Creating with a local path is
+          not currently supported from ollama-js") synchronously when request.from is
+          a local file path. This is a known SDK limitation (GitHub issue #191).
+          Applications that allow user-provided model sources must validate that the
+          path is a registry name (e.g. 'llama3.2') not a filesystem path before
+          calling create(). This error is thrown before any HTTP request is made and
+          will not have a status_code property.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/index.ts
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: show
+    import_path: "ollama"
+    description: >
+      Retrieves metadata and configuration for a specific model on the Ollama server.
+      Used for capability checks (e.g., verifying model supports tools/vision),
+      template inspection, and dynamic model selection flows.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      # and https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+      - id: show-no-try-catch
+        condition: "awaited ollama.show() call is not wrapped in try/catch"
+        throws: "ResponseError"
+        required_handling: >
+          Caller MUST wrap ollama.show() in try/catch. ResponseError with status_code
+          404 is thrown when the model does not exist on the server. This is a common
+          silent failure in model selection flows: code checks show() to determine
+          model capabilities, swallows the 404, and then proceeds to use a model that
+          doesn't exist. The pattern "check capabilities with show() then call chat()"
+          must handle both 404 from show() and ECONNREFUSED from chat().
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: delete
+    import_path: "ollama"
+    description: >
+      Removes a model from the Ollama server. Used in dynamic agent setups that
+      manage model lifecycle, disk space cleanup, or version rotation workflows.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      - id: delete-no-try-catch
+        condition: "awaited ollama.delete() call is not wrapped in try/catch"
+        throws: "ResponseError"
+        required_handling: >
+          Caller MUST wrap ollama.delete() in try/catch. ResponseError with
+          status_code 404 is thrown when the model name does not exist on the server.
+          This is particularly common in idempotent cleanup flows where code tries to
+          delete a model that may already have been removed. Applications that manage
+          model lifecycle must distinguish 404 (already gone, often acceptable) from
+          ECONNREFUSED (server down, critical error).
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: copy
+    import_path: "ollama"
+    description: >
+      Copies/renames a model on the Ollama server. Creates a new model alias that
+      refers to the same base model. Used in model versioning and aliasing workflows.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      - id: copy-no-try-catch
+        condition: "awaited ollama.copy() call is not wrapped in try/catch"
+        throws: "ResponseError"
+        required_handling: >
+          Caller MUST wrap ollama.copy() in try/catch. ResponseError with status_code
+          404 is thrown when the source model (request.source) does not exist. The
+          error message from the Ollama server describes which model was not found.
+          Model versioning flows that copy models must handle source-not-found as a
+          distinct error from server unavailability.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: webSearch
+    import_path: "ollama"
+    description: >
+      Performs web searches using the Ollama cloud web search API (ollama.com).
+      Requires an Ollama account and OLLAMA_API_KEY environment variable. Returns
+      structured search results for use in RAG or agent tool workflows. NOTE: unlike
+      other ollama methods, this calls the external ollama.com API, not the local server.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      # webSearch posts to https://ollama.com/api/web_search (external cloud API)
+      # Requires OLLAMA_API_KEY env var; auto-injected via Authorization: Bearer header
+      - id: websearch-no-try-catch
+        condition: "awaited ollama.webSearch() call is not wrapped in try/catch"
+        throws: "ResponseError | Error"
+        required_handling: >
+          Caller MUST wrap ollama.webSearch() in try/catch. Two distinct error
+          scenarios: (1) Error("Query is required") thrown synchronously when
+          request.query is empty or missing — happens before any network call;
+          (2) ResponseError with status_code 401 when OLLAMA_API_KEY is not set or
+          the API key is invalid/expired. Unlike other ollama methods, webSearch()
+          calls the external ollama.com cloud API, not the local Ollama server, so
+          ECONNREFUSED errors indicate ollama.com connectivity issues, not local
+          server status. Agentic tool workflows that use webSearch as a tool must
+          handle auth failures distinctly from query validation errors.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+          - https://github.com/ollama/ollama-js/blob/main/README.md
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: websearch-missing-api-key
+        condition: "ollama.webSearch() called without OLLAMA_API_KEY environment variable set"
+        throws: "ResponseError"
+        required_handling: >
+          ResponseError with status_code 401 is thrown when OLLAMA_API_KEY is not
+          configured. The ollama-js client automatically injects the key as a Bearer
+          token for requests to ollama.com, but if the env var is absent, the request
+          proceeds unauthenticated and the cloud API rejects it. Applications that
+          use webSearch in production must validate OLLAMA_API_KEY is present at
+          startup, not at first call. Agent systems that register webSearch as a tool
+          must expose an actionable error message rather than letting the 401 surface
+          as an unhandled exception.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: webFetch
+    import_path: "ollama"
+    description: >
+      Fetches content from a URL using the Ollama cloud web fetch API (ollama.com).
+      Requires an Ollama account and OLLAMA_API_KEY environment variable. Returns
+      structured page content (title, URL, content, links) for use in agent tool
+      workflows. Like webSearch, this calls the external ollama.com API.
+
+    postconditions:
+      # Evidence: source-confirmed from https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+      # webFetch posts to https://ollama.com/api/web_fetch (external cloud API)
+      - id: webfetch-no-try-catch
+        condition: "awaited ollama.webFetch() call is not wrapped in try/catch"
+        throws: "ResponseError | Error"
+        required_handling: >
+          Caller MUST wrap ollama.webFetch() in try/catch. Error("URL is required")
+          is thrown synchronously when request.url is empty or missing. ResponseError
+          with status_code 401 when OLLAMA_API_KEY is missing or invalid. ResponseError
+          with non-2xx status when the target URL is unreachable or returns an error
+          (the ollama.com proxy relays target site errors). Agent tools that use
+          webFetch to retrieve web content must handle both auth failures and content
+          retrieval failures; a failed fetch should return a graceful error message
+          to the agent rather than crashing the tool loop.
+        sources:
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/browser.ts
+          - https://raw.githubusercontent.com/ollama/ollama-js/main/src/utils.ts
+          - https://github.com/ollama/ollama-js/blob/main/README.md
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
           incident_cost_range: medium
