@@ -1,10 +1,11 @@
 package: "@aws-sdk/client-sqs"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.89
 
 functions:
   - name: send
@@ -73,11 +74,376 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: send (SendMessageBatchCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Sends up to 10 messages in a single batch to the specified SQS queue.
+      Returns a response with Successful[] and Failed[] arrays. CRITICAL: partial
+      failures return HTTP 200 — individual message failures go to response.Failed[],
+      not thrown exceptions. Code that omits the Failed check silently loses messages.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+      # SDK source: dist-types/commands/SendMessageBatchCommand.d.ts — @throws annotations confirmed
+      # Confirmed: "Because the batch request can result in a combination of successful
+      # and unsuccessful actions, you should check for batch errors even when the call
+      # returns an HTTP status code of 200."
+      - id: sqs-send-batch-failed-not-checked
+        condition: >
+          SendMessageBatchCommand result is used without checking result.Failed array.
+          Individual message failures return HTTP 200 and go to result.Failed[], not
+          thrown exceptions. Missing this check silently drops messages.
+        throws: >
+          Does NOT throw for individual message failures. Returns HTTP 200 with
+          result.Failed as BatchResultErrorEntry[] containing Code, Id, Message,
+          SenderFault fields. Only throws SQSServiceException for request-level errors
+          (QueueDoesNotExist, TooManyEntriesInBatchRequest, BatchEntryIdsNotDistinct,
+          BatchRequestTooLong, EmptyBatchRequest, RequestThrottled).
+        required_handling: >
+          MUST check result.Failed after every SendMessageBatch call:
+            const result = await client.send(new SendMessageBatchCommand({ ... }));
+            if (result.Failed && result.Failed.length > 0) {
+              for (const failure of result.Failed) {
+                logger.error(`Message ${failure.Id} failed: ${failure.Code} - ${failure.Message}`);
+              }
+              // Retry or dead-letter the failed messages
+            }
+          Failure to check result.Failed causes silent message loss with no observable error.
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/sqs/command/SendMessageBatchCommand/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: sqs-send-batch-no-try-catch
+        condition: >
+          SendMessageBatchCommand is awaited without try-catch. Request-level errors
+          (queue deleted, batch too large, throttled) throw SQSServiceException.
+        throws: >
+          SQSServiceException subclass: QueueDoesNotExist (queue URL wrong/deleted),
+          TooManyEntriesInBatchRequest (>10 entries), BatchEntryIdsNotDistinct (duplicate IDs),
+          BatchRequestTooLong (total payload exceeds 256KB), EmptyBatchRequest (no entries),
+          RequestThrottled (rate limit exceeded), InvalidAddress, InvalidSecurity.
+        required_handling: >
+          MUST wrap in try-catch for request-level failures AND check result.Failed for
+          per-message failures:
+            try {
+              const result = await client.send(new SendMessageBatchCommand({ QueueUrl, Entries }));
+              if (result.Failed?.length) {
+                // handle per-message failures
+              }
+            } catch (error) {
+              if (error instanceof SQSServiceException) {
+                logger.error(`SQS batch error [${error.name}]: ${error.message}`);
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: send (DeleteMessageBatchCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Deletes up to 10 messages from an SQS queue by receipt handle. Returns HTTP 200
+      with Successful[] and Failed[] arrays. CRITICAL: partial failures do not throw —
+      undeleted messages re-appear after the visibility timeout expires, causing
+      duplicate processing if result.Failed is not checked.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html
+      # SDK source: dist-types/commands/DeleteMessageBatchCommand.d.ts — confirmed
+      # Confirmed: HTTP 200 returned even for partial failures. result.Failed contains errors.
+      - id: sqs-delete-batch-failed-not-checked
+        condition: >
+          DeleteMessageBatchCommand result is used without checking result.Failed array.
+          Individual deletion failures return HTTP 200 with failures in result.Failed[].
+          Undeleted messages remain visible again after visibility timeout, causing
+          duplicate processing.
+        throws: >
+          Does NOT throw for individual deletion failures. Returns HTTP 200 with
+          result.Failed as BatchResultErrorEntry[] (Code, Id, Message, SenderFault).
+          Only throws SQSServiceException for request-level failures (QueueDoesNotExist,
+          BatchEntryIdsNotDistinct, TooManyEntriesInBatchRequest, etc.).
+        required_handling: >
+          MUST check result.Failed to detect partial failures:
+            const result = await client.send(new DeleteMessageBatchCommand({ QueueUrl, Entries }));
+            if (result.Failed && result.Failed.length > 0) {
+              logger.error('Some messages not deleted', { failed: result.Failed });
+              // These messages will reappear after visibility timeout — handle appropriately
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/sqs/command/DeleteMessageBatchCommand/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: send (ReceiveMessageCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Polls the SQS queue for up to 10 messages. Returns response.Messages which may
+      be an empty array or undefined when the queue is empty. Used in consumer loops
+      that continuously poll for work — error handling is critical because an unhandled
+      exception crashes the entire polling loop and stops message processing.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html
+      # SDK source: dist-types/commands/ReceiveMessageCommand.d.ts — @throws OverLimit, QueueDoesNotExist confirmed
+      - id: sqs-receive-no-try-catch
+        condition: >
+          ReceiveMessageCommand is awaited in a polling loop without try-catch.
+          Any thrown exception crashes the entire consumer loop, stopping all message
+          processing silently until the process is restarted.
+        throws: >
+          SQSServiceException subclass: OverLimit (max in-flight messages reached — queue backlog),
+          QueueDoesNotExist (queue deleted while consumer running), RequestThrottled,
+          InvalidAddress, InvalidSecurity, KMS errors. Network failures throw generic
+          Error (DNS failure, timeout, connection refused).
+        required_handling: >
+          MUST wrap receive in try-catch — especially in polling loops. Never rethrow
+          transient errors from the polling loop body:
+            while (running) {
+              try {
+                const result = await client.send(new ReceiveMessageCommand({ QueueUrl, MaxNumberOfMessages: 10 }));
+                const messages = result.Messages ?? [];
+                for (const message of messages) { await processMessage(message); }
+              } catch (error) {
+                logger.error('SQS receive failed, retrying', { error });
+                await sleep(backoffMs);
+                // Do NOT rethrow — rethrow crashes the loop
+              }
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html"
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-best-practices.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: sqs-receive-messages-undefined
+        condition: >
+          response.Messages is accessed directly without null/undefined guard. When
+          the queue is empty or all messages are in-flight, Messages may be undefined,
+          causing TypeError: Cannot read properties of undefined (reading 'length').
+        throws: >
+          Does NOT throw from SQS — throws TypeError in caller code when accessing
+          undefined.Messages.forEach() or .length. AWS SDK may return Messages as
+          undefined (not empty array) when no messages are available.
+        required_handling: >
+          MUST use null-coalescing when accessing Messages:
+            const messages = result.Messages ?? [];
+            // NOT: result.Messages.forEach(...) — crashes on empty queue
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: send (DeleteMessageCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Deletes a single message from the queue using its receipt handle. Critical
+      postcondition: a message's receipt handle changes each time it is received.
+      Using a stale receipt handle does not throw — the request may succeed but
+      the intended message may not be deleted (it becomes visible again).
+      ReceiptHandleIsInvalid is thrown when the handle is completely invalid/expired.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessage.html
+      # SDK source: dist-types/commands/DeleteMessageCommand.d.ts — @throws ReceiptHandleIsInvalid confirmed
+      - id: sqs-delete-receipt-handle-invalid
+        condition: >
+          DeleteMessageCommand is called with a stale or expired receipt handle.
+          Receipt handles expire after the message visibility timeout. Using a handle
+          from a previous receive call may silently fail (request succeeds but message
+          not deleted) or throw ReceiptHandleIsInvalid.
+        throws: >
+          ReceiptHandleIsInvalid (SQSServiceException subclass): thrown when the
+          receipt handle is completely invalid. However, using a stale handle (from
+          a prior receive when the message was received again) may return HTTP 200
+          while not deleting the intended message.
+        required_handling: >
+          MUST always use the receipt handle from the most recent receive call for the
+          message. Always wrap in try-catch:
+            try {
+              await client.send(new DeleteMessageCommand({ QueueUrl, ReceiptHandle: message.ReceiptHandle }));
+            } catch (error) {
+              if (error.name === 'ReceiptHandleIsInvalid') {
+                // Message visibility timeout expired — message already back in queue
+                logger.warn('Receipt handle expired', { messageId: message.MessageId });
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessage.html"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: send (CreateQueueCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Creates a new SQS queue. Idempotent when called with the same name and attributes.
+      Throws QueueNameExists when the same name is used with different attributes.
+      Throws QueueDeletedRecently when called within 60 seconds of deleting a queue
+      with the same name.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CreateQueue.html
+      # SDK source: dist-types/commands/CreateQueueCommand.d.ts — @throws confirmed
+      - id: sqs-create-queue-no-try-catch
+        condition: >
+          CreateQueueCommand is awaited without try-catch. Common in queue setup/init
+          code that assumes the queue does not exist, but fails if called twice with
+          different attributes or within 60s of deletion.
+        throws: >
+          QueueNameExists (400): queue exists with the same name but different attributes.
+          QueueDeletedRecently (400): must wait 60 seconds after deleting before reusing name.
+          InvalidAttributeName, InvalidAttributeValue: invalid queue configuration.
+          RequestThrottled: rate limit exceeded.
+        required_handling: >
+          MUST wrap in try-catch. CreateQueue is idempotent for same name+attributes —
+          handle QueueNameExists by checking if the existing queue has the expected config:
+            try {
+              const result = await client.send(new CreateQueueCommand({ QueueName, Attributes }));
+              return result.QueueUrl;
+            } catch (error) {
+              if (error.name === 'QueueDeletedRecently') {
+                // Must wait 60s — implement retry with delay
+                throw new Error('Queue was recently deleted, retry after 60 seconds');
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CreateQueue.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: send (PurgeQueueCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Deletes all messages in the queue. AWS enforces a 60-second cooldown between
+      purge operations on the same queue. A second purge within 60s throws
+      PurgeQueueInProgress. Often called in test teardown or queue reset scripts
+      without checking for the cooldown.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html
+      # SDK source: dist-types/commands/PurgeQueueCommand.d.ts — @throws PurgeQueueInProgress confirmed
+      - id: sqs-purge-in-progress
+        condition: >
+          PurgeQueueCommand is called a second time within 60 seconds of a prior
+          purge on the same queue. AWS enforces a 60-second cooldown per queue.
+          Common in test teardown scripts that call purge without checking.
+        throws: >
+          PurgeQueueInProgress (SQSServiceException): thrown when purge was already
+          requested within the last 60 seconds. The previous purge may still be
+          in progress deleting messages.
+        required_handling: >
+          MUST wrap in try-catch and handle the cooldown:
+            try {
+              await client.send(new PurgeQueueCommand({ QueueUrl }));
+            } catch (error) {
+              if (error.name === 'PurgeQueueInProgress') {
+                logger.warn('Queue purge already in progress, waiting 60s');
+                await sleep(60000);
+                await client.send(new PurgeQueueCommand({ QueueUrl })); // retry
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: send (ChangeMessageVisibilityCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Extends the visibility timeout of a message being processed, preventing it from
+      being re-queued while processing is ongoing. Throws MessageNotInflight if the
+      message has already timed out and returned to the queue. Common in long-running
+      job processors that extend visibility periodically.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html
+      # SDK source: dist-types/commands/ChangeMessageVisibilityCommand.d.ts — @throws MessageNotInflight confirmed
+      - id: sqs-change-visibility-not-inflight
+        condition: >
+          ChangeMessageVisibilityCommand is called after the message's visibility
+          timeout has already expired (message returned to queue). The receipt handle
+          is still valid but the message is no longer in-flight, causing
+          MessageNotInflight to be thrown.
+        throws: >
+          MessageNotInflight (SQSServiceException): the message is no longer being
+          processed (timeout expired, returned to queue). ReceiptHandleIsInvalid if
+          the receipt handle is completely invalid.
+        required_handling: >
+          MUST wrap in try-catch. If MessageNotInflight is caught, the message has
+          already been re-queued and is likely being processed by another consumer:
+            try {
+              await client.send(new ChangeMessageVisibilityCommand({
+                QueueUrl,
+                ReceiptHandle: message.ReceiptHandle,
+                VisibilityTimeout: 30
+              }));
+            } catch (error) {
+              if (error.name === 'MessageNotInflight') {
+                // Message timed out — stop processing, it will be handled by another consumer
+                logger.warn('Message visibility expired, abandoning', { messageId });
+                return;
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'QueueDoesNotExist')"
   - "error.$retryable.throttling is true for throttling errors — implement exponential backoff"
   - "DeleteMessageBatchCommand returns HTTP 200 even for partial failures — check result.Failed array separately"
+  - "SendMessageBatchCommand result.Failed contains per-message failures — returns HTTP 200 even for partial failures"
   - "ReceiveMessageCommand response.Messages may be undefined (not empty array) when queue is empty"
   - "ReceiptHandleIsInvalid is thrown when deleting a message after its visibility timeout expires"
   - "SQSClient instance is reusable across multiple send() calls — no per-call instantiation needed"
+  - "ChangeMessageVisibilityBatchCommand follows same partial-failure pattern as DeleteMessageBatch"

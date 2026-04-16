@@ -5,7 +5,14 @@
  * Derived from the @aws-sdk/client-sqs contract spec, NOT V1 behavior.
  *
  * Contracted functions (all via SQSClient imported from "@aws-sdk/client-sqs"):
- *   - sqsClient.send()   postcondition: aws-service-error
+ *   - sqsClient.send()                    postcondition: aws-service-error
+ *   - send(SendMessageBatchCommand)        postconditions: sqs-send-batch-failed-not-checked, sqs-send-batch-no-try-catch
+ *   - send(DeleteMessageBatchCommand)      postcondition: sqs-delete-batch-failed-not-checked
+ *   - send(ReceiveMessageCommand)          postconditions: sqs-receive-no-try-catch, sqs-receive-messages-undefined
+ *   - send(DeleteMessageCommand)           postcondition: sqs-delete-receipt-handle-invalid
+ *   - send(CreateQueueCommand)             postcondition: sqs-create-queue-no-try-catch
+ *   - send(PurgeQueueCommand)              postcondition: sqs-purge-in-progress
+ *   - send(ChangeMessageVisibilityCommand) postcondition: sqs-change-visibility-not-inflight
  *
  * Pattern: SQSClient.send(new XxxCommand(...)) — all operations go through send().
  * Detected as a 2-level property chain (instance.send).
@@ -19,6 +26,9 @@ import {
   DeleteMessageCommand,
   DeleteMessageBatchCommand,
   GetQueueUrlCommand,
+  CreateQueueCommand,
+  PurgeQueueCommand,
+  ChangeMessageVisibilityCommand,
 } from '@aws-sdk/client-sqs';
 
 const sqsClient = new SQSClient({ region: 'us-east-1' });
@@ -238,5 +248,198 @@ class SqsWorker {
       console.error('Process failed:', error);
       throw error;
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. SendMessageBatchCommand — silent failure pattern (result.Failed not checked)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendBatchFailedNotChecked(items: { id: string; body: string }[]) {
+  // @expect-violation: sqs-send-batch-failed-not-checked
+  // SHOULD_FIRE: sqs-send-batch-failed-not-checked — result.Failed[] never inspected
+  // Individual message failures return HTTP 200 in result.Failed[], silently lost
+  try {
+    const result = await sqsClient.send(new SendMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: items.map(i => ({ Id: i.id, MessageBody: i.body })),
+    }));
+    return result.Successful; // ← never checks result.Failed
+  } catch (error) {
+    console.error('Batch send failed:', error);
+    throw error;
+  }
+}
+
+export async function sendBatchProperHandling(items: { id: string; body: string }[]) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: both try-catch AND result.Failed check present
+  try {
+    const result = await sqsClient.send(new SendMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: items.map(i => ({ Id: i.id, MessageBody: i.body })),
+    }));
+    if (result.Failed && result.Failed.length > 0) {
+      for (const failure of result.Failed) {
+        console.error(`Message ${failure.Id} failed: ${failure.Code}`);
+      }
+    }
+    return result.Successful;
+  } catch (error) {
+    console.error('Batch send failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. DeleteMessageBatchCommand — silent failure pattern (result.Failed not checked)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteBatchFailedNotChecked(entries: { Id: string; ReceiptHandle: string }[]) {
+  // @expect-violation: sqs-delete-batch-failed-not-checked
+  // SHOULD_FIRE: sqs-delete-batch-failed-not-checked — result.Failed[] never inspected
+  // Undeleted messages re-appear in queue after visibility timeout
+  try {
+    const result = await sqsClient.send(new DeleteMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: entries,
+    }));
+    return result.Successful; // ← never checks result.Failed
+  } catch (error) {
+    console.error('Batch delete failed:', error);
+    throw error;
+  }
+}
+
+export async function deleteBatchProperHandling(entries: { Id: string; ReceiptHandle: string }[]) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: both try-catch AND result.Failed check present
+  try {
+    const result = await sqsClient.send(new DeleteMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: entries,
+    }));
+    if (result.Failed && result.Failed.length > 0) {
+      console.error('Some messages not deleted', result.Failed);
+    }
+    return result.Successful;
+  } catch (error) {
+    console.error('Batch delete failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. ReceiveMessageCommand — messages undefined access
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function receiveMessagesUndefinedAccess() {
+  // @expect-violation: sqs-receive-messages-undefined
+  // SHOULD_FIRE: sqs-receive-messages-undefined — accessing .Messages directly without null guard
+  try {
+    const response = await sqsClient.send(new ReceiveMessageCommand({
+      QueueUrl: QUEUE_URL,
+      MaxNumberOfMessages: 10,
+    }));
+    return response.Messages!.map(m => m.Body); // ← crashes if Messages is undefined (empty queue)
+  } catch (error) {
+    console.error('Receive failed:', error);
+    return [];
+  }
+}
+
+export async function receiveMessagesWithNullGuard() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: null-coalescing guard on Messages
+  try {
+    const response = await sqsClient.send(new ReceiveMessageCommand({
+      QueueUrl: QUEUE_URL,
+      MaxNumberOfMessages: 10,
+    }));
+    return (response.Messages ?? []).map(m => m.Body);
+  } catch (error) {
+    console.error('Receive failed:', error);
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. CreateQueueCommand — QueueDeletedRecently / QueueNameExists
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createQueueNoCatch(queueName: string) {
+  // @expect-violation: sqs-create-queue-no-try-catch
+  // SHOULD_FIRE: sqs-create-queue-no-try-catch — no try-catch; QueueDeletedRecently throws on re-create
+  const result = await sqsClient.send(new CreateQueueCommand({ QueueName: queueName }));
+  return result.QueueUrl;
+}
+
+export async function createQueueWithCatch(queueName: string) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: wrapped in try-catch
+  try {
+    const result = await sqsClient.send(new CreateQueueCommand({ QueueName: queueName }));
+    return result.QueueUrl;
+  } catch (error: any) {
+    if (error.name === 'QueueDeletedRecently') {
+      throw new Error('Queue was recently deleted, retry after 60 seconds');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. PurgeQueueCommand — PurgeQueueInProgress
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function purgeQueueNoCatch() {
+  // @expect-violation: sqs-purge-in-progress
+  // SHOULD_FIRE: sqs-purge-in-progress — no try-catch; second purge within 60s throws
+  await sqsClient.send(new PurgeQueueCommand({ QueueUrl: QUEUE_URL }));
+}
+
+export async function purgeQueueWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: wrapped in try-catch
+  try {
+    await sqsClient.send(new PurgeQueueCommand({ QueueUrl: QUEUE_URL }));
+  } catch (error: any) {
+    if (error.name === 'PurgeQueueInProgress') {
+      console.warn('Queue purge already in progress');
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. ChangeMessageVisibilityCommand — MessageNotInflight
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function changeVisibilityNoCatch(receiptHandle: string) {
+  // @expect-violation: sqs-change-visibility-not-inflight
+  // SHOULD_FIRE: sqs-change-visibility-not-inflight — no try-catch; MessageNotInflight throws when timeout expired
+  await sqsClient.send(new ChangeMessageVisibilityCommand({
+    QueueUrl: QUEUE_URL,
+    ReceiptHandle: receiptHandle,
+    VisibilityTimeout: 30,
+  }));
+}
+
+export async function changeVisibilityWithCatch(receiptHandle: string, messageId: string) {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: wrapped in try-catch with MessageNotInflight handling
+  try {
+    await sqsClient.send(new ChangeMessageVisibilityCommand({
+      QueueUrl: QUEUE_URL,
+      ReceiptHandle: receiptHandle,
+      VisibilityTimeout: 30,
+    }));
+  } catch (error: any) {
+    if (error.name === 'MessageNotInflight') {
+      console.warn('Message visibility expired, abandoning', { messageId });
+      return;
+    }
+    throw error;
   }
 }
