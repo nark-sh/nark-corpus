@@ -1,10 +1,11 @@
 package: "@auth0/nextjs-auth0"
-semver: ">=2.0.0 <4.0.0"
-contract_version: "1.0.0"
+semver: ">=2.0.0"
+contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
-status: draft
-evidence_quality: partial
+last_verified: "2026-04-16"
+status: production
+evidence_quality: confirmed
+coverage_score: 0.83
 
 functions:
   - name: getAccessToken
@@ -181,11 +182,698 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # v4 Auth0Client instance methods (Auth0Client class, new in v4.x)
+  # Evidence: https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts
+  # Evidence: dist/server/client.d.ts (inspected from npm pack @auth0/nextjs-auth0@4.17.1)
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: Auth0Client.getSession
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Returns session data for the current request. Used in App Router Server
+      Components, Server Actions, Route Handlers, and middleware/getServerSideProps
+      in Pages Router. Returns null when no session exists. In v4, throws
+      SessionDomainMismatchError when using Multiple Custom Domains (MCD) and
+      the session was created on a different domain than the current request.
+    postconditions:
+      - id: auth0-get-session-domain-mismatch
+        severity: warning
+        condition: >
+          Auth0Client is configured with a DomainResolver (Multiple Custom Domains / MCD)
+          and the user's session was created on a different custom domain than the
+          current request domain. Only throws in v4 MCD mode — does not occur in v2/v3
+          or single-domain configurations.
+        throws: >
+          SessionDomainMismatchError — a named error from @auth0/nextjs-auth0/server.
+          Indicates the session belongs to a different domain (e.g., session from
+          brand-a.com accessed on brand-b.com).
+        required_handling: >
+          Caller SHOULD catch SessionDomainMismatchError and redirect the user to
+          re-authenticate on the current domain:
+            const session = await auth0.getSession();
+            // If using MCD, wrap in try-catch:
+            try {
+              const session = await auth0.getSession();
+            } catch (error) {
+              if (error instanceof SessionDomainMismatchError) {
+                redirect('/auth/login');
+              }
+              throw error;
+            }
+          Import: import { SessionDomainMismatchError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: auth0-get-session-no-null-check
+        severity: warning
+        condition: >
+          getSession() returns null when the user is not authenticated (no valid
+          session cookie). Code that destructures the return value without a null
+          guard will throw a TypeError at runtime.
+        returns: >
+          null — when no session exists. This is NOT a thrown error, it is the normal
+          return value for unauthenticated users. The bug is in the caller that
+          destructures null without checking.
+        required_handling: >
+          Always null-check before accessing session properties:
+            const session = await auth0.getSession();
+            if (!session) {
+              return null; // or redirect to login
+            }
+            const { user } = session; // safe — session is not null
+
+          WRONG (crashes for unauthenticated users):
+            const { user } = await auth0.getSession(); // TypeError if null
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: Auth0Client.getAccessToken
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      v4 instance method equivalent of the v2/v3 standalone getAccessToken().
+      Retrieves the access token from the current session, automatically refreshing
+      if expired (when a refresh token is available). Throws AccessTokenError for
+      missing sessions, missing/failed refresh tokens. Throws MfaRequiredError when
+      Auth0 requires step-up MFA authentication during token refresh.
+    postconditions:
+      - id: auth0-v4-access-token-missing-session
+        severity: error
+        condition: >
+          Called with no active user session (no valid session cookie, or session
+          has expired). In the v4 App Router pattern this is the most common failure
+          mode: server actions and route handlers called by unauthenticated users
+          or after session expiry will throw without a try-catch.
+        throws: >
+          AccessTokenError with code AccessTokenErrorCode.MISSING_SESSION
+          ("missing_session"). Import AccessTokenError from '@auth0/nextjs-auth0/server'.
+        required_handling: >
+          Caller MUST wrap in try-catch and convert to a 401 response:
+            try {
+              const { token } = await auth0.getAccessToken();
+              return token;
+            } catch (error) {
+              if (error instanceof AccessTokenError) {
+                return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+              }
+              throw error;
+            }
+          Import: import { AccessTokenError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: auth0-v4-access-token-refresh-failed
+        severity: error
+        condition: >
+          The access token is expired and the refresh token is also expired, revoked
+          (by user password change, admin action, or token rotation race condition),
+          or the refresh grant is rejected by Auth0. Refresh tokens expire after a
+          configurable interval (default 7 days rolling in Auth0 Free/Pro tiers).
+        throws: >
+          AccessTokenError with code AccessTokenErrorCode.FAILED_TO_REFRESH_TOKEN
+          ("failed_to_refresh_token") or AccessTokenErrorCode.MISSING_REFRESH_TOKEN
+          ("missing_refresh_token"). The .cause property contains the underlying
+          OAuth2Error from Auth0.
+        required_handling: >
+          Must catch AccessTokenError and redirect to re-authentication:
+            try {
+              const { token } = await auth0.getAccessToken();
+            } catch (error) {
+              if (error instanceof AccessTokenError) {
+                redirect('/auth/login'); // force re-auth
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: auth0-v4-access-token-mfa-required
+        severity: warning
+        condition: >
+          Auth0 returns mfa_required during token refresh when the API audience
+          requires step-up MFA authentication. The user has a valid session but
+          must complete an MFA challenge before receiving the token.
+        throws: >
+          MfaRequiredError — contains an encrypted mfa_token property (string) that
+          must be passed to auth0.mfa.getAuthenticators() to start the MFA flow.
+          Also contains mfa_requirements listing available challenge types.
+        required_handling: >
+          Must catch MfaRequiredError separately and initiate the MFA challenge:
+            try {
+              const { token } = await auth0.getAccessToken({ audience });
+            } catch (error) {
+              if (error instanceof MfaRequiredError) {
+                // Store mfa_token and redirect to MFA challenge page
+                redirect(`/mfa?token=${error.mfa_token}`);
+              }
+              throw error;
+            }
+          Import: import { MfaRequiredError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: Auth0Client.getAccessTokenForConnection
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Retrieves an access token for a specific OAuth connection (e.g., GitHub, Google,
+      Salesforce). Used in Connected Accounts flows where the application needs a
+      third-party token to call the external API on behalf of the user. Throws
+      AccessTokenForConnectionError when the user has no session or the token exchange fails.
+    postconditions:
+      - id: auth0-connection-token-missing-session
+        severity: error
+        condition: >
+          No active user session exists when calling getAccessTokenForConnection().
+          A valid session is required to exchange for a connection token.
+        throws: >
+          AccessTokenForConnectionError with code
+          AccessTokenForConnectionErrorCode.MISSING_SESSION ("missing_session").
+        required_handling: >
+          Must wrap in try-catch and return 401 for unauthenticated callers:
+            try {
+              const { token } = await auth0.getAccessTokenForConnection({ connection: 'github' });
+            } catch (error) {
+              if (error instanceof AccessTokenForConnectionError) {
+                return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+              }
+              throw error;
+            }
+          Import: import { AccessTokenForConnectionError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: auth0-connection-token-exchange-failed
+        severity: error
+        condition: >
+          Auth0 rejects the connection token exchange. Occurs when the connection
+          is not configured for Offline Access in Auth0, the refresh token was revoked,
+          or the user revoked the third-party app's permissions on the external provider.
+        throws: >
+          AccessTokenForConnectionError with code
+          AccessTokenForConnectionErrorCode.FAILED_TO_EXCHANGE
+          ("failed_to_exchange_refresh_token"). The .cause property contains the
+          underlying OAuth2Error.
+        required_handling: >
+          Must catch and prompt user to re-authorize the connection:
+            try {
+              const { token } = await auth0.getAccessTokenForConnection({ connection: 'github' });
+            } catch (error) {
+              if (error instanceof AccessTokenForConnectionError &&
+                  error.code === 'failed_to_exchange_refresh_token') {
+                // Prompt user to reconnect their GitHub account
+                redirect('/settings/connections');
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Auth0Client.updateSession
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Updates the session for the currently authenticated user. Used to add custom
+      claims, persist user metadata changes, or refresh session data after profile
+      updates. Throws when called without an active session. Cannot persist changes
+      from Server Components (which cannot set cookies).
+    postconditions:
+      - id: auth0-update-session-unauthenticated
+        severity: error
+        condition: >
+          Called without an active user session (user is not logged in, session has
+          expired, or the session cookie is missing). Unlike getSession() which returns
+          null, updateSession() throws when unauthenticated.
+        throws: >
+          Error("The user is not authenticated.") — a plain Error, not an SdkError subclass.
+          Also throws Error("The session data is missing.") if the session argument
+          is undefined or null.
+        required_handling: >
+          Must wrap in try-catch or verify session existence first:
+            const session = await auth0.getSession();
+            if (!session) {
+              return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            }
+            // Now safe to update
+            await auth0.updateSession({ ...session, user: { ...session.user, role: 'admin' } });
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: auth0-update-session-server-component-no-persist
+        severity: warning
+        condition: >
+          updateSession() is called from a React Server Component (not a Server Action
+          or Route Handler). Server Components cannot set cookies, so the session update
+          is silently discarded even though no error is thrown.
+        returns: >
+          Promise<void> — resolves without error but the updated session is NOT persisted.
+          The next request will still see the old session data.
+        required_handling: >
+          Move updateSession() calls to Server Actions or Route Handlers where cookies
+          can be set. Do not call from Server Components for data that must persist:
+            // WRONG — in a Server Component:
+            await auth0.updateSession(updatedSession); // silently ignored
+
+            // CORRECT — in a Server Action:
+            'use server';
+            async function updateUserRole(role: string) {
+              const session = await auth0.getSession();
+              await auth0.updateSession({ ...session!, user: { ...session!.user, role } });
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: Auth0Client.customTokenExchange
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Exchanges an external token (legacy system token, SAML assertion, or other
+      custom credential) for Auth0 tokens using Custom Token Exchange (RFC 8693).
+      Server-only method that does NOT modify the session — callers must store the
+      returned tokens themselves. Throws CustomTokenExchangeError for validation
+      failures and token exchange errors.
+    postconditions:
+      - id: auth0-cte-missing-subject-token
+        severity: error
+        condition: >
+          The subjectToken parameter is empty, null, or undefined. This validation
+          error is thrown before the network request is made.
+        throws: >
+          CustomTokenExchangeError with code
+          CustomTokenExchangeErrorCode.MISSING_SUBJECT_TOKEN ("missing_subject_token").
+          Thrown synchronously during input validation.
+        required_handling: >
+          Validate the subject token before calling customTokenExchange():
+            if (!subjectToken) {
+              return NextResponse.json({ error: 'Missing token' }, { status: 400 });
+            }
+            try {
+              const result = await auth0.customTokenExchange({ subjectToken, subjectTokenType });
+            } catch (error) {
+              if (error instanceof CustomTokenExchangeError) {
+                return NextResponse.json({ error: error.message }, { status: 400 });
+              }
+              throw error;
+            }
+          Import: import { CustomTokenExchangeError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: auth0-cte-exchange-failed
+        severity: error
+        condition: >
+          Auth0 rejects the token exchange. Common causes: subjectTokenType not
+          registered in Auth0 tenant settings, the subject token has expired, invalid
+          token signature, or the client is not authorized for Custom Token Exchange.
+        throws: >
+          CustomTokenExchangeError with code
+          CustomTokenExchangeErrorCode.EXCHANGE_FAILED ("exchange_failed"). The .cause
+          property contains the underlying OAuth2Error with Auth0's error description.
+        required_handling: >
+          Must wrap in try-catch and handle exchange failures:
+            try {
+              const result = await auth0.customTokenExchange({ subjectToken, subjectTokenType });
+              return result;
+            } catch (error) {
+              if (error instanceof CustomTokenExchangeError) {
+                return NextResponse.json({ error: 'Token exchange failed' }, { status: 401 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Auth0Client.mfa.getAuthenticators
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Lists the enrolled MFA authenticators for a user as part of a step-up MFA
+      flow. Called after catching MfaRequiredError from getAccessToken(). The
+      mfaToken parameter is the encrypted token from the MfaRequiredError.
+      Throws MfaGetAuthenticatorsError, MfaTokenExpiredError, or MfaTokenInvalidError.
+    postconditions:
+      - id: auth0-mfa-get-authenticators-token-invalid
+        severity: error
+        condition: >
+          The mfaToken has expired (default TTL: 5 minutes, configurable via
+          mfaTokenTtl option) or was tampered with. The token is an encrypted JWE —
+          modification or re-encryption with a different secret causes MfaTokenInvalidError.
+        throws: >
+          MfaTokenExpiredError when the token's TTL has passed.
+          MfaTokenInvalidError when the token is malformed, tampered, or encrypted
+          with a different secret key.
+        required_handling: >
+          Must catch both token errors and restart the MFA flow:
+            try {
+              const authenticators = await auth0.mfa.getAuthenticators({ mfaToken });
+            } catch (error) {
+              if (error instanceof MfaTokenExpiredError || error instanceof MfaTokenInvalidError) {
+                // mfa_token is lost — user must restart auth flow
+                return NextResponse.json({ error: 'MFA session expired, please try again' }, { status: 401 });
+              }
+              throw error;
+            }
+          Import: import { MfaTokenExpiredError, MfaTokenInvalidError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: auth0-mfa-get-authenticators-api-error
+        severity: error
+        condition: >
+          The Auth0 MFA API request fails. Common causes: Auth0-side token rejection
+          (invalid_token error), network failure reaching the Auth0 API, or the tenant's
+          MFA configuration is missing or misconfigured.
+        throws: >
+          MfaGetAuthenticatorsError — the .cause property contains the Auth0 API
+          error response with error and error_description fields (snake_case).
+        required_handling: >
+          Must wrap in try-catch and handle API failures gracefully:
+            try {
+              const authenticators = await auth0.mfa.getAuthenticators({ mfaToken });
+            } catch (error) {
+              if (error instanceof MfaGetAuthenticatorsError) {
+                return Response.json(error, { status: 400 });
+              }
+              throw error;
+            }
+          Import: import { MfaGetAuthenticatorsError } from the mfa-errors module
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Auth0Client.mfa.challenge
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Initiates an MFA challenge for a specific authenticator (OTP, SMS/OOB, email).
+      Called after getAuthenticators() to trigger the challenge for the chosen method.
+      Returns ChallengeResponse with oobCode (for OOB) or indicates ready for OTP input.
+      Throws MfaChallengeError, MfaTokenExpiredError, or MfaNoAvailableFactorsError.
+    postconditions:
+      - id: auth0-mfa-challenge-invalid-authenticator
+        severity: error
+        condition: >
+          The specified authenticatorId does not exist in Auth0 or is not active.
+          The authenticator may have been removed between listing and challenging,
+          or the wrong property was used to extract the ID from the Authenticator object.
+        throws: >
+          MfaChallengeError with cause.error = 'invalid_authenticator_id'. The error
+          is returned from the Auth0 MFA API.
+        required_handling: >
+          Must catch MfaChallengeError and offer fallback options to the user:
+            try {
+              const challenge = await auth0.mfa.challenge({ mfaToken, challengeType, authenticatorId });
+            } catch (error) {
+              if (error instanceof MfaChallengeError) {
+                return Response.json({ error: 'Authenticator not found' }, { status: 400 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: auth0-mfa-challenge-no-factors
+        severity: error
+        condition: >
+          No enrolled MFA authenticators match the mfa_requirements from the
+          MfaRequiredError (user has no active MFA factors of the required type).
+          This is an SDK-generated error — no Auth0 API call is attempted.
+        throws: >
+          MfaNoAvailableFactorsError — SDK-only error, no Auth0 round-trip.
+          The user must enroll a new authenticator via mfa.enroll() before proceeding.
+        required_handling: >
+          Must catch and redirect the user to MFA enrollment:
+            try {
+              const challenge = await auth0.mfa.challenge({ mfaToken, challengeType: 'otp' });
+            } catch (error) {
+              if (error instanceof MfaNoAvailableFactorsError) {
+                redirect('/mfa/enroll'); // guide user to enroll a new factor
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: Auth0Client.mfa.verify
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Completes the MFA verification by submitting the user's OTP, OOB code, or
+      recovery code. Returns MfaVerifyResponse with the new token set on success.
+      Throws MfaVerifyError on incorrect codes and MfaTokenExpiredError when the
+      mfaToken has expired.
+    postconditions:
+      - id: auth0-mfa-verify-invalid-grant
+        severity: error
+        condition: >
+          The submitted OTP/OOB code is incorrect, has already been used, or has
+          expired. This is the most common MFA verification failure — users mistype
+          codes, codes expire (TOTP is time-based), or SMS codes are slow to arrive.
+        throws: >
+          MfaVerifyError with cause.error = 'invalid_grant'. The mfaToken remains
+          valid until its own TTL expires, allowing the user to retry with a new code.
+        required_handling: >
+          Must catch MfaVerifyError and return a user-friendly "invalid code" message:
+            try {
+              const tokens = await auth0.mfa.verify({ mfaToken, otp: userOtp });
+              return tokens;
+            } catch (error) {
+              if (error instanceof MfaVerifyError && error.cause?.error === 'invalid_grant') {
+                return Response.json({ error: 'Invalid or expired code, please try again' }, { status: 400 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+  - name: Auth0Client.mfa.enroll
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Enrolls a new MFA authenticator (OTP app, SMS, email) for the current user.
+      Returns EnrollmentResponse with the TOTP secret/barcode for OTP or OOB channel
+      info for SMS/email, plus optional recovery codes. Throws MfaEnrollmentError
+      when the enrollment request fails or the tenant doesn't support the requested type.
+    postconditions:
+      - id: auth0-mfa-enroll-unsupported-type
+        severity: error
+        condition: >
+          The Auth0 tenant does not have the requested authenticator type enabled
+          (e.g., enrolling OTP when only email MFA is enabled in tenant settings).
+          Tenant MFA configuration must match the enrollment options presented to users.
+        throws: >
+          MfaEnrollmentError with cause.error = 'unsupported_challenge_type'. The
+          application must verify which authenticator types are enabled in the Auth0
+          tenant before presenting enrollment options.
+        required_handling: >
+          Must catch MfaEnrollmentError and inform the user which types are supported:
+            try {
+              const enrollment = await auth0.mfa.enroll({ mfaToken, authenticatorTypes: ['otp'] });
+              return enrollment;
+            } catch (error) {
+              if (error instanceof MfaEnrollmentError) {
+                return Response.json({ error: 'Authenticator type not supported' }, { status: 400 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/dist/errors/mfa-errors.d.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Auth0Client.getTokenByBackchannelAuth
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Implements Client-Initiated Backchannel Authentication (CIBA) flow. Sends an
+      authentication request to Auth0 which pushes a notification to the user's device,
+      then polls the token endpoint until the user approves (or the request expires).
+      Throws BackchannelAuthenticationNotSupportedError if CIBA is not enabled on the
+      tenant, or BackchannelAuthenticationError if the user denies or the request expires.
+    postconditions:
+      - id: auth0-ciba-not-supported
+        severity: error
+        condition: >
+          The Auth0 tenant does not have CIBA (Client-Initiated Backchannel
+          Authentication) enabled. CIBA must be explicitly enabled in the Auth0
+          dashboard. The error is thrown during the OIDC discovery phase — before
+          any user interaction occurs.
+        throws: >
+          BackchannelAuthenticationNotSupportedError — thrown immediately when CIBA
+          is not present in the Auth0 discovery document's backchannel_authentication_endpoint.
+        required_handling: >
+          Must catch to avoid crashes on tenants without CIBA enabled:
+            try {
+              const tokens = await auth0.getTokenByBackchannelAuth({ bindingMessage, loginHint });
+            } catch (error) {
+              if (error instanceof BackchannelAuthenticationNotSupportedError) {
+                return NextResponse.json({ error: 'CIBA not configured' }, { status: 501 });
+              }
+              throw error;
+            }
+          Import: import { BackchannelAuthenticationNotSupportedError } from '@auth0/nextjs-auth0/server'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://auth0.com/docs/get-started/authentication-and-authorization-flow/client-initiated-backchannel-authentication-flow"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: auth0-ciba-denied-or-expired
+        severity: error
+        condition: >
+          The user denies the push notification, fails to respond within the request
+          expiry window (default 300 seconds / 5 minutes, configurable via
+          requestedExpiry), or Auth0 returns an error during the polling phase
+          (e.g., access_denied, expired_token, slow_down).
+        throws: >
+          BackchannelAuthenticationError — the .cause property contains the underlying
+          OAuth2Error with the specific denial/timeout reason (access_denied, expired_token).
+        required_handling: >
+          Must catch and notify the consumption device that the action was cancelled:
+            try {
+              const tokens = await auth0.getTokenByBackchannelAuth({ bindingMessage, loginHint });
+              return tokens;
+            } catch (error) {
+              if (error instanceof BackchannelAuthenticationError) {
+                // Notify user on consumption device that auth was denied/timed out
+                return NextResponse.json({
+                  error: 'Authentication was denied or timed out'
+                }, { status: 401 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://auth0.com/docs/get-started/authentication-and-authorization-flow/client-initiated-backchannel-authentication-flow"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
 notes:
-  - "v2.x and v3.x share the same standalone function API — this contract covers both"
-  - "v4.x uses Auth0Client instance methods (auth0.getAccessToken()) — separate contract needed"
+  - "v2.x and v3.x share the same standalone function API — first 4 functions in this contract"
+  - "v4.x uses Auth0Client instance methods (auth0.getSession(), etc.) — added in contract v2.0.0"
+  - "semver updated to >=2.0.0 to cover all versions including v4"
   - "handleAuth() with default handlers does NOT need try-catch — SDK handles errors internally"
   - "withApiAuthRequired() returns 401, does NOT throw — no contract needed for it"
-  - "getSession() rarely throws — returns null when no session; null-check errors are out of scope"
+  - "getSession() returns null for unauthenticated users — auth0-get-session-no-null-check covers destructuring"
   - "getAccessToken 60-second clock skew buffer: tokens expire slightly before their stated time"
   - "Token refresh race condition: concurrent requests can cause FAILED_REFRESH_GRANT even with valid tokens"
+  - "MFA methods (getAuthenticators, challenge, verify, enroll) accessed via auth0.mfa.method() — chained"
+  - "createFetcher() is intentionally omitted — it wraps getAccessToken errors, covered by parent postconditions"
+  - "startInteractiveLogin() is intentionally omitted — returns redirect response, no distinct error contract"
+  - "connectAccount() is intentionally omitted — low adoption, similar pattern to getAccessTokenForConnection"
