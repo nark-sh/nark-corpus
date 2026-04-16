@@ -107,3 +107,82 @@ export async function thumbnailWithCatch(inputPath: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. metadata — read image header info (width, height, format, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getImageDimensionsNoCatch(inputPath: string) {
+  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — metadata() rejects on
+  // missing file, corrupt header, or unsupported format. No try-catch.
+  const meta = await sharp(inputPath).metadata();
+  return { width: meta.width, height: meta.height };
+}
+
+export async function getImageDimensionsWithCatch(inputPath: string) {
+  try {
+    // SHOULD_NOT_FIRE: metadata() inside try-catch satisfies error handling
+    const meta = await sharp(inputPath).metadata();
+    return { width: meta.width, height: meta.height };
+  } catch (err) {
+    console.error('Could not read image metadata:', err);
+    throw err;
+  }
+}
+
+export async function validateUploadedImageNoCatch(inputBuffer: Buffer) {
+  // SHOULD_FIRE: metadata-rejects-on-corrupt-or-unsupported-input — user-provided buffer
+  // may be corrupt or not an image at all. No try-catch.
+  const meta = await sharp(inputBuffer).metadata();
+  return meta.format;
+}
+
+export async function validateUploadedImageWithCatch(inputBuffer: Buffer) {
+  try {
+    // SHOULD_NOT_FIRE: upload validation inside try-catch
+    const meta = await sharp(inputBuffer).metadata();
+    return meta.format;
+  } catch (err) {
+    throw new Error(`Invalid image upload: ${(err as Error).message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. stats — pixel-derived statistics (entropy, sharpness, dominant color)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getImageStatsNoCatch(inputPath: string) {
+  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — stats() decodes all pixels
+  // and rejects on corrupt data, missing file, or unsupported format. No try-catch.
+  const s = await sharp(inputPath).stats();
+  return s.entropy;
+}
+
+export async function getImageStatsWithCatch(inputPath: string) {
+  try {
+    // SHOULD_NOT_FIRE: stats() inside try-catch satisfies error handling
+    const s = await sharp(inputPath).stats();
+    return s.entropy;
+  } catch (err) {
+    console.error('Image stats failed:', err);
+    throw err;
+  }
+}
+
+export async function detectBlurryImageNoCatch(inputBuffer: Buffer) {
+  // SHOULD_FIRE: stats-rejects-on-corrupt-or-unsupported-input — blur detection pipeline
+  // fails silently if corrupt buffer provided. No try-catch.
+  const { sharpness } = await sharp(inputBuffer).stats();
+  return sharpness < 10;
+}
+
+export async function detectBlurryImageWithCatch(inputBuffer: Buffer) {
+  try {
+    // SHOULD_NOT_FIRE: blur detection inside try-catch
+    const { sharpness } = await sharp(inputBuffer).stats();
+    return sharpness < 10;
+  } catch (err) {
+    console.error('Blur detection failed:', err);
+    return null;
+  }
+}

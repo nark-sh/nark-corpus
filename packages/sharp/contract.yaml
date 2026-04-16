@@ -2,9 +2,10 @@ package: sharp
 semver: ">=0.30.0 <1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-15"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   type_names:
@@ -59,6 +60,130 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: metadata
+    import_path: "sharp"
+    description: >
+      Fast access to image metadata (width, height, format, channels, EXIF, ICC, etc.)
+      without decoding compressed pixel data. Reads from the image header only.
+      Returns a Promise that rejects if the input is corrupt, missing, or unsupported.
+      Commonly used before toBuffer()/toFile() to determine dimensions or validate
+      that an uploaded image is a genuine image file.
+    postconditions:
+      # Evidence: sharp C++ source — src/common.cc throws VError which propagates as Error
+      # via is.nativeError() in lib/input.js → Promise.reject(is.nativeError(err, stack))
+      # Source lines confirmed: common.cc:562 "Input file is missing: ..."
+      # common.cc:572 "Input file has corrupt header: ..."
+      # common.cc:575 "Input file contains unsupported image format"
+      # common.cc:583 "Input image exceeds pixel limit"
+      # common.cc:485 "Input buffer has corrupt header: ..."
+      # common.cc:488 "Input buffer contains unsupported image format"
+      # metadata.cc:292 → Callback with Napi::Error when baton->err is non-empty
+      # Documentation: https://sharp.pixelplumbing.com/api-input#metadata
+      - id: metadata-rejects-on-corrupt-or-unsupported-input
+        condition: >
+          Input image has a corrupt header, is not a recognized image format, or the
+          input file is missing from the filesystem. Also rejects if the image exceeds
+          the pixel limit (default 268,402,689 pixels) when limitInputPixels is set.
+        throws: >
+          Promise rejection with Error whose message begins with one of:
+          "Input file is missing: <path>",
+          "Input file has corrupt header: <libvips error>",
+          "Input file contains unsupported image format",
+          "Input buffer has corrupt header: <libvips error>",
+          "Input buffer contains unsupported image format",
+          "Input image exceeds pixel limit".
+          All originate from libvips VError converted to a native JS Error via
+          is.nativeError() in lib/input.js.
+        required_handling: >
+          Caller MUST wrap await sharp(input).metadata() in try-catch.
+          Used in upload validation pipelines to check if a file is a genuine image —
+          if the call throws, it must be caught or it silently crashes the upload handler
+          and returns a 500 to the client.
+
+          Correct pattern:
+            try {
+              const meta = await sharp(inputBuffer).metadata();
+              // Use meta.width, meta.height, meta.format
+            } catch (error) {
+              // Input is corrupt, unsupported, or file is missing
+              throw new Error(`Invalid image: ${error.message}`);
+            }
+
+          Note: metadata() reads only the header — a successful metadata() call does NOT
+          guarantee the full image is valid. Corrupt pixel data surfaces only when
+          toBuffer() or toFile() decodes the full image.
+        sources:
+          - "https://sharp.pixelplumbing.com/api-input#metadata"
+          - "https://github.com/lovell/sharp/blob/main/src/common.cc"
+          - "https://github.com/lovell/sharp/blob/main/src/metadata.cc"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: stats
+    import_path: "sharp"
+    description: >
+      Access to pixel-derived statistics (min, max, mean, stdev per channel, entropy,
+      sharpness, dominant color) for the input image. Unlike metadata(), stats() requires
+      full pixel decoding — it cannot analyze transformed images without first calling
+      toBuffer() to materialize the intermediate result. Returns a Promise.
+    postconditions:
+      # Evidence: sharp C++ source — src/stats.cc catches VError from pixel decoding
+      # stats.cc:42-43 catches vips::VError and appends to baton->err
+      # stats.cc:149 → Callback with Napi::Error when baton->err non-empty
+      # Same input-loading errors as metadata() since it uses LoadInputImage()
+      # Documentation: https://sharp.pixelplumbing.com/api-input#stats
+      - id: stats-rejects-on-corrupt-or-unsupported-input
+        condition: >
+          Input image cannot be fully decoded: corrupt file, unsupported format,
+          missing input file, or pixel limit exceeded. Unlike metadata(), stats()
+          decodes all pixel data so corrupt pixel data (not just header corruption)
+          will also cause rejection.
+        throws: >
+          Promise rejection with Error whose message originates from libvips VError:
+          "Input file is missing: <path>",
+          "Input file has corrupt header: <libvips error>",
+          "Input file contains unsupported image format",
+          "Input buffer has corrupt header: <libvips error>",
+          "Input buffer contains unsupported image format",
+          or any libvips processing error from full pixel decode.
+        required_handling: >
+          Caller MUST wrap await sharp(input).stats() in try-catch.
+          stats() is often used for image quality analysis (is it blurry? colorful?).
+          When called without error handling on unvalidated user uploads, a corrupt
+          image will crash the analysis pipeline and leave jobs stuck.
+
+          Correct pattern:
+            try {
+              const { entropy, sharpness, dominant } = await sharp(inputBuffer).stats();
+              // Use entropy to detect blank images, sharpness for blur detection
+            } catch (error) {
+              console.error('Image stats failed:', error.message);
+              throw error;
+            }
+
+          Critical gotcha: statistics are derived from the ORIGINAL input image.
+          If you want stats on a resized/cropped region, you MUST first do:
+            const part = await sharp(input).extract(region).toBuffer();
+            const s = await sharp(part).stats();  // Stats on the cropped region
+          Calling .extract(region).stats() without intermediate toBuffer() reads
+          stats from the original unmodified image — a silent data correctness bug.
+        sources:
+          - "https://sharp.pixelplumbing.com/api-input#stats"
+          - "https://github.com/lovell/sharp/blob/main/src/stats.cc"
+          - "https://github.com/lovell/sharp/blob/main/src/common.cc"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 # Category: image-processing
 # npm: https://www.npmjs.com/package/sharp
