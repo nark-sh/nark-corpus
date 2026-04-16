@@ -1,14 +1,29 @@
 package: '@modelcontextprotocol/sdk'
 semver: ^1.0.0
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-11'
-status: draft
+last_verified: '2026-04-16'
+status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-2 pass 8):
+# API surface: ~20 distinct async-callable operations across Client, McpServer, Server
+# Contracted before: 3 (connect, callTool, listTools)
+# Contracted after: 11 (+8 this pass: close, readResource, getPrompt, createMessage, elicitInput,
+#                         listResources, listPrompts, subscribeResource)
+# Omitted: 9 (ping health-check, setLoggingLevel admin, complete autocomplete utility,
+#              listResourceTemplates same-profile-as-listResources, unsubscribeResource same-profile,
+#              sendRootsListChanged notification, sendLoggingMessage notification wrapper,
+#              listRoots same-profile-as-listTools, listTasksRequest experimental)
+# Coverage: 11/20 = 0.55 (before: 3/20 = 0.15)
+# Evidence: compiled JS at dist/cjs/client/index.js + dist/cjs/server/index.js + dist/cjs/shared/protocol.js
+#   Source: /private/tmp/claude/bc-deepen/@modelcontextprotocol/sdk/node_modules/@modelcontextprotocol/sdk/
+#   Transport docs: https://modelcontextprotocol.io/docs/concepts/transports
+coverage_score: 0.55  # 11 contracted / 20 total async-callable (9 intentionally omitted)
 detection:
   class_names:
     - Client
     - McpServer
+    - Server
 functions:
   - name: connect
     import_path: '@modelcontextprotocol/sdk'
@@ -115,3 +130,545 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: close
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Closes the MCP connection and disposes the transport. Available on Client, McpServer, and
+      Server instances. Must be called to release resources (network connections, stdio subprocesses,
+      timers) when the MCP session is no longer needed. Failure to close causes resource leaks and
+      leaves the remote side with a zombie connection.
+    postconditions:
+      # Evidence: dist/cjs/shared/protocol.js — close() calls transport.close(), which can throw
+      # transport-specific errors (network teardown, subprocess kill failure). The McpError
+      # ConnectionClosed (-32000) is emitted to in-flight request handlers via the error callback.
+      # https://modelcontextprotocol.io/docs/concepts/transports
+      - id: close-discards-in-flight-requests
+        condition: >
+          close() is called while there are pending request() calls awaiting a response.
+          In-flight requests receive McpError(ErrorCode.ConnectionClosed, 'Connection closed') instead
+          of a response. This is confirmed from dist/cjs/shared/protocol.js:
+          "const error = McpError.fromError(ErrorCode.ConnectionClosed, 'Connection closed')".
+        throws: >
+          McpError with code ErrorCode.ConnectionClosed (-32000) thrown into any pending request()
+          awaiting a response. The close() call itself does not throw.
+        required_handling: >
+          Callers MUST handle McpError from in-flight requests when the connection is closed.
+          In teardown sequences (shutdown handlers, test cleanup), ensure all request promises are
+          settled BEFORE calling close(). Common pattern:
+            await Promise.allSettled([pendingRequests]);
+            await client.close();
+          Do NOT fire-and-forget close() if there are active request workflows that need results.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: close-missing-on-server-shutdown
+        condition: >
+          McpServer.connect() is called in a long-running process but close() is never called
+          when the HTTP request ends (stateless Streamable HTTP) or when the user disconnects
+          (stdio session). Transport resources (SSE connections, subprocess handles, timers) accumulate.
+        throws: No error thrown — resource leak is silent
+        required_handling: >
+          Callers MUST call close() in all exit paths: HTTP response finalizers, process SIGTERM
+          handlers, test afterEach/afterAll hooks. For Express/Next.js MCP servers using
+          StreamableHTTPServerTransport, call close() at the end of each request handler.
+          For stdio MCP servers, register process.on('SIGINT', ...) and process.on('SIGTERM', ...)
+          handlers that call server.close().
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: readResource
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Reads the contents of a specific resource by URI from the connected MCP server.
+      Used in agentic systems to retrieve context data (file contents, database records,
+      API responses) that the server exposes as resources. Resources are server-managed
+      data sources identified by URIs (e.g. file:///path/to/file, db://table/row/id).
+    postconditions:
+      # Evidence: dist/cjs/client/index.js — assertCapabilityForMethod checks for
+      # "Server does not support resources (required for resources/read)"
+      # Protocol layer throws McpError on timeout (RequestTimeout -32001) and
+      # ConnectionClosed (-32000) from dist/cjs/shared/protocol.js
+      - id: read-resource-missing-try-catch
+        condition: >
+          async function calls client.readResource() without try-catch. The server may throw
+          McpError for: resource URI not found (MethodNotFound -32601), server-side I/O failure
+          (InternalError -32603), or protocol-level failures (timeout RequestTimeout -32001,
+          connection closed ConnectionClosed -32000).
+        throws: >
+          McpError — base class for protocol errors. Key codes:
+          - ErrorCode.MethodNotFound (-32601): resource URI does not exist on server
+          - ErrorCode.InternalError (-32603): server-side error reading the resource
+          - ErrorCode.RequestTimeout (-32001): no response within timeout (default 60s)
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected during request
+        required_handling: >
+          Caller MUST wrap client.readResource() in try-catch and handle McpError.
+          Resource URIs can disappear (files deleted, DB rows removed) between listResources()
+          and readResource(). TOCTOU pattern is common — always handle MethodNotFound.
+
+          Minimum:
+            try {
+              const result = await client.readResource({ uri: 'file:///data.json' });
+              return result.contents;
+            } catch (error) {
+              if (error instanceof McpError && error.code === ErrorCode.MethodNotFound) {
+                return null; // Resource was removed
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: read-resource-capability-not-advertised
+        condition: >
+          client.readResource() is called when the connected server has NOT advertised the
+          resources capability in its initialization response. The client SDK throws synchronously
+          before sending the request: "Server does not support resources (required for resources/read)".
+        throws: >
+          Error: "Server does not support resources (required for resources/read)"
+          Thrown synchronously from assertCapabilityForMethod() in client/index.js.
+        required_handling: >
+          Callers MUST check server capabilities before calling readResource(). Use
+          client.getServerCapabilities() after connect() to verify resources support:
+            const caps = client.getServerCapabilities();
+            if (!caps?.resources) {
+              throw new Error('This MCP server does not support resources');
+            }
+          Do NOT assume all MCP servers expose resources — it is an optional capability.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getPrompt
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Retrieves a prompt template from the connected MCP server by name, with optional arguments
+      to fill template variables. Used in agentic AI systems to fetch server-managed prompt
+      templates that may include dynamic content, context injection, or parameterized instructions.
+      Returns a list of messages ready for use in an LLM conversation.
+    postconditions:
+      # Evidence: dist/cjs/client/index.js — assertCapabilityForMethod checks:
+      # "Server does not support prompts (required for prompts/get)"
+      # Protocol throws McpError on timeout, connection close, MethodNotFound
+      - id: get-prompt-missing-try-catch
+        condition: >
+          async function calls client.getPrompt() without try-catch. Throws McpError when the
+          prompt name does not exist on the server (MethodNotFound -32601), arguments fail
+          server-side validation (InvalidParams -32602), transport fails (ConnectionClosed -32000),
+          or request times out (RequestTimeout -32001).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.MethodNotFound (-32601): prompt name not found on server
+          - ErrorCode.InvalidParams (-32602): invalid or missing required prompt arguments
+          - ErrorCode.RequestTimeout (-32001): no response within timeout (default 60s)
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+        required_handling: >
+          Caller MUST wrap client.getPrompt() in try-catch. Prompt names and arguments are
+          often user-controlled or configured at runtime — validate before calling, and handle
+          MethodNotFound gracefully (the prompt may have been removed after listing):
+
+            try {
+              const prompt = await client.getPrompt({ name: 'analyze-code', arguments: { lang: 'ts' } });
+              return prompt.messages;
+            } catch (error) {
+              if (error instanceof McpError && error.code === ErrorCode.MethodNotFound) {
+                // Prompt was removed, fall back to default
+                return getDefaultPrompt();
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: get-prompt-capability-not-advertised
+        condition: >
+          client.getPrompt() is called when the connected server has NOT advertised the
+          prompts capability. SDK throws synchronously:
+          "Server does not support prompts (required for prompts/get)"
+        throws: >
+          Error: "Server does not support prompts (required for prompts/get)"
+        required_handling: >
+          Callers MUST verify prompts capability via client.getServerCapabilities() after connect().
+          Prompts is an optional server capability — not all MCP servers expose prompt templates.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: createMessage
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Server-to-client sampling request: asks the MCP client to invoke an LLM and return
+      the result. Used by MCP servers that need AI capabilities themselves (e.g., server-side
+      reasoning, content generation). The server sends this request; the client (which holds
+      LLM API keys) executes the sampling and returns the result. This is the "server asking
+      the client to do AI" pattern. Only available on Server class instances.
+    postconditions:
+      # Evidence: dist/cjs/server/index.js — assertCapabilityForMethod:
+      # "Client does not support sampling (required for sampling/createMessage)"
+      # Also: "Client does not support sampling tools capability."
+      # Protocol throws McpError on timeout and connection close.
+      - id: create-message-missing-try-catch
+        condition: >
+          async function calls server.createMessage() without try-catch. The client may reject
+          the sampling request (capability not supported, rate limit, model error) via McpError.
+          Also throws on transport failure (ConnectionClosed -32000) or timeout (RequestTimeout -32001).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.InvalidParams (-32602): malformed message or invalid model parameters
+          - ErrorCode.RequestTimeout (-32001): LLM call timed out (client's LLM API is slow)
+          - ErrorCode.ConnectionClosed (-32000): client disconnected before responding
+          Additionally: Error "Client does not support sampling (required for sampling/createMessage)"
+          when client has no sampling capability.
+        required_handling: >
+          Caller MUST wrap server.createMessage() in try-catch. LLM API calls are slow (5-60s)
+          and can fail at any point. The server's request handler should not crash on sampling failure:
+
+            try {
+              const result = await server.createMessage({
+                messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
+                maxTokens: 1024
+              });
+              return result.content;
+            } catch (error) {
+              if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
+                throw new McpError(ErrorCode.InternalError, 'LLM sampling timed out');
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: create-message-capability-not-advertised
+        condition: >
+          server.createMessage() is called when the connected client has NOT advertised the
+          sampling capability. SDK throws synchronously:
+          "Client does not support sampling (required for sampling/createMessage)"
+          This is thrown from assertCapabilityForMethod() before any network call.
+        throws: >
+          Error: "Client does not support sampling (required for sampling/createMessage)"
+        required_handling: >
+          Server implementations MUST check client capabilities via server.getClientCapabilities()
+          before calling createMessage(). Not all MCP clients support sampling. If sampling is
+          not available, fall back to static responses or inform the caller via McpError:
+            const caps = server.getClientCapabilities();
+            if (!caps?.sampling) {
+              throw new McpError(ErrorCode.MethodNotFound,
+                'This operation requires client-side AI sampling, which is not supported');
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: elicitInput
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Server-to-client interaction request: asks the MCP client (and through it, the user)
+      to provide structured input data in response to a prompt. Used by MCP servers that need
+      user confirmation, additional parameters, or interactive data collection during a tool
+      call. The server pauses execution and waits for the client to present a form or UI to
+      the user and return the result. Only available on Server class instances.
+    postconditions:
+      # Evidence: dist/cjs/server/index.js:
+      # "Client does not support elicitation (required for elicitation/create)"
+      # "Client does not support URL elicitation (required for ...)"
+      # McpError(ErrorCode.InvalidParams) when elicitation response fails schema validation
+      # dist/cjs/shared/protocol.js: RequestTimeout, ConnectionClosed
+      - id: elicit-input-missing-try-catch
+        condition: >
+          async function calls server.elicitInput() without try-catch. The client may reject
+          the elicitation (user cancels, capability not supported, response validation failure)
+          via McpError. Also throws on timeout (RequestTimeout -32001) if the user never responds
+          or connection closes (ConnectionClosed -32000).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.InvalidParams (-32602): client's elicitation response does not match the
+            requested JSON Schema ("Elicitation response content does not match requested schema")
+          - ErrorCode.RequestTimeout (-32001): user did not respond within timeout
+          - ErrorCode.ConnectionClosed (-32000): client disconnected before submitting form
+          Additionally: Error "Client does not support elicitation (required for elicitation/create)"
+          or Error "Client does not support URL elicitation" for mode mismatches.
+        required_handling: >
+          Caller MUST wrap server.elicitInput() in try-catch. Users can cancel or time out,
+          and clients may not support elicitation. Handle cancellation gracefully:
+
+            try {
+              const result = await server.elicitInput({
+                requestedSchema: { type: 'object', properties: { confirm: { type: 'boolean' } } },
+                message: 'Confirm deletion of all records?'
+              });
+              if (result.action === 'cancel') {
+                return { cancelled: true };
+              }
+              return processUserInput(result.content);
+            } catch (error) {
+              if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
+                return { timedOut: true };
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: elicit-input-capability-not-advertised
+        condition: >
+          server.elicitInput() is called when the connected client has NOT advertised the
+          elicitation capability. SDK throws synchronously:
+          "Client does not support elicitation (required for elicitation/create)"
+          For URL-mode elicitation specifically:
+          "Client does not support URL elicitation (required for ...)"
+        throws: >
+          Error: "Client does not support elicitation (required for elicitation/create)"
+          Error: "Client does not support URL elicitation" (for URL-mode params)
+        required_handling: >
+          Server implementations MUST check client capabilities before calling elicitInput().
+          Elicitation is an optional client capability introduced in MCP protocol 2025-06-18.
+          Older clients (Claude Desktop pre-2025, most CLI clients) do not support it:
+            const caps = server.getClientCapabilities();
+            if (!caps?.elicitation) {
+              // Fall back to including data in the tool's input schema
+              throw new McpError(ErrorCode.InvalidRequest,
+                'Client does not support interactive input — provide all parameters upfront');
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: listResources
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Lists all resources available on the connected MCP server, with optional cursor for
+      pagination. Resources are server-managed data sources exposed to clients (files, DB rows,
+      API results). The listing may be paginated via nextCursor when the server has many resources.
+    postconditions:
+      # Evidence: dist/cjs/client/index.js — assertCapabilityForMethod:
+      # "Server does not support resources (required for resources/list)"
+      # Protocol throws McpError on timeout and connection close.
+      - id: list-resources-missing-try-catch
+        condition: >
+          async function calls client.listResources() without try-catch. Throws McpError when
+          the transport fails (ConnectionClosed -32000), request times out (RequestTimeout -32001),
+          or server returns an error response (InternalError -32603 for server-side listing failure).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.RequestTimeout (-32001): server did not respond within timeout
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+          - ErrorCode.InternalError (-32603): server-side resource enumeration failure
+        required_handling: >
+          Caller MUST wrap client.listResources() in try-catch. Server-side resource enumeration
+          can fail (DB unavailable, filesystem permission denied). Pagination cursors expire — handle
+          InvalidParams when a stale cursor is used.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: list-resources-capability-not-advertised
+        condition: >
+          client.listResources() is called when the connected server has NOT advertised the
+          resources capability. SDK throws synchronously:
+          "Server does not support resources (required for resources/list)"
+        throws: >
+          Error: "Server does not support resources (required for resources/list)"
+        required_handling: >
+          Check server capabilities via client.getServerCapabilities() after connect() before
+          calling listResources(). Resources is an optional capability — not all MCP servers
+          expose data sources.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: listPrompts
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Lists all prompt templates available on the connected MCP server, with optional cursor
+      for pagination. Used to discover what prompt templates the server offers before calling
+      getPrompt(). Analogous to listTools() but for prompt templates.
+    postconditions:
+      # Evidence: dist/cjs/client/index.js — assertCapabilityForMethod:
+      # "Server does not support prompts (required for prompts/list)"
+      - id: list-prompts-missing-try-catch
+        condition: >
+          async function calls client.listPrompts() without try-catch. Throws McpError on
+          transport failure (ConnectionClosed -32000) or timeout (RequestTimeout -32001).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.RequestTimeout (-32001): server did not respond
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+        required_handling: >
+          Caller MUST wrap client.listPrompts() in try-catch. Network-connected MCP servers
+          can fail or disconnect. Handle gracefully by disabling prompt features.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: list-prompts-capability-not-advertised
+        condition: >
+          client.listPrompts() is called when the connected server has NOT advertised the
+          prompts capability. SDK throws synchronously:
+          "Server does not support prompts (required for prompts/list)"
+        throws: >
+          Error: "Server does not support prompts (required for prompts/list)"
+        required_handling: >
+          Check server capabilities via client.getServerCapabilities() before calling listPrompts().
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: subscribeResource
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Subscribes to change notifications for a specific resource URI on the connected MCP server.
+      After subscribing, the server will send notifications/resources/updated notifications when
+      the resource changes. The client must register a notification handler to receive updates.
+      Subscription requires both resources AND resource subscriptions capability from the server.
+    postconditions:
+      # Evidence: dist/cjs/client/index.js — assertCapabilityForMethod:
+      # "Server does not support resource subscriptions (required for resources/subscribe)"
+      # Protocol throws McpError on timeout and connection close.
+      - id: subscribe-resource-missing-try-catch
+        condition: >
+          async function calls client.subscribeResource() without try-catch. Throws McpError
+          when: URI not found on server (MethodNotFound -32601), subscriptions not supported
+          (InvalidRequest -32600 or capability Error), transport fails (ConnectionClosed -32000),
+          or request times out (RequestTimeout -32001).
+        throws: >
+          McpError — key codes:
+          - ErrorCode.MethodNotFound (-32601): the resource URI does not exist
+          - ErrorCode.RequestTimeout (-32001): no response within timeout
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+          Additionally: Error "Server does not support resource subscriptions (required for resources/subscribe)"
+        required_handling: >
+          Caller MUST wrap client.subscribeResource() in try-catch. Subscriptions are typically
+          set up at session start — a failure here means the client will miss resource change events
+          silently if not handled:
+
+            try {
+              await client.subscribeResource({ uri: 'file:///config.json' });
+            } catch (error) {
+              console.error('Resource subscription failed:', error.message);
+              // Fall back to polling or static read
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: subscribe-resource-no-notification-handler
+        condition: >
+          client.subscribeResource() is called but no handler is registered for
+          notifications/resources/updated notifications via client.setNotificationHandler().
+          The subscription succeeds but change notifications are silently dropped.
+        throws: No error thrown — notification is silently discarded
+        required_handling: >
+          Callers MUST register a notification handler BEFORE subscribing to resources.
+          Register with:
+            client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+              const updatedUri = notification.params.uri;
+              // Re-read the resource
+              client.readResource({ uri: updatedUri }).then(handleUpdatedResource);
+            });
+          The handler must be registered before connect() or at minimum before subscribeResource()
+          to avoid a race condition where the first update notification arrives before the handler.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
