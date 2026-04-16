@@ -27,6 +27,7 @@ import {
   oneOf,
   validationResult,
   matchedData,
+  ExpressValidator,
 } from 'express-validator';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,4 +276,87 @@ export async function handleWithSafeFormatter(req: Request, res: Response) {
     return res.status(400).json({ errors: errors.array() });
   }
   res.json({ email: req.body.email });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. matchedData() — used without validationResult check
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: matcheddata-used-without-validationresult-check
+// SHOULD_FIRE: matchedData() called without first checking validationResult().isEmpty()
+// Invalid fields silently absent from result — DB update may write partial/corrupt data
+export async function handleUpdateUserMissingResultCheck(req: Request, res: Response) {
+  await body('email').isEmail().run(req);
+  await body('name').notEmpty().run(req);
+  // No validationResult check — if email is invalid, it's silently absent from matchedData()
+  const data = matchedData(req);
+  // If email failed validation, data.email is undefined but no error is returned to caller
+  res.json({ updated: true, data });
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: validationResult checked before matchedData() is used
+export async function handleUpdateUserWithResultCheck(req: Request, res: Response) {
+  await body('email').isEmail().run(req);
+  await body('name').notEmpty().run(req);
+  const errors = validationResult(req);
+  if (\!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  const data = matchedData(req);
+  res.json({ updated: true, data });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. ExpressValidator — custom sanitizer missing return value
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @no-detector: express-validator-custom-sanitizer-no-return
+// No scanner rule yet — concern queued (concern-20260416-express-validator-deepen-1)
+// When scanner rule is added, change annotation to @expect-violation
+// POSTCONDITION: custom sanitizer does not return a value — field silently becomes undefined
+const { body: evBody, validationResult: evResult } = new ExpressValidator(
+  {},
+  {
+    // BUG: sanitizer does not return the sanitized value — field will be undefined after sanitization
+    stripPrefix: (value: string) => {
+      value.replace(/^PREFIX_/, '');
+      // Missing: return value.replace(...)  or  return sanitizedValue
+    },
+  },
+);
+export async function handleEvSanitizerNoReturn(req: Request, res: Response) {
+  await evBody('code').customSanitizer((value: string) => {
+    // Same pattern: no return — field silently becomes undefined
+    value.toString().toUpperCase();
+  }).run(req);
+  const errors = evResult(req);
+  if (\!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  // data.code is undefined despite no validation error being reported
+  const data = matchedData(req);
+  res.json(data);
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: custom sanitizer properly returns the transformed value
+const { body: evBody2, validationResult: evResult2 } = new ExpressValidator(
+  {},
+  {
+    stripPrefix: (value: string) => {
+      return value.replace(/^PREFIX_/, '');
+    },
+  },
+);
+export async function handleEvSanitizerWithReturn(req: Request, res: Response) {
+  await evBody2('code').customSanitizer((value: string) => {
+    return value.toString().toUpperCase();
+  }).run(req);
+  const errors = evResult2(req);
+  if (\!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  const data = matchedData(req);
+  res.json(data);
 }

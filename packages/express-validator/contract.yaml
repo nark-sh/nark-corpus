@@ -2,10 +2,10 @@ package: express-validator
 semver: '>=6.0.0 <8.0.0'
 contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-13'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
-coverage_score: 0.73
+coverage_score: 0.87
 functions:
   - name: validationResult
     import_path: express-validator
@@ -499,6 +499,122 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: lost_data
+          incident_cost_range: medium
+  - name: matchedData
+    import_path: express-validator
+    description: >
+      Extracts all validated and/or sanitized field values from the request into a plain object.
+      Commonly used after validation chains run to get only the clean, validated data without
+      accessing req.body/req.query directly. By default, omits fields that have validation
+      errors (onlyValidData: true) and omits optional fields that were not provided
+      (includeOptionals: false). Does not throw.
+    postconditions:
+      # Evidence: https://express-validator.github.io/docs/api/matched-data
+      # Confirmed from source: lib/matched-data.js — createValidityFilter defaults onlyValidData=true
+      - id: matcheddata-used-without-validationresult-check
+        condition: >
+          matchedData(req) is called but the caller did NOT first call validationResult(req) and
+          check isEmpty() — invalid fields silently absent from the returned object
+        returns: >-
+          Returns an object that silently omits all fields that failed validation. If the caller
+          assumes all submitted fields are present (e.g., spreading into a DB write), invalid
+          user input is treated as missing rather than invalid — no error is thrown.
+        required_handling: >
+          Always call validationResult(req) and verify isEmpty() before calling matchedData(req).
+          Without this check, the returned object silently excludes invalid fields. Code that
+          does `db.update({ ...matchedData(req) })` without first verifying validation passed
+          will silently persist partial data or update with undefined fields.
+        sources:
+          - https://express-validator.github.io/docs/api/matched-data
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+      - id: matcheddata-optional-fields-silently-absent
+        condition: >
+          matchedData(req) is called without { includeOptionals: true } but the code assumes
+          all validated optional fields are present in the returned object
+        returns: >-
+          Optional fields that were not included in the request are absent from the result
+          by default. Code that destructures matchedData() and assigns directly to a record
+          update will silently skip optional fields, leaving stale values unchanged instead
+          of clearing them (e.g., a user attempting to unset an optional profile field).
+        required_handling: >
+          Pass { includeOptionals: true } when you need optional fields present (even as
+          undefined) in the returned object. Otherwise, distinguish between "user didn't
+          submit this field" (absent) and "user submitted this field as empty" using req.body
+          directly for optional fields. Failure to handle this causes silent PATCH semantics
+          even when a PUT was intended.
+        sources:
+          - https://express-validator.github.io/docs/api/matched-data
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+  - name: ExpressValidator
+    import_path: express-validator
+    description: >
+      Class that wraps the express-validator API to support custom validators and sanitizers.
+      Instantiated once (typically at module level) and its methods (body(), query(), check(),
+      checkSchema(), validationResult(), etc.) replace the standalone functions. Custom
+      validators/sanitizers are registered in the constructor and become available as chain
+      methods (e.g., chain.isAllowedDomain()). The primary use case is cross-cutting validation
+      rules that need to be shared across routes.
+    postconditions:
+      # Evidence: https://express-validator.github.io/docs/guides/customizing
+      # Confirmed from source: lib/context-items/sanitization.js — newValue set directly from return value
+      - id: express-validator-custom-sanitizer-no-return
+        condition: >
+          A custom sanitizer registered with new ExpressValidator() does not return a value
+          (or implicitly returns undefined)
+        returns: >-
+          The field's value is silently set to undefined. Validation technically "succeeds" —
+          no error is added — but the field value is permanently corrupted to undefined in the
+          request context. Any subsequent matchedData() call will include the field as undefined.
+          DB writes using the field will store null/undefined.
+        required_handling: >
+          Custom sanitizers MUST return a value. The official docs warn: "If you don't return
+          from a custom sanitizer, your field will become undefined!" This is a silent data
+          corruption — no exception is thrown, validation passes, but the field is destroyed.
+          Always explicitly return the sanitized value.
+        sources:
+          - https://express-validator.github.io/docs/guides/customizing
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+      - id: express-validator-async-validator-swallows-infra-error
+        condition: >
+          A custom async validator performs a database or network call that rejects due to an
+          infrastructure error (DB timeout, network failure), but the calling code does not
+          distinguish validation failures from infrastructure failures
+        returns: >-
+          The field is marked as invalid (same as a real validation failure). No exception
+          propagates — the promise rejection is caught internally and converted to a validation
+          error. validationResult(req) reports the field as invalid. The underlying DB/network
+          error is silently consumed with no alerting, logging, or 500 response.
+        required_handling: >
+          Custom async validators that make DB or network calls should catch and re-throw
+          infrastructure errors separately. Pattern: if the error is a DB/network error
+          (not a business rule failure), rethrow so that the route can return 500 instead
+          of 422. Without this, a DB timeout silently looks like "invalid email" to the user.
+        sources:
+          - https://express-validator.github.io/docs/guides/customizing
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
           incident_cost_range: medium
   - name: result-throw
     import_path: express-validator
