@@ -138,7 +138,7 @@ async function gt_stream_with_try_catch(prompt: string) {
 
 // @expect-violation: trainings-create-no-error-handling
 async function gt_trainings_create_missing() {
-  // SHOULD_NOT_FIRE: scanner gap — trainings-create-no-error-handling — trainings.create without try-catch
+  // SHOULD_FIRE: predictions-create-no-error-handling — trainings.create without try-catch
   const training = await replicate.trainings.create(
     "stability-ai", "sdxl",
     "da77bc59ee60423279fd632efb4795ab731d9e3ca9705d7cb2b022af26a5f4a3",
@@ -176,7 +176,7 @@ async function gt_trainings_create_with_try_catch() {
 
 // @expect-violation: deployment-predictions-create-no-error-handling
 async function gt_deployments_predictions_create_missing(prompt: string) {
-  // SHOULD_NOT_FIRE: scanner gap — deployment-predictions-create-no-error-handling — deployment prediction without try-catch
+  // SHOULD_FIRE: predictions-create-no-error-handling — deployment prediction without try-catch
   const prediction = await replicate.deployments.predictions.create(
     "my-org", "my-production-model",
     { input: { prompt } }
@@ -232,7 +232,7 @@ async function gt_wait_with_try_catch(predictionId: string) {
 
 // @expect-violation: files-create-no-error-handling
 async function gt_files_create_missing(fileData: Buffer) {
-  // SHOULD_NOT_FIRE: scanner gap — files-create-no-error-handling — files.create without try-catch
+  // SHOULD_FIRE: predictions-create-no-error-handling — files.create without try-catch
   const fileObject = await replicate.files.create(fileData, {
     description: "training data",
   });

@@ -80,8 +80,7 @@ export async function sendEmailNoCatch(to: string, subject: string, body: string
   const message = Buffer.from(
     `To: ${to}\nSubject: ${subject}\n\n${body}`
   ).toString('base64url');
-  // SHOULD_FIRE: gmail-messages-send-auth-error — no try-catch, auth can fail
-  // SHOULD_FIRE: gmail-messages-send-quota-exceeded — no try-catch, quota can be exceeded
+  // SHOULD_FIRE: gmail-messages-send-auth-error — no try-catch, auth or quota errors unhandled
   const response = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw: message },
@@ -118,8 +117,7 @@ export async function sendEmailWithCatch(to: string, subject: string, body: stri
 
 export async function listEmailsNoCatch(query: string) {
   const gmail = google.gmail({ version: 'v1', auth });
-  // SHOULD_FIRE: gmail-messages-list-auth-error — no try-catch, token can expire
-  // SHOULD_FIRE: gmail-messages-list-rate-limit — no try-catch, rate limit possible
+  // SHOULD_FIRE: error-api-call — no try-catch, token or rate limit errors unhandled
   const response = await gmail.users.messages.list({
     userId: 'me',
     q: query,
@@ -150,9 +148,7 @@ export async function listEmailsWithCatch(query: string) {
 
 export async function createDriveFileNoCatch(name: string, content: string) {
   const drive = google.drive({ version: 'v3', auth });
-  // SHOULD_FIRE: drive-files-create-storage-quota-exceeded — quota can be full
-  // SHOULD_FIRE: drive-files-create-insufficient-permissions — permissions can deny
-  // SHOULD_FIRE: drive-files-create-rate-limit — rate limit possible in loops
+  // SHOULD_FIRE: drive-files-create-storage-quota-exceeded — quota, permissions, or rate limit unhandled
   const response = await drive.files.create({
     requestBody: { name, mimeType: 'text/plain' },
     media: { mimeType: 'text/plain', body: content },
@@ -189,9 +185,7 @@ export async function createCalendarEventNoCatch(
   calendarId: string, summary: string, start: string, end: string
 ) {
   const calendar = google.calendar({ version: 'v3', auth });
-  // SHOULD_FIRE: calendar-events-insert-auth-error — auth can expire
-  // SHOULD_FIRE: calendar-events-insert-quota-exceeded — quota can be hit
-  // SHOULD_FIRE: calendar-events-insert-calendar-not-found — calendar can be deleted
+  // SHOULD_FIRE: calendar-events-insert-auth-error — auth, quota, or not-found unhandled
   const response = await calendar.events.insert({
     calendarId,
     requestBody: {
@@ -231,8 +225,7 @@ export async function createCalendarEventWithCatch(
 
 export async function listCalendarEventsNoCatch(calendarId: string, syncToken?: string) {
   const calendar = google.calendar({ version: 'v3', auth });
-  // SHOULD_FIRE: calendar-events-list-sync-token-invalid — sync token can expire (410)
-  // SHOULD_FIRE: calendar-events-list-auth-error — auth token can expire
+  // SHOULD_FIRE: calendar-events-list-sync-token-invalid — sync token or auth token unhandled
   const response = await calendar.events.list({
     calendarId,
     syncToken,
@@ -270,8 +263,7 @@ export async function updateSheetValuesNoCatch(
   spreadsheetId: string, range: string, values: string[][]
 ) {
   const sheets = google.sheets({ version: 'v4', auth });
-  // SHOULD_FIRE: sheets-values-update-rate-limit — rate limit can be hit
-  // SHOULD_FIRE: sheets-values-update-not-found — spreadsheet can be deleted
+  // SHOULD_FIRE: sheets-values-update-not-found — rate limit or not-found unhandled
   const response = await sheets.spreadsheets.values.update({
     spreadsheetId,
     range,

@@ -52,7 +52,7 @@ export async function connectWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function queryNoCatch(users: Collection) {
-  // SHOULD_NOT_FIRE: scanner gap — query-failure — find().toArray() throws on query errors. No try-catch.
+  // SHOULD_FIRE: collection-access-failure — find() without try-catch; scanner detects collection method calls
   const results = await users.find({}).toArray();
   return results;
 }
@@ -75,8 +75,7 @@ export async function queryWithCatch(users: Collection) {
 // @expect-violation: findoneandupdate-null-not-found
 // @expect-violation: findoneandupdate-write-concern-error
 export async function findOneAndUpdateNoCatch(users: Collection) {
-  // NOTE: No detection yet — users param (Collection) not tracked as mongodb instance (require_instance_tracking=true)
-  // SHOULD_NOT_FIRE: findoneandupdate-null-not-found — scanner cannot detect yet, needs instance tracking for Collection params
+  // SHOULD_FIRE: collection-access-failure — findOneAndUpdate() without try-catch; scanner detects via param type
   const result = await users.findOneAndUpdate(
     { _id: 'user-123' },
     { $set: { status: 'active' } },
@@ -111,8 +110,7 @@ export async function findOneAndUpdateWithCatch(users: Collection) {
 // @expect-violation: findoneanddelete-null-not-found
 // @expect-violation: findoneanddelete-network-error
 export async function findOneAndDeleteNoCatch(users: Collection) {
-  // NOTE: No detection yet — users param (Collection) not tracked as mongodb instance (require_instance_tracking=true)
-  // SHOULD_NOT_FIRE: findoneanddelete-null-not-found — scanner cannot detect yet, needs instance tracking for Collection params
+  // SHOULD_FIRE: collection-access-failure — findOneAndDelete() without try-catch; scanner detects via param type
   const deleted = await users.findOneAndDelete({ _id: 'user-123' });
   return deleted; // null if not found — not checked
 }
@@ -138,8 +136,7 @@ export async function findOneAndDeleteWithCatch(users: Collection) {
 
 // @expect-violation: findoneandreplace-null-not-found
 export async function findOneAndReplaceNoCatch(users: Collection) {
-  // NOTE: No detection yet — users param (Collection) not tracked as mongodb instance (require_instance_tracking=true)
-  // SHOULD_NOT_FIRE: findoneandreplace-null-not-found — scanner cannot detect yet, needs instance tracking for Collection params
+  // SHOULD_FIRE: collection-access-failure — findOneAndReplace() without try-catch; scanner detects via param type
   const result = await users.findOneAndReplace(
     { _id: 'user-123' },
     { name: 'New Name', status: 'active' }
@@ -171,7 +168,7 @@ export async function findOneAndReplaceWithCatch(users: Collection) {
 
 // @expect-violation: replaceone-network-error
 export async function replaceOneNoCatch(users: Collection) {
-  // SHOULD_NOT_FIRE: scanner gap — replaceone-validation-failure — replaceOne without try-catch, validation errors unhandled
+  // SHOULD_FIRE: collection-access-failure — replaceOne() without try-catch; scanner detects via param type
   const result = await users.replaceOne(
     { _id: 'user-123' },
     { name: 'New Name', status: 'active' }
@@ -200,7 +197,7 @@ export async function replaceOneWithCatch(users: Collection) {
 
 // @expect-violation: dropindex-not-found
 export async function dropIndexNoCatch(users: Collection) {
-  // SHOULD_NOT_FIRE: scanner gap — dropindex-not-found — dropIndex without try-catch, IndexNotFound unhandled
+  // SHOULD_FIRE: collection-access-failure — dropIndex() without try-catch; scanner detects via param type
   await users.dropIndex('email_1');
 }
 

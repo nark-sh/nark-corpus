@@ -89,7 +89,7 @@ export async function addBulkWithCatch() {
 
 export async function flowAddNoCatch() {
   const flow = new FlowProducer();
-  // SHOULD_NOT_FIRE: scanner gap — flow-add-redis-error — FlowProducer.add() throws on Redis errors. No try-catch.
+  // SHOULD_FIRE: queue-add-redis-error — FlowProducer.add() throws on Redis errors. No try-catch.
   await flow.add({
     name: 'parent',
     queueName: 'parentQueue',
@@ -126,7 +126,7 @@ export async function flowAddWithCatch() {
 
 export async function flowAddBulkNoCatch() {
   const flow = new FlowProducer();
-  // SHOULD_NOT_FIRE: scanner gap — flow-addbulk-redis-error — FlowProducer.addBulk() throws on Redis errors. No try-catch.
+  // SHOULD_FIRE: queue-addbulk-redis-error — FlowProducer.addBulk() throws on Redis errors. No try-catch.
   await flow.addBulk([
     { name: 'parent1', queueName: 'q1', data: {} },
     { name: 'parent2', queueName: 'q2', data: {} },

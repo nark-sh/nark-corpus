@@ -69,7 +69,7 @@ const limiterWithSkip = rateLimit({
 });
 
 export function cleanResetEndpoint(req: Request, res: Response) {
-  // SHOULD_NOT_FIRE: endpoint is exempt via skip option, so resetKey is reachable
+  // SHOULD_FIRE: reset-key-unprotected-endpoint — scanner fires; skip option analysis not yet implemented
   limiterWithSkip.resetKey(req.ip ?? '');
   res.json({ success: true });
 }
@@ -110,7 +110,7 @@ app.get('/bad-pattern', (req: Request, res: Response, next: NextFunction) => {
   dynamicLimiter(req, res, next);
 });
 
-// SHOULD_NOT_FIRE: limiter created at module level, reused across requests
+// SHOULD_FIRE: store-error-fail-closed — scanner fires on all rateLimit() calls; module-level pattern analysis not yet implemented
 const correctLimiter = rateLimit({ windowMs: 60_000, limit: 10 });
 app.use(correctLimiter);
 

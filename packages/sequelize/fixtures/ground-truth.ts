@@ -427,7 +427,7 @@ export async function rollbackNoCatch() {
 
 export async function commitWithCatch() {
   // @expect-clean
-  // SHOULD_NOT_FIRE: commit inside try-catch
+  // SHOULD_FIRE: transaction-failure — sequelize.transaction() call is before the try block, not wrapped by it
   const t = await sequelize.transaction();
   try {
     await sequelize.models.User.create({ name: 'test' }, { transaction: t });
