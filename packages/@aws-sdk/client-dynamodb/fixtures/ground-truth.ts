@@ -22,6 +22,7 @@ import {
   BatchWriteItemCommand,
   BatchGetItemCommand,
   TransactWriteItemsCommand,
+  ExecuteStatementCommand,
 } from '@aws-sdk/client-dynamodb';
 
 const dynamoClient = new DynamoDBClient({ region: 'us-east-1' });
@@ -272,6 +273,214 @@ export async function transactWriteWithCatch(pk1: string, pk2: string) {
     }));
   } catch (error) {
     console.error('Transaction failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — batch-write-unprocessed-items-not-checked
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: batch-write-unprocessed-items-not-checked
+// BatchWriteItemCommand called without checking response.UnprocessedItems
+// HTTP 200 is returned even when some items fail — silent data loss
+export async function batchWriteIgnoresUnprocessedItems(items: { pk: string; value: string }[]) {
+  try {
+    const result = await dynamoClient.send(new BatchWriteItemCommand({
+      RequestItems: {
+        [TABLE]: items.map(item => ({
+          PutRequest: { Item: { pk: { S: item.pk }, value: { S: item.value } } },
+        })),
+      },
+    }));
+    // ❌ Ignores result.UnprocessedItems — silent data loss if some writes failed
+    return { success: true };
+  } catch (error) {
+    console.error('BatchWrite failed:', error);
+    throw error;
+  }
+}
+
+// @expect-clean
+// BatchWriteItemCommand with proper UnprocessedItems check
+export async function batchWriteChecksUnprocessedItems(items: { pk: string; value: string }[]) {
+  try {
+    const result = await dynamoClient.send(new BatchWriteItemCommand({
+      RequestItems: {
+        [TABLE]: items.map(item => ({
+          PutRequest: { Item: { pk: { S: item.pk }, value: { S: item.value } } },
+        })),
+      },
+    }));
+    // ✅ Checks UnprocessedItems — handles partial failure
+    if (result.UnprocessedItems && Object.keys(result.UnprocessedItems).length > 0) {
+      throw new Error(`BatchWrite partial failure: ${JSON.stringify(result.UnprocessedItems)}`);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('BatchWrite failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — batch-get-unprocessed-keys-not-checked
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: batch-get-unprocessed-keys-not-checked
+// BatchGetItemCommand called without checking response.UnprocessedKeys
+// HTTP 200 with partial results — missing items silently omitted from response.Responses
+export async function batchGetIgnoresUnprocessedKeys(keys: string[]) {
+  try {
+    const result = await dynamoClient.send(new BatchGetItemCommand({
+      RequestItems: {
+        [TABLE]: { Keys: keys.map(k => ({ pk: { S: k } })) },
+      },
+    }));
+    // ❌ Returns only successfully retrieved items, ignores UnprocessedKeys
+    // If throughput limit hit, some items silently missing from Responses
+    return result.Responses?.[TABLE] ?? [];
+  } catch (error) {
+    console.error('BatchGet failed:', error);
+    throw error;
+  }
+}
+
+// @expect-clean
+// BatchGetItemCommand with proper UnprocessedKeys retry loop
+export async function batchGetChecksUnprocessedKeys(keys: string[]) {
+  let remainingKeys = { [TABLE]: { Keys: keys.map(k => ({ pk: { S: k } })) } };
+  const allItems: Record<string, unknown>[] = [];
+
+  try {
+    while (Object.keys(remainingKeys).length > 0) {
+      const result = await dynamoClient.send(new BatchGetItemCommand({
+        RequestItems: remainingKeys,
+      }));
+      // ✅ Accumulates all retrieved items
+      for (const tableItems of Object.values(result.Responses ?? {})) {
+        allItems.push(...(tableItems as Record<string, unknown>[]));
+      }
+      // ✅ Retries UnprocessedKeys until none remain
+      remainingKeys = result.UnprocessedKeys ?? {};
+    }
+    return allItems;
+  } catch (error) {
+    console.error('BatchGet failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — transact-write-cancellation-reasons-not-inspected
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: transact-write-cancellation-reasons-not-inspected
+// TransactWriteItemsCommand catches TransactionCanceledException but does not
+// inspect CancellationReasons — cannot distinguish ConditionalCheckFailed
+// (business conflict, not retryable) from ProvisionedThroughputExceeded (retryable)
+export async function transactWriteWithoutCancellationReasonCheck(pk1: string, pk2: string) {
+  try {
+    await dynamoClient.send(new TransactWriteItemsCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: TABLE,
+            Item: { pk: { S: pk1 } },
+            ConditionExpression: 'attribute_not_exists(pk)',
+          },
+        },
+        { Delete: { TableName: TABLE, Key: { pk: { S: pk2 } } } },
+      ],
+    }));
+  } catch (error: unknown) {
+    // ❌ Catches error but does not inspect CancellationReasons
+    // Cannot tell if this is a business conflict or infrastructure failure
+    if (error instanceof Error && error.name === 'TransactionCanceledException') {
+      console.error('Transaction cancelled:', error.message);
+      throw error;
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+// TransactWriteItemsCommand with proper CancellationReasons inspection
+export async function transactWriteWithCancellationReasonCheck(pk1: string, pk2: string) {
+  try {
+    await dynamoClient.send(new TransactWriteItemsCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: TABLE,
+            Item: { pk: { S: pk1 } },
+            ConditionExpression: 'attribute_not_exists(pk)',
+          },
+        },
+        { Delete: { TableName: TABLE, Key: { pk: { S: pk2 } } } },
+      ],
+    }));
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === 'TransactionCanceledException') {
+      const cancelledError = error as Error & {
+        CancellationReasons?: Array<{ Code?: string; Message?: string }>;
+      };
+      // ✅ Inspect CancellationReasons to distinguish conflict types
+      for (const reason of cancelledError.CancellationReasons ?? []) {
+        if (reason.Code === 'ConditionalCheckFailed') {
+          throw new Error(`Optimistic lock conflict: ${reason.Message}`);
+        } else if (reason.Code === 'TransactionConflict') {
+          throw new Error(`Concurrent transaction: ${reason.Message}`);
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW POSTCONDITIONS — execute-statement-duplicate-item
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: execute-statement-duplicate-item
+// ExecuteStatementCommand with PartiQL INSERT without handling DuplicateItemException
+// Unlike PutItemCommand (which silently overwrites), INSERT throws on duplicate primary key
+export async function executeInsertNoCatch(userId: string, email: string) {
+  // ❌ No try-catch — DuplicateItemException crashes on duplicate userId
+  await dynamoClient.send(new ExecuteStatementCommand({
+    Statement: `INSERT INTO Users VALUE {'userId': ?, 'email': ?}`,
+    Parameters: [{ S: userId }, { S: email }],
+  }));
+}
+
+// @expect-violation: execute-statement-duplicate-item
+// Catches error but does not handle DuplicateItemException specifically
+export async function executeInsertGenericCatch(userId: string, email: string) {
+  try {
+    await dynamoClient.send(new ExecuteStatementCommand({
+      Statement: `INSERT INTO Users VALUE {'userId': ?, 'email': ?}`,
+      Parameters: [{ S: userId }, { S: email }],
+    }));
+  } catch (error) {
+    // ❌ Generic catch — user gets 500 instead of "user already exists" message
+    console.error('Insert failed:', error);
+    throw error;
+  }
+}
+
+// @expect-clean
+// ExecuteStatementCommand with proper DuplicateItemException handling
+export async function executeInsertWithDuplicateCheck(userId: string, email: string) {
+  try {
+    await dynamoClient.send(new ExecuteStatementCommand({
+      Statement: `INSERT INTO Users VALUE {'userId': ?, 'email': ?}`,
+      Parameters: [{ S: userId }, { S: email }],
+    }));
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === 'DuplicateItemException') {
+      // ✅ Handle duplicate as expected business case
+      throw new Error(`User with email ${email} already exists`);
+    }
     throw error;
   }
 }

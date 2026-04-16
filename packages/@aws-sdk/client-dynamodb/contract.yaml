@@ -2,9 +2,10 @@ package: "@aws-sdk/client-dynamodb"
 semver: ">=3.0.0 <4.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.71
 
 functions:
   - name: send
@@ -80,6 +81,212 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: BatchWriteItemCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Puts or deletes multiple items across one or more tables in a single call.
+      Supports up to 25 write operations per call (up to 16 MB total).
+      CRITICAL: Uses HTTP 200 for PARTIAL FAILURES — individual item failures are NOT
+      thrown as exceptions. Failed items are returned in response.UnprocessedItems.
+      Callers who ignore UnprocessedItems silently lose data with no error signal.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
+      # Confirmed from AWS SDK v3 type declarations: BatchWriteItemOutput.UnprocessedItems
+      # AWS docs: "If any requested operations fail because the table's provisioned throughput
+      #  is exceeded or an internal processing failure occurs, the failed operations are returned
+      #  in the UnprocessedItems response parameter."
+      - id: batch-write-unprocessed-items-not-checked
+        severity: error
+        condition: >
+          BatchWriteItemCommand succeeds (no throw) but response.UnprocessedItems is
+          non-empty — some items were NOT written due to throughput limits or internal
+          AWS processing failures. Caller does not check response.UnprocessedItems.
+        description: >
+          BatchWriteItemCommand returns HTTP 200 even when some writes FAIL. Failed items
+          are placed in response.UnprocessedItems — they are NOT written to DynamoDB, and
+          NO exception is thrown. Callers who do not check response.UnprocessedItems after
+          every BatchWriteItem call silently drop data with no error signal.
+
+          This is the most dangerous silent failure pattern in DynamoDB. The operation
+          succeeds from JavaScript's perspective (no throw, no rejection), but some
+          items were never written. Background batch jobs, import scripts, and data
+          pipelines are all affected.
+
+          Partial failure causes: provisioned throughput exceeded on specific tables,
+          partition-level throttling, internal AWS processing failures. If ALL items
+          fail, DynamoDB throws ProvisionedThroughputExceededException instead.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST check response.UnprocessedItems after every BatchWriteItem call
+          and retry with exponential backoff. AWS strongly recommends exponential backoff.
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html#Programming.Errors.BatchOperations"
+
+  - name: BatchGetItemCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Retrieves multiple items from one or more tables in a single call.
+      Supports up to 100 items per call (up to 16 MB response).
+      CRITICAL: Uses HTTP 200 for PARTIAL FAILURES — items that could not be read are
+      NOT thrown as exceptions. Unread items are silently omitted from response.Responses
+      and listed in response.UnprocessedKeys. Callers who ignore UnprocessedKeys receive
+      incomplete result sets with no error signal.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchGetItem.html
+      # AWS docs: "If at least one of the items is successfully processed, then BatchGetItem
+      #  completes successfully, while returning the keys of the unread items in UnprocessedKeys."
+      # Confirmed from AWS SDK v3 type declarations: BatchGetItemOutput.UnprocessedKeys
+      - id: batch-get-unprocessed-keys-not-checked
+        severity: error
+        condition: >
+          BatchGetItemCommand succeeds (no throw) but response.UnprocessedKeys is
+          non-empty — some items could not be read due to throughput limits or 16 MB
+          response size limit. Caller does not check response.UnprocessedKeys.
+        description: >
+          BatchGetItemCommand returns HTTP 200 even when some items CANNOT BE READ.
+          Successfully retrieved items appear in response.Responses. Unread items are
+          silently omitted from response.Responses and listed in response.UnprocessedKeys.
+          NO exception is thrown for partial failures.
+
+          AWS documentation explicitly states: "If at least one of the items is successfully
+          processed, then BatchGetItem completes successfully, while returning the keys
+          of the unread items in UnprocessedKeys."
+
+          Common partial failure causes: response size exceeds 16 MB (truncation), or
+          provisioned throughput exceeded on specific tables. If ALL items fail to read,
+          DynamoDB throws ProvisionedThroughputExceededException instead.
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST check response.UnprocessedKeys and retry in a loop until empty,
+          using exponential backoff between retries.
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchGetItem.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html#Programming.Errors.BatchOperations"
+
+  - name: TransactWriteItemsCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Performs up to 100 write operations across multiple tables atomically.
+      All items succeed or all fail together. Throws TransactionCanceledException with
+      a per-item CancellationReasons array that callers must inspect to determine
+      which items failed and why (business conflict vs infrastructure failure).
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html
+      # Confirmed from AWS SDK v3 type declarations: TransactWriteItemsCommand throws
+      - id: transact-write-cancellation-reasons-not-inspected
+        severity: error
+        condition: >
+          TransactWriteItemsCommand throws TransactionCanceledException and caller
+          catches it but does not inspect CancellationReasons array to distinguish
+          ConditionalCheckFailed (business conflict, NOT retryable) from
+          ProvisionedThroughputExceeded or TransactionConflict (infrastructure, retryable).
+        description: >
+          TransactWriteItemsCommand throws TransactionCanceledException when any condition
+          expression fails or a conflict occurs. The exception contains a CancellationReasons
+          array with one entry per item in the transaction. Each entry has a Code field:
+          "ConditionalCheckFailed", "TransactionConflict", "ItemCollectionSizeLimitExceeded",
+          "ProvisionedThroughputExceeded", "ThrottlingError", "ValidationError", or "None".
+
+          Callers who catch TransactionCanceledException without inspecting CancellationReasons
+          cannot distinguish business-logic conflicts from infrastructure failures.
+          Business conflicts must NOT be retried; infrastructure failures SHOULD be retried.
+
+          CancellationReasons is ordered by the TransactItems request order. Entries with
+          Code === "None" indicate that item succeeded.
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST catch TransactionCanceledException and inspect CancellationReasons
+          to distinguish ConditionalCheckFailed (not retryable) from TransactionConflict
+          and ProvisionedThroughputExceeded (retryable with exponential backoff).
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html"
+
+      - id: transact-write-in-progress-exception
+        severity: warning
+        condition: >
+          Caller retries TransactWriteItemsCommand before the previous attempt completes,
+          using the same ClientRequestToken, causing TransactionInProgressException.
+        description: >
+          TransactWriteItemsCommand throws TransactionInProgressException (HTTP 400)
+          when the same ClientRequestToken is still being processed by a previous call.
+          The SDK's built-in retry logic can trigger this when the first attempt times out
+          but DynamoDB is still processing it. Reusing the same token with a different
+          payload triggers IdempotentParameterMismatchException.
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Use unique ClientRequestToken per logical transaction. Do not retry with the
+          same token within 10 minutes unless the payload is identical. Implement
+          application-level retries only for TransactionCanceledException.
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html"
+
+  - name: ExecuteStatementCommand
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Executes a PartiQL statement (SQL-like syntax) against a DynamoDB table.
+      Supports SELECT, INSERT, UPDATE, DELETE via PartiQL. Unlike PutItemCommand
+      which silently overwrites, PartiQL INSERT throws DuplicateItemException when
+      the primary key already exists.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteStatement.html
+      # Confirmed from AWS SDK v3 declarations: ExecuteStatementCommand throws list
+      - id: execute-statement-duplicate-item
+        severity: error
+        condition: >
+          PartiQL INSERT statement targets a primary key that already exists in the
+          table. DuplicateItemException is thrown. Caller has no try-catch or catches
+          generically without checking for DuplicateItemException specifically.
+        description: >
+          ExecuteStatementCommand throws DuplicateItemException when a PartiQL INSERT
+          statement attempts to insert an item with a primary key that already exists.
+          This error is unique to ExecuteStatementCommand and BatchExecuteStatementCommand
+          — the native PutItemCommand overwrites existing items by default (no error).
+          Callers migrating from PutItemCommand to PartiQL INSERT without adding error
+          handling will encounter unexpected DuplicateItemException crashes.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Callers using PartiQL INSERT MUST catch DuplicateItemException specifically
+          and return a user-friendly error rather than propagating an unhandled exception.
+        sources:
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ExecuteStatement.html"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ql-reference.insert.html"
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All DynamoDB operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'ResourceNotFoundException', 'ConditionalCheckFailedException')"
@@ -89,3 +296,6 @@ notes:
   - "BatchWriteItemCommand / BatchGetItemCommand return HTTP 200 for partial failures — check UnprocessedItems/UnprocessedKeys in response (not a thrown error)"
   - "DynamoDBClient instance is reusable across multiple send() calls — no per-call instantiation needed"
   - "DynamoDB also exposes DynamoDBDocumentClient (from @aws-sdk/lib-dynamodb) which wraps DynamoDBClient — same send() contract applies"
+  - "ExecuteStatementCommand uses PartiQL syntax — DuplicateItemException is unique to INSERT statements (PutItemCommand silently overwrites)"
+  - "TransactGetItemsCommand has the same TransactionCanceledException contract as TransactWriteItemsCommand"
+  - "BatchExecuteStatementCommand follows the same silent partial failure pattern as BatchWriteItemCommand/BatchGetItemCommand via UnprocessedItems"
