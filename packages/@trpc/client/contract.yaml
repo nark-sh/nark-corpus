@@ -2,13 +2,16 @@
 # (non-React context), they throw TRPCClientError on network failures or server-side
 # TRPCError (UNAUTHORIZED, NOT_FOUND, INTERNAL_SERVER_ERROR, etc.).
 # Without try-catch, unhandled errors crash the async call chain.
+# .subscribe() errors are dispatched via optional onError callback — if absent, errors
+# are silently dropped (TRPCUntypedClient.ts: opts.onError?.(err)).
 package: "@trpc/client"
 semver: ">=10.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
 
 detection:
   factory_methods:
@@ -113,9 +116,105 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: subscribe
+    import_path: "@trpc/client"
+    description: >
+      Calls a tRPC subscription procedure on the vanilla client.
+      Used as: client.someRoute.subscribe(input, { onData, onError, onComplete }).
+      Returns an Unsubscribable handle (not a Promise). Unlike .query()/.mutate(),
+      subscription errors do NOT throw into the calling code — they are dispatched
+      via the optional onError(err: TRPCClientError) callback. If onError is absent,
+      all errors (network failures, server-thrown TRPCError, authentication failures,
+      WebSocket disconnects) are silently swallowed via opts.onError?.(err) — the
+      optional chaining is a no-op when onError is not provided.
+
+    postconditions:
+      # Evidence: TRPCUntypedClient.ts source, line 154-155:
+      #   error(err) { opts.onError?.(err); }
+      # The ?. means if onError is absent, the error is silently dropped with no exception.
+      # Source inspected: /node_modules/@trpc/client/src/internals/TRPCUntypedClient.ts
+      # TRPCSubscriptionObserver.onError is typed as (err: TError) => void
+      # The opts parameter is Partial<TRPCSubscriptionObserver<...>> — all fields optional.
+      # Confirmed via: https://trpc.io/docs/subscriptions
+      - id: trpc-subscribe-missing-on-error
+        condition: >
+          async function calls a tRPC vanilla client .subscribe() method without
+          providing an onError callback in the options object. All subscription errors
+          (network disconnect, server TRPCError, UNAUTHORIZED, WebSocket close via
+          TRPCWebSocketClosedError) are silently dropped — the internal error path
+          is opts.onError?.(err), which is a no-op when the callback is absent.
+        throws: >
+          TRPCClientError — dispatched via onError callback, NOT thrown into calling code.
+          Error is silently dropped when onError is absent.
+          Error codes covered: UNAUTHORIZED (401), FORBIDDEN (403),
+          INTERNAL_SERVER_ERROR (500), TIMEOUT (408), SERVICE_UNAVAILABLE (503),
+          BAD_REQUEST (400), and TRPCWebSocketClosedError when the underlying
+          WebSocket connection closes during an active subscription.
+        required_handling: >
+          Caller MUST provide onError in the subscribe() options object.
+
+          Minimum handling:
+            const sub = trpc.liveUpdates.subscribe(input, {
+              onData(data) {
+                // handle incoming data
+              },
+              onError(cause) {
+                if (isTRPCClientError(cause)) {
+                  if (cause.data?.code === 'UNAUTHORIZED') {
+                    // redirect to login or refresh auth
+                  }
+                  console.error('Subscription error:', cause.message);
+                }
+              },
+              onComplete() {
+                // subscription ended normally
+              },
+            });
+        sources:
+          - "https://github.com/trpc/trpc/blob/main/packages/client/src/internals/TRPCUntypedClient.ts"
+          - "https://trpc.io/docs/subscriptions"
+          - "https://trpc.io/docs/server/error-handling"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: https://trpc.io/docs/subscriptions — "5xx errors trigger automatic
+      # reconnection, other errors cancel the subscription entirely"
+      # Auth failures (UNAUTHORIZED/FORBIDDEN) cancel the subscription server-side.
+      # Without onError, client sees only that onData stops — no failure signal.
+      - id: trpc-subscribe-auth-error-silent
+        condition: >
+          tRPC subscription receives UNAUTHORIZED (401) or FORBIDDEN (403) from
+          the server (token expired, session revoked, or permission change during
+          an active real-time connection) but caller has no onError callback to detect
+          the auth failure. The subscription is cancelled server-side and the client
+          silently stops receiving data without any error signal.
+        throws: >
+          TRPCClientError with data.code = 'UNAUTHORIZED' or 'FORBIDDEN'.
+          Dispatched via optional onError callback — silently dropped if absent.
+        required_handling: >
+          Check cause.data?.code in onError handler and redirect to login or
+          refresh the auth token when 'UNAUTHORIZED' or 'FORBIDDEN' is received.
+        sources:
+          - "https://trpc.io/docs/subscriptions"
+          - "https://trpc.io/docs/server/error-handling"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
 notes:
-  - "This contract covers ONLY the vanilla @trpc/client direct calls (.query(), .mutate())"
+  - "This contract covers the vanilla @trpc/client direct calls (.query(), .mutate(), .subscribe())"
   - "React hook usage via @trpc/react-query (trpc.x.useQuery()) has different error handling"
   - "isTRPCClientError() is a type guard helper exported from @trpc/client"
   - "Vanilla client used in: server-side code, Zustand stores, utility functions"
   - "Real-world evidence: civitai/civitai uses trpcVanilla.x.query() without try-catch"
+  - "subscribe() errors are dispatched via optional onError callback — NOT thrown. Missing onError = silent drop."
+  - "createWSClient() errors surface via WebSocketClientOptions.onError callback (sync, not awaited)"
