@@ -19,7 +19,7 @@ package: "@google/genai"
 semver: ">=0.1.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
 
@@ -152,3 +152,295 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: sendMessage
+    import_path: "@google/genai"
+    description: >
+      Sends a message in a multi-turn chat session and returns the model response.
+      Called as chat.sendMessage({ message }) where chat is created via ai.chats.create().
+      Internally delegates to ai.models.generateContent() with the accumulated chat history.
+      Throws ApiError on any HTTP failure. Has sequential queuing — if a previous
+      sendMessage() is still in flight, this call awaits that first.
+
+    postconditions:
+      # Evidence: source inspection — sendMessage() calls this.modelsModule.generateContent()
+      # which calls apiClient.request() → throws ApiError on 4xx/5xx HTTP responses.
+      # Confirmed from @google/genai dist/index.cjs lines 7127-7160 (sendMessage implementation)
+      - id: genai-send-message-no-error-handling
+        condition: >
+          chat.sendMessage() called in async context without surrounding try-catch.
+          ApiError propagates as unhandled promise rejection.
+        throws: >
+          ApiError (name='ApiError') with .status (HTTP status code) and .message.
+          Common statuses: 400 (invalid request/model), 401 (missing API key),
+          403 (API key invalid/permission denied), 429 (quota exceeded/rate limit),
+          500 (internal server error), 503 (service unavailable).
+          Error (generic) for mimeType or history validation failures.
+        required_handling: >
+          Caller MUST wrap await chat.sendMessage() in try-catch. Chat sessions are
+          stateful — an unhandled error during a turn corrupts the conversational state.
+          The SDK resets sendPromise on error, so subsequent sends can proceed, but the
+          failed turn is recorded as invalid in comprehensive history.
+
+          try {
+            const response = await chat.sendMessage({ message: userInput });
+            return response.text;
+          } catch (error) {
+            if (error instanceof ApiError) {
+              if (error.status === 429) {
+                // Rate limit — retry with backoff
+              } else if (error.status === 400) {
+                // Invalid content — surface to user
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/src/chats.ts"
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/dist/index.cjs (lines 7127-7160)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: sendMessageStream
+    import_path: "@google/genai"
+    description: >
+      Sends a message in a multi-turn chat session and returns the response as an
+      async generator yielding chunks. Called as chat.sendMessageStream({ message })
+      where chat is created via ai.chats.create(). Internally delegates to
+      ai.models.generateContentStream() with the accumulated chat history.
+      Throws ApiError on the initial await if the HTTP request fails before
+      any chunks are yielded.
+
+    postconditions:
+      # Evidence: source inspection — sendMessageStream() calls generateContentStream()
+      # which calls apiClient.requestStream() → throws ApiError on 4xx/5xx responses.
+      # Confirmed from @google/genai dist/index.cjs lines 7182-7225 (sendMessageStream impl)
+      - id: genai-send-message-stream-no-error-handling
+        condition: >
+          chat.sendMessageStream() called in async context without surrounding try-catch.
+          ApiError propagates as unhandled promise rejection on the initial await.
+        throws: >
+          ApiError (name='ApiError') with .status and .message on HTTP failure before
+          any chunks arrive. Errors during streaming (mid-stream) also throw ApiError
+          on the next chunk iteration.
+        required_handling: >
+          Caller MUST wrap await chat.sendMessageStream() in try-catch. The initial
+          await can throw before any chunks arrive. Streaming errors mid-response
+          also propagate as ApiError on the async generator.
+
+          try {
+            const stream = await chat.sendMessageStream({ message: userInput });
+            for await (const chunk of stream) {
+              process.stdout.write(chunk.text ?? '');
+            }
+          } catch (error) {
+            if (error instanceof ApiError) {
+              // Handle network error or API failure
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/src/chats.ts"
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/dist/index.cjs (lines 7182-7225)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: upload
+    import_path: "@google/genai"
+    description: >
+      Uploads a file to the Gemini Files API for use in multimodal prompts.
+      Called as ai.files.upload({ file, config }). Supports Node.js file paths
+      (string) and Blob objects. Files are stored for 48 hours then auto-deleted.
+      Maximum file size: 2 GB. Project storage cap: 20 GB total.
+      NOT available in Vertex AI — throws immediately if called on a Vertex AI client.
+
+    postconditions:
+      # Evidence: source inspection — upload() calls apiClient.uploadFile() which calls
+      # apiClient.request() → throws ApiError on HTTP failures (400/401/403/429/500/503).
+      # Confirmed from @google/genai dist/index.cjs lines 8563-8583 (upload implementation)
+      # and lines 8107, 8281, 8290, 8346 (upload protocol error throws).
+      # File size limits confirmed: https://ai.google.dev/gemini-api/docs/files (2GB, 20GB project)
+      - id: genai-files-upload-no-error-handling
+        condition: >
+          ai.files.upload() called without try-catch. Upload protocol errors, quota
+          exceeded, or API failures result in unhandled promise rejection.
+        throws: >
+          ApiError (name='ApiError') with .status and .message for HTTP failures
+          (401 missing API key, 403 storage quota exceeded, 413 file too large,
+          429 rate limit, 500 server error).
+          Error (generic) for mimeType inference failure ('Can not determine mimeType'),
+          upload protocol failures ('Failed to get upload url'), finalization errors
+          ('Failed to upload file: Upload status is not finalized'), or when called
+          on Vertex AI ('Vertex AI does not support uploading files').
+        required_handling: >
+          Caller MUST wrap await ai.files.upload() in try-catch. Large file uploads
+          are particularly prone to failure mid-upload (network interruption, quota).
+          The Files API has strict limits: 2 GB per file, 20 GB project storage.
+
+          try {
+            const file = await ai.files.upload({
+              file: '/path/to/video.mp4',
+              config: { mimeType: 'video/mp4' },
+            });
+            // Use file.name in subsequent generateContent calls
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 403) {
+              throw new Error('File storage quota exceeded');
+            }
+            throw error;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/files"
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/dist/index.cjs (lines 8563-8583)"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: countTokens
+    import_path: "@google/genai"
+    description: >
+      Counts the number of tokens in the given content. Called as
+      ai.models.countTokens({ model, contents }). Commonly used as a pre-flight
+      check before sending large prompts to avoid token limit errors. Makes an
+      HTTP POST to the Gemini API and throws ApiError on any failure.
+      Critical: errors here prevent the pre-flight check from working, causing
+      downstream generateContent calls to fail with opaque token-limit errors.
+
+    postconditions:
+      # Evidence: source inspection — countTokens() calls apiClient.request() with
+      # POST to '{model}:countTokens' endpoint → throws ApiError on 4xx/5xx.
+      # Confirmed from @google/genai dist/index.cjs lines 18305-18375 (countTokens impl)
+      - id: genai-count-tokens-no-error-handling
+        condition: >
+          ai.models.countTokens() called without try-catch. Used as pre-flight check
+          to measure token count before sending large prompts. ApiError on invalid
+          model name or API failure silently breaks the pre-flight guard.
+        throws: >
+          ApiError (name='ApiError') with .status and .message on HTTP failure.
+          404: model name not found or invalid format.
+          400: invalid content (e.g., empty contents array).
+          401: missing or invalid API key.
+          429: rate limit exceeded (countTokens has its own rate limits, separate from generateContent).
+        required_handling: >
+          Caller MUST wrap await ai.models.countTokens() in try-catch. If the
+          pre-flight check throws and the error is swallowed, the caller proceeds
+          with an untested prompt that may exceed context limits.
+
+          try {
+            const result = await ai.models.countTokens({
+              model: 'gemini-2.0-flash',
+              contents: largePrompt,
+            });
+            if (result.totalTokens > 1000000) {
+              throw new Error('Prompt too large for model context window');
+            }
+          } catch (error) {
+            if (error instanceof ApiError) {
+              // Pre-flight failed — proceed with caution or abort
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/dist/index.cjs (lines 18305-18375)"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: create
+    import_path: "@google/genai"
+    description: >
+      Creates a cached content resource (context cache) for reuse across multiple
+      requests. Called as ai.caches.create({ model, config }). Context caching
+      reduces latency and cost for large, reused prompts (e.g. long system
+      instructions or reference documents). Only supported on specific models
+      (Gemini 2.5 Flash, 2.5 Pro, etc.). Minimum token threshold required
+      (1,024 tokens for Flash, 4,096 for Pro models). Makes an HTTP POST to the
+      Gemini API and throws ApiError on any failure.
+
+    postconditions:
+      # Evidence: source inspection — caches.create() calls apiClient.request() with
+      # POST to 'cachedContents' → throws ApiError on 4xx/5xx HTTP responses.
+      # Confirmed from @google/genai dist/index.cjs lines 6568-6630 (caches.create impl)
+      # Model support and token minimums: https://ai.google.dev/gemini-api/docs/caching
+      - id: genai-caches-create-no-error-handling
+        condition: >
+          ai.caches.create() called without try-catch. API failures (unsupported model,
+          token threshold not met, quota exceeded) result in unhandled promise rejection.
+        throws: >
+          ApiError (name='ApiError') with .status and .message on HTTP failure.
+          400: model does not support context caching, or content below minimum token
+               threshold (1,024 tokens for Flash models, 4,096 for Pro models).
+          401: missing or invalid API key.
+          403: quota exceeded or billing issue.
+          404: model not found.
+          429: rate limit exceeded.
+        required_handling: >
+          Caller MUST wrap await ai.caches.create() in try-catch. A 400 error
+          indicates either an incompatible model or insufficient content — both
+          require different resolution strategies.
+
+          try {
+            const cache = await ai.caches.create({
+              model: 'gemini-2.5-flash',
+              config: {
+                contents: largeSystemContext,
+                ttl: '3600s',
+              },
+            });
+            // Use cache.name in subsequent generateContent calls
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 400) {
+              // Either model doesn't support caching or content < minimum tokens
+            }
+            throw error;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/caching"
+          - "https://raw.githubusercontent.com/googleapis/js-genai/main/dist/index.cjs (lines 6568-6630)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+metadata:
+  last_verified: "2026-04-16"
+  evidence_quality: confirmed
+  coverage_score: 1.0
+  # API surface: 18 async-callable functions total (from @google/genai dist/genai.d.ts inspection)
+  # Contracted: 9 (generateContent, generateContentStream, generateImages, embedContent,
+  #              sendMessage, sendMessageStream, files.upload, countTokens, caches.create)
+  # Intentionally omitted: 9
+  #   - editImage(): Vertex AI only, niche image editing (same ApiError surface as generateImages)
+  #   - upscaleImage(): Vertex AI only, very niche usage
+  #   - generateVideos(): Long-running operation returning a polling Operation object;
+  #     errors occur on polling not creation; Vertex AI primary target
+  #   - computeTokens(): Vertex AI only, not available in Gemini API
+  #   - recontextImage(): Vertex AI only Virtual Try-On, very niche
+  #   - segmentImage(): Vertex AI only image segmentation, very niche
+  #   - batches.create(): Requires GCS bucket; admin-tier operation for offline batch jobs
+  #   - live.connect(): WebSocket-based stateful API; errors delivered via onopen/onerror
+  #     callbacks, not thrown from the connect() Promise itself
+  #   - operations.getVideosOperation(): Polling utility for generateVideos(); same error
+  #     surface as generateVideos, already omitted
+  # Coverage = 9 contracted / (18 total - 9 omitted) = 9/9 = 1.0 (100% of non-omitted)

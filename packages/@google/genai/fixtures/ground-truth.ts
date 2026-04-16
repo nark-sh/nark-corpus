@@ -9,6 +9,11 @@
  *   - ai.models.generateContentStream throws ApiError on HTTP failure → MUST try-catch
  *   - ai.models.generateImages throws ApiError on HTTP failure → MUST try-catch
  *   - ai.models.embedContent throws ApiError on HTTP failure → MUST try-catch
+ *   - chat.sendMessage throws ApiError on HTTP failure → MUST try-catch
+ *   - chat.sendMessageStream throws ApiError on HTTP failure → MUST try-catch
+ *   - ai.files.upload throws ApiError/Error on HTTP failure → MUST try-catch
+ *   - ai.models.countTokens throws ApiError on HTTP failure → MUST try-catch
+ *   - ai.caches.create throws ApiError on HTTP failure → MUST try-catch
  *   - A try-catch (any catch block) satisfies the requirement
  *   - A .catch() chain also satisfies the requirement
  *   - try-finally without catch does NOT satisfy the requirement
@@ -161,6 +166,153 @@ export async function generateImagesWithCatch(prompt: string) {
     return response.generatedImages;
   } catch (error) {
     console.error("Image generation error:", error);
+    throw error;
+  }
+}
+
+// ─── 11. chat.sendMessage — no try-catch ─────────────────────────────────────
+
+export async function sendMessageNoCatch(userInput: string) {
+  const chat = ai.chats.create({ model: "gemini-2.0-flash" });
+  // SHOULD_FIRE: genai-send-message-no-error-handling — sendMessage makes HTTP call, no try-catch
+  const response = await chat.sendMessage({ message: userInput });
+  return response.text;
+}
+
+// ─── 12. chat.sendMessage — try-catch present ────────────────────────────────
+
+export async function sendMessageWithCatch(userInput: string) {
+  const chat = ai.chats.create({ model: "gemini-2.0-flash" });
+  try {
+    // SHOULD_NOT_FIRE: sendMessage is inside try-catch
+    const response = await chat.sendMessage({ message: userInput });
+    return response.text;
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw new Error(`Chat error ${error.status}: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ─── 13. chat.sendMessageStream — no try-catch ───────────────────────────────
+
+export async function sendMessageStreamNoCatch(userInput: string) {
+  const chat = ai.chats.create({ model: "gemini-2.0-flash" });
+  // SHOULD_FIRE: genai-send-message-stream-no-error-handling — sendMessageStream no try-catch
+  const stream = await chat.sendMessageStream({ message: userInput });
+  let result = "";
+  for await (const chunk of stream) {
+    result += chunk.text ?? "";
+  }
+  return result;
+}
+
+// ─── 14. chat.sendMessageStream — try-catch present ──────────────────────────
+
+export async function sendMessageStreamWithCatch(userInput: string) {
+  const chat = ai.chats.create({ model: "gemini-2.0-flash" });
+  try {
+    // SHOULD_NOT_FIRE: sendMessageStream is inside try-catch
+    const stream = await chat.sendMessageStream({ message: userInput });
+    let result = "";
+    for await (const chunk of stream) {
+      result += chunk.text ?? "";
+    }
+    return result;
+  } catch (error) {
+    console.error("Chat streaming error:", error);
+    throw error;
+  }
+}
+
+// ─── 15. ai.files.upload — no try-catch ──────────────────────────────────────
+
+export async function filesUploadNoCatch(filePath: string) {
+  // SHOULD_FIRE: genai-files-upload-no-error-handling — upload makes HTTP call, no try-catch
+  const file = await ai.files.upload({
+    file: filePath,
+    config: { mimeType: "text/plain" },
+  });
+  return file.name;
+}
+
+// ─── 16. ai.files.upload — try-catch present ─────────────────────────────────
+
+export async function filesUploadWithCatch(filePath: string) {
+  try {
+    // SHOULD_NOT_FIRE: files.upload is inside try-catch
+    const file = await ai.files.upload({
+      file: filePath,
+      config: { mimeType: "text/plain" },
+    });
+    return file.name;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 403) {
+      throw new Error("File storage quota exceeded");
+    }
+    throw error;
+  }
+}
+
+// ─── 17. ai.models.countTokens — no try-catch ────────────────────────────────
+
+export async function countTokensNoCatch(prompt: string) {
+  // SHOULD_FIRE: genai-count-tokens-no-error-handling — countTokens makes HTTP call, no try-catch
+  const result = await ai.models.countTokens({
+    model: "gemini-2.0-flash",
+    contents: prompt,
+  });
+  return result.totalTokens;
+}
+
+// ─── 18. ai.models.countTokens — try-catch present ───────────────────────────
+
+export async function countTokensWithCatch(prompt: string) {
+  try {
+    // SHOULD_NOT_FIRE: countTokens is inside try-catch
+    const result = await ai.models.countTokens({
+      model: "gemini-2.0-flash",
+      contents: prompt,
+    });
+    return result.totalTokens;
+  } catch (error) {
+    console.error("Token count error:", error);
+    throw error;
+  }
+}
+
+// ─── 19. ai.caches.create — no try-catch ─────────────────────────────────────
+
+export async function cachesCreateNoCatch(systemInstruction: string) {
+  // SHOULD_FIRE: genai-caches-create-no-error-handling — caches.create makes HTTP call, no try-catch
+  const cache = await ai.caches.create({
+    model: "gemini-2.5-flash",
+    config: {
+      contents: [{ role: "user", parts: [{ text: systemInstruction }] }],
+      ttl: "3600s",
+    },
+  });
+  return cache.name;
+}
+
+// ─── 20. ai.caches.create — try-catch present ────────────────────────────────
+
+export async function cachesCreateWithCatch(systemInstruction: string) {
+  try {
+    // SHOULD_NOT_FIRE: caches.create is inside try-catch
+    const cache = await ai.caches.create({
+      model: "gemini-2.5-flash",
+      config: {
+        contents: [{ role: "user", parts: [{ text: systemInstruction }] }],
+        ttl: "3600s",
+      },
+    });
+    return cache.name;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 400) {
+      throw new Error("Model does not support caching or content below minimum token threshold");
+    }
     throw error;
   }
 }
