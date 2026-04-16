@@ -1,10 +1,11 @@
 package: express-session
 semver: '>=1.17.0 <2.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-02'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
+coverage_score: 0.80
 functions:
   - name: session
     import_path: express-session
@@ -150,4 +151,223 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: source inspection — session/session.js, session/store.js
+  # Source: https://raw.githubusercontent.com/expressjs/session/master/README.md
+  # All four session instance methods accept callbacks with (err) signature.
+  # Store errors from underlying store implementations (connect-redis, connect-pg-simple, etc.)
+  # are propagated verbatim to the callback. If callback ignores err, errors are silently swallowed.
+  - name: req.session.destroy
+    import_path: express-session
+    description: >
+      Destroys the session and unsets req.session. Calls the session store's destroy(sid, callback)
+      method. Used in logout flows, account deletion, and session invalidation. If the callback does
+      not check for err, store errors (Redis disconnect, DB connection loss, etc.) are silently
+      swallowed and the user is never notified that their session was not actually destroyed.
+    postconditions:
+      # Evidence: session/session.js line 109-113, store.js regenerate() calls destroy()
+      # README: "Destroys the session and will unset the req.session property. Once complete, the callback will be invoked."
+      - id: destroy-callback-error-unchecked
+        condition: >
+          req.session.destroy(callback) called but callback does not check the err argument.
+          Store errors from Redis disconnect, PostgreSQL connection loss, or any persistent store
+          failure are silently swallowed.
+        throws: >
+          Store-dependent errors passed as first argument to callback:
+          Redis: ReplyError (READONLY, WRONGTYPE, connection lost)
+          PostgreSQL: Error from pg (connection terminated, relation does not exist)
+          Generic: Error('could not destroy session') from custom stores
+        required_handling: >
+          Caller MUST check err in the destroy callback. The pattern:
+          req.session.destroy(function(err) { if (err) { /* handle */ } ... })
+          Without checking err: store failures are silently ignored, the session may persist in the
+          store (user not actually logged out from server side), and monitoring systems never see
+          the failure. The session cookie is cleared on the client regardless — creating a
+          split-brain where the client thinks the session is gone but the store still has it.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/session/session.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: destroy-no-callback
+        condition: >
+          req.session.destroy() called without any callback. Store errors have no handler at all.
+          The destroy operation is fire-and-forget with no way to react to failure.
+        returns: >
+          No value returned that indicates success or failure. Store errors are silently swallowed.
+          In Node.js environments without a global uncaughtException handler, unhandled errors in
+          store callbacks may go completely unnoticed.
+        required_handling: >
+          Always pass a callback to req.session.destroy(). Even a minimal error logger is better
+          than no callback. In redirect-after-logout flows, the redirect MUST happen inside the
+          callback — not after it — to ensure the session is actually destroyed before the user
+          is redirected.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/session/session.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: req.session.regenerate
+    import_path: express-session
+    description: >
+      Regenerates the session by destroying the current session and creating a new one with a new
+      session ID. MUST be called after successful authentication to prevent session fixation attacks.
+      Internally calls store.destroy(oldSID) then store.generate(req) which creates a new session.
+      If err is not checked in callback, a store failure during regeneration leaves the old session
+      ID in place — user is authenticated but carries the pre-auth session ID (session fixation).
+    postconditions:
+      # Evidence: session/store.js lines 50-56: regenerate() calls destroy() then generate()
+      # If destroy() fails, err is passed to callback but generate() is still called.
+      # README: "Once complete, a new SID and Session instance will be initialized at req.session and the callback will be invoked."
+      - id: regenerate-callback-error-unchecked
+        condition: >
+          req.session.regenerate(callback) called but callback does not check err. If the store
+          fails to destroy the old session, the error is silently ignored. The new session is still
+          created (store.generate() always runs regardless of err in the destroy step), but the
+          old session may persist in the store.
+        throws: >
+          Store-dependent errors passed as first argument to callback:
+          Same error types as destroy: Redis ReplyError, PostgreSQL connection errors.
+          Error from store.destroy() when the old session cannot be removed.
+        required_handling: >
+          Caller MUST check err in the regenerate callback. If err is present after login, the
+          regeneration failed and the session fixation defense may be incomplete. Minimum required:
+          if (err) { return next(err); } // abort login, don't proceed with authenticated state
+          Never call next() or redirect without checking err — doing so can leave the user
+          authenticated on a compromised session ID.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/session/store.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: req.session.save
+    import_path: express-session
+    description: >
+      Explicitly saves session data back to the store. Normally called automatically at the end of
+      each HTTP request, but MUST be called explicitly before redirects, in WebSocket handlers,
+      and in Server-Sent Events (SSE) connections — because the automatic save runs on response end,
+      which may not trigger in long-lived connections. Calls store.set(sid, sessionData, callback).
+      Failure to handle callback errors means data loss goes undetected.
+    postconditions:
+      # Evidence: session/session.js lines 71-74: save() calls this.req.sessionStore.set(this.id, this, fn)
+      # README: "Save the session back to the store... used before redirects, long-lived requests or in WebSockets."
+      - id: save-callback-error-unchecked
+        condition: >
+          req.session.save(callback) called explicitly (e.g., before redirect) but callback does
+          not check err. If the session store fails (Redis timeout, DB write failure), the session
+          data is lost and the redirect proceeds as if the save succeeded.
+        throws: >
+          Store-dependent errors: Redis ReplyError (READONLY, OOM, connection lost),
+          PostgreSQL write errors, or any error thrown by store.set() implementation.
+        required_handling: >
+          Caller MUST check err in the save callback. Redirect flow pattern:
+          req.session.save(function(err) {
+            if (err) return next(err);
+            res.redirect('/dashboard');
+          });
+          Proceeding with the redirect without checking err means the user's session data (e.g.,
+          userId, role, cart) may not be persisted, causing authentication failures or data loss
+          on the next request.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/session/session.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: save-before-redirect-missing
+        condition: >
+          Session data is modified and res.redirect() is called without first calling
+          req.session.save(). The automatic save triggered at response end may not fire before
+          the redirect response is sent in all frameworks/middleware configurations.
+        returns: >
+          The redirect response is sent immediately. The session save (if it happens at all)
+          runs asynchronously after the response. On the redirect destination, the session data
+          may not yet be persisted, causing the next request to see stale or missing session data.
+        required_handling: >
+          Always call req.session.save() explicitly before res.redirect() when session data has
+          been modified. This is documented as a known pattern in express-session README.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: req.session.reload
+    import_path: express-session
+    description: >
+      Reloads session data from the store and re-populates req.session. Used in long-lived
+      connections (WebSockets, SSE) to refresh session state from the store without a new HTTP
+      request. Calls store.get(sid) internally. If the session no longer exists in the store
+      (expired, explicitly destroyed from another process), reload throws 'failed to load session'.
+    postconditions:
+      # Evidence: session/session.js lines 88-99: reload calls store.get(), if !sess throws Error('failed to load session')
+      # README: "Reloads the session data from the store and re-populates the req.session object."
+      - id: reload-session-not-found
+        condition: >
+          req.session.reload(callback) called but the session no longer exists in the store.
+          This occurs when: (1) session expired via TTL in Redis/DB, (2) session was destroyed by
+          another server instance or background process, (3) store was flushed.
+        throws: "Error: 'failed to load session' — thrown internally when store.get() returns null/undefined"
+        required_handling: >
+          Caller MUST check err in the reload callback. When err is 'failed to load session',
+          the appropriate response is to redirect the user to the login page — their session is gone.
+          In WebSocket handlers: close the connection with a 4401 code and require re-authentication.
+          Ignoring err leaves req.session with stale data from before the reload attempt.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/session/session.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: reload-store-error
+        condition: >
+          req.session.reload(callback) called but the store.get() operation fails with a store
+          error (Redis connection failure, DB timeout) before it can determine if the session exists.
+        throws: >
+          Store-dependent errors: Redis ReplyError, PostgreSQL connection errors.
+          Error propagated verbatim from store.get() to the reload callback.
+        required_handling: >
+          Caller MUST check err in the reload callback and distinguish between 'failed to load
+          session' (session gone — force re-login) and store connection errors (retry or fail safely).
+        sources:
+          - https://github.com/expressjs/session/blob/master/session/session.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
           incident_cost_range: medium
