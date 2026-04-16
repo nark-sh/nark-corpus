@@ -1,15 +1,22 @@
 package: "@aws-sdk/client-ses"
 semver: "^3.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-15"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.50
-# coverage_score = 7 contracted / 14 total API functions (7 contracted + 7 intentionally omitted)
-# Intentionally omitted: VerifyEmailIdentityCommand, VerifyDomainIdentityCommand, DeleteTemplateCommand,
+coverage_score: 0.65
+# coverage_score = 13 contracted / 20 total relevant API functions (13 contracted + 7 intentionally omitted)
+# Previously contracted (7): send, SendTemplatedEmailCommand, SendBulkTemplatedEmailCommand,
+#   SendRawEmailCommand, SendCustomVerificationEmailCommand, CreateTemplateCommand, UpdateTemplateCommand
+# Newly contracted this pass (6): SendEmailCommand, TestRenderTemplateCommand,
+#   CreateConfigurationSetCommand, CreateConfigurationSetEventDestinationCommand,
+#   CreateCustomVerificationEmailTemplateCommand, UpdateCustomVerificationEmailTemplateCommand
+# Intentionally omitted (7): VerifyEmailIdentityCommand, VerifyDomainIdentityCommand, DeleteTemplateCommand,
 #   GetTemplateCommand, ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
-# All omitted functions are either read-only GETs or have no distinct errors beyond generic SESServiceException
+# All omitted functions are either read-only GETs, idempotent deletes, or have no distinct errors
+#   beyond generic SESServiceException already covered by the generic send() postcondition.
+# Note: The full SDK has 72 commands; the above counts only those relevant for SaaS app runtime code.
 
 functions:
   - name: send
@@ -473,6 +480,480 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: SendEmailCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Composes an email message and immediately queues it for sending. This is the
+      primary command for sending plain-text and HTML emails to a single set of
+      recipients (up to 50 total across To, CC, and BCC). The sender address must
+      be verified in SES. Every recipient counts against the 24-hour sending quota.
+      Most common command for transactional email (welcome, password reset, notifications).
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendEmailCommand/
+      # Error types confirmed from dist-types/commands/SendEmailCommand.d.ts @throws annotations
+      # AccountSendingPausedException, ConfigurationSetDoesNotExistException, ConfigurationSetSendingPausedException,
+      # MailFromDomainNotVerifiedException, MessageRejected all confirmed from SDK v3 type declarations.
+      - id: ses-send-email-no-try-catch
+        condition: >-
+          sesClient.send(new SendEmailCommand(...)) called without a try-catch
+          wrapping the await expression
+        throws: >-
+          MessageRejected (400) — message failed SES content policy, spam scoring, or blocklist;
+          MailFromDomainNotVerifiedException (400) — custom MAIL FROM domain has broken DNS/MX record;
+          AccountSendingPausedException (400) — sending paused at account level (billing/compliance);
+          ConfigurationSetSendingPausedException (400) — sending disabled on the named config set;
+          ConfigurationSetDoesNotExistException (400) — named configuration set not found;
+          LimitExceededException (400) — 24-hour quota or per-second sending rate exceeded;
+          ThrottlingException (400) — request rate too high, retryable.
+          All errors are subclasses of SESServiceException; error name is in error.name.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >-
+          SendEmailCommand makes a synchronous network request to Amazon SES.
+          Unhandled promise rejections crash Node.js workers and break the user-facing
+          action that triggered the email (registration, password reset, order confirmation).
+          The 50-recipient limit and quota constraints are commonly hit in bulk-send loops.
+
+          Pattern to avoid:
+            await sesClient.send(new SendEmailCommand(params)); // no try-catch
+
+          Correct pattern:
+            try {
+              await sesClient.send(new SendEmailCommand(params));
+            } catch (err) {
+              if (err.name === 'MessageRejected') {
+                logger.error('SES rejected message — check content policy', err);
+              } else if (err.name === 'AccountSendingPausedException') {
+                logger.error('SES account sending paused — escalate immediately', err);
+                throw err;
+              } else {
+                logger.error('SES SendEmail failed', err);
+                throw err;
+              }
+            }
+        required_handling: >-
+          MUST wrap await sesClient.send(new SendEmailCommand(...)) in try-catch.
+          Catch block SHOULD distinguish MessageRejected (permanent — do not retry),
+          AccountSendingPausedException (operational alert required), and
+          LimitExceededException / ThrottlingException (retryable with backoff).
+          Never silently swallow errors — the user is waiting for the email.
+        source: "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendEmailCommand/"
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/SendEmailCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_SendEmail.html"
+        evidence_quality: confirmed
+
+  - name: TestRenderTemplateCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Generates a preview of an email template by substituting the provided
+      TemplateData values into the template. Used in deployment scripts and
+      CI pipelines to validate templates before production use. If the template
+      renders successfully, the output contains the complete MIME content.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/TestRenderTemplateCommand/
+      # Error types confirmed from dist-types/commands/TestRenderTemplateCommand.d.ts @throws annotations:
+      # TemplateDoesNotExistException, MissingRenderingAttributeException, InvalidRenderingParameterException
+      - id: ses-test-render-template-missing
+        condition: >-
+          sesClient.send(new TestRenderTemplateCommand(...)) called with a TemplateName
+          that does not exist in the SES account
+        throws: TemplateDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. TemplateDoesNotExistException is thrown at request
+          time when the template name is not found. This is the first point of failure
+          in deployment pipelines that validate templates before sending.
+          Catch block SHOULD log the template name to aid debugging.
+          Pattern: catch TemplateDoesNotExistException and fail the deployment or alert operators.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/TestRenderTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_TestRenderTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-test-render-missing-attribute
+        condition: >-
+          sesClient.send(new TestRenderTemplateCommand(...)) called with TemplateData
+          JSON that is missing one or more variable names referenced in the template
+        throws: MissingRenderingAttributeException
+        required_handling: >-
+          MUST wrap in try-catch. MissingRenderingAttributeException is thrown when
+          TemplateData does not include all variables the template references.
+          Unlike SendTemplatedEmailCommand (which silently fails delivery),
+          TestRenderTemplateCommand explicitly throws this error.
+          Catch block SHOULD log missing attribute names and fix TemplateData before
+          attempting to render or send.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/TestRenderTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_TestRenderTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-test-render-invalid-parameter
+        condition: >-
+          sesClient.send(new TestRenderTemplateCommand(...)) called with a TemplateData
+          JSON object containing invalid values for one or more template variables
+          (e.g., wrong type, null where a string is expected)
+        throws: InvalidRenderingParameterException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidRenderingParameterException is thrown when
+          TemplateData values are of the wrong type or otherwise invalid.
+          Catch block SHOULD log the invalid parameters from the error message.
+          Validate TemplateData shape against the template variable list before calling.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/TestRenderTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_TestRenderTemplate.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateConfigurationSetCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates a new SES configuration set, which is a named group of settings
+      for email sending. Configuration sets enable event publishing (bounces, complaints,
+      deliveries, opens, clicks) to CloudWatch, Kinesis Firehose, or SNS. Used during
+      application setup or deployment to create the configuration set required for
+      sending event monitoring. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetCommand/
+      # Error types confirmed from dist-types/commands/CreateConfigurationSetCommand.d.ts @throws annotations:
+      # ConfigurationSetAlreadyExistsException, InvalidConfigurationSetException, LimitExceededException
+      - id: ses-create-config-set-already-exists
+        condition: >-
+          sesClient.send(new CreateConfigurationSetCommand(...)) called with a
+          ConfigurationSet.Name that already exists in the SES account
+        throws: ConfigurationSetAlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. In idempotent deployment scripts, catch
+          ConfigurationSetAlreadyExistsException and skip (the set already exists —
+          this is a recoverable condition). Do NOT let this exception fail a CI/CD
+          deployment. Pattern: try { create } catch(ConfigurationSetAlreadyExistsException) { skip }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSet.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-config-set-invalid
+        condition: >-
+          sesClient.send(new CreateConfigurationSetCommand(...)) called with a
+          ConfigurationSet.Name containing invalid characters or exceeding length limits
+        throws: InvalidConfigurationSetException
+        required_handling: >-
+          MUST wrap in try-catch. InvalidConfigurationSetException is thrown when the
+          configuration set name is invalid. Names must be ASCII and conform to AWS
+          naming constraints. Catch block SHOULD log the invalid name and correct
+          it in the deployment configuration.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-config-set-limit-exceeded
+        condition: >-
+          sesClient.send(new CreateConfigurationSetCommand(...)) called when the AWS
+          account has reached the maximum allowed number of configuration sets
+        throws: LimitExceededException
+        required_handling: >-
+          MUST wrap in try-catch. LimitExceededException is thrown when the account
+          has reached the SES configuration set limit. Catch block SHOULD log the
+          error and alert operators to review and delete unused configuration sets.
+          This limit is rarely hit in practice but can block deployment automation.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetCommand/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateConfigurationSetEventDestinationCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates an event destination within an existing SES configuration set.
+      Event destinations route email sending events (send, bounce, complaint,
+      delivery, open, click, renderingFailure) to CloudWatch, Kinesis Firehose,
+      or SNS for monitoring and alerting. This is the critical setup step for
+      bounce and complaint handling, which is required to maintain sender reputation
+      and comply with AWS acceptable use policy. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetEventDestinationCommand/
+      # Error types confirmed from dist-types/commands/CreateConfigurationSetEventDestinationCommand.d.ts:
+      # ConfigurationSetDoesNotExistException, EventDestinationAlreadyExistsException,
+      # InvalidCloudWatchDestinationException, InvalidFirehoseDestinationException,
+      # InvalidSNSDestinationException, LimitExceededException
+      - id: ses-event-dest-config-set-not-found
+        condition: >-
+          sesClient.send(new CreateConfigurationSetEventDestinationCommand(...)) called
+          with a ConfigurationSetName that does not exist in the SES account
+        throws: ConfigurationSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. ConfigurationSetDoesNotExistException is thrown when
+          the configuration set specified by ConfigurationSetName does not exist.
+          In deployment scripts, ensure CreateConfigurationSetCommand is called first
+          (or catch ConfigurationSetAlreadyExistsException to confirm it exists).
+          Catch block SHOULD log the missing configuration set name.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetEventDestination.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-event-dest-already-exists
+        condition: >-
+          sesClient.send(new CreateConfigurationSetEventDestinationCommand(...)) called
+          with an EventDestination.Name that already exists in the specified configuration set
+        throws: EventDestinationAlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. EventDestinationAlreadyExistsException is thrown when
+          a destination with the same name already exists. In idempotent deployment
+          scripts, catch this and skip (destination already configured).
+          Pattern: try { create } catch(EventDestinationAlreadyExistsException) { skip }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetEventDestination.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-event-dest-invalid-destination
+        condition: >-
+          sesClient.send(new CreateConfigurationSetEventDestinationCommand(...)) called
+          with an EventDestination whose CloudWatch, Kinesis Firehose, or SNS configuration
+          parameters are invalid (e.g., invalid ARN, IAM role lacks permissions, SNS topic
+          in wrong region, CloudWatch dimension configuration invalid)
+        throws: >-
+          InvalidCloudWatchDestinationException — CloudWatch destination parameters invalid;
+          InvalidFirehoseDestinationException — Kinesis Firehose ARN or IAM role invalid;
+          InvalidSNSDestinationException — SNS topic ARN invalid or in wrong region.
+        required_handling: >-
+          MUST wrap in try-catch. Destination validation errors indicate misconfigured
+          AWS resources (wrong ARNs, insufficient IAM permissions). These are deployment-time
+          errors that prevent the event pipeline from being set up correctly.
+          If not caught and the deployment proceeds, email events (bounces, complaints) will
+          not be delivered to the monitoring destination — silent observability failure.
+          Catch block SHOULD log the destination type and the specific error message from AWS.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateConfigurationSetEventDestinationCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateConfigurationSetEventDestination.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: CreateCustomVerificationEmailTemplateCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates a new custom verification email template used by
+      SendCustomVerificationEmailCommand. The template defines the sender address,
+      subject, HTML content, and success/failure redirect URLs for the email
+      verification flow. The FromEmailAddress must already be verified in SES.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateCustomVerificationEmailTemplateCommand/
+      # Error types confirmed from dist-types/commands/CreateCustomVerificationEmailTemplateCommand.d.ts:
+      # CustomVerificationEmailInvalidContentException, CustomVerificationEmailTemplateAlreadyExistsException,
+      # FromEmailAddressNotVerifiedException, LimitExceededException
+      - id: ses-create-cve-template-already-exists
+        condition: >-
+          sesClient.send(new CreateCustomVerificationEmailTemplateCommand(...)) called
+          with a TemplateName that already exists in the SES account
+        throws: CustomVerificationEmailTemplateAlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. In idempotent deployment scripts, catch
+          CustomVerificationEmailTemplateAlreadyExistsException and either skip
+          or switch to UpdateCustomVerificationEmailTemplateCommand to update the content.
+          Pattern: try { create } catch(TemplateAlreadyExists) { update instead }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateCustomVerificationEmailTemplate.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-cve-template-invalid-content
+        condition: >-
+          sesClient.send(new CreateCustomVerificationEmailTemplateCommand(...)) called
+          with TemplateContent that exceeds 10 MB or contains invalid HTML structure
+        throws: CustomVerificationEmailInvalidContentException
+        required_handling: >-
+          MUST wrap in try-catch. CustomVerificationEmailInvalidContentException is thrown
+          when the template content is too large or structurally invalid.
+          Catch block SHOULD log the template name and validate content size and HTML
+          validity before retrying.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateCustomVerificationEmailTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-create-cve-template-from-not-verified
+        condition: >-
+          sesClient.send(new CreateCustomVerificationEmailTemplateCommand(...)) called
+          with a FromEmailAddress that has not been verified in SES
+        throws: FromEmailAddressNotVerifiedException
+        required_handling: >-
+          MUST wrap in try-catch. FromEmailAddressNotVerifiedException is thrown when
+          the FromEmailAddress is not an SES-verified identity. The template is NOT
+          created. Verify the sender address in SES before calling this command.
+          Catch block SHOULD log the unverified address and alert operators.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateCustomVerificationEmailTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: UpdateCustomVerificationEmailTemplateCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Updates an existing custom verification email template's content (subject,
+      HTML body, sender, redirect URLs). Used in deployment scripts to update
+      email verification flows. Fails if the template does not exist. If
+      FromEmailAddress is changed, the new address must be verified in SES.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateCustomVerificationEmailTemplateCommand/
+      # Error types confirmed from dist-types/commands/UpdateCustomVerificationEmailTemplateCommand.d.ts:
+      # CustomVerificationEmailInvalidContentException, CustomVerificationEmailTemplateDoesNotExistException,
+      # FromEmailAddressNotVerifiedException
+      - id: ses-update-cve-template-not-found
+        condition: >-
+          sesClient.send(new UpdateCustomVerificationEmailTemplateCommand(...)) called
+          with a TemplateName that does not exist in the SES account
+        throws: CustomVerificationEmailTemplateDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. CustomVerificationEmailTemplateDoesNotExistException
+          is thrown when the template to update does not exist. In idempotent deployment
+          scripts, catch this and switch to CreateCustomVerificationEmailTemplateCommand.
+          Pattern: try { update } catch(TemplateDoesNotExist) { create instead }.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateCustomVerificationEmailTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-update-cve-template-invalid-content
+        condition: >-
+          sesClient.send(new UpdateCustomVerificationEmailTemplateCommand(...)) called
+          with updated TemplateContent that exceeds 10 MB or contains invalid HTML
+        throws: CustomVerificationEmailInvalidContentException
+        required_handling: >-
+          MUST wrap in try-catch. CustomVerificationEmailInvalidContentException is
+          thrown when the updated content is too large or invalid. Previous template
+          content is preserved — the update does not partially apply.
+          Catch block SHOULD validate content size and HTML structure before retrying.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateCustomVerificationEmailTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-update-cve-template-from-not-verified
+        condition: >-
+          sesClient.send(new UpdateCustomVerificationEmailTemplateCommand(...)) called
+          with a new FromEmailAddress that has not been verified in SES
+        throws: FromEmailAddressNotVerifiedException
+        required_handling: >-
+          MUST wrap in try-catch. FromEmailAddressNotVerifiedException is thrown when
+          the updated FromEmailAddress is not a verified SES identity. The update is
+          NOT applied. Catch block SHOULD log the unverified address and ensure the
+          new sender identity is verified before retrying the update.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateCustomVerificationEmailTemplateCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateCustomVerificationEmailTemplate.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
         evidence_quality: confirmed
 
 tags:

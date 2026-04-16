@@ -6,6 +6,7 @@
  *
  * Contracted functions (from import "@aws-sdk/client-ses"):
  *   - sesClient.send()  postcondition: ses-send-no-try-catch
+ *   - SendEmailCommand  postcondition: ses-send-email-no-try-catch
  *   - SendTemplatedEmailCommand  postconditions: ses-template-does-not-exist,
  *       ses-template-rendering-failure-silent, ses-template-missing-rendering-attribute
  *   - SendBulkTemplatedEmailCommand  postconditions: ses-bulk-template-does-not-exist,
@@ -17,6 +18,16 @@
  *       ses-create-template-invalid-syntax
  *   - UpdateTemplateCommand  postconditions: ses-update-template-not-found,
  *       ses-update-template-invalid-syntax
+ *   - TestRenderTemplateCommand  postconditions: ses-test-render-template-missing,
+ *       ses-test-render-missing-attribute, ses-test-render-invalid-parameter
+ *   - CreateConfigurationSetCommand  postconditions: ses-create-config-set-already-exists,
+ *       ses-create-config-set-invalid, ses-create-config-set-limit-exceeded
+ *   - CreateConfigurationSetEventDestinationCommand  postconditions: ses-event-dest-config-set-not-found,
+ *       ses-event-dest-already-exists, ses-event-dest-invalid-destination
+ *   - CreateCustomVerificationEmailTemplateCommand  postconditions: ses-create-cve-template-already-exists,
+ *       ses-create-cve-template-invalid-content, ses-create-cve-template-from-not-verified
+ *   - UpdateCustomVerificationEmailTemplateCommand  postconditions: ses-update-cve-template-not-found,
+ *       ses-update-cve-template-invalid-content, ses-update-cve-template-from-not-verified
  *
  * Detection pattern:
  *   - SESClient is imported from @aws-sdk/client-ses
@@ -34,6 +45,11 @@ import {
   SendCustomVerificationEmailCommand,
   CreateTemplateCommand,
   UpdateTemplateCommand,
+  TestRenderTemplateCommand,
+  CreateConfigurationSetCommand,
+  CreateConfigurationSetEventDestinationCommand,
+  CreateCustomVerificationEmailTemplateCommand,
+  UpdateCustomVerificationEmailTemplateCommand,
 } from '@aws-sdk/client-ses';
 
 const sesClient = new SESClient({ region: 'us-east-1' });
@@ -359,6 +375,203 @@ export async function updateSesTemplateWithFallback(name: string, subject: strin
           HtmlPart: html,
           TextPart: 'Please view in an HTML-capable email client.',
         },
+      }));
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. TestRenderTemplateCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-test-render-template-missing
+// @expect-violation: ses-test-render-missing-attribute
+// @expect-violation: ses-test-render-invalid-parameter
+export async function testRenderTemplateNoCatch(templateName: string, templateData: string) {
+  // SHOULD_FIRE: ses-test-render-* — TestRenderTemplateCommand throws multiple errors, no try-catch
+  const result = await sesClient.send(new TestRenderTemplateCommand({
+    TemplateName: templateName,
+    TemplateData: templateData,
+  }));
+  return result.RenderedTemplate;
+}
+
+// @expect-clean
+export async function testRenderTemplateWithCatch(templateName: string, templateData: string) {
+  try {
+    // SHOULD_NOT_FIRE: TestRenderTemplateCommand inside try-catch
+    const result = await sesClient.send(new TestRenderTemplateCommand({
+      TemplateName: templateName,
+      TemplateData: templateData,
+    }));
+    return result.RenderedTemplate;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TemplateDoesNotExistException') {
+      console.error('Template not found:', templateName);
+    } else if (err instanceof Error && err.name === 'MissingRenderingAttributeException') {
+      console.error('Missing template variable in TemplateData');
+    } else if (err instanceof Error && err.name === 'InvalidRenderingParameterException') {
+      console.error('Invalid template variable value in TemplateData');
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. CreateConfigurationSetCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-config-set-already-exists
+// @expect-violation: ses-create-config-set-invalid
+// @expect-violation: ses-create-config-set-limit-exceeded
+export async function createConfigurationSetNoCatch(configSetName: string) {
+  // SHOULD_FIRE: ses-create-config-set-* — CreateConfigurationSetCommand throws multiple errors, no try-catch
+  await sesClient.send(new CreateConfigurationSetCommand({
+    ConfigurationSet: { Name: configSetName },
+  }));
+}
+
+// @expect-clean
+export async function createConfigurationSetIdempotent(configSetName: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateConfigurationSetCommand inside try-catch with AlreadyExists handling
+    await sesClient.send(new CreateConfigurationSetCommand({
+      ConfigurationSet: { Name: configSetName },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ConfigurationSetAlreadyExistsException') {
+      // Already exists — idempotent create succeeded
+      console.log('Configuration set already exists, skipping:', configSetName);
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. CreateConfigurationSetEventDestinationCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-event-dest-config-set-not-found
+// @expect-violation: ses-event-dest-already-exists
+// @expect-violation: ses-event-dest-invalid-destination
+export async function createEventDestinationNoCatch(configSetName: string, topicArn: string) {
+  // SHOULD_FIRE: ses-event-dest-* — CreateConfigurationSetEventDestinationCommand throws multiple errors, no try-catch
+  await sesClient.send(new CreateConfigurationSetEventDestinationCommand({
+    ConfigurationSetName: configSetName,
+    EventDestination: {
+      Name: 'BounceAndComplaintNotifications',
+      Enabled: true,
+      MatchingEventTypes: ['bounce', 'complaint'],
+      SNSDestination: { TopicARN: topicArn },
+    },
+  }));
+}
+
+// @expect-clean
+export async function createEventDestinationIdempotent(configSetName: string, topicArn: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateConfigurationSetEventDestinationCommand inside try-catch
+    await sesClient.send(new CreateConfigurationSetEventDestinationCommand({
+      ConfigurationSetName: configSetName,
+      EventDestination: {
+        Name: 'BounceAndComplaintNotifications',
+        Enabled: true,
+        MatchingEventTypes: ['bounce', 'complaint'],
+        SNSDestination: { TopicARN: topicArn },
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'EventDestinationAlreadyExistsException') {
+      console.log('Event destination already configured, skipping');
+      return;
+    }
+    if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
+      console.error('Configuration set not found — create it first:', configSetName);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. CreateCustomVerificationEmailTemplateCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-cve-template-already-exists
+// @expect-violation: ses-create-cve-template-invalid-content
+// @expect-violation: ses-create-cve-template-from-not-verified
+export async function createCveTemplateNoCatch(name: string, fromEmail: string, html: string) {
+  // SHOULD_FIRE: ses-create-cve-template-* — CreateCustomVerificationEmailTemplateCommand throws multiple errors, no try-catch
+  await sesClient.send(new CreateCustomVerificationEmailTemplateCommand({
+    TemplateName: name,
+    FromEmailAddress: fromEmail,
+    TemplateSubject: 'Please verify your email address',
+    TemplateContent: html,
+    SuccessRedirectionURL: 'https://example.com/verified',
+    FailureRedirectionURL: 'https://example.com/failed',
+  }));
+}
+
+// @expect-clean
+export async function createCveTemplateIdempotent(name: string, fromEmail: string, html: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateCustomVerificationEmailTemplateCommand inside try-catch
+    await sesClient.send(new CreateCustomVerificationEmailTemplateCommand({
+      TemplateName: name,
+      FromEmailAddress: fromEmail,
+      TemplateSubject: 'Please verify your email address',
+      TemplateContent: html,
+      SuccessRedirectionURL: 'https://example.com/verified',
+      FailureRedirectionURL: 'https://example.com/failed',
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'CustomVerificationEmailTemplateAlreadyExistsException') {
+      console.log('Custom verification template already exists, updating instead');
+    } else if (err instanceof Error && err.name === 'FromEmailAddressNotVerifiedException') {
+      console.error('From address not verified in SES:', fromEmail);
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. UpdateCustomVerificationEmailTemplateCommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-update-cve-template-not-found
+// @expect-violation: ses-update-cve-template-invalid-content
+// @expect-violation: ses-update-cve-template-from-not-verified
+export async function updateCveTemplateNoCatch(name: string, html: string) {
+  // SHOULD_FIRE: ses-update-cve-template-* — UpdateCustomVerificationEmailTemplateCommand throws multiple errors, no try-catch
+  await sesClient.send(new UpdateCustomVerificationEmailTemplateCommand({
+    TemplateName: name,
+    TemplateContent: html,
+  }));
+}
+
+// @expect-clean
+export async function updateCveTemplateWithFallback(name: string, fromEmail: string, html: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateCustomVerificationEmailTemplateCommand inside try-catch with fallback
+    await sesClient.send(new UpdateCustomVerificationEmailTemplateCommand({
+      TemplateName: name,
+      FromEmailAddress: fromEmail,
+      TemplateContent: html,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'CustomVerificationEmailTemplateDoesNotExistException') {
+      // Template doesn't exist — create instead
+      await sesClient.send(new CreateCustomVerificationEmailTemplateCommand({
+        TemplateName: name,
+        FromEmailAddress: fromEmail,
+        TemplateSubject: 'Please verify your email address',
+        TemplateContent: html,
+        SuccessRedirectionURL: 'https://example.com/verified',
+        FailureRedirectionURL: 'https://example.com/failed',
       }));
       return;
     }
