@@ -1,10 +1,11 @@
 package: "@aws-sdk/client-sns"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-16"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.80
 
 functions:
   - name: send
@@ -64,6 +65,307 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: PublishBatchCommand
+    import_path: "@aws-sdk/client-sns"
+    description: >
+      Publishes up to 10 messages to an SNS topic in a single batch call. Maximum total
+      payload is 256 KB. Returns HTTP 200 even when some messages fail to publish —
+      individual message failures are NOT thrown as exceptions but are placed in
+      response.Failed[]. Callers who do not check response.Failed[] silently lose
+      messages with no error signal.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html
+      # AWS docs: "The result of publishing each message is reported individually in the response.
+      #  Because the batch request can result in a combination of successful and unsuccessful
+      #  actions, you should check for batch errors even when the call returns an HTTP status
+      #  code of 200."
+      # Confirmed from dist-types/commands/PublishBatchCommand.d.ts: response.Failed is
+      #  BatchResultErrorEntry[] — not thrown, present in response body.
+      - id: sns-publish-batch-failed-not-checked
+        severity: error
+        condition: >
+          PublishBatchCommand returns HTTP 200 but response.Failed is non-empty — some
+          messages were NOT delivered to topic subscribers due to endpoint disabled,
+          KMS errors, authorization errors, or per-message parameter violations. Caller
+          does not check response.Failed after the call.
+        description: >
+          PublishBatchCommand returns HTTP 200 even when individual messages fail to
+          publish. Failed messages are placed in response.Failed[] as BatchResultErrorEntry
+          objects with Code, Message, Id, and SenderFault fields. No exception is thrown
+          for partial failures.
+
+          Common per-message failure codes: AuthorizationError (caller lacks SNS:Publish
+          permission for this endpoint), KMSAccessDenied / KMSDisabled / KMSNotFound
+          (topic KMS key issues), EndpointDisabled (push notification endpoint deregistered),
+          PlatformApplicationDisabled (mobile push app disabled),
+          InvalidParameter / ParameterValueInvalid (per-message parameter violations).
+
+          Callers who publish notification batches without checking response.Failed silently
+          lose messages — the UI shows "notification sent" but subscribers never receive it.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Caller MUST inspect response.Failed after every PublishBatch call and handle or
+          alert on any failed entries. Retry SenderFault=false entries (infrastructure
+          failures); do not retry SenderFault=true entries (caller-side errors).
+
+          Pattern:
+            const response = await snsClient.send(new PublishBatchCommand({ TopicArn, PublishBatchRequestEntries }));
+            if (response.Failed && response.Failed.length > 0) {
+              const retryable = response.Failed.filter(f => !f.SenderFault);
+              const permanent = response.Failed.filter(f => f.SenderFault);
+              if (permanent.length > 0) {
+                console.error('Permanent batch publish failures:', permanent.map(f => `${f.Id}: ${f.Code}`));
+              }
+              if (retryable.length > 0) {
+                // retry with exponential backoff
+              }
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html"
+          - "https://docs.aws.amazon.com/sns/latest/api/API_BatchResultErrorEntry.html"
+
+      - id: sns-publish-batch-request-level-error
+        severity: error
+        condition: >
+          PublishBatchCommand throws a request-level exception before processing any
+          messages: TooManyEntriesInBatchRequestException (>10 messages),
+          EmptyBatchRequestException, BatchEntryIdsNotDistinctException (duplicate Id
+          fields), InvalidBatchEntryIdException (Id doesn't match [A-Za-z0-9_-]{1,80}),
+          or BatchRequestTooLongException (total payload >256KB).
+        description: >
+          PublishBatchCommand validates the entire request before processing any messages.
+          Validation errors throw SNSServiceException subclasses that reject the whole
+          batch (no messages are published). These are distinct from per-message failures
+          in response.Failed[].
+
+          TooManyEntriesInBatchRequest (HTTP 400): More than 10 messages in one call.
+          BatchEntryIdsNotDistinct (HTTP 400): Duplicate Id values within the batch.
+          BatchRequestTooLong (HTTP 400): Total size of all messages exceeds 256 KB.
+          EmptyBatchRequest (HTTP 400): No entries provided.
+          InvalidBatchEntryId (HTTP 400): An Id contains characters outside [A-Za-z0-9_-].
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        required_handling: >
+          Validate batch size (max 10 entries), unique Ids, and total payload size before
+          calling PublishBatchCommand. Wrap in try-catch to handle SNSServiceException.
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html"
+
+  - name: SubscribeCommand
+    import_path: "@aws-sdk/client-sns"
+    description: >
+      Subscribes an endpoint (HTTP/S URL, email, SQS queue, Lambda, mobile push endpoint,
+      SMS phone number, or Kinesis Firehose) to an SNS topic. For HTTP/S, email, and
+      cross-account subscriptions, requires a confirmation step. Returns a subscription
+      ARN or "pending confirmation" string. Throws account-level limit errors that are
+      distinct from any other SNS operation.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html
+      # Confirmed from dist-types/commands/SubscribeCommand.d.ts: @throws list
+      - id: sns-subscribe-subscription-limit-exceeded
+        severity: error
+        condition: >
+          SubscribeCommand throws SubscriptionLimitExceededException when the AWS account
+          has reached the maximum allowed number of SNS subscriptions. Default limit is
+          account-level and requires AWS Support to increase.
+        description: >
+          SubscribeCommand throws SubscriptionLimitExceededException (HTTP 403) when the
+          caller's AWS account has exceeded the maximum allowed SNS subscriptions. This
+          error does not appear in generic SNS operations — it is unique to Subscribe.
+
+          SaaS multi-tenant architectures often create per-customer subscriptions
+          (e.g., one SQS queue per tenant subscribed to a shared SNS topic). High-growth
+          SaaS apps can hit this limit unexpectedly during rapid customer onboarding, and
+          since the error only appears at subscription creation time (not at publish time),
+          it is easy to miss in load testing.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Wrap SubscribeCommand in try-catch and handle SubscriptionLimitExceededException
+          separately from other errors. When caught, alert operations team and submit
+          AWS Support limit increase request. Do NOT silently swallow the error.
+
+          Pattern:
+            try {
+              const result = await snsClient.send(new SubscribeCommand({ TopicArn, Protocol, Endpoint }));
+            } catch (error) {
+              if (error instanceof SNSServiceException) {
+                if (error.name === 'SubscriptionLimitExceeded') {
+                  // Alert ops team — needs AWS limit increase
+                  throw new CapacityError('SNS subscription limit reached', error);
+                }
+                throw error;
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html"
+
+      - id: sns-subscribe-filter-policy-limit-exceeded
+        severity: warning
+        condition: >
+          SubscribeCommand throws FilterPolicyLimitExceededException when a subscription
+          filter policy is provided and the AWS account has exceeded the maximum number
+          of filter policies across all subscriptions. Filter policies enable per-subscription
+          message routing but are counted at the account level.
+        description: >
+          SubscribeCommand throws FilterPolicyLimitExceededException (HTTP 403) when adding
+          a FilterPolicy attribute to the subscription would exceed the account-level filter
+          policy limit. AWS accounts have a default limit on the total number of filter policy
+          operators (conditions) across all subscriptions.
+
+          This error only occurs when the subscription includes a FilterPolicy attribute.
+          Subscriptions without filter policies are not affected. Multi-tenant architectures
+          that create per-tenant filter policies (to route messages to specific tenant SQS
+          queues) are most at risk.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        required_handling: >
+          Catch FilterPolicyLimitExceededException and alert the operations team. Consider
+          redesigning to use fewer filter policies (e.g., per-topic message attributes
+          instead of per-subscription filtering).
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html"
+          - "https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html"
+
+      - id: sns-subscribe-pending-confirmation-not-handled
+        severity: warning
+        condition: >
+          SubscribeCommand succeeds but returns "pending confirmation" instead of a real
+          subscription ARN. Caller treats the subscription as active and proceeds to
+          publish messages assuming delivery, but the endpoint (HTTP/S, email) has not
+          yet confirmed the subscription.
+        description: >
+          For HTTP/S endpoint and email subscriptions, SubscribeCommand returns HTTP 200
+          with SubscriptionArn set to "pending confirmation" — NOT the actual subscription
+          ARN. No exception is thrown. The endpoint will NOT receive messages until
+          ConfirmSubscription is called with the token sent to the endpoint.
+
+          Confirmation tokens expire after 2 days. If the endpoint never calls
+          ConfirmSubscription, the subscription remains pending indefinitely and no
+          messages are delivered. Callers who check only for exceptions (not the ARN
+          value) will incorrectly assume the subscription is active.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          After SubscribeCommand, check if result.SubscriptionArn === 'pending confirmation'.
+          If so, inform users to check their email/endpoint for a confirmation request.
+          Design subscription confirmation flows for HTTP/S endpoints.
+
+          Pattern:
+            const result = await snsClient.send(new SubscribeCommand({ TopicArn, Protocol: 'https', Endpoint: url }));
+            if (result.SubscriptionArn === 'pending confirmation') {
+              // Endpoint must call ConfirmSubscription — subscription not yet active
+              await notifyUser('Please confirm your SNS subscription endpoint');
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html"
+          - "https://docs.aws.amazon.com/sns/latest/dg/SendMessageToHttp.html"
+
+  - name: CreateTopicCommand
+    import_path: "@aws-sdk/client-sns"
+    description: >
+      Creates an SNS topic. Idempotent — calling with an existing topic name returns the
+      existing ARN without error. Standard topics support up to 100,000 per account;
+      FIFO topics support up to 1,000 per account. FIFO topics require the name to end
+      with ".fifo" suffix.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html
+      # Confirmed from dist-types/commands/CreateTopicCommand.d.ts: @throws list
+      # AWS docs: "This action is idempotent, so if the requester already owns a topic
+      #  with the specified name, that topic's ARN is returned without creating a new topic."
+      - id: sns-create-topic-limit-exceeded
+        severity: error
+        condition: >
+          CreateTopicCommand throws TopicLimitExceededException when the AWS account
+          has reached the maximum number of SNS topics (100,000 standard topics or
+          1,000 FIFO topics per account).
+        description: >
+          CreateTopicCommand throws TopicLimitExceededException (HTTP 403) when the
+          account-level topic limit is reached. The default limit is 100,000 standard
+          SNS topics or 1,000 FIFO topics per AWS account.
+
+          SaaS architectures that dynamically create per-customer, per-feature, or
+          per-environment topics at scale can hit this limit unexpectedly.
+          CreateTopicCommand is idempotent for existing topic names, so this error
+          only surfaces when genuinely new topics are being created.
+
+          FIFO topic limit (1,000) is especially easy to hit if teams create FIFO topics
+          per feature or per region during CI/CD pipelines.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Catch TopicLimitExceededException and alert the operations team. Audit topic
+          usage to identify unused topics that can be deleted. Request an AWS Support
+          limit increase if needed.
+
+          Note: CreateTopicCommand is idempotent — calling it with the same topic name
+          does NOT hit the limit again. Only new unique topic names consume the quota.
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html"
+          - "https://docs.aws.amazon.com/general/latest/gr/sns.html"
+
+      - id: sns-create-topic-concurrent-access-exception
+        severity: warning
+        condition: >
+          CreateTopicCommand throws ConcurrentAccessException when multiple callers
+          attempt to tag the same topic simultaneously during creation. This is a race
+          condition specific to CreateTopic with Tags when concurrent requests arrive.
+        description: >
+          CreateTopicCommand can throw ConcurrentAccessException (HTTP 400) when the
+          same topic ARN is being tagged by concurrent CreateTopic or TagResource calls.
+          This is a transient error — retrying with exponential backoff resolves it.
+
+          This error is distinct from the normal idempotency behavior: even though
+          CreateTopic is idempotent for topic creation, concurrent tagging on the same
+          topic name can still produce this transient conflict.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        required_handling: >
+          Catch ConcurrentAccessException and retry with exponential backoff (it is
+          transient). Do not propagate ConcurrentAccessException to end users.
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html"
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
