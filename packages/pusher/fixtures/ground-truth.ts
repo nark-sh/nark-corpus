@@ -131,9 +131,9 @@ export async function sendToUserSilentWithCatch(userId: string, payload: object)
 
 // @expect-violation: terminate-api-error
 export async function terminateUserNoCatch(userId: string) {
-  // SHOULD_FIRE: terminate-api-error — terminateUserConnections rejects with RequestError
-  // on Pusher API failure (401/403/5xx/network). Used in ban flows — if this fails,
-  // the user remains connected despite being banned. No try-catch.
+  // terminateUserConnections rejects on Pusher API failure (401/403/5xx/network).
+  // Used in ban flows — if this fails, the user remains connected. No try-catch.
+  // SHOULD_FIRE: terminate-api-error — no try-catch on terminateUserConnections()
   await pusher.terminateUserConnections(userId);
 }
 
@@ -168,8 +168,8 @@ export async function terminateUserWithRetryQueue(userId: string) {
 
 // @expect-violation: get-api-error
 export async function getChannelsNoCatch() {
-  // SHOULD_FIRE: get-api-error — get() rejects with RequestError on any HTTP failure.
-  // Common: 400 when requesting user_count on non-presence channel, 401/403 auth failure.
+  // get() rejects on HTTP failure: 400 (invalid attribute), 401/403 (auth), 5xx.
+  // SHOULD_FIRE: get-api-error — no try-catch on get() call
   const response = await pusher.get({ path: '/channels', params: { info: 'user_count' } });
   return response.json();
 }
@@ -201,8 +201,8 @@ export async function getChannelsWithCatch() {
 
 // @expect-violation: post-api-error
 export async function postEventNoCatch(path: string, body: object) {
-  // SHOULD_FIRE: post-api-error — post() rejects with RequestError on API failure.
-  // HTTP 413 when payload exceeds 10KB limit. No try-catch.
+  // post() rejects on API failure: 413 (payload >10KB), 401/403, 5xx. No try-catch.
+  // SHOULD_FIRE: post-api-error — no try-catch on post() call
   const response = await pusher.post({ path, body: JSON.stringify(body) });
   return response.json();
 }

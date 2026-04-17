@@ -1,10 +1,13 @@
 package: "@anthropic-ai/claude-agent-sdk"
 semver: ">=0.1.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"  # deepen-stream-1 pass 5: added unstable_v2_prompt + SDKSession V2 API
 status: production
 evidence_quality: confirmed
+coverage_score: 0.69  # 9 contracted / 13 total async-callable (5 omitted read-only) — +1 this pass (unstable_v2_prompt)
+# effective_coverage: 1.00 — 9/9 non-omitted functions contracted (unstable_v2_prompt added)
+# V2 SDKSession methods (send/stream) treated as variants of SDKSession interface, subsumed by unstable_v2_prompt contract
 
 description: >
   SDK for building AI agents with Claude Code's capabilities.
@@ -12,11 +15,21 @@ description: >
   Iterating via `for await` can throw `AbortError` when the query is aborted
   via an AbortController. The stream also emits result messages with error
   subtypes (billing_error, rate_limit, etc.) that must be checked in message handlers.
+  startup() pre-warms the subprocess but rejects on timeout.
+  Session management functions (forkSession, renameSession, tagSession, etc.)
+  operate on local JSONL transcript files and throw filesystem errors.
+  V2 API (unstable/alpha): unstable_v2_prompt() is a one-shot convenience that
+  returns SDKResultMessage (must check subtype before reading result field).
+  SDKSession.send() + SDKSession.stream() underlie unstable_v2_prompt() and share
+  the same error profile as query() (AbortError, process errors, session-ended errors).
 
 sources:
   - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.2.91/sdk.d.ts
   - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.2.91/README.md
-  - https://platform.claude.com/docs/en/agent-sdk/overview
+  - https://code.claude.com/docs/en/agent-sdk/overview
+  - https://code.claude.com/docs/en/agent-sdk/typescript
+  - https://code.claude.com/docs/en/agent-sdk/sessions
+  - https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
 
 functions:
   - name: query
@@ -77,3 +90,440 @@ functions:
           incident_cost_range: medium
         sources:
           - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.2.91/sdk.d.ts
+
+      - id: query-result-error-subtype-unchecked
+        condition: >
+          The `for await` loop processes messages from query() but only reads
+          `message.result` without checking `message.subtype`. When the agent
+          hits max turns, exhausts the budget, or encounters execution errors,
+          the loop emits an SDKResultError (type: 'result', subtype:
+          'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd' |
+          'error_max_structured_output_retries') — but `message.result` is
+          undefined on the error variant, and `message.errors` contains the
+          actual failure reason. Code that accesses `message.result` directly
+          reads undefined, silently returning no output.
+        throws: "SDKResultError (type: 'result', subtype: 'error_*') — not thrown but emitted as a message"
+        required_handling: >
+          Always check message.subtype before accessing message.result:
+            if (message.type === 'result') {
+              if (message.subtype === 'success') {
+                console.log(message.result);
+              } else {
+                // error_during_execution | error_max_turns | error_max_budget_usd
+                console.error('Agent failed:', message.errors);
+                throw new Error(`Agent error: ${message.subtype}: ${message.errors.join('; ')}`);
+              }
+            }
+          The SDKResultError shape has no `result` field — only `errors: string[]`.
+          Callers that do `if ('result' in message) ...` will silently skip the error.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          # Evidence: sdk.d.ts SDKResultError type confirmed — no `result` field on error variant
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript SDKResultMessage type reference
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+      - id: query-assistant-message-error-unchecked
+        condition: >
+          The `for await` loop processes SDKAssistantMessage objects but does not
+          check the optional `error` field. When the Anthropic API returns an
+          error mid-stream (authentication_failed, billing_error, rate_limit,
+          server_error, max_output_tokens), the assistant message's `error` field
+          is set to one of those string literals. The message is still emitted
+          with an empty/partial content block — callers that don't check `error`
+          display corrupt output and continue as if the turn succeeded.
+        throws: "SDKAssistantMessageError: 'authentication_failed' | 'billing_error' | 'rate_limit' | 'invalid_request' | 'server_error' | 'unknown' | 'max_output_tokens'"
+        required_handling: >
+          Check the error field on assistant messages:
+            if (message.type === 'assistant' && message.error) {
+              switch (message.error) {
+                case 'authentication_failed':
+                  throw new Error('API key invalid or revoked');
+                case 'billing_error':
+                  throw new Error('Account billing issue — check Anthropic Console');
+                case 'rate_limit':
+                  // Implement backoff and retry
+                  break;
+                case 'max_output_tokens':
+                  // Increase maxTokens or break the task into smaller subtasks
+                  break;
+                default:
+                  throw new Error(`API error: ${message.error}`);
+              }
+            }
+          Without this check, a billing_error or auth failure silently produces
+          empty agent output that looks like a successful empty response.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          # Evidence: sdk.d.ts SDKAssistantMessage.error?: SDKAssistantMessageError (line ~2038)
+          # Evidence: sdk.d.ts SDKAssistantMessageError = 'authentication_failed' | 'billing_error' | ... (line ~2043)
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+  - name: startup
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Pre-warms the Claude CLI subprocess so the first query() resolves immediately.
+      Returns a WarmQuery handle. Resolves once the subprocess spawns and completes
+      the initialize handshake. Rejects if initialization takes longer than
+      initializeTimeoutMs (default: 60,000ms / 60 seconds).
+      Use to eliminate cold-start latency in interactive or latency-sensitive agents.
+    patterns:
+      - 'startup('
+      - 'await startup('
+    postconditions:
+      # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript — startup() documented
+      # "If initialization does not complete in time, the promise rejects with a timeout error"
+      # Evidence: sdk.d.ts — startup(): Promise<WarmQuery>, initializeTimeoutMs?: number (default 60000)
+      - id: startup-timeout-uncaught
+        condition: >
+          startup() is called without a try/catch or .catch() handler, and the
+          Claude CLI subprocess fails to initialize within initializeTimeoutMs
+          (default 60 seconds). This happens when the CLI binary is missing,
+          the process cannot be spawned (permissions, PATH issues), or the
+          machine is under heavy load.
+        throws: Error (timeout — "initialization did not complete in time")
+        required_handling: >
+          Wrap startup() in a try/catch and handle the timeout explicitly:
+            try {
+              const warm = await startup({ initializeTimeoutMs: 30000 });
+              const result = warm.query(prompt);
+              // ... process result
+            } catch (err) {
+              if (err.message?.includes('timeout') || err.message?.includes('initialization')) {
+                // Fall back to cold-start query() or surface error to user
+                console.error('Agent startup timed out:', err.message);
+              }
+              throw err;
+            }
+          If startup() is called once at application start in a background job,
+          an unhandled rejection crashes the Node.js process silently.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript
+          # "initializeTimeoutMs: defaults to 60000. If initialization does not complete in time,
+          #  the promise rejects with a timeout error."
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+      - id: startup-warm-query-not-disposed
+        condition: >
+          startup() resolves successfully, but the WarmQuery handle is never
+          used (warm.query() is never called) and is also never closed via
+          warm.close() or `using warm = await startup(...)`. WarmQuery implements
+          AsyncDisposable. An unclosed WarmQuery leaves the subprocess running
+          and blocks clean process exit.
+        throws: "No thrown error — subprocess leak, process hangs on exit"
+        required_handling: >
+          Always either use or close the WarmQuery:
+            // Option 1: Use it immediately
+            const warm = await startup();
+            const result = warm.query(prompt); // consumes the warm query
+
+            // Option 2: Use `using` for automatic disposal (TypeScript 5.2+)
+            await using warm = await startup();
+            const result = warm.query(prompt);
+
+            // Option 3: Close explicitly if not needed
+            const warm = await startup();
+            if (!needsAgent) { warm.close(); return; }
+          A leaked WarmQuery in a serverless function prevents the invocation
+          from completing — the function times out and incurs full execution cost.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          # Evidence: sdk.d.ts — WarmQuery extends AsyncDisposable (line ~4796)
+          # interface WarmQuery extends AsyncDisposable { query(), close() }
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+  - name: forkSession
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Forks an existing session by copying its JSONL transcript into a new session file.
+      Returns the new fork's sessionId. The original session is not modified.
+      Reads from and writes to the local filesystem (~/.claude/projects/).
+      Forking branches the conversation history only — filesystem changes made
+      in the original session remain visible to both sessions.
+    patterns:
+      - 'forkSession('
+      - 'await forkSession('
+    postconditions:
+      # Evidence: sdk.d.ts — forkSession(_sessionId, _options?): Promise<ForkSessionResult>
+      # Evidence: https://code.claude.com/docs/en/agent-sdk/sessions — fork documentation
+      - id: fork-session-not-found
+        condition: >
+          forkSession() is called with a sessionId that doesn't exist in the
+          project directory. The session file may have been deleted, or the
+          calling process is using a different cwd than the process that created
+          the session. Sessions are stored at:
+          ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
+          where encoded-cwd replaces non-alphanumeric chars with '-'.
+          A cwd mismatch causes a "session not found" failure.
+        throws: Error (session file not found / ENOENT)
+        required_handling: >
+          Wrap forkSession() in a try/catch and verify the sessionId before
+          calling:
+            try {
+              const { sessionId: forkId } = await forkSession(originalSessionId);
+            } catch (err) {
+              if (err.code === 'ENOENT' || err.message?.includes('not found')) {
+                console.error('Session not found — cwd mismatch or file deleted:', err);
+                // Cannot fork; start a fresh session instead
+              } else {
+                throw err;
+              }
+            }
+          The docs explicitly warn: if a resume call returns a fresh session, the
+          most common cause is a cwd mismatch. The same applies to forkSession.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/sessions
+          # "Sessions are stored under ~/.claude/projects/<encoded-cwd>/*.jsonl"
+          # "If a resume call returns a fresh session instead of the expected history,
+          #  the most common cause is a mismatched cwd."
+          - https://code.claude.com/docs/en/agent-sdk/sessions
+
+  - name: renameSession
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Renames a session by appending a custom-title entry to the session's JSONL
+      transcript file. Requires the title to be non-empty after trimming whitespace.
+      Writes to ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl.
+    patterns:
+      - 'renameSession('
+      - 'await renameSession('
+    postconditions:
+      # Evidence: sdk.d.ts — renameSession(_sessionId, _title, _options?): Promise<void>
+      # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript
+      # "title: must be non-empty after trimming"
+      - id: rename-session-empty-title
+        condition: >
+          renameSession() is called with a title that is empty or whitespace-only
+          (e.g., '', '   '). The documentation states the title "must be non-empty
+          after trimming whitespace." An empty title throws a validation error.
+          This commonly occurs when user input is passed directly without validation.
+        throws: Error (validation — title must be non-empty after trimming)
+        required_handling: >
+          Validate the title before calling renameSession():
+            const trimmedTitle = title.trim();
+            if (!trimmedTitle) {
+              throw new Error('Session title cannot be empty');
+            }
+            await renameSession(sessionId, trimmedTitle);
+          Without this guard, passing an empty string from a UI form throws an
+          unhandled error that surfaces to the user as an unhandled rejection.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript
+          # "title: New title, must be non-empty after trimming (required)"
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+  - name: tagSession
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Tags a session. Pass null to clear the tag. Appends a tag entry to the
+      session's JSONL transcript file. Writes to the local filesystem.
+      Sessions are tagged per-session and can be used to organize/filter sessions.
+    patterns:
+      - 'tagSession('
+      - 'await tagSession('
+    postconditions:
+      # Evidence: sdk.d.ts — tagSession(_sessionId, _tag: string | null, _options?): Promise<void>
+      # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript
+      - id: tag-session-not-found
+        condition: >
+          tagSession() is called with a sessionId that does not exist on the
+          local filesystem, or the cwd doesn't match the directory where the
+          session was created. The function writes to the session's JSONL file
+          and will throw a filesystem error if the file is not found.
+        throws: Error (ENOENT — session file not found)
+        required_handling: >
+          Verify the session exists before tagging, or catch the error:
+            try {
+              await tagSession(sessionId, tag);
+            } catch (err) {
+              if (err.code === 'ENOENT') {
+                console.warn('Session not found for tagging:', sessionId);
+              } else {
+                throw err;
+              }
+            }
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts — tagSession returns Promise<void>, writes to session file
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript
+          - https://code.claude.com/docs/en/agent-sdk/typescript
+
+  - name: unstable_v2_prompt
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      V2 Alpha one-shot convenience function for single-turn queries.
+      Creates an SDKSession internally, sends the prompt, iterates the response
+      stream until a 'result' message, then returns SDKResultMessage.
+      SDKResultMessage is a discriminated union: SDKResultSuccess (subtype: 'success',
+      has result field) or SDKResultError (subtype: 'error_*', has errors[] field).
+      Callers MUST check result.subtype before accessing result.result or result.errors.
+      Throws if the underlying subprocess fails to produce a result message.
+      Annotated @alpha — API may change before stable release.
+    patterns:
+      - 'unstable_v2_prompt('
+      - 'await unstable_v2_prompt('
+    postconditions:
+      # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+      # Official docs show: if (result.subtype === "success") { console.log(result.result); }
+      # This means callers who skip the subtype check silently get undefined from result.result
+      # Evidence: sdk.d.ts — SDKResultMessage = SDKResultSuccess | SDKResultError
+      # SDKResultError has: subtype: 'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd' | 'error_max_structured_output_retries'
+      # Evidence: sdk.mjs source: async function k$$($,X){... for await(let U of J.stream()) if(U.type==="result")return U; throw Error("Session ended without result message")}
+      - id: v2-prompt-result-error-unchecked
+        condition: >
+          unstable_v2_prompt() is called and the returned SDKResultMessage is accessed
+          directly without checking result.subtype. SDKResultMessage is a discriminated
+          union: SDKResultSuccess (subtype: 'success', has result: string field) and
+          SDKResultError (subtype: 'error_during_execution' | 'error_max_turns' |
+          'error_max_budget_usd' | 'error_max_structured_output_retries', no result
+          field, has errors: string[] field). When Claude hits max turns, budget limits,
+          or execution errors, the promise resolves with SDKResultError — not rejected.
+          Code that reads result.result directly gets undefined silently.
+        throws: >
+          SDKResultError (type: 'result', subtype: 'error_*') — promise resolves (not
+          rejected) with an error-variant result. result.result is undefined on error variant.
+        required_handling: >
+          Always check result.subtype before reading result.result:
+            const result = await unstable_v2_prompt("prompt", { model: '...' });
+            if (result.subtype === 'success') {
+              console.log(result.result);
+            } else {
+              // result.subtype is 'error_during_execution', 'error_max_turns',
+              // 'error_max_budget_usd', or 'error_max_structured_output_retries'
+              console.error('Agent failed:', result.errors);
+            }
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+          # "if (result.subtype === 'success') { console.log(result.result); }"
+          - https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+
+      - id: v2-prompt-no-try-catch
+        condition: >
+          unstable_v2_prompt() is called without a try/catch block, and the underlying
+          Claude subprocess fails to start (e.g., native binary missing, process crash)
+          or the response stream terminates without a result message. The SDK source
+          throws Error("Session ended without result message") if the stream ends without
+          a result-type message. AbortError is thrown if the operation is aborted.
+          Native binary missing throws Error("Native CLI binary for <platform>-<arch>
+          not found. Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional").
+        throws: >
+          Error (session ended without result) | AbortError (if aborted) |
+          Error (native binary missing)
+        required_handling: >
+          Wrap unstable_v2_prompt() in a try/catch:
+            try {
+              const result = await unstable_v2_prompt("prompt", { model: '...' });
+              if (result.subtype === 'success') {
+                return result.result;
+              } else {
+                throw new Error(`Agent failed: ${result.errors.join(', ')}`);
+              }
+            } catch (error) {
+              if (error.name === 'AbortError') {
+                // Handle intentional cancellation
+              } else {
+                // Handle subprocess/process errors
+                throw error;
+              }
+            }
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          # Evidence: sdk.mjs source line: throw Error("Session ended without result message")
+          # Evidence: sdk.mjs KW constructor: throw Error("Native CLI binary for ${process.platform}-${process.arch} not found...")
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+          - https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+
+      - id: v2-session-not-closed
+        condition: >
+          An SDKSession created by unstable_v2_createSession() is used without closing it
+          via session.close(), `await using`, or Symbol.asyncDispose. SDKSession wraps a
+          Claude subprocess — if not closed, the subprocess continues running until the
+          Node.js process exits. In long-running services, each unclosed session leaks a
+          subprocess. The V2 docs explicitly recommend `await using` (TypeScript 5.2+)
+          for automatic cleanup.
+        throws: >
+          No throw — leaked subprocess runs silently in background. Visible as process
+          accumulation in `ps aux` or resource exhaustion on the host.
+        required_handling: >
+          Use `await using` for automatic cleanup (TypeScript 5.2+):
+            await using session = unstable_v2_createSession({ model: '...' });
+            // session.close() called automatically on scope exit
+
+          Or call session.close() explicitly in a finally block:
+            const session = unstable_v2_createSession({ model: '...' });
+            try {
+              await session.send("Hello");
+              for await (const msg of session.stream()) { ... }
+            } finally {
+              session.close();
+            }
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        sources:
+          # Evidence: https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+          # "Sessions can be closed manually or automatically using await using"
+          # Evidence: sdk.mjs KW.close() — sets closed=true, calls inputStream.done(), abortController.abort() after timeout
+          # Evidence: sdk.mjs KW[Symbol.asyncDispose]() — delegates to close()
+          - https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
