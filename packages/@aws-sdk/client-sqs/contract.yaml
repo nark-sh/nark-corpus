@@ -5,7 +5,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.89
+coverage_score: 1.0  # 9 contracted / 9 contractable (24 total - 15 intentionally omitted)
 
 functions:
   - name: send
@@ -434,6 +434,155 @@ functions:
           incident_label: DATA_LOSS
           production_behavior: silent_failure
           visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: send (SendMessageCommand)
+    import_path: "@aws-sdk/client-sqs"
+    description: >
+      Sends a single message to the specified SQS queue. The most fundamental SQS
+      operation — used in event-driven systems to enqueue work items, notifications,
+      and async tasks. Returns MessageId and MD5 checksums on success. Has distinct
+      error contracts for: invalid message content (character set violations), KMS
+      encryption failures when the queue uses server-side encryption, and FIFO queue
+      requirements (MessageGroupId required, MessageDeduplicationId needed if
+      ContentBasedDeduplication not enabled).
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
+      # SDK source: dist-types/commands/SendMessageCommand.d.ts — @throws annotations confirmed
+      # Generic send() postcondition covers: QueueDoesNotExist, RequestThrottled, AccessDeniedException
+      # This entry adds distinct postconditions not covered by the generic send() entry.
+
+      - id: sqs-send-invalid-message-contents
+        condition: >
+          SendMessageCommand is called with a message body containing characters outside
+          the allowed Unicode set. SQS only allows: #x9, #xA, #xD, #x20-#xD7FF,
+          #xE000-#xFFFD, #x10000-#x10FFFF. Common when serializing arbitrary user input,
+          binary data, or control characters (e.g., \x00-\x08, \x0B-\x0C, \x0E-\x1F).
+        throws: >
+          InvalidMessageContents (SQSServiceException, HTTP 400): the message is rejected
+          entirely — not delivered to the queue. No partial delivery occurs.
+        required_handling: >
+          MUST validate or sanitize message body before calling SendMessageCommand when
+          the source data may contain arbitrary user input or binary content.
+          Use Base64 encoding for binary payloads, or strip/replace invalid characters:
+            // Option A: Base64 encode binary/arbitrary content
+            const messageBody = Buffer.from(rawData).toString('base64');
+
+            // Option B: Validate characters before sending
+            const VALID_SQS_CHARS = /^[\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]*$/u;
+            if (!VALID_SQS_CHARS.test(messageBody)) {
+              throw new Error('Message body contains invalid SQS characters — encode as Base64');
+            }
+
+            try {
+              await client.send(new SendMessageCommand({ QueueUrl, MessageBody: messageBody }));
+            } catch (error) {
+              if (error.name === 'InvalidMessageContents') {
+                throw new Error(`SQS rejected message: invalid characters in body`);
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/sqs/command/SendMessageCommand/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: sqs-send-kms-errors
+        condition: >
+          SendMessageCommand is called on a queue with server-side encryption (SSE) using
+          AWS KMS, and the KMS key is unavailable, misconfigured, or the caller lacks
+          permissions. KMS errors are categorically distinct from SQS service errors and
+          require different remediation (IAM policy changes, KMS key rotation, key state fixes)
+          rather than retry logic.
+        throws: >
+          One of 7 KmsXxx error classes (all SQSServiceException subclasses, HTTP 400):
+          KmsAccessDenied (caller lacks kms:GenerateDataKey permission),
+          KmsDisabled (KMS key is disabled),
+          KmsInvalidKeyUsage (key not configured for encryption),
+          KmsInvalidState (key in PENDING_DELETION or other invalid state),
+          KmsNotFound (KMS key ARN does not exist or is in wrong region),
+          KmsOptInRequired (KMS not enabled for the AWS account in this region),
+          KmsThrottled (KMS request rate exceeded — usually transient).
+        required_handling: >
+          MUST distinguish KMS errors from generic SQS errors — KMS errors require
+          infrastructure fixes, not message-level retry:
+            try {
+              await client.send(new SendMessageCommand({ QueueUrl, MessageBody }));
+            } catch (error) {
+              if (error.name?.startsWith('Kms')) {
+                // KMS infrastructure error — alert ops team, do not retry indefinitely
+                logger.error('SQS KMS encryption failure', {
+                  errorCode: error.name,
+                  queueUrl: QueueUrl,
+                  // KmsThrottled is transient; others require IAM/key fixes
+                  retryable: error.name === 'KmsThrottled',
+                });
+                throw error;
+              }
+              if (error instanceof SQSServiceException) {
+                logger.error(`SQS error [${error.name}]: ${error.message}`);
+              }
+              throw error;
+            }
+          KmsThrottled is transient and can be retried with backoff. All other Kms*
+          errors require infrastructure remediation (IAM policies, key state, key ARN).
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html"
+          - "https://docs.aws.amazon.com/kms/latest/developerguide/services-sqs.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: sqs-send-fifo-missing-message-group-id
+        condition: >
+          SendMessageCommand is called on a FIFO queue (.fifo suffix in QueueUrl) without
+          providing MessageGroupId. FIFO queues require MessageGroupId to organize messages
+          into ordered processing groups. Omitting it causes the action to fail. Teams that
+          initially build with standard queues and later migrate to FIFO queues commonly
+          hit this error because the parameter is not required in the SDK type signature.
+        throws: >
+          InvalidParameterValue or UnsupportedOperation (SQSServiceException, HTTP 400):
+          the action fails — the message is NOT sent to the queue. No partial delivery.
+          Error occurs immediately, before any message is enqueued.
+        required_handling: >
+          MUST provide MessageGroupId when sending to FIFO queues:
+            const isFifoQueue = QueueUrl.endsWith('.fifo');
+            await client.send(new SendMessageCommand({
+              QueueUrl,
+              MessageBody,
+              // Required for FIFO queues:
+              ...(isFifoQueue && { MessageGroupId: 'default' }),
+              // Optional: override content-based deduplication:
+              // MessageDeduplicationId: crypto.randomUUID(),
+            }));
+
+          FIFO queue requirements:
+          1. MessageGroupId: REQUIRED — messages in the same group are processed in FIFO order
+          2. MessageDeduplicationId: required only if ContentBasedDeduplication is NOT enabled
+             on the queue. If enabled, SQS auto-generates a deduplication ID from the SHA-256
+             hash of the message body.
+          Messages with identical MessageDeduplicationId within 5 minutes are silently deduplicated
+          (only one copy delivered) — use UUIDs or content hashes to prevent accidental deduplication.
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html"
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
           user_experience: lost_data
           incident_cost_range: medium
 
