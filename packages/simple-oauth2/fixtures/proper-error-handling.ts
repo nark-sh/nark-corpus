@@ -35,3 +35,38 @@ async function refreshToken(token: any) {
     throw error;
   }
 }
+
+// @expect-clean
+// Proper error handling for revokeAll — handles partial failure case
+async function logoutUserSafely(token: any) {
+  const accessToken = client.createToken(token);
+  try {
+    await accessToken.revokeAll();
+  } catch (error) {
+    // CRITICAL: partial revocation may have occurred — refresh_token may still be valid
+    console.error('Token revocation incomplete:', error);
+    throw new Error('Logout incomplete — please re-authenticate');
+  }
+}
+
+// @expect-clean
+// Preferred: revoke tokens independently for fine-grained error handling
+async function logoutUserIndependently(token: any) {
+  const accessToken = client.createToken(token);
+  let revokeError: Error | null = null;
+  try {
+    await accessToken.revoke('access_token');
+  } catch (error) {
+    console.error('access_token revocation failed:', error);
+    revokeError = error as Error;
+  }
+  try {
+    await accessToken.revoke('refresh_token');
+  } catch (error) {
+    console.error('refresh_token revocation failed:', error);
+    revokeError = error as Error;
+  }
+  if (revokeError) {
+    throw new Error('One or more tokens could not be revoked');
+  }
+}

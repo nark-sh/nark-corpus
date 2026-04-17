@@ -25,3 +25,21 @@ async function refreshToken(token: any) {
   const refreshed = await accessToken.refresh();
   return refreshed.token;
 }
+
+// @expect-violation: revokeall-partial-failure
+// @expect-violation: revokeall-network-error
+// Missing error handling - revokeAll can fail (leaving refresh_token active)
+async function logoutUser(token: any) {
+  const accessToken = client.createToken(token);
+  await accessToken.revokeAll();
+  // User appears logged out but if revokeAll throws, refresh_token may still be valid
+}
+
+// @expect-violation: revokeall-partial-failure
+// @expect-violation: revokeall-network-error
+// Missing error handling - revokeAll in a logout handler
+async function handleLogout(token: any) {
+  const accessToken = client.createToken(token);
+  // No try-catch — if access_token revoke fails, refresh_token is never revoked
+  await accessToken.revokeAll();
+}

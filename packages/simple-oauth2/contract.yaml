@@ -1,10 +1,27 @@
+# simple-oauth2 — OAuth2 token management library for Node.js
+# Supports Authorization Code, Client Credentials, and Resource Owner Password grants.
+# Primary async API: getToken() (on grant instances), refresh()/revoke()/revokeAll() (on AccessToken)
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 4):
+# API surface: 4 async-callable functions (3 intentionally omitted)
+# Contracted before: 3 (getToken, refresh, revoke)
+# Contracted after:  4 (+1 new function: revokeAll)
+#   revokeAll: 2 postconditions (partial-failure, network-error)
+# Omitted: 3 (authorizeURL — sync URL builder; createToken — sync factory; expired — sync boolean)
+# Coverage: 4/4 = 1.0 (effective contracted/non-omitted = 4/4 = 100%)
+# Evidence sources confirmed from:
+#   simple-oauth2/lib/access-token.js — revokeAll() sequential await implementation
+#   @hapi/wreck/lib/index.js — Boom.badGateway/gatewayTimeout/Boom error types
+#   https://github.com/lelylan/simple-oauth2/blob/master/API.md
+#   https://github.com/lelylan/simple-oauth2/blob/master/CHANGELOG.md
 package: simple-oauth2
 semver: ">=4.0.0 <6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 4 contracted / 4 total async-callable (3 intentionally omitted: authorizeURL, createToken, expired)
 
 functions:
   - name: getToken
@@ -166,3 +183,129 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: revokeAll
+    import_path: "simple-oauth2"
+    description: >
+      Revokes both the access token and the refresh token in a single call.
+      Internally calls revoke('access_token') first, then revoke('refresh_token').
+      CRITICAL: if the first revoke call throws, the second call is never executed —
+      the refresh token remains valid even though the access token was revoked (or
+      the error may indicate neither was revoked). This is the most common misuse:
+      callers assume revokeAll() atomically revokes both tokens, but it does not.
+
+    postconditions:
+      # Evidence: simple-oauth2/lib/access-token.js — revokeAll() implementation:
+      #   async revokeAll(httpOptions) {
+      #     await this.revoke(ACCESS_TOKEN_PROPERTY_NAME, httpOptions);
+      #     await this.revoke(REFRESH_TOKEN_PROPERTY_NAME, httpOptions);
+      #   }
+      # If revoke('access_token') throws, revoke('refresh_token') is never called.
+      # @hapi/wreck throws Boom errors: Boom.badGateway (502) for network errors,
+      # Boom.gatewayTimeout (504) for timeouts, Boom.Boom(statusCode) for HTTP 4xx/5xx.
+      - id: revokeall-partial-failure
+        condition: >
+          revokeAll() is called and the first internal revoke call (for the access_token)
+          throws a network error, timeout, or HTTP error from the OAuth2 server. The second
+          revoke call (for the refresh_token) is never executed because revokeAll() uses
+          sequential await without try-catch between the two calls. As a result:
+          - If access_token revoke fails: BOTH tokens may still be valid on the server
+          - If access_token revoke succeeds but is not confirmed: the refresh_token is
+            still valid and can be used to obtain new access tokens
+          This creates a security-critical partial logout state — the user appears logged
+          out on the client but their refresh token can still mint new access tokens.
+        throws: >
+          Boom.Boom error (isBoom: true) with one of:
+          - output.statusCode 502 (Boom.badGateway): network error (ECONNREFUSED, DNS failure)
+          - output.statusCode 504 (Boom.gatewayTimeout): request timeout
+          - output.statusCode matching HTTP status: OAuth2 server returned 4xx/5xx
+          All Boom errors have .isBoom === true, .message with details, and
+          .output.statusCode with the effective HTTP status code.
+        required_handling: >
+          NEVER use revokeAll() for security-sensitive logout flows without error handling.
+          Wrap revokeAll() in try-catch AND consider calling revoke() twice separately
+          to handle partial failures:
+
+            // Preferred: handle each revocation independently
+            try {
+              await accessToken.revoke('access_token');
+            } catch (err) {
+              console.error('access_token revocation failed:', err.message);
+              // Decide: continue to refresh_token revoke? Or abort?
+            }
+            try {
+              await accessToken.revoke('refresh_token');
+            } catch (err) {
+              console.error('refresh_token revocation failed:', err.message);
+            }
+
+          If using revokeAll(), always catch and treat the session as potentially
+          still valid — force re-authentication on the next request:
+
+            try {
+              await accessToken.revokeAll();
+            } catch (err) {
+              // CRITICAL: refresh token may still be valid.
+              // Mark the session as potentially compromised and
+              // require re-authentication.
+              logger.error('Token revocation incomplete:', err.message);
+              throw new Error('Logout incomplete — please re-authenticate');
+            }
+        sources:
+          - "https://github.com/lelylan/simple-oauth2/blob/master/API.md"
+          - "https://github.com/lelylan/simple-oauth2/blob/master/lib/access-token.js"
+          - "https://github.com/hapijs/wreck/blob/master/lib/index.js"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+      - id: revokeall-network-error
+        condition: >
+          Network error or timeout occurs when revokeAll() attempts the first HTTP request
+          to the OAuth2 token revocation endpoint. The OAuth2 server is unreachable due to
+          DNS failure, connection refused, socket timeout, or TLS error. Because revokeAll()
+          does not retry or fallback, a transient network blip prevents any token from being
+          revoked.
+        throws: >
+          Boom.Boom error (isBoom: true):
+          - Boom.badGateway (502): 'Client request error: <ECONNREFUSED|ENOTFOUND|...>'
+          - Boom.gatewayTimeout (504): 'Client request timeout'
+          Check: err.isBoom === true && err.output.statusCode in [502, 504]
+        required_handling: >
+          Caller MUST wrap revokeAll() in try-catch. For network errors during logout,
+          log the failure and implement a retry mechanism or fallback strategy (e.g.,
+          invalidate the session server-side even if the OAuth2 server could not be
+          notified). Do not silently ignore revocation failures.
+
+            try {
+              await accessToken.revokeAll();
+            } catch (err) {
+              if (err.isBoom && [502, 504].includes(err.output?.statusCode)) {
+                // Network failure — could not reach revocation endpoint
+                logger.warn('Token revocation network failure, session may persist:', err.message);
+                // Invalidate server-side session anyway for security
+              }
+              throw err;
+            }
+        sources:
+          - "https://github.com/lelylan/simple-oauth2/blob/master/API.md"
+          - "https://github.com/hapijs/wreck/blob/master/lib/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "revokeAll() is NOT atomic — if access_token revoke fails, refresh_token is never revoked"
+  - "All HTTP errors are Boom errors (isBoom: true). Check err.output.statusCode for HTTP status"
+  - "Network errors: Boom.badGateway (502), timeouts: Boom.gatewayTimeout (504)"
+  - "Client Credentials tokens have no refresh_token — calling revokeAll() on them will still attempt refresh_token revoke which may 400"
+  - "Omitted (synchronous, no error contracts): authorizeURL(), createToken(), expired(), toJSON()"
+  - "simple-oauth2 wraps @hapi/wreck for HTTP. Custom httpOptions can override timeout, maxBytes, etc."
