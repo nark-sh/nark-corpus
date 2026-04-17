@@ -487,12 +487,149 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: GoogleAuth.fromStream
+    import_path: "google-auth-library"
+    description: >
+      Creates a credential client by reading and parsing a JSON credentials file
+      from a readable stream. Used to load service account keys from strings,
+      buffers, or secret manager responses in cloud environments where credentials
+      are delivered as streams rather than files. Throws immediately when no stream
+      is provided, and propagates stream read errors and JSON parse failures.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js fromStreamAsync() — line 543:
+      #   throw new Error('Must pass in a stream containing the Google auth settings.')
+      #   .on('error', reject) propagates stream read errors
+      #   JSON.parse() failure propagates if keyFilename fallback is also absent
+      - id: from-stream-unprotected
+        condition: >
+          Async call to auth.fromStream(inputStream) is not wrapped in a try-catch block.
+          Throws Error('Must pass in a stream containing the Google auth settings.') when
+          null or undefined is passed as the stream argument. Also propagates any stream
+          read errors (e.g., network stream dropped mid-read) via the .on('error') handler.
+          JSON.parse() failures propagate as SyntaxError if keyFilename fallback is absent.
+          Commonly used in initialization code that loads credentials from Google Secret
+          Manager or AWS Secrets Manager, where stream errors are often silently swallowed.
+        throws: "Error | SyntaxError"
+        required_handling: >
+          Caller MUST wrap await auth.fromStream(stream) in a try-catch block.
+          Validate that the stream argument is non-null before calling. Handle SyntaxError
+          for invalid JSON credentials (common when secrets are rotated to an unexpected
+          format). Handle stream read errors separately — these are often transient network
+          errors that warrant retry. Unhandled errors in credential loading cause all
+          downstream Google API calls to fail with 'No credentials found'.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: GoogleAuth.getCredentials
+    import_path: "google-auth-library"
+    description: >
+      Returns the credential body (client_email, private_key, universe_domain) for
+      the current auth client. On GCE, fetches the service account email from the
+      metadata server. Throws when credentials cannot be found in any source —
+      neither jsonContent, nor the metadata server, nor an external credential client.
+      Commonly used to get the service account email for IAM operations, logging, or
+      token verification.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html
+      # Source confirmed: googleauth.js getCredentialsAsync() line 726:
+      #   throw new Error(GoogleAuthExceptionMessages.NO_CREDENTIALS_FOUND)
+      #   where NO_CREDENTIALS_FOUND = 'Unable to find credentials in current environment...'
+      #   Also propagates GaxiosError from _checkIsGCE() metadata server call on GCE
+      - id: get-credentials-unprotected
+        condition: >
+          Async call to auth.getCredentials() is not wrapped in a try-catch block.
+          Throws Error('Unable to find credentials in current environment. To learn more
+          about authentication and Google APIs, visit: https://cloud.google.com/docs/authentication/getting-started')
+          when (1) no JSON credentials are loaded, (2) not running on GCE, and (3) no
+          external account client is configured. Also propagates GaxiosError from the
+          GCE metadata server call if running in a restricted environment where metadata
+          server access is blocked.
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await auth.getCredentials() in a try-catch block.
+          Error('Unable to find credentials in current environment') indicates the auth
+          client has no credentials loaded — ensure GOOGLE_APPLICATION_CREDENTIALS is set
+          or credentials were loaded via fromStream()/fromJSON(). The GaxiosError from
+          metadata server access is typically a network error in locked-down environments.
+          Commonly used in logging/monitoring code where missing credentials is silently
+          ignored, causing NullPointerError-style failures downstream.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/GoogleAuth.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Impersonated.fetchIdToken
+    import_path: "google-auth-library"
+    description: >
+      Fetches a Google ID token for an impersonated service account using the IAM
+      Credentials API (generateIdToken endpoint). Used in multi-tenant architectures
+      where a primary service account impersonates secondary accounts to call Cloud
+      Run, Cloud Functions, or other audience-restricted services. Calls both
+      sourceClient.getAccessToken() and then the IAM Credentials API — both can fail.
+      Error messages are reformatted to include IAM status codes and messages.
+
+    postconditions:
+      # Evidence: https://googleapis.dev/nodejs/google-auth-library/latest/classes/Impersonated.html
+      # Source confirmed: impersonated.js fetchIdToken() — calls:
+      #   1. await this.sourceClient.getAccessToken()  [throws if source token fails]
+      #   2. await this.sourceClient.request(POST iamcredentials.googleapis.com/v1/.../generateIdToken)
+      # refreshToken() error handler reformats: error.message = `${status}: unable to impersonate: ${message}`
+      # Common IAM errors: PERMISSION_DENIED (roles/iam.serviceAccountTokenCreator missing),
+      #   NOT_FOUND (target SA doesn't exist), INVALID_ARGUMENT (audience format invalid)
+      - id: impersonated-fetch-id-token-unprotected
+        condition: >
+          Async call to impersonatedClient.fetchIdToken(targetAudience) is not wrapped in
+          a try-catch block. Makes two network calls: (1) sourceClient.getAccessToken()
+          which throws GaxiosError on source credential failure; (2) IAM Credentials API
+          POST to generateIdToken which throws GaxiosError with reformatted message
+          'PERMISSION_DENIED: unable to impersonate: ...' when the source SA lacks
+          roles/iam.serviceAccountTokenCreator on the target SA, 'NOT_FOUND: unable to
+          impersonate: ...' when targetPrincipal does not exist, or 'INVALID_ARGUMENT'
+          for malformed audience URLs.
+        throws: GaxiosError
+        required_handling: >
+          Caller MUST wrap await impersonatedClient.fetchIdToken(audience) in a try-catch
+          block. Check error.message for IAM status prefix ('PERMISSION_DENIED', 'NOT_FOUND',
+          'INVALID_ARGUMENT') to distinguish misconfigured IAM roles from nonexistent service
+          accounts. PERMISSION_DENIED requires granting roles/iam.serviceAccountTokenCreator
+          on the target service account. This is commonly used in cross-service auth middleware
+          where a single uncaught error blocks all requests to impersonated services.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/Impersonated.html"
+          - "https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateIdToken"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 metadata:
   last_verified: "2026-04-16"
   evidence_quality: confirmed
-  coverage_score: 0.75
-  # 12 contracted functions / 16 total async-callable (4 intentionally omitted)
-  # Added this pass: JWT.fetchIdToken (deepen-stream-2 pass 6)
+  coverage_score: 0.79
+  # 15 contracted functions / 19 total async-callable (4 intentionally omitted)
+  # Added this pass (deepen-stream-2 pass 12): GoogleAuth.fromStream, GoogleAuth.getCredentials,
+  #   Impersonated.fetchIdToken (3 new functions; total expanded from 16→19)
   # Omitted: revokeToken, revokeCredentials (cleanup paths, same GaxiosError profile),
   #          getFederatedSignonCerts/getIapPublicKeys (internal auth infra),
   #          getRequestHeaders/authorizeRequest/request/fetch (pass-through wrappers)

@@ -16,6 +16,9 @@
  *   - GoogleAuth.sign() throws 'Cannot sign data without client_email' → MUST try-catch
  *   - JWT.authorize() throws GaxiosError from token endpoint → MUST try-catch
  *   - JWT.fetchIdToken() throws GaxiosError on token endpoint rejection → MUST try-catch
+ *   - GoogleAuth.fromStream() throws Error if stream is null/invalid → MUST try-catch
+ *   - GoogleAuth.getCredentials() throws 'Unable to find credentials in current environment' → MUST try-catch
+ *   - Impersonated.fetchIdToken() throws GaxiosError with IAM status ('PERMISSION_DENIED: unable to impersonate') → MUST try-catch
  *   - A try-catch (any catch block) satisfies the requirement
  *   - A .catch() chain also satisfies the requirement
  *   - try-finally without catch does NOT satisfy the requirement
@@ -272,6 +275,78 @@ export async function fetchIdTokenWithCatch(targetAudience: string) {
     return idToken;
   } catch (error) {
     console.error('ID token fetch failed:', error);
+    throw error;
+  }
+}
+
+// ─── 20. GoogleAuth.fromStream — bare call, no try-catch ─────────────────────
+
+// @expect-violation: from-stream-unprotected
+export async function loadCredsFromStreamNoCatch(stream: NodeJS.ReadableStream) {
+  // SHOULD_FIRE: from-stream-unprotected — throws if stream is null/invalid or JSON parse fails
+  const client = await auth.fromStream(stream);
+  return client;
+}
+
+// @expect-clean
+export async function loadCredsFromStreamWithCatch(stream: NodeJS.ReadableStream) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — from-stream-unprotected satisfied
+    const client = await auth.fromStream(stream);
+    return client;
+  } catch (error) {
+    console.error('Credential stream load failed:', error);
+    throw error;
+  }
+}
+
+// ─── 21. GoogleAuth.getCredentials — bare call, no try-catch ─────────────────
+
+// @expect-violation: get-credentials-unprotected
+export async function getCredentialsNoCatch() {
+  // SHOULD_FIRE: get-credentials-unprotected — throws 'Unable to find credentials in current environment'
+  const creds = await auth.getCredentials();
+  return creds;
+}
+
+// @expect-clean
+export async function getCredentialsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — get-credentials-unprotected satisfied
+    const creds = await auth.getCredentials();
+    return creds.client_email;
+  } catch (error) {
+    console.error('No credentials found:', error);
+    throw error;
+  }
+}
+
+// ─── 22. Impersonated.fetchIdToken — bare call, no try-catch ─────────────────
+
+import { Impersonated } from 'google-auth-library';
+
+const impersonatedClient = new Impersonated({
+  sourceClient: jwtClient,
+  targetPrincipal: 'target-sa@project.iam.gserviceaccount.com',
+  targetScopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+// @expect-violation: impersonated-fetch-id-token-unprotected
+export async function impersonatedFetchIdTokenNoCatch(audience: string) {
+  // SHOULD_FIRE: impersonated-fetch-id-token-unprotected — GaxiosError when source token fails
+  // or IAM API returns PERMISSION_DENIED/NOT_FOUND
+  const idToken = await impersonatedClient.fetchIdToken(audience);
+  return idToken;
+}
+
+// @expect-clean
+export async function impersonatedFetchIdTokenWithCatch(audience: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch — impersonated-fetch-id-token-unprotected satisfied
+    const idToken = await impersonatedClient.fetchIdToken(audience);
+    return idToken;
+  } catch (error) {
+    console.error('Impersonated ID token fetch failed:', error);
     throw error;
   }
 }
