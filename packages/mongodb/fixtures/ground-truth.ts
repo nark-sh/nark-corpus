@@ -59,7 +59,7 @@ export async function connectWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function queryNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — find() without try-catch; scanner detects collection method calls
+  // SHOULD_FIRE: query-failure — find() without try-catch; scanner detects collection method calls
   const results = await users.find({}).toArray();
   return results;
 }
@@ -82,13 +82,13 @@ export async function queryWithCatch(users: Collection) {
 // @expect-violation: findoneandupdate-null-not-found
 // @expect-violation: findoneandupdate-write-concern-error
 export async function findOneAndUpdateNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — findOneAndUpdate() without try-catch; scanner detects via param type
+  // SHOULD_FIRE: findoneandupdate-null-not-found — findOneAndUpdate() without null check; result may be null
   const result = await users.findOneAndUpdate(
     { _id: 'user-123' },
     { $set: { status: 'active' } },
     { returnDocument: 'after' }
   );
-  return result; // null if not found — not checked
+  return result.status; // null if not found — non-optional property access on potentially-null result
 }
 
 // @expect-clean
@@ -117,9 +117,9 @@ export async function findOneAndUpdateWithCatch(users: Collection) {
 // @expect-violation: findoneanddelete-null-not-found
 // @expect-violation: findoneanddelete-network-error
 export async function findOneAndDeleteNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — findOneAndDelete() without try-catch; scanner detects via param type
+  // SHOULD_FIRE: findoneanddelete-null-not-found — findOneAndDelete() without null check; result may be null
   const deleted = await users.findOneAndDelete({ _id: 'user-123' });
-  return deleted; // null if not found — not checked
+  return deleted._id; // null if not found — non-optional property access on potentially-null result
 }
 
 // @expect-clean
@@ -143,12 +143,12 @@ export async function findOneAndDeleteWithCatch(users: Collection) {
 
 // @expect-violation: findoneandreplace-null-not-found
 export async function findOneAndReplaceNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — findOneAndReplace() without try-catch; scanner detects via param type
+  // SHOULD_FIRE: findoneandreplace-null-not-found — findOneAndReplace() without null check; result may be null
   const result = await users.findOneAndReplace(
     { _id: 'user-123' },
     { name: 'New Name', status: 'active' }
   );
-  return result; // null if not found — not checked
+  return result.name; // null if not found — non-optional property access on potentially-null result
 }
 
 // @expect-clean
@@ -175,7 +175,7 @@ export async function findOneAndReplaceWithCatch(users: Collection) {
 
 // @expect-violation: replaceone-network-error
 export async function replaceOneNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — replaceOne() without try-catch; scanner detects via param type
+  // SHOULD_FIRE: replaceone-validation-failure — replaceOne() without try-catch
   const result = await users.replaceOne(
     { _id: 'user-123' },
     { name: 'New Name', status: 'active' }
@@ -204,7 +204,7 @@ export async function replaceOneWithCatch(users: Collection) {
 
 // @expect-violation: dropindex-not-found
 export async function dropIndexNoCatch(users: Collection) {
-  // SHOULD_FIRE: collection-access-failure — dropIndex() without try-catch; scanner detects via param type
+  // SHOULD_FIRE: dropindex-not-found — dropIndex() without try-catch
   await users.dropIndex('email_1');
 }
 

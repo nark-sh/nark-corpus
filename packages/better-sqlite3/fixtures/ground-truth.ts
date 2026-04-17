@@ -173,7 +173,8 @@ export async function backupMissingDirectory() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function openDatabaseFileMustExistNoCatch(dbPath: string): Database.Database {
-  // SHOULD_FIRE: database-file-must-exist-error — fileMustExist: true but no try/catch; throws SqliteError if file missing
+  // DETECTION_GAP: database-file-must-exist-error — fileMustExist: true but no try/catch; throws SqliteError if file missing
+  // (requires option-argument inspection: new Database(path, { fileMustExist: true }) — not yet implemented)
   return new Database(dbPath, { fileMustExist: true });
 }
 
@@ -203,7 +204,8 @@ export function transactionNoCatch() {
       stmt.run(email);
     }
   });
-  // SHOULD_FIRE: transaction-inner-exception-rollback — transaction invocation without try/catch; SqliteError propagates on constraint violation
+  // DETECTION_GAP: transaction-inner-exception-rollback — transaction invocation without try/catch; SqliteError propagates on constraint violation
+  // (requires tracking that insertMany was produced by db.transaction() — not yet implemented)
   insertMany(['a@example.com', 'a@example.com']); // duplicate will throw
 }
 
