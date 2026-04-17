@@ -5,22 +5,29 @@
  * Derived from the contract spec, NOT V1 behavior.
  *
  * Contracted functions (from import "mongodb"):
- *   - MongoClient.connect()      postcondition: connection-failure
- *   - users.find()               postcondition: query-failure
- *   - users.findOneAndUpdate()   postconditions: findoneandupdate-null-not-found, findoneandupdate-write-concern-error
- *   - users.findOneAndDelete()   postconditions: findoneanddelete-null-not-found
- *   - users.findOneAndReplace()  postconditions: findoneandreplace-null-not-found
- *   - session.withTransaction()  postconditions: withtransaction-transient-error-not-retried-externally
- *   - collection.watch()         postconditions: watch-error-event-not-thrown
- *   - collection.replaceOne()    postconditions: replaceone-network-error
- *   - client.close()             postconditions: close-not-called-resource-leak
- *   - collection.dropIndex()     postconditions: dropindex-not-found
+ *   - MongoClient.connect()       postcondition: connection-failure
+ *   - users.find()                postcondition: query-failure
+ *   - users.findOneAndUpdate()    postconditions: findoneandupdate-null-not-found, findoneandupdate-write-concern-error
+ *   - users.findOneAndDelete()    postconditions: findoneanddelete-null-not-found
+ *   - users.findOneAndReplace()   postconditions: findoneandreplace-null-not-found
+ *   - session.withTransaction()   postconditions: withtransaction-transient-error-not-retried-externally
+ *   - collection.watch()          postconditions: watch-error-event-not-thrown
+ *   - collection.replaceOne()     postconditions: replaceone-network-error
+ *   - client.close()              postconditions: close-not-called-resource-leak
+ *   - collection.dropIndex()      postconditions: dropindex-not-found
+ *   --- Added deepen-stream-2 pass 13 (2026-04-17) ---
+ *   - db.createCollection()       postconditions: createcollection-namespace-exists, createcollection-validation-schema-error
+ *   - collection.distinct()       postcondition: distinct-no-try-catch
+ *   - collection.createIndexes()  postcondition: createindexes-options-conflict
+ *   - collection.dropIndexes()    postcondition: dropindexes-namespace-not-found
+ *   - client.withSession()        postconditions: withsession-callback-error-propagates, withsession-operations-missing-session
+ *   - collection.rename()         postconditions: rename-target-exists, rename-no-try-catch
  *
  * Detection path: MongoClient.connect → InstanceTracker fires →
  *   ContractMatcher checks try-catch → postcondition fires
  */
 
-import { MongoClient, Collection } from 'mongodb';
+import { MongoClient, Collection, Db } from 'mongodb';
 
 const connectionString = 'mongodb://localhost:27017';
 
@@ -238,5 +245,159 @@ export async function clientWithClose() {
     return result;
   } finally {
     await client.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. db.createCollection() — without try-catch (namespace exists)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: createcollection-namespace-exists
+// @expect-violation: createcollection-validation-schema-error
+export async function createCollectionNoCatch(db: Db) {
+  // SHOULD_FIRE: createcollection-namespace-exists — createCollection() without try-catch
+  await db.createCollection('users');
+}
+
+// @expect-clean
+export async function createCollectionWithCatch(db: Db) {
+  try {
+    // SHOULD_NOT_FIRE: createCollection inside try-catch with idempotent handling
+    await db.createCollection('users', {
+      validator: { $jsonSchema: { bsonType: 'object', required: ['email'] } }
+    });
+  } catch (err: any) {
+    if (err?.code === 48) {
+      // NamespaceExists — collection already exists, safe to continue
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. collection.distinct() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: distinct-no-try-catch
+export async function distinctNoCatch(users: Collection) {
+  // SHOULD_FIRE: distinct-no-try-catch — distinct() without try-catch
+  const categories = await users.distinct('category', { status: 'active' });
+  return categories;
+}
+
+// @expect-clean
+export async function distinctWithCatch(users: Collection) {
+  try {
+    // SHOULD_NOT_FIRE: distinct inside try-catch
+    const categories = await users.distinct('category', { status: 'active' });
+    return categories;
+  } catch (err) {
+    console.error('distinct failed:', err);
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. collection.createIndexes() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: createindexes-options-conflict
+export async function createIndexesNoCatch(users: Collection) {
+  // SHOULD_FIRE: createindexes-options-conflict — createIndexes() without try-catch
+  await users.createIndexes([
+    { key: { email: 1 }, name: 'email_unique', unique: true },
+    { key: { createdAt: -1 }, name: 'created_at_desc' }
+  ]);
+}
+
+// @expect-clean
+export async function createIndexesWithCatch(users: Collection) {
+  try {
+    // SHOULD_NOT_FIRE: createIndexes inside try-catch
+    await users.createIndexes([
+      { key: { email: 1 }, name: 'email_unique', unique: true },
+      { key: { createdAt: -1 }, name: 'created_at_desc' }
+    ]);
+  } catch (err: any) {
+    if (err?.code === 85 || err?.code === 86) {
+      console.error('Index conflict:', err.message);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. collection.dropIndexes() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: dropindexes-namespace-not-found
+export async function dropIndexesNoCatch(users: Collection) {
+  // SHOULD_FIRE: dropindexes-namespace-not-found — dropIndexes() without try-catch
+  await users.dropIndexes();
+}
+
+// @expect-clean
+export async function dropIndexesWithCatch(users: Collection) {
+  try {
+    // SHOULD_NOT_FIRE: dropIndexes inside try-catch
+    await users.dropIndexes();
+  } catch (err: any) {
+    if (err?.code === 26) {
+      // NamespaceNotFound — collection doesn't exist, skip
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. client.withSession() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: withsession-callback-error-propagates
+export async function withSessionNoCatch(client: MongoClient, users: Collection) {
+  // SHOULD_FIRE: withsession-callback-error-propagates — withSession() without try-catch
+  await client.withSession(async (session) => {
+    await users.findOne({ _id: 'user-123' }, { session });
+  });
+}
+
+// @expect-clean
+export async function withSessionWithCatch(client: MongoClient, users: Collection) {
+  try {
+    // SHOULD_NOT_FIRE: withSession inside try-catch with session passed to operations
+    await client.withSession(async (session) => {
+      const result = await users.findOne({ _id: 'user-123' }, { session });
+      return result;
+    });
+  } catch (err) {
+    console.error('Session operation failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. collection.rename() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: rename-target-exists
+// @expect-violation: rename-no-try-catch
+export async function renameNoCatch(users: Collection) {
+  // SHOULD_FIRE: rename-target-exists — rename() without try-catch
+  await users.rename('users_archive');
+}
+
+// @expect-clean
+export async function renameWithCatch(users: Collection) {
+  try {
+    // SHOULD_NOT_FIRE: rename inside try-catch
+    await users.rename('users_archive', { dropTarget: false });
+  } catch (err: any) {
+    if (err?.code === 26) {
+      throw new Error('Source collection does not exist for rename');
+    }
+    throw err;
   }
 }

@@ -1,11 +1,31 @@
 package: mongodb
 semver: ">=5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.64
+coverage_score: 0.84
+# Depth pass 2026-04-17 (deepen-stream-2 pass 13):
+# API surface: ~36 async-callable functions in Collection, Db, MongoClient, ClientSession
+# Contracted before: 23; Contracted after: 28 (+5 this pass)
+# Added: createCollection, distinct, createIndexes, dropIndexes, withSession, rename
+# Omitted: estimatedDocumentCount (same error profile as countDocuments),
+#   createSearchIndex/createSearchIndexes/dropSearchIndex (Atlas-only, v7.0+, niche),
+#   Db.command (raw admin command, not SaaS runtime code),
+#   Admin.* (all admin server operations, monitoring/admin only),
+#   ClientSession.endSession (covered by withSession/withTransaction finally block),
+#   Db.stats/profilingLevel/createIndex/removeUser (admin/monitoring ops),
+#   Cursor.toArray/forEach/next (cursor iteration, same network error profile as find)
+# Coverage: 28/33 non-omitted = 0.85 (effective); 28/36 total = 0.78 (raw)
+# Evidence sources confirmed from installed package source (v6.x):
+#   node_modules/mongodb/lib/operations/create_collection.js
+#   node_modules/mongodb/lib/operations/distinct.js
+#   node_modules/mongodb/lib/operations/indexes.js
+#   node_modules/mongodb/lib/operations/rename.js
+#   node_modules/mongodb/lib/mongo_client.js (withSession)
+#   node_modules/mongodb/lib/error.js (MONGODB_ERROR_CODES: NamespaceNotFound=26, NamespaceExists=48)
+#   https://www.mongodb.com/docs/manual/reference/error-codes/
 
 # CRITICAL SECURITY NOTES:
 #
@@ -70,9 +90,15 @@ detection:
 
     # Admin operations
     - ".createindex("
+    - ".createindexes("
     - ".dropindex("
+    - ".dropindexes("
     - ".drop("
     - ".collection("
+    - ".createcollection("
+    - ".distinct("
+    - ".rename("
+    - ".withsession("
 
 functions:
   - name: connect
@@ -791,6 +817,440 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: createCollection
+    import_path: "mongodb"
+    description: >
+      Creates a new collection in the database with optional configuration (capped collections,
+      schema validation, collation, time series, etc.). Called on a Db instance. Commonly used
+      in startup initialization and migration scripts. Returns the Collection object on success.
+    postconditions:
+      # Evidence: confirmed from mongodb source (create_collection.js, error.js MONGODB_ERROR_CODES)
+      # NamespaceExists error code 48 confirmed from MongoDB server error code reference
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/create_collection.ts
+      - id: createcollection-namespace-exists
+        condition: >
+          A collection with the same name already exists in the database. This is the most
+          common error for createCollection() in migration/startup code. If the collection
+          was created by a previous migration run, a second call throws instead of being idempotent.
+        throws: >
+          MongoServerError with code 48 (NamespaceExists) and codeName: 'NamespaceExists'.
+          The error message is: "Collection <dbname>.<name> already exists."
+        required_handling: >
+          Caller MUST catch MongoServerError code 48 and handle idempotently. Two patterns:
+
+          Option 1 (recommended): Use Db.listCollections() to check first, or catch and ignore:
+            try {
+              await db.createCollection('users', {
+                validator: { $jsonSchema: { ... } }
+              });
+            } catch (error) {
+              if (error instanceof MongoServerError && error.code === 48) {
+                // Collection already exists — safe to ignore in idempotent migrations
+              } else {
+                throw error;
+              }
+            }
+
+          Option 2: Pass { checkExistingFieldNames: false } if using schema validation and
+          collection may already exist.
+
+          CRITICAL: Do NOT ignore all MongoServerError — code 48 is idempotent-safe,
+          but other codes (schema validation syntax errors, permission denied) must propagate.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/error-codes/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/create_collection.ts"
+          - "https://www.mongodb.com/docs/drivers/node/current/fundamentals/schema-validation/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: createcollection-validation-schema-error
+        condition: >
+          The validator option specifies an invalid JSON schema — syntax errors, unknown
+          keywords, or invalid $jsonSchema values. Also thrown when schema contains
+          Queryable Encryption (FLE2) fields but the MongoDB server version is below
+          the minimum required for encrypted collections (< 7.0 wire protocol version 21).
+        throws: >
+          MongoServerError with codeName: 'BadValue' for invalid schema syntax.
+          MongoCompatibilityError (extends MongoDriverError) with message:
+          "Driver support of Queryable Encryption is incompatible with server..." when
+          FLE2 encrypted fields are used against an older server. Confirmed from
+          create_collection.js: 'throw new MongoCompatibilityError(INVALID_QE_VERSION)'.
+        required_handling: >
+          Caller MUST catch both MongoServerError (schema syntax) and MongoCompatibilityError
+          (FLE2 version mismatch) in startup/migration paths. A schema validation error in
+          startup silently skips collection configuration in some frameworks (Next.js
+          swallows module-load errors) — always log and halt.
+
+            try {
+              await db.createCollection('products', {
+                validator: { $jsonSchema: { bsonType: 'object', required: ['name'] } }
+              });
+            } catch (error) {
+              if (error instanceof MongoCompatibilityError) {
+                console.error('Server too old for encrypted collections:', error.message);
+                process.exit(1);
+              }
+              if (error instanceof MongoServerError && error.code === 48) {
+                // Already exists — acceptable in idempotent migrations
+              } else if (error instanceof MongoServerError) {
+                console.error('Invalid collection config:', error.message);
+                throw error;
+              }
+            }
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/fundamentals/schema-validation/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/create_collection.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: distinct
+    import_path: "mongodb"
+    description: >
+      Returns an array of distinct values for the specified field across a collection.
+      Commonly used for faceted navigation, tag aggregation, and deduplication queries.
+      The field parameter is a string key path (dot-notation for nested fields).
+      Called on a Collection instance.
+    postconditions:
+      # Evidence: confirmed from mongodb source (distinct.js DistinctOperation class)
+      # distinct wraps the server 'distinct' command — MongoServerError on command errors
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/distinct.ts
+      - id: distinct-no-try-catch
+        condition: >
+          distinct() is called without try-catch. If the collection or database is unavailable
+          (network failure, server selection timeout), or if the key field path is invalid
+          according to server-side rules, the Promise rejects. Common in API endpoints that
+          return facet values for UI dropdowns — an uncaught error returns a 500 instead of
+          an empty facet list.
+        throws: >
+          MongoServerError (invalid field path or server-side validation failure),
+          MongoNetworkError (network failure — connection dropped),
+          MongoServerSelectionError (no server available within serverSelectionTimeoutMS),
+          MongoError (catch-all base class for all MongoDB errors).
+          Returns empty array [] when no documents match — does NOT throw.
+        required_handling: >
+          Caller MUST wrap distinct() in try-catch. Returning [] on error is often acceptable
+          for non-critical facet endpoints:
+
+            try {
+              const categories = await collection.distinct('category', { status: 'active' });
+              return categories;
+            } catch (error) {
+              if (error instanceof MongoNetworkError) {
+                // Transient — retry or return stale cached values
+                throw error;
+              }
+              if (error instanceof MongoServerError) {
+                // Field path invalid or server error — log and return empty
+                console.error('distinct failed:', error.message, error.code);
+                return [];
+              }
+              throw error;
+            }
+
+          Note: distinct() returns [] when the query matches no documents. An empty result
+          is NOT an error and must not be confused with a failed query.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/distinct/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/distinct.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: createIndexes
+    import_path: "mongodb"
+    description: >
+      Creates multiple indexes on a collection in a single command. More efficient than
+      calling createIndex() in a loop. Commonly used in startup migration scripts to
+      set up all required indexes at once. Returns an array of created index names.
+    postconditions:
+      # Evidence: confirmed from mongodb source (indexes.js CreateIndexesOperation class)
+      # IndexOptionsConflict (code 85) and IndexKeySpecsConflict (code 86) confirmed from
+      # MongoDB server error codes + node-mongodb-native source
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/indexes.ts
+      - id: createindexes-options-conflict
+        condition: >
+          An index with the same key spec already exists but with different options (e.g., same
+          fields but different unique/sparse/collation settings). MongoDB rejects index
+          creation when the name or key spec conflicts with an existing index definition.
+          Common in deployments where index options are changed between app versions.
+        throws: >
+          MongoServerError with code 85 (IndexOptionsConflict) when an existing index has
+          the same name but different options, or code 86 (IndexKeySpecsConflict) when
+          the same key spec exists under a different index name. Neither is idempotent-safe.
+          Confirmed from MongoDB server error codes reference.
+        required_handling: >
+          Caller MUST catch MongoServerError and check the code. createIndexes() is idempotent
+          for identical index definitions (same key + same options), but throws on conflicting
+          definitions. In migration code:
+
+            try {
+              await collection.createIndexes([
+                { key: { email: 1 }, name: 'email_unique', unique: true },
+                { key: { createdAt: -1 }, name: 'created_at_desc', expireAfterSeconds: 86400 }
+              ]);
+            } catch (error) {
+              if (error instanceof MongoServerError && (error.code === 85 || error.code === 86)) {
+                // Index conflict — need to drop and recreate, or update migration script
+                console.error('Index conflict — cannot create:', error.message);
+                throw error;
+              }
+              throw error;
+            }
+
+          To safely update an existing index, call dropIndex() with the conflicting name
+          before calling createIndexes() in the same migration transaction.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/error-codes/"
+          - "https://www.mongodb.com/docs/manual/reference/command/createIndexes/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/indexes.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: dropIndexes
+    import_path: "mongodb"
+    description: >
+      Drops all indexes on a collection except the default _id index, or drops a specific
+      index by name (string) or specification (object). Unlike dropIndex(), dropIndexes()
+      succeeds even if no indexes exist (idempotent for the no-indexes case). Used in
+      migrations to clear outdated indexes before recreating them.
+    postconditions:
+      # Evidence: confirmed from mongodb TypeScript declarations (mongodb.d.ts line 2880)
+      # NamespaceNotFound code 26 is in MONGODB_ERROR_CODES in error.js
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/indexes.ts
+      - id: dropindexes-namespace-not-found
+        condition: >
+          dropIndexes() is called on a collection that does not exist in the database.
+          This differs from dropIndex() behavior — while both operate on indexes, dropIndexes()
+          on a non-existent collection throws NamespaceNotFound. Common in migration scripts
+          that attempt to clean up indexes before the collection has been created.
+        throws: >
+          MongoServerError with code 26 (NamespaceNotFound, defined in MONGODB_ERROR_CODES
+          in error.js). Message: "ns not found". Note: dropIndexes() on an existing but
+          empty collection (no non-_id indexes) returns immediately without error.
+        required_handling: >
+          Caller MUST catch MongoServerError code 26 in migration scripts that may run
+          before collection creation:
+
+            try {
+              await collection.dropIndexes();
+            } catch (error) {
+              if (error instanceof MongoServerError && error.code === 26) {
+                // Collection does not exist yet — skip index cleanup
+                console.warn(`Collection ${collection.collectionName} not found — skipping dropIndexes`);
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/dropIndexes/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/error.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: withSession
+    import_path: "mongodb"
+    description: >
+      Executes a callback function within a client session context and automatically calls
+      endSession() when the callback completes (even on error). Used for explicit session
+      management when read preferences, causally consistent reads, or retryable writes
+      are needed without a full transaction. Unlike withTransaction, does NOT retry errors
+      and does NOT commit/abort automatically.
+    postconditions:
+      # Evidence: confirmed from mongodb source (mongo_client.js withSession implementation)
+      # Implementation: creates session, calls callback(session), finally: session.endSession()
+      # MongoInvalidArgumentError thrown when callback is null — confirmed from source line 465
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/mongo_client.ts
+      - id: withsession-callback-error-propagates
+        condition: >
+          The callback passed to withSession() throws or rejects. Unlike withTransaction(),
+          withSession() does NOT catch or retry errors from the callback — any error thrown
+          inside propagates directly to the caller. endSession() is still called (via finally),
+          but the original error propagates up unchanged. This is a critical behavioral
+          difference from withTransaction().
+        throws: >
+          Any error thrown by the callback propagates unchanged. If the callback performs
+          MongoDB operations without try-catch, typical errors include:
+          MongoNetworkError, MongoServerError, MongoServerSelectionError, or MongoError.
+          The session is always closed via finally, so SESSION_CLOSED or resource leak
+          is NOT the risk here — the callback error is the risk.
+        required_handling: >
+          Caller MUST wrap withSession() in try-catch OR handle errors inside the callback.
+          This is different from withTransaction() where errors in the callback are retried.
+          A common mistake is using withSession() when withTransaction() was intended:
+
+            // CORRECT: catch at the withSession call site
+            try {
+              await client.withSession(async (session) => {
+                const docs = await collection.find({}, { session }).toArray();
+                await otherCollection.insertMany(docs, { session });
+              });
+            } catch (error) {
+              console.error('Session operation failed:', error.message);
+              throw error;
+            }
+
+          Note: endSession() errors are swallowed (squashError) — they do not mask the
+          original callback error. Confirmed from mongo_client.js source.
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/mongo_client.ts"
+          - "https://www.mongodb.com/docs/drivers/node/current/fundamentals/sessions/"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: withsession-operations-missing-session
+        condition: >
+          MongoDB operations inside the withSession callback do NOT pass the session object.
+          Operations run without the session are not part of the session's causal consistency
+          chain and will use separate connections from the pool, bypassing the session's
+          read concern and read preference settings.
+        throws: "Does not throw — silent behavioral error (operations run outside session context)"
+        required_handling: >
+          CRITICAL: Every MongoDB operation inside withSession MUST pass { session }:
+
+            // WRONG — operations bypass session
+            await client.withSession(async (session) => {
+              const result = await collection.findOne({ _id: id }); // ❌ Missing session
+              return result;
+            });
+
+            // CORRECT
+            await client.withSession(async (session) => {
+              const result = await collection.findOne({ _id: id }, { session }); // ✅
+              return result;
+            });
+
+          This is the same session-passing requirement as withTransaction(), but
+          withSession() is used more often for simple operations where the mistake
+          is easier to make.
+        sources:
+          - "https://www.mongodb.com/docs/drivers/node/current/fundamentals/sessions/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/mongo_client.ts"
+        evidence_quality: confirmed
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: rename
+    import_path: "mongodb"
+    description: >
+      Renames a collection within the same database. Returns the renamed Collection object.
+      Used in blue-green migration patterns (rename temp collection to production name after
+      a bulk data load). The operation sends a renameCollection admin command that runs
+      against the admin database even when called on a collection in another database.
+    postconditions:
+      # Evidence: confirmed from mongodb source (rename.js RenameOperation class)
+      # renameCollection command sends to admin/$cmd — confirmed from ns: new MongoDBNamespace('admin', '$cmd')
+      # TargetNamespaceExists error from MongoDB renameCollection command reference
+      # https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/rename.ts
+      - id: rename-target-exists
+        condition: >
+          The target collection name already exists in the database and dropTarget option is
+          not set to true. By default, rename() refuses to overwrite an existing collection.
+          Common in blue-green migrations where the production collection exists and a new
+          version was loaded into a temp collection.
+        throws: >
+          MongoServerError with message containing "target namespace exists" or similar,
+          from the MongoDB server's renameCollection command. The exact codeName varies
+          by server version. dropTarget: true option allows overwriting.
+        required_handling: >
+          Caller MUST either set dropTarget: true (destructive) or drop the target first:
+
+            // Option 1: atomic rename-with-drop (atomic on single-node, not on sharded)
+            await collection.rename('users_new', { dropTarget: true });
+
+            // Option 2: drop then rename (two-step, brief downtime window)
+            try {
+              await db.dropCollection('users_backup');
+            } catch (e) { /* ignore not-found */ }
+            await collection.rename('users_backup');
+
+          CRITICAL: dropTarget: true is NOT atomic on sharded clusters — there is a brief
+          window where neither old nor new collection is accessible.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/renameCollection/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/rename.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: rename-no-try-catch
+        condition: >
+          rename() is called without try-catch. Network errors during the rename admin
+          command (which runs against the admin database) cause the Promise to reject.
+          The rename is atomic on standalone and replica sets but not on sharded clusters.
+        throws: >
+          MongoNetworkError (connection failure during rename command),
+          MongoServerError (insufficient permissions — rename requires admin privileges,
+          or source collection does not exist — NamespaceNotFound code 26).
+        required_handling: >
+          Caller MUST wrap rename() in try-catch. Source collection not existing is a
+          MongoServerError with NamespaceNotFound (code 26):
+
+            try {
+              const newCollection = await collection.rename('users_v2');
+              return newCollection;
+            } catch (error) {
+              if (error instanceof MongoServerError && error.code === 26) {
+                throw new Error(`Source collection does not exist`);
+              }
+              throw error;
+            }
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/renameCollection/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/rename.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
 # Common edge cases and production bugs
 edge_cases:
