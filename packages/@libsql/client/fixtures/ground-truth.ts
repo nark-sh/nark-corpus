@@ -230,3 +230,44 @@ export async function commitWithCatch(fromId: number, toId: number, amount: numb
     tx.close();
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. execute() with large integer result — RangeError not LibsqlError
+// Postcondition: execute-integer-range-error
+// NOTE: Scanner detection rule not yet implemented (concern-20260417-libsql-client-deepen-7).
+// This postcondition fires when result contains integers > 2^53-1 and intMode="number" (default).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: execute-integer-range-error
+// Future SHOULD_FIRE: execute() with no catch for RangeError when large integers in result
+// (only LibsqlError caught — RangeError from result deserialization is missed)
+export async function fetchLargeIdRowOnlyLibsqlCatch() {
+  try {
+    // SHOULD_FIRE: catches LibsqlError but NOT RangeError from integer deserialization
+    const { rows } = await db.execute("SELECT id, value FROM large_table WHERE id > 9007199254740991");
+    return rows;
+  } catch (error) {
+    if (error instanceof Error && error.constructor.name === "LibsqlError") {
+      console.error("DB error:", error.message);
+    }
+    throw error;
+    // RangeError from intMode="number" overflow is NOT caught — will propagate uncaught
+  }
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: catches all errors including RangeError
+export async function fetchLargeIdRowWithFullCatch() {
+  try {
+    const { rows } = await db.execute("SELECT id, value FROM large_table WHERE id > 9007199254740991");
+    return rows;
+  } catch (error) {
+    // Catches both LibsqlError and RangeError
+    if (error instanceof RangeError) {
+      // Large integer detected — client should be reconfigured with intMode: "bigint"
+      throw new Error("Database contains integers too large for JS number type; use intMode: 'bigint'");
+    }
+    console.error("DB error:", error);
+    throw error;
+  }
+}

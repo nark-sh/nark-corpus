@@ -20,6 +20,14 @@
 #   node_modules/@libsql/hrana-client/lib-esm/errors.d.ts — error class hierarchy
 #   https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts
 #   https://docs.turso.tech/sdk/ts/reference
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 4):
+# Added postcondition: execute-integer-range-error
+#   execute() throws RangeError (not LibsqlError) when result contains integers > 2^53-1
+#   and createClient() was configured with default intMode: "number".
+#   Confirmed from @libsql/hrana-client/lib-esm/value.js source and
+#   https://raw.githubusercontent.com/tursodatabase/libsql-client-ts/main/packages/libsql-core/src/api.ts
+# Coverage after pass 4: 8 functions + 1 additional postcondition on execute()
 package: "@libsql/client"
 semver: ">=0.3.0"
 contract_version: "1.1.0"
@@ -28,6 +36,8 @@ last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
 coverage_score: 0.62  # 8 contracted / 13 total async-callable (5 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
+# Pass 4 added execute-integer-range-error postcondition to existing execute() function entry
 
 detection:
   function_names:
@@ -85,6 +95,63 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: https://raw.githubusercontent.com/tursodatabase/libsql-client-ts/main/packages/libsql-core/src/api.ts
+      # Confirmed from @libsql/hrana-client/lib-esm/value.js:
+      #   "Received integer which is too large to be safely represented as a JavaScript number"
+      # Config docs: "number cannot precisely represent integers larger than 2^53-1 in absolute
+      #   value, so attempting to read larger integers will throw a RangeError."
+      - id: execute-integer-range-error
+        condition: >
+          execute() is called on a table that contains SQLite INTEGER columns with values
+          larger than 2^53-1 (Number.MAX_SAFE_INTEGER = 9007199254740991), and the
+          createClient() was called with the default intMode: "number" (or intMode not set).
+          The RangeError is thrown during result deserialization — after the network request
+          succeeds — so callers who only catch LibsqlError will miss it.
+          Common triggers: auto-increment IDs after billions of rows, Twitter/Snowflake-style
+          IDs, UNIX timestamps in microseconds, or any INTEGER PRIMARY KEY in a high-write table.
+        throws: >
+          RangeError (not LibsqlError) — thrown synchronously from result deserialization
+          code in @libsql/hrana-client/lib-esm/value.js with message:
+          "Received integer which is too large to be safely represented as a JavaScript number".
+          This is a plain JavaScript RangeError, NOT a LibsqlError — it has no .code property.
+          A catch block that checks `instanceof LibsqlError` will NOT catch this error.
+        required_handling: >
+          Option 1 (recommended): Configure createClient() with intMode: "bigint" when
+          tables contain large integers. BigInt can represent all SQLite INTEGER values.
+
+            const db = createClient({
+              url: process.env.TURSO_DATABASE_URL!,
+              authToken: process.env.TURSO_AUTH_TOKEN,
+              intMode: 'bigint'  // safe for all INTEGER columns
+            });
+
+          Option 2: Catch both error types explicitly:
+            try {
+              const { rows } = await db.execute('SELECT id, value FROM large_table');
+              return rows;
+            } catch (error) {
+              if (error instanceof RangeError) {
+                // Large integer in result — reconfigure client with intMode: "bigint"
+                throw new Error('Database contains integers too large for JS number type');
+              }
+              if (error instanceof LibsqlError) {
+                console.error('Database error:', error.message, 'code:', error.code);
+              }
+              throw error;
+            }
+
+          Option 3: Use intMode: "string" to return all integers as strings.
+        sources:
+          - "https://raw.githubusercontent.com/tursodatabase/libsql-client-ts/main/packages/libsql-core/src/api.ts"
+          - "https://github.com/tursodatabase/libsql-client-ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
   - name: batch
     import_path: "@libsql/client"
