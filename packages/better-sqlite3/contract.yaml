@@ -1,13 +1,17 @@
 package: better-sqlite3
 semver: ">=7.0.0 <13.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.90
 # Audit 2026-04-13: 12 repos scanned, 4 affected (33%), 12 violations. exec(4), all(4), get(3), run(1).
 # Top affected: cline/cline (⭐ 59274), ItzCrazyKns/Vane (⭐ 33343), Anarkh-Lee/universal-db-mcp (⭐ 675)
 # FP rate: 0% (prior audit data; contracts unchanged)
+# Deepen pass 2026-04-16: +5 functions (backup, Database constructor, transaction, iterate) +7 postconditions
+# API surface: 9 callable functions with error contracts (4 previously + 5 new)
+# coverage_score: 9/10 callable API surface (1 intentionally omitted: loadExtension — niche, no standard error contract)
 
 description: >
   Synchronous SQLite database library for Node.js. All statement methods
@@ -136,5 +140,221 @@ functions:
           visibility: visible
           user_experience: lost_data
           incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+  - name: Database.backup
+    import_path: "better-sqlite3"
+    description: >
+      Asynchronously backs up the database to a destination file. Returns a
+      Promise that resolves with backup metadata (totalPages, remainingPages)
+      when complete. The ONLY async method in better-sqlite3. Backup runs
+      in the background via setImmediate scheduling, transferring pages until
+      complete.
+    patterns:
+      - 'db.backup('
+      - '.backup('
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md (fetched 2026-04-16)
+      # Source confirmed from better-sqlite3/lib/methods/backup.js: async function, rejects promise on error
+      # backup.js line 61-63: catch(err) { backup.close(); reject(err); }
+      - id: backup-unhandled-rejection
+        condition: >
+          Database.backup() is called without .catch() or await inside try/catch.
+          If the backup fails (directory missing, disk full, database error),
+          the returned Promise is rejected with an Error.
+        throws: Error
+        required_handling: >
+          Await db.backup() inside a try/catch block or chain .catch() on the
+          returned Promise. Log or handle the error to prevent silent backup
+          failures in production.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+      - id: backup-directory-missing
+        condition: >
+          Database.backup() is called with a destination path whose parent
+          directory does not exist. The backup() method checks directory
+          existence before starting; throws TypeError synchronously then
+          the promise rejects.
+        throws: TypeError
+        error_code: "Cannot save backup because the directory does not exist"
+        required_handling: >
+          Ensure the destination directory exists before calling backup(), or
+          wrap in try/catch to handle the TypeError from missing directory.
+          Use fs.mkdirSync(path.dirname(dest), { recursive: true }) before backup.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+  - name: Database
+    import_path: "better-sqlite3"
+    description: >
+      Opens a SQLite database connection. Synchronous constructor — throws
+      immediately on failure. Common error source: fileMustExist option throws
+      if the database file does not exist, preventing accidental database
+      creation in production.
+    patterns:
+      - 'new Database('
+      - 'Database('
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md (fetched 2026-04-16)
+      # Source confirmed from better-sqlite3/lib/database.js:
+      #   line: new addon.Database(filename, filenameGiven, anonymous, readonly, fileMustExist, timeout, ...)
+      #   fileMustExist causes SqliteError when file does not exist
+      - id: database-file-must-exist-error
+        condition: >
+          new Database(path, { fileMustExist: true }) is called but the database
+          file at the given path does not exist. The constructor throws a SqliteError
+          immediately — no database is created, no fallback occurs.
+        throws: SqliteError
+        required_handling: >
+          Wrap new Database() in a try/catch when using fileMustExist: true.
+          Catch SqliteError and handle the missing-file case (e.g., log, alert,
+          or gracefully degrade rather than crashing the application).
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+      - id: database-directory-missing-error
+        condition: >
+          new Database(path) is called where the parent directory of the path
+          does not exist. The constructor throws a TypeError synchronously:
+          "Cannot open database because the directory does not exist."
+        throws: TypeError
+        error_code: "Cannot open database because the directory does not exist"
+        required_handling: >
+          Ensure the parent directory exists before calling new Database(path).
+          Use fs.mkdirSync(path.dirname(dbPath), { recursive: true }) first,
+          or wrap in try/catch to handle the TypeError.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+  - name: Database.transaction
+    import_path: "better-sqlite3"
+    description: >
+      Creates a transaction function that wraps user code in BEGIN/COMMIT/ROLLBACK.
+      The returned callable is synchronous. When invoked, it runs the wrapped
+      function inside a SQLite transaction. If the wrapped function throws any
+      exception, the transaction is automatically rolled back and the exception
+      re-thrown. Critical misunderstanding: async functions passed to transaction()
+      are NOT supported — they return a Promise immediately, which triggers a
+      TypeError and the transaction is never committed.
+    patterns:
+      - 'db.transaction('
+      - '.transaction('
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md (fetched 2026-04-16)
+      # Source confirmed from better-sqlite3/lib/methods/transaction.js:
+      #   line 66-67: if (result && typeof result.then === 'function') { throw new TypeError('Transaction function cannot return a promise'); }
+      #   line 71-76: catch(ex) { if (db.inTransaction) { undo.run(); ...} throw ex; }
+      - id: transaction-async-function-error
+        condition: >
+          An async function is passed to db.transaction(). The transaction wrapper
+          detects a returned Promise and throws TypeError('Transaction function cannot
+          return a promise'). The transaction is rolled back. This is a common mistake
+          when migrating code from async/await patterns to better-sqlite3.
+        throws: TypeError
+        error_code: "Transaction function cannot return a promise"
+        required_handling: >
+          Only pass synchronous functions to db.transaction(). All database operations
+          inside the transaction function must be synchronous better-sqlite3 calls.
+          Do not use async/await, Promises, or any async I/O inside the transaction
+          callback.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+      - id: transaction-inner-exception-rollback
+        condition: >
+          A function wrapped by db.transaction() throws an exception during
+          execution (e.g., a SqliteError from a constraint violation or a
+          JavaScript error). The transaction is automatically rolled back.
+          If the calling code does not catch the exception, it propagates
+          up and may crash the application.
+        throws: SqliteError
+        required_handling: >
+          Wrap the invocation of a transaction function in a try/catch block.
+          Even though better-sqlite3 auto-rolls back the transaction, the
+          exception still propagates and must be caught to prevent application
+          crashes. Handle constraint violations (SQLITE_CONSTRAINT) to implement
+          retry or conflict resolution logic.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
+
+  - name: Statement.iterate
+    import_path: "better-sqlite3"
+    description: >
+      Execute a prepared SELECT statement and return a lazy iterator. Rows are
+      fetched one at a time during iteration. Synchronous. Unlike .all() which
+      throws immediately on error, .iterate() errors surface only when the
+      iterator is consumed — inside the loop body, not at the call site.
+      This deferred error surface is a common source of unhandled exceptions.
+    patterns:
+      - 'stmt.iterate('
+      - '.iterate('
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md (fetched 2026-04-16)
+      # Docs quote: "If execution of the statement fails, an Error is thrown and the iterator is closed"
+      # Error surface is deferred — throws during for...of, not at iterate() call
+      - id: iterate-deferred-execution-error
+        condition: >
+          Statement.iterate() is called and the result is consumed in a for...of
+          loop without a try/catch wrapping the iteration. If the database is
+          locked or the statement fails mid-iteration, an Error is thrown inside
+          the loop and the iterator is closed. The error does NOT appear at the
+          iterate() call site.
+        throws: SqliteError
+        required_handling: >
+          Wrap the for...of loop consuming the iterator in a try/catch block,
+          NOT just the iterate() call site. The error surface is deferred to
+          iteration time, so catching at the call site is insufficient.
+          Example: try { for (const row of stmt.iterate()) { ... } } catch (err) { ... }
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
         sources:
           - https://raw.githubusercontent.com/WiseLibs/better-sqlite3/master/docs/api.md
