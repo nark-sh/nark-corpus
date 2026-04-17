@@ -35,7 +35,7 @@ evidence_quality: confirmed
 #   lib.esm/contract/contract.js:681-713 -- waitForDeployment() wraps deployTx.wait()
 #   lib.esm/contract/contract.js:770-798 -- queryFilter() delegates to provider.getLogs()
 #   lib.esm/wallet/base-wallet.js:105-124 -- signTypedData UNSUPPORTED_OPERATION, UNCONFIGURED_NAME
-coverage_score: 0.54  # 13 contracted / 24 total async-callable (11 intentionally omitted)
+coverage_score: 0.67  # 16 contracted / 24 total async-callable (11 intentionally omitted)
 
 detection:
   type_names:
@@ -737,6 +737,172 @@ functions:
           user_experience: authentication_failure
           incident_cost_range: low
 
+  - name: BrowserProvider.getSigner
+    import_path: "ethers"
+    description: >
+      Requests account access from the browser wallet (MetaMask, WalletConnect, etc.) and
+      returns a JsonRpcSigner for the requested address. Internally calls eth_requestAccounts
+      which triggers a browser pop-up requiring user authorization. This is the FIRST async
+      call in almost every dApp — the entry point to all wallet interactions. User rejection
+      or missing wallet throws ACTION_REJECTED.
+    postconditions:
+      # Evidence: lib.esm/providers/provider-browser.js:getSigner() -- calls eth_requestAccounts
+      #   and wraps error with this.getRpcError(payload, {id: payload.id, error}):
+      #   provider-jsonrpc.js:698-712 -- if error.message.match(/user denied|ethers-user-denied/i)
+      #   → makeError("user rejected action", "ACTION_REJECTED", {action: "requestAccess", reason: "rejected"})
+      # Evidence: lib.esm/providers/provider-jsonrpc.js:329-340 -- getSigner() throws "no such account"
+      #   when numeric index >= accounts.length, throws "invalid account" when address not in list
+      - id: browserprovider-getsigner-action-rejected
+        condition: >
+          User denies the MetaMask/WalletConnect permission popup triggered by eth_requestAccounts.
+          Also fires when the request has expired ("expired" reason) or another pending request
+          blocks the new one ("pending" reason). This is the most common wallet interaction error --
+          users frequently dismiss the wallet connection popup.
+        throws: "EthersError with error.code = ACTION_REJECTED (ActionRejectedError) -- error.action = 'requestAccess', error.reason = 'rejected' | 'expired' | 'pending'"
+        required_handling: >
+          Caller MUST wrap BrowserProvider.getSigner() in try-catch. Use isError(error, "ACTION_REJECTED")
+          to distinguish user rejection from infrastructure failure. Provide a "Please connect your wallet"
+          message, NOT a generic "Something went wrong." Not catching ACTION_REJECTED crashes the wallet
+          connection flow and leaves the app in an unusable state for the user.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#BrowserProvider-getSigner"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: browserprovider-getsigner-no-wallet
+        condition: >
+          No Web3 wallet is installed or accessible. BrowserProvider constructor will fail
+          if window.ethereum is not available, but getSigner() can additionally throw
+          UNSUPPORTED_OPERATION when the wallet lacks eth_requestAccounts support
+          (e.g., older wallet versions, restricted browser contexts, mobile WebViews).
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION -- or plain Error('no such account')"
+        required_handling: >
+          Caller MUST detect missing wallet before calling getSigner(). Check for window.ethereum
+          or use BrowserProvider.discover() first. Always provide a "Install MetaMask" or
+          "No wallet found" fallback. Uncaught errors leave dApp silently broken for users
+          without wallets (which is common on desktop browsers without extensions).
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#BrowserProvider-getSigner"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Wallet.encrypt
+    import_path: "ethers"
+    description: >
+      Asynchronously encrypts the wallet's private key into a JSON Keystore Wallet (v3 format)
+      using scrypt key derivation (N=131072 by default). CPU and memory intensive — takes
+      several seconds on standard hardware. Used server-side to persist wallet credentials
+      to disk or database. Returns a JSON string (not a file). The default scrypt parameters
+      are intentionally expensive; do NOT lower them in production.
+    postconditions:
+      # Evidence: lib.esm/wallet/json-keystore.js:180-182 -- getEncryptKdfParams() calls assertArgument
+      #   for N (must be power of 2), r, p validity.
+      #   assertArgument(..., "invalid scrypt N parameter", "options.N", N)
+      # Evidence: lib.esm/wallet/wallet.js -- Wallet.encrypt() calls encryptKeystoreJson()
+      #   which calls scrypt() which is CPU/memory intensive; N=131072 default requires ~128MB RAM
+      # Evidence: lib.esm/wallet/json-keystore.js:189 -- assertArgument(iv.length === 16,
+      #   "invalid options.iv length", "options.iv", options.iv)
+      - id: encrypt-invalid-scrypt-options
+        condition: >
+          Invalid scrypt parameters are passed in options.scrypt. N must be a positive power of 2
+          (e.g., 1024, 8192, 131072). r and p must be positive integers. If invalid, throws an
+          INVALID_ARGUMENT error with argument name "options.N", "options.r", or "options.p".
+          Common when developers accidentally pass non-power-of-2 N values or 0 for r or p.
+        throws: "EthersError (INVALID_ARGUMENT) -- assertArgument failure with 'invalid scrypt N parameter'"
+        required_handling: >
+          Caller MUST validate scrypt options before calling encrypt(). Always use the default
+          parameters (omit options.scrypt entirely) in production unless you have specific
+          requirements. Never set N below 8192 for production wallets -- lower values are
+          insecure. Wrap encrypt() in try-catch to catch INVALID_ARGUMENT from malformed options.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#Wallet-encrypt"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: encrypt-oom-crash
+        condition: >
+          The scrypt KDF with default parameters (N=131072, r=8, p=1) requires approximately
+          128MB of RAM. In serverless functions (Lambda, Vercel Functions) with memory limits
+          below 256MB, or in containers with strict memory cgroups, the underlying WebAssembly
+          scrypt implementation can exhaust available memory and cause the process to crash or
+          throw an out-of-memory error. The error message varies by runtime (RangeError, ENOMEM,
+          or uncaught exception from the scrypt WASM module).
+        throws: "RangeError: WebAssembly.Memory.grow(): Out of memory | or process-level OOM crash"
+        required_handling: >
+          Caller MUST ensure sufficient memory is available when calling Wallet.encrypt() in
+          serverless or containerized environments. Either increase memory limits to 512MB+,
+          or use reduced scrypt parameters (N=8192 minimum — only for non-production key storage).
+          Never call encrypt() in memory-constrained Lambda functions with default parameters.
+          Consider offloading key encryption to a dedicated service with adequate memory.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#Wallet-encrypt"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: JsonRpcProvider.getSigner
+    import_path: "ethers"
+    description: >
+      Returns a JsonRpcSigner for the given address or account index from the JSON-RPC node.
+      Only works with managed-account providers (Geth with unlocked account, Hardhat, Anvil,
+      local nodes). Does NOT work against Infura, Alchemy, or other public RPC endpoints —
+      those have no managed accounts. Throws when the requested account is not available.
+    postconditions:
+      # Evidence: lib.esm/providers/provider-jsonrpc.js:329-340 -- getSigner() implementation:
+      #   if (address >= accounts.length) { throw new Error("no such account"); }
+      #   if no address found: throw new Error("invalid account");
+      #   calls this.send("eth_accounts", []) which throws SERVER_ERROR on network failure
+      - id: jsonrpc-getsigner-no-such-account
+        condition: >
+          The requested account index or address is not available on the JSON-RPC node.
+          Throws a plain Error (not an EthersError) with message "no such account" when numeric
+          index >= accounts.length, or "invalid account" when the address is not in the managed
+          account list. Common when using Hardhat/Anvil test accounts by index (indices 10+)
+          or when the target node has no unlocked accounts (public RPC endpoints).
+        throws: "Error with message 'no such account' | 'invalid account' (plain Error, not EthersError)"
+        required_handling: >
+          Caller MUST wrap JsonRpcProvider.getSigner() in try-catch. Note: throws a plain Error,
+          NOT an EthersError, so isError() will not work here. Use standard instanceof Error check.
+          In scripts targeting local Hardhat/Anvil nodes, validate the account index before calling
+          getSigner(). For production code, always use a Wallet connected to a provider instead of
+          getSigner() -- public RPC endpoints never have managed accounts.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/jsonrpc/#JsonRpcProvider-getSigner"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -771,21 +937,28 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-04-17"
+  last_verified: "2026-04-16"
   evidence_quality: confirmed
-  coverage_score: 0.54
-  # 13 contracted functions / 24 total async-callable
+  coverage_score: 0.67
+  # 16 contracted functions / 24 total async-callable (11 intentionally omitted, 13 previously contracted)
   # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
   #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
   #   provider.waitForTransaction, provider.getLogs
   # Added deepen-stream-2 pass 4: ContractFactory.deploy, Contract.waitForDeployment,
   #   Contract.queryFilter, wallet.signTypedData
+  # Added deepen-stream-2 pass 7: BrowserProvider.getSigner, Wallet.encrypt,
+  #   JsonRpcProvider.getSigner
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR
   #   provider.getNetwork, getFeeData -- infrastructure reads
   #   provider.resolveName, lookupAddress -- ENS utilities, narrow adoption
   #   wallet.signMessage -- async wrapper over sync crypto, no network calls
+  # Intentionally skipped (not counted):
+  #   provider.waitForBlock() -- NOT_IMPLEMENTED in source (throws "not implemented yet")
+  #   Contract.queryTransaction() -- throws "@TODO" (not implemented)
+  #   Contract.getDeployedCode() -- read-only GET
+  #   provider.getTransactionResult() -- read-only GET
 
 # Category: blockchain
 # Latest version: 6.13.0

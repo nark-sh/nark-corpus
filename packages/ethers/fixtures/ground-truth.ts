@@ -2,6 +2,7 @@
  * Ground-truth fixtures for ethers v6 behavioral contract.
  * Added by deepen-stream-1 pass 2 on 2026-04-16.
  * Updated by deepen-stream-2 pass 4 on 2026-04-17.
+ * Updated by deepen-stream-2 pass 7 on 2026-04-16.
  *
  * Postconditions covered:
  *  - wait-transaction-replaced (TransactionResponse.wait)
@@ -18,9 +19,14 @@
  *  - waitfordeployment-constructor-reverted (Contract.waitForDeployment)
  *  - queryfilter-range-too-large (Contract.queryFilter)
  *  - signtypeddata-no-provider-for-ens (wallet.signTypedData)
+ *  - browserprovider-getsigner-action-rejected (BrowserProvider.getSigner)
+ *  - browserprovider-getsigner-no-wallet (BrowserProvider.getSigner)
+ *  - encrypt-invalid-scrypt-options (Wallet.encrypt)
+ *  - encrypt-oom-crash (Wallet.encrypt)
+ *  - jsonrpc-getsigner-no-such-account (JsonRpcProvider.getSigner)
  */
 
-import { ethers, isError, Wallet, ContractFactory, BaseContract } from 'ethers';
+import { ethers, isError, Wallet, ContractFactory, BaseContract, BrowserProvider, JsonRpcProvider } from 'ethers';
 
 // ============================================================
 // VIOLATION CASES (scanner SHOULD flag these)
@@ -316,4 +322,99 @@ async function fetchLogsPaginated(
     }
   }
   return allLogs;
+}
+
+// ============================================================
+// PASS 7 additions: BrowserProvider.getSigner, Wallet.encrypt,
+//   JsonRpcProvider.getSigner (added 2026-04-16)
+// ============================================================
+
+// @expect-violation: browserprovider-getsigner-action-rejected
+// @expect-violation: browserprovider-getsigner-no-wallet
+async function connectWalletWithoutErrorHandling(
+  provider: BrowserProvider
+) {
+  // Missing try-catch -- ACTION_REJECTED when user denies MetaMask popup unhandled
+  const signer = await provider.getSigner();
+  return signer;
+}
+
+// @expect-violation: encrypt-invalid-scrypt-options
+// @expect-violation: encrypt-oom-crash
+async function encryptWalletWithoutErrorHandling(
+  wallet: Wallet,
+  password: string
+) {
+  // Missing try-catch -- INVALID_ARGUMENT or OOM crash on bad options unhandled
+  const json = await wallet.encrypt(password);
+  return json;
+}
+
+// @expect-violation: jsonrpc-getsigner-no-such-account
+async function getJsonRpcSignerWithoutErrorHandling(
+  provider: JsonRpcProvider,
+  accountIndex: number
+) {
+  // Missing try-catch -- throws "no such account" if index >= accounts.length
+  const signer = await provider.getSigner(accountIndex);
+  return signer;
+}
+
+// @expect-clean
+async function connectWalletWithErrorHandling(
+  provider: BrowserProvider
+) {
+  try {
+    const signer = await provider.getSigner();
+    return signer;
+  } catch (error) {
+    if (isError(error, 'ACTION_REJECTED')) {
+      // User dismissed the wallet connection popup -- not a bug
+      console.info('Wallet connection rejected by user');
+      return null;
+    }
+    if (isError(error, 'UNSUPPORTED_OPERATION')) {
+      throw new Error('Wallet does not support account access -- please update your wallet');
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function encryptWalletSafely(
+  wallet: Wallet,
+  password: string
+) {
+  try {
+    const json = await wallet.encrypt(password);
+    return json;
+  } catch (error) {
+    if (error instanceof RangeError) {
+      throw new Error('Insufficient memory for wallet encryption -- increase Lambda memory to 512MB+');
+    }
+    if (error instanceof Error && error.message.includes('invalid scrypt')) {
+      throw new Error('Invalid encryption options -- use default scrypt parameters');
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function getJsonRpcSignerSafely(
+  provider: JsonRpcProvider,
+  accountIndex: number
+) {
+  try {
+    const signer = await provider.getSigner(accountIndex);
+    return signer;
+  } catch (error) {
+    // Note: throws plain Error (not EthersError), so isError() won't work here
+    if (error instanceof Error && (
+      error.message === 'no such account' ||
+      error.message === 'invalid account'
+    )) {
+      throw new Error(`Account index ${accountIndex} not available on this node`);
+    }
+    throw error;
+  }
 }
