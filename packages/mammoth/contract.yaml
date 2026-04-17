@@ -1,10 +1,24 @@
 package: "mammoth"
 semver: ">=1.11.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.80  # 4 contracted / 5 total primary async functions (1 intentionally omitted)
+# Depth pass 2026-04-17 (deepen-stream-2 pass 7):
+# API surface: 5 primary async-callable functions (convert() alias omitted as identical to convertToHtml;
+#              image.read* methods omitted as internal callbacks used only in custom imageConverter options)
+# Contracted before: 2 (convertToHtml, extractRawText)
+# Contracted after: 4 (+2 this pass: convertToMarkdown, embedStyleMap)
+# Omitted: 1 (readEmbeddedStyleMap — read-only, returns null when absent, same file/zip error profile as others)
+# Coverage: 4/5 = 0.80
+# Evidence sources confirmed from:
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.js — exported functions
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.d.ts — TypeScript declarations
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/unzip.js — error throw sites
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/style-reader.js — style map parse errors
+#   https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
 
 functions:
   - name: convertToHtml
@@ -78,3 +92,161 @@ functions:
           incident_cost_range: medium
         sources:
           - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+
+  - name: convertToMarkdown
+    import_path: "mammoth"
+    description: >
+      Converts a .docx file to Markdown. Deprecated — the official README states:
+      "Markdown support is deprecated. Generating HTML and using a separate library
+      to convert the HTML to Markdown is recommended, and is likely to produce better results."
+      Behaves identically to convertToHtml except value contains Markdown instead of HTML.
+
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md — deprecation note
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.js — line 28: calls convert()
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/unzip.js — ENOENT/EACCES throw sites
+      #   Confirmed: same error profile as convertToHtml (both delegate to internal convert())
+      - id: converttomarkdown-file-read-error
+        condition: "File path does not exist, cannot be read, or input options are missing"
+        throws: "Error (ENOENT, EACCES, or 'Could not find file in options')"
+        required_handling: >
+          Caller MUST wrap convertToMarkdown() in try-catch. Error propagates from unzip.js
+          when the file path does not exist (ENOENT), cannot be accessed (EACCES), or when
+          no valid input type is provided. Without handling, a missing upload causes an
+          unhandled promise rejection that crashes the processing pipeline.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/unzip.js
+
+      - id: converttomarkdown-corrupt-docx-error
+        condition: "Buffer contains invalid or corrupt docx/zip data"
+        throws: "Error (zip parsing error from JSZip.loadAsync)"
+        required_handling: >
+          Caller MUST wrap convertToMarkdown() in try-catch. Corrupt .docx files are common
+          when processing user-uploaded documents. JSZip.loadAsync() rejects when the input
+          is not a valid ZIP file (all .docx are ZIP archives). The error propagates up through
+          unzip.openZip() without transformation.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/zipfile.js
+
+      - id: converttomarkdown-deprecated-use
+        condition: >
+          convertToMarkdown is called in new code (not legacy maintenance) instead of
+          converting to HTML first and using a dedicated HTML-to-Markdown library
+        returns: >
+          Markdown output in result.value, but the implementation is not maintained.
+          The official recommendation is to call convertToHtml() and pipe through
+          a dedicated library (e.g. turndown) for better results.
+        required_handling: >
+          SHOULD migrate to convertToHtml() + turndown pattern. The Mammoth maintainer
+          has explicitly deprecated this function. New code should not use it. Existing
+          callers should migrate to avoid quality regressions as the Markdown support
+          is no longer improved.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+
+  - name: embedStyleMap
+    import_path: "mammoth"
+    description: >
+      Given an existing .docx file, generates a new .docx with the passed style map embedded.
+      When the new .docx is later processed by Mammoth, it will use the embedded style map
+      automatically without needing to pass it as an option. Returns a promise resolving to
+      an object with toArrayBuffer() and toBuffer() methods.
+
+    postconditions:
+      # Evidence:
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.js — lines 89-107
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/unzip.js — file read errors
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/docx/style-map.js — write errors
+      #   https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+      - id: embedstylemap-file-read-error
+        condition: "Input file path does not exist, is unreadable, or input options are missing"
+        throws: "Error (ENOENT, EACCES, or 'Could not find file in options')"
+        required_handling: >
+          Caller MUST wrap embedStyleMap() in try-catch. The function opens the .docx via
+          unzip.openZip(), which throws when the file path is missing or the buffer is invalid.
+          Document transformation pipelines that pre-process uploaded .docx files for style
+          consistency must handle missing-file scenarios.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/unzip.js
+
+      - id: embedstylemap-corrupt-docx-error
+        condition: "Input buffer contains invalid or corrupt docx/zip data"
+        throws: "Error (zip parsing error from JSZip.loadAsync)"
+        required_handling: >
+          Caller MUST wrap embedStyleMap() in try-catch. The function reads the .docx ZIP
+          structure to inject the style map. A corrupt archive causes JSZip to reject.
+          This is critical in document pre-processing pipelines that modify uploaded docs
+          before storage — corrupted inputs must be caught and rejected early.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/zipfile.js
+
+      - id: embedstylemap-result-not-saved
+        condition: >
+          embedStyleMap() resolves successfully but the caller does not call toBuffer()
+          or toArrayBuffer() to persist the modified document, OR does not write the
+          returned buffer to storage (file system or object store)
+        returns: >
+          Promise resolves to {toArrayBuffer(), toBuffer()} — if the result is not
+          written to storage, the embedded style map is silently lost. The original
+          file is NOT modified in place — a new document must be explicitly saved.
+        required_handling: >
+          Caller MUST call docx.toBuffer() or docx.toArrayBuffer() on the resolved value
+          AND write it to persistent storage. The function does not overwrite the original
+          file. If the result is not persisted, the style map embedding is silently lost
+          and future conversions will use the original document without the embedded map.
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/index.js
