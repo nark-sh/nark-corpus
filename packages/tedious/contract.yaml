@@ -2,9 +2,10 @@ package: tedious
 semver: ">=18.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 13 contracted / 13 non-omitted (5 omitted: close, cancel, reset, newBulkLoad, connect-factory)
 
 # Tedious - Microsoft SQL Server Driver for Node.js
 #
@@ -339,6 +340,274 @@ functions:
           Unprepare should always be called to free server resources.
         sources:
           - "https://tediousjs.github.io/tedious/api-request.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: execute
+    import_path: "tedious"
+    description: >
+      Executes a previously prepared SQL statement (via prepare()) with the supplied
+      parameter values. Unlike execSql(), uses sp_execute to run the prepared handle.
+      The Request's completion callback receives (err, rowCount, rows). Parameter
+      validation errors are delivered synchronously via process.nextTick to the callback.
+    postconditions:
+      # Evidence: https://tediousjs.github.io/tedious/api-connection.html#execute
+      # Source confirmed: connection.js lines 1874-1898 — parameter validation via DataType.validate()
+      # throws synchronously (via nextTick) on type mismatch; SQL errors via request.callback
+      - id: execute-parameter-validation-error
+        condition: >
+          Parameter value type does not match the declared parameter type (e.g., passing
+          a string where an Int parameter is expected). Validation runs synchronously in
+          execute() via DataType.validate() before any network call.
+        throws: "RequestError delivered to Request callback (code: undefined)"
+        required_handling: >
+          Caller MUST handle 'error' event on the Request object.
+          Parameter type mismatches are caught before the request is sent to SQL Server.
+          Validate parameter types before calling execute(). The same error handler used
+          for prepare()/unprepare() MUST also cover execute().
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: execute-invalid-state-error
+        condition: >
+          execute() is called while the connection is not in LOGGED_IN state —
+          e.g., a prior request is still in-flight, or the connection is closing.
+          SQL Server allows only one request at a time per connection.
+        throws: "RequestError with code 'EINVALIDSTATE' delivered to Request callback"
+        required_handling: >
+          Caller MUST wait for the previous request's callback before calling execute().
+          Only one request at a time per Connection is allowed. Use connection pooling
+          (e.g., mssql) to run concurrent queries. Always handle the 'error' event.
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+          - "https://tediousjs.github.io/tedious/frequently-encountered-problems.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: execBulkLoad
+    import_path: "tedious"
+    description: >
+      Executes a bulk insert operation created by newBulkLoad(). Accepts an AsyncIterable
+      or Iterable of row objects. The BulkLoad callback receives (err, rowCount) when
+      complete. This is the primary way to bulk-insert large datasets into SQL Server
+      efficiently. Used in ETL pipelines, data migrations, and large import operations.
+    postconditions:
+      # Evidence: https://tediousjs.github.io/tedious/bulk-load.html
+      # Source confirmed: bulk-load.js lines 321-324 (addColumn throws), connection.js lines 1741-1748
+      # (execBulkLoad throws synchronously for streaming mode / already-written rows)
+      - id: bulk-load-constraint-violation
+        condition: >
+          Bulk insert violates a table constraint — e.g., unique key violation (error 2627),
+          foreign key constraint (error 547), NOT NULL constraint (error 515) — when
+          checkConstraints is enabled in BulkLoad options. Without checkConstraints, SQL Server
+          may bypass constraint checks, causing silent data corruption.
+        throws: "Error delivered to BulkLoad callback (err.number = 2627 | 547 | 515)"
+        required_handling: >
+          Caller MUST handle error in the BulkLoad callback: newBulkLoad(table, options, (err, rowCount) => {
+            if (err) { /* handle constraint violation */ }
+          }).
+          Consider enabling checkConstraints: true option to catch violations during insert.
+          Log rowCount on success to confirm all rows were inserted.
+        sources:
+          - "https://tediousjs.github.io/tedious/bulk-load.html"
+          - "https://docs.microsoft.com/en-us/sql/relational-databases/errors-events/database-engine-events-and-errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: bulk-load-column-definition-mismatch
+        condition: >
+          Column definitions added via bulkLoad.addColumn() do not match the actual table schema
+          (wrong data type, wrong nullable flag, or column doesn't exist). This causes the bulk
+          insert to fail. Attempting to call addColumn() after rows have already been written
+          throws synchronously: "Columns cannot be added to bulk insert after the first row
+          has been written."
+        throws: "Error thrown synchronously from addColumn() OR Error delivered to BulkLoad callback"
+        required_handling: >
+          Call addColumn() for ALL columns before writing any rows. Verify column definitions
+          against the live table schema before performing bulk load operations. Always handle
+          the BulkLoad callback for schema errors that surface at insert time.
+        sources:
+          - "https://tediousjs.github.io/tedious/bulk-load.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: bulk-load-timeout
+        condition: >
+          Bulk load exceeds the timeout configured via bulkLoad.setTimeout() or the
+          connection's requestTimeout. Large datasets or slow networks can exceed the
+          timeout, resulting in the bulk load being considered failed.
+        throws: "RequestError with code 'ETIMEOUT' delivered to BulkLoad callback"
+        required_handling: >
+          Set an appropriate timeout with bulkLoad.setTimeout(ms) for large bulk operations.
+          Default is the Connection's requestTimeout (default: 15000ms). For large datasets,
+          use setTimeout(0) for no timeout or increase it explicitly. Handle ETIMEOUT in
+          the callback and implement retry logic for transient failures.
+        sources:
+          - "https://tediousjs.github.io/tedious/bulk-load.html"
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: saveTransaction
+    import_path: "tedious"
+    description: >
+      Sets a savepoint within an active transaction. Must be called when inTransaction
+      is true. Used for nested transaction semantics — allows partial rollback to the
+      savepoint rather than rolling back the entire transaction. The callback receives
+      (err) when the savepoint has been established.
+    postconditions:
+      # Evidence: https://tediousjs.github.io/tedious/api-connection.html
+      # Source confirmed: connection.js lines 2022-2031 — delegates to makeRequest() which
+      # checks LOGGED_IN state and delivers RequestError('EINVALIDSTATE') on wrong state
+      - id: save-transaction-state-error
+        condition: >
+          saveTransaction() is called when no active transaction exists, or the connection
+          is not in LOGGED_IN state (e.g., a prior request is still pending, connection
+          is closing). SQL Server requires an active transaction for savepoints.
+        throws: "RequestError with code 'EINVALIDSTATE' delivered to saveTransaction callback"
+        required_handling: >
+          Caller MUST check that beginTransaction() has been called before saveTransaction().
+          Wait for each request's callback to complete before issuing the next request.
+          Always handle the err argument in the saveTransaction callback.
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: save-transaction-connection-error
+        condition: >
+          Connection is lost while setting the savepoint. Network failure or server restart
+          during the TRANSACTION_MANAGER request causes an error in the callback.
+        throws: "ConnectionError delivered to saveTransaction callback"
+        required_handling: >
+          Caller MUST handle error in the saveTransaction callback. On connection error,
+          the parent transaction state is undefined — roll back and reconnect.
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transaction
+    import_path: "tedious"
+    description: >
+      High-level transaction helper that automatically manages beginTransaction, commit,
+      and rollback. The callback cb receives (err, done) where done() is called to
+      commit or rollback. If cb is not a function, throws TypeError synchronously.
+      Supports nested transactions via savepoints (when inTransaction is already true).
+      This is the recommended way to use transactions in tedious.
+    postconditions:
+      # Evidence: https://tediousjs.github.io/tedious/api-connection.html
+      # Source confirmed: connection.js lines 2055-2102 — throws TypeError synchronously if
+      # cb is not a function; delivers connection/server errors to cb(err)
+      - id: transaction-begin-error
+        condition: >
+          Transaction cannot be started — connection is not in LOGGED_IN state (EINVALIDSTATE),
+          or the connection was lost before beginTransaction completed. The error is delivered
+          to the cb callback: cb(err) with no done argument.
+        throws: "RequestError or ConnectionError delivered to cb(err)"
+        required_handling: >
+          Caller MUST check the err argument in the transaction callback before using done().
+          If err is set, do NOT call done() — the transaction was never started.
+          Example: connection.transaction((err, done) => { if (err) return handleError(err); ... })
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: transaction-commit-error
+        condition: >
+          Transaction commit fails due to deferred constraint violation, connection loss,
+          or server error during COMMIT. The error is delivered through the done() callback:
+          done(err). If the commit fails and the connection is still LOGGED_IN, tedious
+          automatically attempts to rollback before passing the error to done().
+        throws: "RequestError or ConnectionError delivered through done(err)"
+        required_handling: >
+          Caller MUST handle the err argument in the done() callback. On commit error,
+          do NOT retry the transaction without re-starting it from beginTransaction.
+          The automatic rollback in tedious's transaction() helper means the transaction
+          is already rolled back when done(err) is called.
+          Example: done(err) => { if (err) { /* transaction was rolled back */ } }
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: execSqlBatch
+    import_path: "tedious"
+    description: >
+      Executes a SQL batch without parameter support (no sp_executesql wrapping). Used
+      when execSql() causes scoping issues with local temporary tables or when raw SQL
+      batch execution is required. The same error profile as execSql() applies: errors
+      are delivered to the Request's completion callback.
+    postconditions:
+      # Evidence: https://tediousjs.github.io/tedious/api-connection.html
+      # Source confirmed: connection.js lines 1631-1633 — delegates to makeRequest() with
+      # SQL_BATCH packet type; same EINVALIDSTATE / SQL error delivery as execSql
+      - id: exec-sql-batch-invalid-state
+        condition: >
+          execSqlBatch() is called while the connection is not in LOGGED_IN state —
+          another request is in-flight, the connection is closing, or was never established.
+          Error message: "Requests can only be made in the LoggedIn state, not the X state."
+        throws: "RequestError with code 'EINVALIDSTATE' delivered to Request callback"
+        required_handling: >
+          Caller MUST wait for the previous request's callback before calling execSqlBatch().
+          Only one request per connection is allowed at a time. Handle the 'error' event
+          on the Request object.
+        sources:
+          - "https://tediousjs.github.io/tedious/api-connection.html"
+          - "https://tediousjs.github.io/tedious/frequently-encountered-problems.html"
         severity: error
         business_impact:
           incident_label: DOWNTIME
