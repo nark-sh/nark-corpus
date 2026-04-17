@@ -1,10 +1,11 @@
 package: winston
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.86
 # Evidence: 6 repos scanned in scan-winston-2026-04-04.json, 2 affected (33%), 2 violations
 # Top affected: seerr-team/seerr, santiq/bulletproof-nodejs
 # All violations are createLogger() without .on('error') listener
@@ -44,6 +45,180 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: query
+    import_path: "winston"
+    description: >
+      Queries all transport backends for stored log entries. Errors from individual
+      transport queries are passed to the callback as the first argument. If no
+      transports support querying, the callback is invoked with an empty results
+      object — not an error. Used for log retrieval UIs and monitoring dashboards.
+    postconditions:
+      # Evidence: logger.js source — transport.query(options, (err, res) => { if (err) { return next(err); } })
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js
+      - id: query-unhandled-callback-error
+        condition: >
+          logger.query() callback receives err as first argument when any transport query
+          fails (e.g. File transport ENOENT/EACCES on log read, or transport does not
+          support query method). Callers that omit the err check silently receive null/undefined results.
+        required_handling: >
+          Caller MUST check the first argument to the callback: if (err) { handle or rethrow }.
+          Ignoring err causes silent failures in log monitoring dashboards and audit UIs.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: "transports.File"
+    import_path: "winston"
+    description: >
+      Creates a File transport that writes log entries to disk. Constructor throws
+      synchronously on conflicting or missing options. File write errors and rotation
+      failures are emitted as 'error' events on the transport instance, not on the logger.
+      Without a per-transport error listener, rotation and write failures are silently lost.
+    postconditions:
+      # Evidence: file.js source — this._onError attached to dest streams; constructor throws on bad opts
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/transports/file.js
+      - id: file-transport-missing-per-transport-error-listener
+        condition: >
+          new transports.File() created without transport.on('error', handler). Filesystem
+          errors (ENOSPC disk full, EACCES permission denied, ENOENT missing directory) during
+          log writes are emitted on the transport instance itself — NOT on the parent logger.
+          A logger.on('error') listener does not catch transport-level errors.
+        required_handling: >
+          After creating a File transport, attach: transport.on('error', (err) => { ... }).
+          This is separate from and required in addition to logger.on('error'). Without it,
+          log file write failures are silently lost and logs are dropped without any alert.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/transports/file.js"
+          - "https://github.com/winstonjs/winston#readme"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: file-transport-constructor-throws-on-invalid-options
+        condition: >
+          new transports.File() called with both 'stream' and 'filename'/'dirname' options
+          simultaneously, or with neither a filename nor a stream. Constructor throws
+          synchronously. When File transports are created dynamically (per-tenant log files,
+          runtime-configured paths), uncaught throws crash the request handler.
+        throws: "Error (synchronous, at construction time)"
+        required_handling: >
+          Wrap dynamic new transports.File() calls in try/catch when filename is derived
+          from runtime input. Validate that mutually exclusive options are not passed together.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/transports/file.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: "transports.Http"
+    import_path: "winston"
+    description: >
+      Creates an HTTP transport that POSTs log entries to a remote endpoint (e.g. Loggly,
+      custom log aggregator). Network errors during log transmission are emitted as 'warn'
+      events on the transport instance, not as 'error' events. Most error handlers only
+      listen for 'error', leaving network failures completely unhandled.
+    postconditions:
+      # Evidence: http.js source — this.emit('warn', err) on request failure, not 'error'
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/transports/http.js
+      - id: http-transport-warn-not-error-on-failure
+        condition: >
+          transports.Http used without a 'warn' event listener. HTTP 4xx/5xx responses and
+          connection errors trigger this.emit('warn', err) on the transport — not 'error'.
+          Code that only attaches transport.on('error', handler) silently misses all
+          network transport failures.
+        required_handling: >
+          When using Http transport and log delivery reliability matters, attach both:
+          transport.on('error', handler) AND transport.on('warn', handler).
+          The 'warn' event carries network failures, not 'error'. Omitting the warn
+          listener means silent log loss to remote aggregators.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/transports/http.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: configure
+    import_path: "winston"
+    description: >
+      Reconfigures an existing logger instance wholesale: resets all transports, applies new
+      levels/format/options. Throws synchronously when deprecated winston@2 options
+      (colors, emitErrs, formatters, padLevels, rewriters, stripColors) are passed.
+      Called internally by the Logger constructor.
+    postconditions:
+      # Evidence: logger.js source — throw new Error('[...] were removed in winston@3.0.0.')
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js
+      - id: configure-throws-on-v2-options
+        condition: >
+          logger.configure() or createLogger() called with any of the removed winston@2 options:
+          colors, emitErrs, formatters, padLevels, rewriters, stripColors. Throws synchronously
+          with "{ colors, emitErrs, formatters, padLevels, rewriters, stripColors } were removed
+          in winston@3.0.0." Migration codebases frequently pass both old and new options.
+        throws: "Error — deprecated option keys present in configure options object"
+        required_handling: >
+          Remove all deprecated v2 option keys before passing to createLogger() or configure().
+          Use winston.format.* combinators instead of the removed formatters/padLevels/stripColors
+          options. Wrap logger initialization in try/catch when config is loaded from external
+          sources (env vars, config files) that may contain v2-era options.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js"
+          - "https://github.com/winstonjs/winston/blob/master/UPGRADE-3.0.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: add
+    import_path: "winston"
+    description: >
+      Adds a transport to an existing logger instance. Throws synchronously if the transport
+      is not a WritableStream in objectMode. Used when building loggers dynamically or adding
+      conditional transports at runtime.
+    postconditions:
+      # Evidence: logger.js source — throw new Error('Transports must WritableStreams in objectMode.')
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js
+      - id: add-throws-on-non-objectmode-transport
+        condition: >
+          logger.add() called with a transport that lacks _writableState.objectMode.
+          Throws synchronously with "Transports must WritableStreams in objectMode."
+          Typically surfaces when using third-party custom transports written for
+          winston@2 (non-stream transports) not yet updated for @3.
+        throws: "Error — transport is not a WritableStream in objectMode"
+        required_handling: >
+          Wrap logger.add() in try/catch when transport type is not known at compile time.
+          Verify third-party transports extend winston-transport (which sets objectMode: true)
+          before dynamically adding them. For per-request transport patterns, validate
+          transport instance before calling add().
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: medium
 
 edge_cases:
