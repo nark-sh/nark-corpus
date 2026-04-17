@@ -1,0 +1,246 @@
+import Queue from 'bull';
+import { Job } from 'bull';
+
+// ============================================================
+// VIOLATION CASES — should be flagged by scanner
+// ============================================================
+
+// @expect-violation: add-redis-connection-error
+// @expect-violation: addbulk-redis-connection-error
+async function addJobWithoutErrorHandling() {
+  const queue = new Queue('email-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled', job.id));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — Redis connection errors propagate as unhandled rejections
+  const job = await queue.add({ email: 'user@example.com', subject: 'Welcome' });
+  return job.id;
+}
+
+// @expect-violation: addbulk-redis-connection-error
+async function addBulkWithoutErrorHandling() {
+  const queue = new Queue('bulk-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled', job.id));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — if Redis drops, entire batch of jobs is lost silently
+  const jobs = await queue.addBulk([
+    { data: { userId: 1, event: 'signup' } },
+    { data: { userId: 2, event: 'signup' } },
+    { data: { userId: 3, event: 'signup' } },
+  ]);
+  return jobs.map(j => j.id);
+}
+
+// @expect-violation: close-not-called-on-shutdown
+function setupQueueWithNoShutdown() {
+  // ❌ Queue created but close() never called — Redis connections leak on process exit
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled', job.id));
+  queue.on('error', (err) => console.error(err));
+
+  queue.process(async (job) => {
+    try {
+      return await processWork(job.data);
+    } catch (err) {
+      throw err;
+    }
+  });
+
+  // ❌ No process.on('SIGTERM', ...) calling queue.close()
+  return queue;
+}
+
+// @expect-violation: obliterate-active-jobs-error
+// @expect-violation: obliterate-irreversible
+async function obliterateQueueWithoutGuard() {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+
+  // ❌ No try-catch — throws if active jobs exist
+  // ❌ No environment guard — dangerous if called in production
+  await queue.obliterate();
+}
+
+// @expect-violation: clean-missing-grace-period
+// @expect-violation: clean-invalid-type
+async function cleanQueueIncorrectly() {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — throws "You must define a grace period." if grace is undefined
+  // (would throw: grace must be provided)
+  const removed = await queue.clean(undefined as any, 'completed');
+
+  // ❌ No try-catch — 'waiting' is invalid, correct value is 'wait'
+  await queue.clean(3600000, 'waiting' as any);
+}
+
+// @expect-violation: retry-job-not-exist
+// @expect-violation: retry-job-not-failed
+async function retryJobWithoutErrorHandling(jobId: string) {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  const job = await queue.getJob(jobId);
+
+  if (job) {
+    // ❌ No try-catch — throws "Couldn't retry job: The job doesn't exist"
+    // if job was removed between getJob() and retry()
+    await job.retry();
+  }
+}
+
+// @expect-violation: finished-job-failed
+// @expect-violation: finished-queue-closing
+async function waitForJobWithoutErrorHandling() {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  const job = await queue.add({ work: 'heavy-computation' });
+
+  // ❌ No try-catch — rejects with job.failedReason if job fails
+  // ❌ No try-catch — rejects if queue.close() is called while waiting
+  const result = await job.finished();
+  return result;
+}
+
+// ============================================================
+// CLEAN CASES — should NOT be flagged by scanner
+// ============================================================
+
+// @expect-clean
+async function addJobWithErrorHandling() {
+  const queue = new Queue('email-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error('Job failed:', err));
+  queue.on('stalled', (job) => console.error('Job stalled:', job.id));
+  queue.on('error', (err) => console.error('Queue error:', err));
+
+  try {
+    const job = await queue.add({ email: 'user@example.com', subject: 'Welcome' });
+    return job.id;
+  } catch (err) {
+    console.error('Failed to add job:', err);
+    throw err;
+  }
+}
+
+// @expect-clean
+async function addBulkWithErrorHandling() {
+  const queue = new Queue('bulk-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled', job.id));
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    const jobs = await queue.addBulk([
+      { data: { userId: 1 } },
+      { data: { userId: 2 } },
+    ]);
+    return jobs.map(j => j.id);
+  } catch (err) {
+    console.error('Failed to add bulk jobs:', err);
+    throw err;
+  }
+}
+
+// @expect-clean
+async function setupQueueWithGracefulShutdown() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error('Job failed:', err));
+  queue.on('stalled', (job) => console.error('Job stalled:', job.id));
+  queue.on('error', (err) => console.error('Queue error:', err));
+
+  queue.process(async (job) => {
+    try {
+      return await processWork(job.data);
+    } catch (err) {
+      throw err;
+    }
+  });
+
+  // ✅ Proper shutdown handler
+  process.on('SIGTERM', async () => {
+    await queue.close();
+    process.exit(0);
+  });
+
+  return queue;
+}
+
+// @expect-clean
+async function obliterateWithGuards() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Cannot obliterate in production');
+  }
+
+  const queue = new Queue('test-queue', { redis: { host: 'localhost', port: 6379 } });
+
+  try {
+    await queue.obliterate({ force: true });
+  } catch (err) {
+    console.error('Failed to obliterate queue:', err);
+    throw err;
+  } finally {
+    await queue.close();
+  }
+}
+
+// @expect-clean
+async function cleanQueueCorrectly() {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    // ✅ Correct: provides grace period, uses valid type string 'wait' (not 'waiting')
+    const completedRemoved = await queue.clean(7 * 24 * 3600 * 1000, 'completed');
+    const failedRemoved = await queue.clean(24 * 3600 * 1000, 'failed');
+    console.log(`Cleaned ${completedRemoved.length} completed, ${failedRemoved.length} failed`);
+  } catch (err) {
+    console.error('Queue clean failed:', err);
+    throw err;
+  }
+}
+
+// @expect-clean
+async function retryJobWithErrorHandling(jobId: string) {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  const job = await queue.getJob(jobId);
+
+  if (job) {
+    try {
+      await job.retry();
+    } catch (err: any) {
+      if (err.message.includes("doesn't exist")) {
+        console.warn('Job no longer exists — may have expired');
+      } else if (err.message.includes('not failed')) {
+        console.warn('Job is not in failed state — already recovered');
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+// @expect-clean
+async function waitForJobWithErrorHandling() {
+  const queue = new Queue('jobs', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  const job = await queue.add({ work: 'heavy-computation' });
+
+  try {
+    const result = await job.finished();
+    return result;
+  } catch (err: any) {
+    console.error('Job failed:', err.message);
+    throw err;
+  }
+}
+
+// Stub for compilation
+async function processWork(data: any) { return data; }
