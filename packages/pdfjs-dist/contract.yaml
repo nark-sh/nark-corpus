@@ -1,10 +1,32 @@
+# pdfjs-dist — Mozilla PDF.js library for rendering and extracting PDF files.
+# Primary API: getDocument() returns a loading task; await .promise to get PDFDocumentProxy.
+# Then call doc.getPage(n) to get PDFPageProxy, then page.getTextContent() or page.render().
+# Error classes: InvalidPDFException, PasswordException, ResponseException, AbortException,
+# FormatError, UnknownErrorException (all extend BaseException), RenderingCancelledException.
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 5):
+# API surface: 13 async-callable operations (7 intentionally omitted read-only operations)
+# Contracted before: 1 (getDocument)
+# Contracted after: 6 (+5 this pass: doc.getPage, page.getTextContent, page.render,
+#                      doc.saveDocument, doc.destroy)
+# Omitted: 7 (read-only GETs with no domain-specific error contracts)
+# Coverage: 6/13 = 0.46 (effective contracted/non-omitted = 6/6 = 1.0)
+# Evidence sources confirmed from:
+#   node_modules/pdfjs-dist/build/pdf.mjs (transport.getPage lines 16084-16110)
+#   node_modules/pdfjs-dist/build/pdf.mjs (getTextContent lines 15284-15300)
+#   node_modules/pdfjs-dist/build/pdf.mjs (InternalRenderTask.cancel lines 16370-16385)
+#   node_modules/pdfjs-dist/build/pdf.mjs (PDFDocumentLoadingTask.destroy lines 14828-14845)
+#   node_modules/pdfjs-dist/types/src/shared/util.d.ts (error class declarations)
+#   https://mozilla.github.io/pdf.js/api/draft/
 package: "pdfjs-dist"
 semver: ">=2.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.46  # 6 contracted / 13 total async-callable (7 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 6/6 = 1.0
 
 functions:
   - name: getDocument
@@ -15,6 +37,12 @@ functions:
       The promise rejects with typed exceptions when loading fails.
 
     postconditions:
+      # Evidence:
+      #   node_modules/pdfjs-dist/types/src/shared/util.d.ts — error class declarations
+      #   node_modules/pdfjs-dist/build/pdf.mjs line 8571 — error class hierarchy
+      #   https://raw.githubusercontent.com/mozilla/pdf.js/master/src/shared/util.js
+      #   https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js
+      #   https://github.com/mozilla/pdf.js/security/advisories/GHSA-wgrm-67xf-hhpq
       - id: getdocument-no-try-catch
         condition: >
           PDF file is corrupted (InvalidPDFException), encrypted without password handling
@@ -38,3 +66,400 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: getPage
+    import_path: "pdfjs-dist"
+    description: >
+      Fetches a page from the loaded PDF document. Called on PDFDocumentProxy after
+      getDocument().promise resolves. Returns a Promise that resolves to PDFPageProxy.
+      This is the mandatory second step in all PDF processing workflows — after getting
+      the document, every page-level operation starts with getPage(). The promise rejects
+      if the page number is out of bounds or if the worker is destroyed.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 16084-16110 (transport.getPage)
+      # Confirmed: returns Promise.reject(new Error("Invalid page request.")) when:
+      #   - pageNumber is not an integer
+      #   - pageNumber <= 0
+      #   - pageNumber > pagesMapper.pagesNumber
+      # Also: throws new Error("Transport destroyed") when transport was destroyed mid-request.
+      - id: getpage-invalid-page-number
+        condition: >
+          doc.getPage(pageNumber) is called without try-catch, and either:
+          (a) pageNumber is out of range (less than 1 or greater than doc.numPages), or
+          (b) pageNumber is not an integer (e.g., a float or NaN), or
+          (c) the PDF worker was destroyed while the page request was in-flight.
+          This is the most common error in PDF processing loops — iterating over pages
+          with incorrect index arithmetic (e.g., starting from 0 instead of 1, or
+          reading doc.numPages but using a 0-based variable).
+        throws: >
+          Error with message "Invalid page request." (from transport.getPage validation:
+          `!Number.isInteger(pageNumber) || pageNumber <= 0 || pageNumber > pagesMapper.pagesNumber`).
+          Also Error("Transport destroyed") when worker is destroyed after document loaded.
+          These are plain JavaScript Error objects, not pdf.js-specific exception types.
+          Confirmed from node_modules/pdfjs-dist/build/pdf.mjs line 16086:
+          `return Promise.reject(new Error("Invalid page request."))`.
+        required_handling: >
+          Caller MUST wrap doc.getPage() in try-catch. Pages in pdfjs-dist are 1-indexed
+          (first page = 1, last page = doc.numPages). Using 0-based indexing is a common bug.
+
+          Correct page iteration pattern:
+            try {
+              const doc = await getDocument(src).promise;
+              for (let i = 1; i <= doc.numPages; i++) {
+                const page = await doc.getPage(i);  // 1-indexed!
+                const textContent = await page.getTextContent();
+                // ... process text
+              }
+            } catch (error) {
+              if (error.message === 'Invalid page request.') {
+                console.error('Page number out of range — check 1-based indexing');
+              }
+              throw error;
+            } finally {
+              await doc.destroy();
+            }
+
+          Note: doc.numPages is synchronous (no await needed) once the document is loaded.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getTextContent
+    import_path: "pdfjs-dist"
+    description: >
+      Extracts all text content from a PDF page as a structured object. Called on
+      PDFPageProxy. Returns a Promise that resolves with a TextContent object containing
+      items (text runs) and styles. This is the primary function used in SaaS apps for
+      PDF-to-text extraction (RAG pipelines, search indexing, document analysis).
+      The method internally uses streamTextContent and consumes a ReadableStream.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 15284-15300 (async getTextContent)
+      # The method uses streamTextContent() internally with `for await` iteration.
+      # If the worker encounters a malformed page content stream, it rejects with
+      # UnknownErrorException (worker-side error) or AbortException (if cancelled).
+      # When stopAtErrors: true is set in getDocument(), more errors are surfaced.
+      # https://mozilla.github.io/pdf.js/api/draft/ — stopAtErrors parameter docs
+      - id: gettextcontent-no-try-catch
+        condition: >
+          page.getTextContent() is called without try-catch, and the page content stream
+          cannot be parsed (worker-side parsing error). This is more likely with:
+          - Scanned PDFs that have no text layer (returns empty items, but some malformed
+            PDFs cause parsing errors rather than empty results)
+          - PDFs created with obscure or non-standard encodings
+          - Encrypted PDFs where the content stream cannot be decoded
+          - When getDocument() was called with stopAtErrors: true, which causes more
+            parsing errors to propagate rather than being silently recovered
+          The async iteration over the text content stream propagates any worker errors.
+        throws: >
+          UnknownErrorException (pdfjs-dist custom class extending BaseException) — thrown
+          when the worker encounters an unrecoverable parsing error during content streaming.
+          AbortException — thrown when doc.destroy() is called while text extraction is
+          in progress (same AbortException class used by getDocument abort).
+          Error — generic errors from the transport layer when the worker is destroyed.
+          All these extend BaseException (except plain Error). Check name property:
+          error.name === 'UnknownErrorException' | 'AbortException'.
+        required_handling: >
+          Caller MUST wrap page.getTextContent() in try-catch. Empty text content (no text
+          layer in a scanned PDF) is returned as {items: [], styles: {}, lang: null} — not
+          an error — so callers should check items.length before assuming text was extracted.
+
+            try {
+              const textContent = await page.getTextContent();
+              if (textContent.items.length === 0) {
+                // Scanned image-only PDF — no text layer
+                console.warn('Page has no extractable text (may be a scanned image)');
+                return '';
+              }
+              return textContent.items
+                .filter(item => 'str' in item)
+                .map(item => item.str)
+                .join(' ');
+            } catch (error) {
+              if (error.name === 'AbortException') {
+                // Document was destroyed during extraction — expected in cleanup
+                throw new Error('PDF text extraction was cancelled');
+              }
+              console.error('Text extraction failed:', error.message);
+              throw error;
+            }
+
+          For batch processing many pages, check for empty results per page, not just errors.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFPageProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs line 114 (stopAtErrors documented):
+      # "Reject certain promises, e.g. getOperatorList, getTextContent, and RenderTask,
+      #  when the associated PDF data cannot be successfully parsed"
+      # By default (stopAtErrors: false), pdf.js silently skips unparseable content.
+      # With stopAtErrors: true, getTextContent() rejects instead of returning partial results.
+      - id: gettextcontent-partial-extraction
+        condition: >
+          page.getTextContent() completes successfully but the caller does not check for
+          missing or incomplete text data. When getDocument() is called without
+          stopAtErrors: true (the default), malformed page content is silently skipped —
+          some text items may be missing from the result without any error being thrown.
+          This is especially common with:
+          - PDFs with mixed content (some pages have text, some are scanned images)
+          - PDFs with font encoding issues where some characters cannot be decoded
+          - PDFs from certain generators that produce non-standard content streams
+        throws: >
+          Does not throw — silently returns partial TextContent with fewer items than
+          the page actually contains. This is not an exception but a data quality issue.
+          With stopAtErrors: true in getDocument() params, an UnknownErrorException
+          IS thrown instead of returning partial results.
+        required_handling: >
+          For reliable text extraction, callers should validate the output completeness:
+          1. Check items.length > 0 (not just that the call succeeded)
+          2. Consider using stopAtErrors: true if partial extraction is unacceptable:
+
+            const loadingTask = getDocument({
+              data: pdfBytes,
+              stopAtErrors: true  // reject instead of partial results
+            });
+            try {
+              const doc = await loadingTask.promise;
+              const page = await doc.getPage(1);
+              const text = await page.getTextContent();
+              // text.items is guaranteed complete (no silent skips)
+            } catch (error) {
+              // Parsing failure now propagated rather than silently skipped
+              console.error('PDF parsing failed:', error);
+            }
+
+          3. For AI/RAG pipelines, always log when items.length === 0 — it indicates
+             a scanned/image PDF that needs OCR processing, not a successful extraction.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: render
+    import_path: "pdfjs-dist"
+    description: >
+      Renders a PDF page to an HTML Canvas element (or Node.js canvas). Called on
+      PDFPageProxy with a RenderParameters object (canvas, viewport). Returns a
+      RenderTask — call await renderTask.promise to wait for completion. This is the
+      primary function used to generate PDF preview images and thumbnails. In Node.js
+      SaaS applications, rendering requires an external canvas library (node-canvas).
+      The render task can be explicitly cancelled via renderTask.cancel().
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 16370-16390 (InternalRenderTask.cancel):
+      # `error ||= new RenderingCancelledException(...)`
+      # `this.callback(error)` → `this.capability.reject(error)` → RenderTask.promise rejects
+      # Confirmed: RenderingCancelledException extends BaseException with name 'RenderingCancelledException'
+      # Also: when the worker sends back a parsing error during rendering (not a cancel),
+      # it propagates as UnknownErrorException or FormatError through the same promise path.
+      - id: render-no-try-catch
+        condition: >
+          await page.render(params).promise is called without try-catch, and either:
+          (a) renderTask.cancel() is explicitly called (e.g., component unmounts during render)
+          (b) doc.destroy() is called while rendering is in progress
+          (c) The PDF page content cannot be parsed (FormatError, UnknownErrorException)
+          (d) The canvas context is null or invalid (plain Error)
+          RenderTask.promise will reject in all of these cases, causing an unhandled
+          rejection if not caught.
+        throws: >
+          RenderingCancelledException (pdfjs-dist custom class, extends BaseException) —
+          thrown when rendering is cancelled (via cancel() or doc.destroy()).
+          name: 'RenderingCancelledException', message: 'Rendering cancelled, page N'.
+          Confirmed from build/pdf.mjs line 16378:
+          `new RenderingCancelledException(\`Rendering cancelled, page \${pageIndex + 1}\`)`.
+          Also: UnknownErrorException (worker-side parsing errors that propagate to render),
+          FormatError (malformed PDF page content stream), plain Error (transport destroyed).
+        required_handling: >
+          Caller MUST await renderTask.promise in a try-catch. In React components and
+          API routes, the most common failure mode is a component unmounting before the
+          render completes — cancel() is called but the rejection still propagates if
+          not caught.
+
+            const renderTask = page.render({ canvas, viewport });
+            try {
+              await renderTask.promise;
+            } catch (error) {
+              if (error.name === 'RenderingCancelledException') {
+                // Expected — rendering was cancelled (e.g., component unmounted, page changed)
+                // Do NOT re-throw — this is an intentional cancellation
+                console.log('Rendering was cancelled:', error.message);
+                return;
+              }
+              // Actual rendering error — log and re-throw
+              console.error('PDF rendering failed:', error);
+              throw error;
+            }
+
+          Note: RenderingCancelledException should NOT be re-thrown in most cases —
+          it is an expected termination signal, not a failure. Only re-throw it if the
+          caller needs to distinguish intentional cancellations from errors.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-RenderTask.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: saveDocument
+    import_path: "pdfjs-dist"
+    description: >
+      Saves the PDF document with any annotation changes applied. Returns a Promise
+      that resolves with a Uint8Array containing the full serialized PDF bytes.
+      Used in SaaS apps that implement PDF annotation editing or form filling.
+      Internally sends a SaveDocument message to the worker thread. Emits a warning
+      (not an error) if annotationStorage is empty — callers should use getData()
+      instead if no annotations were modified.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 16050-16067 (transport.saveDocument)
+      # The method calls messageHandler.sendWithPromise("SaveDocument", ...) which
+      # rejects if the worker throws an error during PDF serialization (e.g., memory
+      # allocation failure for large PDFs, worker destroyed mid-serialization).
+      # Confirmed: worker errors are re-thrown through the messageHandler promise chain.
+      - id: savedocument-no-try-catch
+        condition: >
+          doc.saveDocument() is called without try-catch. The worker thread performs PDF
+          serialization and can fail if the document is large, the worker is destroyed
+          before serialization completes, or an internal serialization error occurs.
+          The returned Promise rejects in these cases.
+        throws: >
+          Error (generic) — from the transport/worker layer when the worker is destroyed
+          mid-serialization or encounters an internal error. The message may be
+          "Worker was destroyed" or a serialization-specific message.
+          UnknownErrorException — if the worker-side PDF serialization itself fails
+          (e.g., invalid XFA data, malformed annotations).
+          These propagate through messageHandler.sendWithPromise's rejection path.
+          Confirmed from build/pdf.mjs line 16050: uses sendWithPromise which inherits
+          worker error propagation.
+        required_handling: >
+          Caller MUST wrap doc.saveDocument() in try-catch. PDF serialization failures
+          cause silent data loss if uncaught — the user's edits/annotations are not saved.
+
+            try {
+              const pdfBytes = await doc.saveDocument();
+              // pdfBytes is Uint8Array — save to storage, send to client, etc.
+              await storage.put('document.pdf', Buffer.from(pdfBytes));
+            } catch (error) {
+              console.error('Failed to save PDF:', error.message);
+              // Alert user that their changes were not saved
+              throw new Error('PDF save failed — changes not persisted');
+            }
+
+          Note: saveDocument() logs a console warning (not an error) when
+          annotationStorage is empty — use getData() instead for unmodified PDFs.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: destroy
+    import_path: "pdfjs-dist"
+    description: >
+      Destroys the PDF document instance and terminates the web worker. Called on
+      PDFDocumentProxy (which delegates to PDFDocumentLoadingTask.destroy()). MUST
+      be called in a finally block after PDF processing is complete to prevent worker
+      process leaks. In Node.js server environments, un-destroyed workers accumulate
+      and eventually exhaust process resources. The method is async and should be
+      awaited.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 14828-14845 (PDFDocumentLoadingTask.destroy):
+      # The destroy() method sets this.destroyed = true, awaits this._transport?.destroy(),
+      # then calls this._worker?.destroy(). The transport.destroy() can throw if the worker
+      # port is in an invalid state. The error is re-thrown from the try/catch block.
+      # Critical for Node.js: each getDocument() call creates a new worker thread.
+      # Not calling destroy() leaks the worker.
+      - id: destroy-not-called-finally
+        condition: >
+          doc.destroy() is not called in a finally block. If the PDF processing throws
+          an error between getDocument() and a hypothetical destroy() call, the worker
+          thread continues running in the background. In Node.js server environments
+          handling many PDF requests, leaked workers accumulate and cause:
+          - Memory pressure from un-garbage-collected worker threads
+          - Worker pool exhaustion (hit limits on concurrent workers)
+          - Process hanging on exit (active worker threads prevent Node.js from terminating)
+          This is the #1 resource leak in server-side PDF processing with pdfjs-dist.
+        throws: >
+          Does not throw in the common case. However, if destroy() is called while a
+          PDFWorker is in an invalid state (e.g., already destroyed), it may throw Error.
+          Safe to call multiple times — subsequent calls after destruction are no-ops.
+          The issue is the ABSENCE of this call in error paths, not the call itself.
+        required_handling: >
+          Caller MUST use try/finally to ensure destroy() is always called:
+
+            let doc;
+            try {
+              const loadingTask = getDocument(pdfData);
+              doc = await loadingTask.promise;
+
+              // Process all pages
+              const results = [];
+              for (let i = 1; i <= doc.numPages; i++) {
+                const page = await doc.getPage(i);
+                const text = await page.getTextContent();
+                results.push(text.items.map(item => item.str).join(' '));
+              }
+              return results;
+            } catch (error) {
+              console.error('PDF processing failed:', error);
+              throw error;
+            } finally {
+              await doc?.destroy();  // ALWAYS destroy — even on error
+            }
+
+          Note: destroy() must be awaited — it is async and the caller should ensure
+          cleanup completes before the function returns. Using void doc?.destroy() without
+          await is a common antipattern that causes race conditions in serverless functions.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentLoadingTask.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+notes:
+  - "getDocument() returns a PDFDocumentLoadingTask — must await .promise to get PDFDocumentProxy"
+  - "Pages are 1-indexed: first page = 1, last page = doc.numPages. 0-indexing is a very common bug."
+  - "getTextContent() returns empty items array for scanned image-only PDFs — not an error. Check items.length."
+  - "stopAtErrors: true in getDocument() causes parsing failures to reject promises (default: false = silent skip)"
+  - "render() returns RenderTask — must await .promise. RenderingCancelledException is an intentional cancel signal."
+  - "In Node.js, pdfjs-dist requires node-canvas for render() — not needed for getTextContent()"
+  - "Error classes: InvalidPDFException, PasswordException, ResponseException, AbortException, FormatError, UnknownErrorException, RenderingCancelledException — all extend BaseException (name property set)"
+  - "PasswordException.code indicates type: PasswordResponses.NEED_PASSWORD (1) or INCORRECT_PASSWORD (2)"
+  - "Leaked workers (no destroy()) cause Node.js process to hang on exit and memory to grow unboundedly"
+  - "saveDocument() warns (not errors) when annotationStorage is empty — use getData() for unmodified PDFs"
