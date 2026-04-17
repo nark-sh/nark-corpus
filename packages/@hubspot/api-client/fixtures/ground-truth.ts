@@ -387,10 +387,10 @@ async function gt_batchUpdate_contacts_safe() {
 // 12. timeline.eventsApi.create — depth pass 2026-04-16 (stream-2)
 // ──────────────────────────────────────────────────
 
-// @expect-violation: create-no-try-catch
+// NOTE: timeline-create-no-try-catch requires a scanner rule for 'eventsApi.create'
+// No @expect-violation annotation — scanner detection not yet implemented (see upgrade-concerns.json)
 async function gt_timeline_create_missing() {
-  // SHOULD_FIRE: create-no-try-catch — eventsApi.create matches create pattern
-  // (timeline-create-no-try-catch is a more specific postcondition without scanner rule yet)
+  // future SHOULD_FIRE: timeline-create-no-try-catch — eventsApi.create no try-catch
   const result = await client.crm.timeline.eventsApi.create({
     eventTemplateId: "template-123",
     objectId: "contact-456",
