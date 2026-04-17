@@ -46,7 +46,21 @@ evidence_quality: confirmed
 # Evidence: dist/cjs/client/auth.js (auth, exchange, refresh, register) confirmed from source throws
 #           dist/cjs/server/webStandardStreamableHttp.js (handleRequest) confirmed from source throws
 #   Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
-coverage_score: 0.68  # 19 contracted / 28 total async-callable (+5 this pass; 15 omitted)
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 13):
+# API surface: 32 distinct async-callable operations (discovered transport-level async methods)
+# Contracted before: 19 (after pass 12)
+# Contracted after: 23 (+4 this pass: StdioClientTransport.start, StreamableHTTPClientTransport.finishAuth,
+#                          StreamableHTTPClientTransport.terminateSession,
+#                          WebStandardStreamableHTTPServerTransport.handleRequest)
+# Omitted additions: SSEClientTransport.finishAuth (deprecated transport, same error profile as
+#                    StreamableHTTPClientTransport.finishAuth), resumeStream (same error profile as connect)
+# Coverage: 23/32 = 0.72
+# Evidence: dist/cjs/client/stdio.js (spawn ENOENT/EACCES/already-started confirmed from source)
+#           dist/cjs/client/streamableHttp.js (finishAuth UnauthorizedError, terminateSession StreamableHTTPError)
+#           dist/cjs/server/webStandardStreamableHttp.js (stateless reuse error + session routing)
+#   Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+coverage_score: 0.72  # 23 contracted / 32 total async-callable (+4 this pass: StdioClientTransport.start, StreamableHTTPClientTransport.finishAuth, terminateSession, WebStandardStreamableHTTPServerTransport.handleRequest; 15 omitted)
 detection:
   class_names:
     - Client
@@ -1237,6 +1251,322 @@ functions:
             });
         sources:
           - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: StdioClientTransport.start
+    import_path: '@modelcontextprotocol/sdk/client/stdio'
+    description: >
+      Launches the MCP server as a child process and establishes stdin/stdout communication.
+      Called automatically by Client.connect(transport) when using StdioClientTransport —
+      callers typically do not call start() directly. However, callers who instantiate
+      StdioClientTransport and call start() directly must handle spawn failures. Uses
+      cross-spawn under the hood; throws if the command is not found, not executable, or
+      the transport has already been started.
+    postconditions:
+      # Evidence: dist/cjs/client/stdio.js — start() rejects promise on 'error' event from child_process.spawn
+      # cross-spawn throws ENOENT when command not found, EACCES when not executable
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#stdio
+      - id: stdio-start-throws-on-spawn-failure
+        condition: >
+          async function constructs StdioClientTransport and calls start() (or calls
+          Client.connect() with a StdioClientTransport) without try-catch. The spawn
+          fails when: (1) command is not found on PATH — throws ENOENT; (2) command
+          exists but is not executable — throws EACCES; (3) transport is already started
+          — throws Error('StdioClientTransport already started!'). These failures reject
+          the start() promise, propagating through Client.connect() as an uncaught rejection.
+        throws: >
+          Error from Node.js child_process spawn:
+          - ENOENT: command not found on PATH (e.g. 'npx mcp-server-xyz' where package is not installed)
+          - EACCES: command found but not executable (permission denied)
+          - Error('StdioClientTransport already started!'): transport reuse — call close() first
+        required_handling: >
+          Wrap Client.connect() (or transport.start()) in try-catch and handle spawn errors:
+
+            import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio';
+            import { Client } from '@modelcontextprotocol/sdk/client';
+
+            const transport = new StdioClientTransport({
+              command: 'npx',
+              args: ['-y', '@modelcontextprotocol/server-filesystem'],
+            });
+            try {
+              await client.connect(transport);
+            } catch (error) {
+              if (error.code === 'ENOENT') {
+                console.error('MCP server binary not found — ensure it is installed');
+              } else if (error.code === 'EACCES') {
+                console.error('MCP server binary not executable — check file permissions');
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#stdio
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: stdio-start-throws-already-started
+        condition: >
+          Code creates a StdioClientTransport and calls connect() (or start()) twice on the
+          same instance without calling close() between connections. This is a common mistake
+          when implementing reconnection logic — the old transport instance must be discarded
+          and a new one created after each disconnect, not restarted.
+        throws: >
+          Error('StdioClientTransport already started! If using Client class, note that
+          connect() calls start() automatically.')
+        required_handling: >
+          For reconnection, create a new StdioClientTransport instance rather than reusing
+          the old one. Attach onerror/onclose handlers to detect disconnect:
+
+            transport.onclose = async () => {
+              // Create a fresh transport — do NOT reuse the old one
+              const newTransport = new StdioClientTransport({ command, args });
+              await client.connect(newTransport);
+            };
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#stdio
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: StreamableHTTPClientTransport.finishAuth
+    import_path: '@modelcontextprotocol/sdk/client/streamableHttp'
+    description: >
+      Completes the OAuth 2.1 authorization flow for StreamableHTTPClientTransport after
+      the user returns from the browser authorization page. Exchanges the authorization
+      code for tokens by calling the same auth() helper used by the auth skill. Must be
+      called with the authorization_code from the redirect URL query parameters before
+      retrying client.connect(). This is the HTTP transport's counterpart to the
+      top-level auth() function — it handles the final leg of PKCE.
+    postconditions:
+      # Evidence: dist/cjs/client/streamableHttp.js — finishAuth() calls auth() with authorizationCode
+      # Throws UnauthorizedError when authProvider not set or when auth() returns non-AUTHORIZED
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+      - id: finish-auth-throws-no-provider
+        condition: >
+          async function calls transport.finishAuth(code) on a StreamableHTTPClientTransport
+          that was constructed without an authProvider option. The transport cannot complete
+          the OAuth flow because no provider is configured to store tokens or perform the
+          exchange.
+        throws: >
+          UnauthorizedError('No auth provider') from '@modelcontextprotocol/sdk/client/auth'
+        required_handling: >
+          Only call finishAuth() on a transport that was constructed with an authProvider:
+
+            const transport = new StreamableHTTPClientTransport(serverUrl, {
+              authProvider: myOAuthProvider,  // REQUIRED for finishAuth() to work
+            });
+            // After redirect:
+            const code = new URL(window.location.href).searchParams.get('code');
+            try {
+              await transport.finishAuth(code);
+            } catch (error) {
+              if (error instanceof UnauthorizedError) {
+                // Re-show login flow
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: finish-auth-throws-authorization-failed
+        condition: >
+          async function calls transport.finishAuth(code) without try-catch. The auth()
+          helper returns a non-'AUTHORIZED' result (e.g. 'REDIRECT') when token exchange
+          fails — the code may be expired, already used, or the PKCE verifier may be
+          stale (e.g. user reloaded the redirect page). The transport throws
+          UnauthorizedError('Failed to authorize') in this case.
+        throws: >
+          UnauthorizedError('Failed to authorize') — token exchange completed but did not
+          produce a valid access token. PKCE mismatch, expired code, or re-used code.
+        required_handling: >
+          Catch UnauthorizedError and restart the full OAuth flow from the beginning:
+
+            try {
+              await transport.finishAuth(authorizationCode);
+              await client.connect(transport);
+            } catch (error) {
+              if (error instanceof UnauthorizedError) {
+                // Code is stale or already used — restart from authorization URL
+                const freshTransport = new StreamableHTTPClientTransport(serverUrl, { authProvider });
+                await client.connect(freshTransport); // triggers new redirect
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: StreamableHTTPClientTransport.terminateSession
+    import_path: '@modelcontextprotocol/sdk/client/streamableHttp'
+    description: >
+      Explicitly terminates the MCP session by sending an HTTP DELETE to the MCP endpoint
+      with the Mcp-Session-Id header. Per the MCP spec, clients SHOULD call this when they
+      no longer need the session (e.g. user navigating away). The server may respond with
+      HTTP 405 Method Not Allowed if it does not support explicit session termination —
+      this is treated as a valid response (not an error). Any other non-2xx response throws
+      StreamableHTTPError. Note: if there is no active sessionId, this method returns
+      immediately without making a network request.
+    postconditions:
+      # Evidence: dist/cjs/client/streamableHttp.js — terminateSession() throws StreamableHTTPError on !ok && status !== 405
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#session-management
+      - id: terminate-session-throws-on-server-error
+        condition: >
+          async function calls transport.terminateSession() without try-catch. The server
+          returns a non-2xx, non-405 HTTP response (e.g. 500 Internal Server Error,
+          503 Service Unavailable, or 403 Forbidden). StreamableHTTPError is thrown with
+          the HTTP status code and statusText. Note that HTTP 405 Method Not Allowed is
+          explicitly handled as success per the MCP spec — only unexpected failures throw.
+        throws: >
+          StreamableHTTPError(statusCode, 'Failed to terminate session: <statusText>')
+          from '@modelcontextprotocol/sdk/client/streamableHttp'.
+          HTTP 405 is NOT thrown — it indicates the server doesn't support explicit termination.
+        required_handling: >
+          Wrap terminateSession() in try-catch. Failure to terminate is non-fatal — the
+          session will eventually expire server-side. Treat errors as best-effort cleanup:
+
+            try {
+              await transport.terminateSession();
+            } catch (error) {
+              if (error instanceof StreamableHTTPError) {
+                // Non-fatal — session will expire naturally
+                console.warn('Session termination failed:', error.message);
+              } else {
+                throw error; // Re-throw unexpected errors (network failure, etc.)
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#session-management
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: WebStandardStreamableHTTPServerTransport.handleRequest
+    import_path: '@modelcontextprotocol/sdk/server/webStandardStreamableHttp'
+    description: >
+      Handles an incoming HTTP Request object (Web Standards API) and returns a Response
+      object. This is the web-standards counterpart to StreamableHTTPServerTransport.handleRequest
+      (which uses Node.js IncomingMessage/ServerResponse). Use this transport for runtimes
+      that support Web Standards: Cloudflare Workers, Deno, Bun, Next.js edge, or any
+      WinterCG-compatible runtime. Handles GET (SSE stream), POST (JSON-RPC messages), and
+      DELETE (session termination). In stateless mode, each request MUST use a fresh
+      transport instance — reuse throws an error.
+    postconditions:
+      # Evidence: dist/cjs/server/webStandardStreamableHttp.js
+      # Throws Error('Stateless transport cannot be reused') on second call without sessionIdGenerator
+      # Returns HTTP 400 on invalid session, HTTP 405 on unsupported methods
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http
+      - id: web-transport-stateless-reuse-throws
+        condition: >
+          Cloudflare Worker or similar serverless handler creates one
+          WebStandardStreamableHTTPServerTransport instance (e.g. at module scope or in a
+          singleton) in stateless mode (no sessionIdGenerator) and reuses it across multiple
+          requests. The second call to handleRequest() throws because stateless transport
+          is single-use — message ID counters from the first request would collide with
+          the second.
+        throws: >
+          Error('Stateless transport cannot be reused across requests. Create a new transport per request.')
+        required_handling: >
+          In stateless mode, create a new transport per request:
+
+            // Cloudflare Worker — CORRECT
+            export default {
+              async fetch(request: Request): Promise<Response> {
+                const transport = new WebStandardStreamableHTTPServerTransport(); // new per request
+                const server = new McpServer(serverInfo);
+                await server.connect(transport);
+                return transport.handleRequest(request);
+              }
+            };
+
+            // WRONG — singleton transport in stateless mode
+            const transport = new WebStandardStreamableHTTPServerTransport(); // reused!
+            export default {
+              async fetch(request) {
+                return transport.handleRequest(request); // throws on 2nd request
+              }
+            };
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: web-transport-missing-session-routing
+        condition: >
+          MCP server uses stateful WebStandardStreamableHTTPServerTransport (with
+          sessionIdGenerator) but routes all requests to a single transport instance.
+          The transport returns a JSON error response with HTTP 404 for any request whose
+          session ID does not match. This mirrors the same mistake as with
+          StreamableHTTPServerTransport but in web-standards environments (Hono, Deno,
+          Cloudflare Workers with Durable Objects).
+        throws: >
+          Does NOT throw — returns Response with HTTP 404 and JSON body:
+          { jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' } }
+        required_handling: >
+          For stateful deployments, maintain a session map and route by Mcp-Session-Id header:
+
+            const sessions = new Map();
+
+            // Hono.js example
+            app.all('/mcp', async (c) => {
+              const sessionId = c.req.header('mcp-session-id');
+              let transport = sessionId ? sessions.get(sessionId) : undefined;
+              if (!transport) {
+                transport = new WebStandardStreamableHTTPServerTransport({
+                  sessionIdGenerator: () => crypto.randomUUID(),
+                  onsessionclosed: (id) => sessions.delete(id),
+                });
+                const server = new McpServer(serverInfo);
+                await server.connect(transport);
+              }
+              const response = await transport.handleRequest(c.req.raw);
+              if (transport.sessionId) sessions.set(transport.sessionId, transport);
+              return response;
+            });
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#session-management
         severity: error
         evidence_quality: confirmed
         business_impact:

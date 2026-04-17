@@ -26,6 +26,10 @@
  *   - refreshAuthorization()                     postcondition: refresh-authorization-throws-on-revoked-token
  *   - registerClient()                           postcondition: register-client-throws-on-invalid-metadata
  *   - StreamableHTTPServerTransport.handleRequest() postcondition: handle-request-throws-on-stateless-reuse, handle-request-missing-session-routing
+ *   - StdioClientTransport.start()                  postcondition: stdio-start-throws-on-spawn-failure, stdio-start-throws-already-started
+ *   - StreamableHTTPClientTransport.finishAuth()    postcondition: finish-auth-throws-no-provider, finish-auth-throws-authorization-failed
+ *   - StreamableHTTPClientTransport.terminateSession() postcondition: terminate-session-throws-on-server-error
+ *   - WebStandardStreamableHTTPServerTransport.handleRequest() postcondition: web-transport-stateless-reuse-throws, web-transport-missing-session-routing
  *
  * Detection path: instance tracking (new Client() → instanceMap) →
  *   ThrowingFunctionDetector fires client.connect() →
@@ -37,8 +41,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { auth, exchangeAuthorization, refreshAuthorization, registerClient, OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+import { auth, exchangeAuthorization, refreshAuthorization, registerClient, OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { OAuthTokens, OAuthClientInformationMixed, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -619,5 +625,129 @@ async function gt_handleRequest_proper(transport: StreamableHTTPServerTransport,
   } catch (e) {
     // Error: 'Stateless transport cannot be reused' handled
     res.status(500).json({ error: 'Transport error' });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 40. StdioClientTransport.start() — no try-catch (violation)
+// @expect-violation: stdio-start-throws-on-spawn-failure
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_stdioStart_violation(client: Client) {
+  const transport = new StdioClientTransport({
+    command: 'npx',
+    args: ['-y', '@modelcontextprotocol/server-filesystem'],
+  });
+  // SHOULD_FIRE: stdio-start-throws-on-spawn-failure — no try-catch; ENOENT if command not found
+  await client.connect(transport);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 41. StdioClientTransport.start() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_stdioStart_proper(client: Client) {
+  const transport = new StdioClientTransport({
+    command: 'npx',
+    args: ['-y', '@modelcontextprotocol/server-filesystem'],
+  });
+  try {
+    // SHOULD_NOT_FIRE
+    await client.connect(transport);
+  } catch (error: any) {
+    if (error.code === 'ENOENT') {
+      console.error('MCP server binary not found');
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 42. StreamableHTTPClientTransport.finishAuth() — no try-catch (violation)
+// @expect-violation: finish-auth-throws-no-provider
+// @expect-violation: finish-auth-throws-authorization-failed
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_finishAuth_violation(serverUrl: URL, authCode: string) {
+  const transport = new StreamableHTTPClientTransport(serverUrl);
+  // SHOULD_FIRE: finish-auth-throws-no-provider — no try-catch; UnauthorizedError when no authProvider set
+  await transport.finishAuth(authCode);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 43. StreamableHTTPClientTransport.finishAuth() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_finishAuth_proper(transport: StreamableHTTPClientTransport, authCode: string) {
+  try {
+    // SHOULD_NOT_FIRE
+    await transport.finishAuth(authCode);
+  } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      console.error('Auth failed, restart login flow:', error.message);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44. StreamableHTTPClientTransport.terminateSession() — no try-catch (violation)
+// @expect-violation: terminate-session-throws-on-server-error
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_terminateSession_violation(transport: StreamableHTTPClientTransport) {
+  // SHOULD_FIRE: terminate-session-throws-on-server-error — no try-catch; StreamableHTTPError on non-2xx/non-405
+  await transport.terminateSession();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 45. StreamableHTTPClientTransport.terminateSession() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_terminateSession_proper(transport: StreamableHTTPClientTransport) {
+  try {
+    // SHOULD_NOT_FIRE
+    await transport.terminateSession();
+  } catch (error) {
+    if (error instanceof StreamableHTTPError) {
+      // Non-fatal — session will expire naturally on server side
+      console.warn('Session termination failed:', error.message);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 46. WebStandardStreamableHTTPServerTransport.handleRequest() — stateless reuse (violation)
+// @expect-violation: web-transport-stateless-reuse-throws
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Simulates singleton transport at module scope — reused across requests
+const sharedWebTransport = new WebStandardStreamableHTTPServerTransport();
+
+async function gt_webTransportReuse_violation(request: Request): Promise<Response> {
+  // SHOULD_FIRE: web-transport-stateless-reuse-throws — no try-catch; stateless transport cannot be reused
+  return sharedWebTransport.handleRequest(request);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 47. WebStandardStreamableHTTPServerTransport.handleRequest() — new per request (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_webTransportPerRequest_proper(request: Request, serverInfo: any): Promise<Response> {
+  const transport = new WebStandardStreamableHTTPServerTransport(); // new per request
+  try {
+    // SHOULD_NOT_FIRE
+    return await transport.handleRequest(request);
+  } catch (error) {
+    console.error('Transport error:', error);
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
