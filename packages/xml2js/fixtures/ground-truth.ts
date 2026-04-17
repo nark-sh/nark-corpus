@@ -4,7 +4,7 @@
  *
  * Postcondition IDs from contract.yaml:
  *   parse-error-malformed-xml
- *   parse-promise-empty-string
+ *   parse-promise-null-return
  *   parse-string-callback-error-ignored
  *   parse-string-no-callback
  *   build-object-invalid-root-name
@@ -62,7 +62,7 @@ async function parseXmlNamedUnprotected(xml: string) {
 
 async function parseXmlInstanceUnprotected(xml: string) {
   const parser = new Parser();
-  // SHOULD_FIRE: parse-error-malformed-xml — instance method without try-catch
+  // SHOULD_FIRE: parser-instance-malformed-xml — instance method without try-catch
   const result = await parser.parseStringPromise(xml);
   return result;
 }
@@ -117,14 +117,14 @@ function buildObjectClean(data: Record<string, unknown>): string {
 }
 
 function buildObjectNoTryCatch(data: Record<string, unknown>): string {
-  // SHOULD_FIRE: build-object-invalid-root-name — buildObject can throw, no try-catch
   const builder = new xml2js.Builder();
+  // SHOULD_FIRE: build-object-invalid-root-name — buildObject can throw, no try-catch
   return builder.buildObject(data);
 }
 
 function buildObjectFromDynamicData(userInput: Record<string, unknown>): string {
-  // SHOULD_FIRE: build-object-invalid-xml-chars — user data may contain invalid XML chars, no try-catch
   const builder = new xml2js.Builder({ rootName: 'response' });
+  // SHOULD_FIRE: build-object-invalid-root-name — buildObject can throw on user data, no try-catch
   return builder.buildObject(userInput);
 }
 
@@ -143,8 +143,8 @@ async function parserInstanceClean(xml: string) {
 }
 
 async function parserInstanceNoErrorHandling(xml: string) {
-  // SHOULD_FIRE: parser-instance-malformed-xml — Parser instance without try-catch
   const parser = new Parser({ explicitArray: false });
+  // SHOULD_FIRE: parser-instance-malformed-xml — Parser instance without try-catch
   const result = await parser.parseStringPromise(xml);
   return result;
 }
@@ -161,7 +161,7 @@ async function parseEmptyStringClean(xml: string) {
 }
 
 async function parseEmptyStringNoNullCheck(xml: string) {
-  // SHOULD_FIRE: parse-promise-empty-string — result not null-checked, crashes on empty input
+  // SHOULD_FIRE: parse-promise-null-return — result not null-checked, crashes on empty input
   const result = await parseStringPromise(xml);
   return result.root.items;
 }
