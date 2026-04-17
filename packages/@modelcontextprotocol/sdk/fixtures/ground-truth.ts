@@ -18,6 +18,14 @@
  *   - Client.listResources()   postcondition: list-resources-missing-try-catch
  *   - Client.listPrompts()     postcondition: list-prompts-missing-try-catch
  *   - Client.subscribeResource() postcondition: subscribe-resource-missing-try-catch
+ *   - client.experimental.tasks.callToolStream() postcondition: call-tool-stream-error-message-unhandled, call-tool-stream-missing-try-catch
+ *   - client.experimental.tasks.cancelTask()     postcondition: cancel-task-missing-try-catch
+ *   - client.experimental.tasks.getTask()        postcondition: get-task-missing-try-catch
+ *   - auth()                                     postcondition: auth-throws-oauth-error-on-server-rejection, auth-redirect-result-not-checked
+ *   - exchangeAuthorization()                    postcondition: exchange-authorization-throws-on-invalid-code
+ *   - refreshAuthorization()                     postcondition: refresh-authorization-throws-on-revoked-token
+ *   - registerClient()                           postcondition: register-client-throws-on-invalid-metadata
+ *   - StreamableHTTPServerTransport.handleRequest() postcondition: handle-request-throws-on-stateless-reuse, handle-request-missing-session-routing
  *
  * Detection path: instance tracking (new Client() → instanceMap) →
  *   ThrowingFunctionDetector fires client.connect() →
@@ -29,6 +37,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { auth, exchangeAuthorization, refreshAuthorization, registerClient, OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { OAuthTokens, OAuthClientInformationMixed, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Client.connect() — without try-catch
@@ -319,5 +330,294 @@ async function gt_elicitInput_proper(server: Server) {
     return result;
   } catch (e) {
     return { action: 'cancel' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. client.experimental.tasks.callToolStream() — error message not handled
+// @expect-violation: call-tool-stream-error-message-unhandled
+// @expect-violation: call-tool-stream-missing-try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_callToolStream_missing(client: Client) {
+  // SHOULD_FIRE: call-tool-stream-error-message-unhandled — no check for message.type === 'error'
+  // SHOULD_FIRE: call-tool-stream-missing-try-catch — no outer try-catch for transport failures
+  const stream = client.experimental.tasks.callToolStream({ name: 'myTool', arguments: {} });
+  for await (const message of stream) {
+    if (message.type === 'result') {
+      return message.result;
+    }
+    // ❌ 'error' messages are never handled — tool failures silently lost
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. client.experimental.tasks.callToolStream() — properly handled
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_callToolStream_proper(client: Client) {
+  try {
+    // SHOULD_NOT_FIRE
+    const stream = client.experimental.tasks.callToolStream({ name: 'myTool', arguments: {} });
+    for await (const message of stream) {
+      if (message.type === 'error') {
+        throw new Error(`Tool stream error: ${message.error.message}`);
+      }
+      if (message.type === 'result') {
+        return message.result;
+      }
+    }
+  } catch (e) {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. client.experimental.tasks.cancelTask() — without try-catch
+// @expect-violation: cancel-task-missing-try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_cancelTask_missing(client: Client, taskId: string) {
+  // SHOULD_FIRE: cancel-task-missing-try-catch — no try-catch; task may have already completed
+  await client.experimental.tasks.cancelTask(taskId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. client.experimental.tasks.cancelTask() — inside try-catch
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_cancelTask_proper(client: Client, taskId: string) {
+  try {
+    // SHOULD_NOT_FIRE
+    await client.experimental.tasks.cancelTask(taskId);
+  } catch (e) {
+    // Expected: task may have already completed or been cleaned up
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. client.experimental.tasks.getTask() — without try-catch
+// @expect-violation: get-task-missing-try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_getTask_missing(client: Client, taskId: string) {
+  // SHOULD_FIRE: get-task-missing-try-catch — task may have been cleaned up from task store
+  const taskStatus = await client.experimental.tasks.getTask(taskId);
+  return taskStatus;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. client.experimental.tasks.getTask() — inside try-catch
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_getTask_proper(client: Client, taskId: string) {
+  try {
+    // SHOULD_NOT_FIRE
+    const taskStatus = await client.experimental.tasks.getTask(taskId);
+    return taskStatus;
+  } catch (e) {
+    // Expected: task may have expired from task store
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. auth() — without try-catch
+// @expect-violation: auth-throws-oauth-error-on-server-rejection
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_auth_missing(provider: OAuthClientProvider) {
+  // SHOULD_FIRE: auth-throws-oauth-error-on-server-rejection — no try-catch; OAuthError thrown on server rejection
+  const result = await auth(provider, { serverUrl: 'https://api.example.com/mcp' });
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. auth() — return value not checked for REDIRECT
+// @expect-violation: auth-redirect-result-not-checked
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_auth_redirect_unchecked(provider: OAuthClientProvider, client: Client, transport: StdioClientTransport) {
+  try {
+    // SHOULD_FIRE: auth-redirect-result-not-checked — result is not checked before calling client.connect()
+    await auth(provider, { serverUrl: 'https://api.example.com/mcp' });
+    await client.connect(transport); // proceeds even if result === 'REDIRECT'
+  } catch (e) {
+    // handles errors but not the REDIRECT return value
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. auth() — with try-catch and redirect check (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_auth_proper(provider: OAuthClientProvider, client: Client, transport: StdioClientTransport) {
+  try {
+    // SHOULD_NOT_FIRE
+    const result = await auth(provider, { serverUrl: 'https://api.example.com/mcp' });
+    if (result === 'REDIRECT') {
+      return; // user being redirected to authorize
+    }
+    await client.connect(transport);
+  } catch (e) {
+    // OAuthError subtypes handled
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 32. exchangeAuthorization() — without try-catch
+// @expect-violation: exchange-authorization-throws-on-invalid-code
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_exchangeAuth_missing(
+  authServerUrl: string,
+  clientInfo: OAuthClientInformationMixed,
+  code: string,
+  verifier: string,
+  provider: OAuthClientProvider
+) {
+  // SHOULD_FIRE: exchange-authorization-throws-on-invalid-code — no try-catch; code may be expired
+  const tokens = await exchangeAuthorization(authServerUrl, {
+    clientInformation: clientInfo,
+    authorizationCode: code,
+    codeVerifier: verifier,
+    redirectUri: 'https://myapp.com/callback',
+  });
+  return tokens;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 33. exchangeAuthorization() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_exchangeAuth_proper(
+  authServerUrl: string,
+  clientInfo: OAuthClientInformationMixed,
+  code: string,
+  verifier: string,
+  provider: OAuthClientProvider
+) {
+  try {
+    // SHOULD_NOT_FIRE
+    const tokens = await exchangeAuthorization(authServerUrl, {
+      clientInformation: clientInfo,
+      authorizationCode: code,
+      codeVerifier: verifier,
+      redirectUri: 'https://myapp.com/callback',
+    });
+    return tokens;
+  } catch (e) {
+    // InvalidGrantError etc. handled
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 34. refreshAuthorization() — without try-catch
+// @expect-violation: refresh-authorization-throws-on-revoked-token
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_refreshAuth_missing(
+  authServerUrl: string,
+  clientInfo: OAuthClientInformationMixed,
+  refreshToken: string
+) {
+  // SHOULD_FIRE: refresh-authorization-throws-on-revoked-token — no try-catch; refresh token may be revoked
+  const tokens = await refreshAuthorization(authServerUrl, {
+    clientInformation: clientInfo,
+    refreshToken,
+  });
+  return tokens;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 35. refreshAuthorization() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_refreshAuth_proper(
+  authServerUrl: string,
+  clientInfo: OAuthClientInformationMixed,
+  refreshToken: string
+) {
+  try {
+    // SHOULD_NOT_FIRE
+    const tokens = await refreshAuthorization(authServerUrl, {
+      clientInformation: clientInfo,
+      refreshToken,
+    });
+    return tokens;
+  } catch (e) {
+    // InvalidGrantError: refresh token revoked — schedule re-auth
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 36. registerClient() — without try-catch
+// @expect-violation: register-client-throws-on-invalid-metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_registerClient_missing(
+  authServerUrl: string,
+  clientMetadata: OAuthClientMetadata
+) {
+  // SHOULD_FIRE: register-client-throws-on-invalid-metadata — no try-catch; registration may fail
+  const clientInfo = await registerClient(authServerUrl, {
+    clientMetadata,
+  });
+  return clientInfo;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 37. registerClient() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_registerClient_proper(
+  authServerUrl: string,
+  clientMetadata: OAuthClientMetadata
+) {
+  try {
+    // SHOULD_NOT_FIRE
+    const clientInfo = await registerClient(authServerUrl, {
+      clientMetadata,
+    });
+    return clientInfo;
+  } catch (e) {
+    // InvalidClientMetadataError etc. handled
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 38. StreamableHTTPServerTransport.handleRequest() — stateless reuse
+// @expect-violation: handle-request-throws-on-stateless-reuse
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_handleRequest_reuse(transport: StreamableHTTPServerTransport, req: any, res: any) {
+  // SHOULD_FIRE: handle-request-throws-on-stateless-reuse — no try-catch; stateless transport cannot be reused
+  await transport.handleRequest(req, res, req.body);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 39. StreamableHTTPServerTransport.handleRequest() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_handleRequest_proper(transport: StreamableHTTPServerTransport, req: any, res: any) {
+  try {
+    // SHOULD_NOT_FIRE
+    await transport.handleRequest(req, res, req.body);
+  } catch (e) {
+    // Error: 'Stateless transport cannot be reused' handled
+    res.status(500).json({ error: 'Transport error' });
   }
 }

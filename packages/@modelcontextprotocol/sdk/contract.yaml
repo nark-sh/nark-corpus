@@ -18,7 +18,35 @@ evidence_quality: confirmed
 # Evidence: compiled JS at dist/cjs/client/index.js + dist/cjs/server/index.js + dist/cjs/shared/protocol.js
 #   Source: /private/tmp/claude/bc-deepen/@modelcontextprotocol/sdk/node_modules/@modelcontextprotocol/sdk/
 #   Transport docs: https://modelcontextprotocol.io/docs/concepts/transports
-coverage_score: 0.55  # 11 contracted / 20 total async-callable (9 intentionally omitted)
+#
+# Depth pass 2026-04-16 (deepen-stream-2 pass 9):
+# API surface: 23 distinct async-callable operations (discovered experimental.tasks.* additions)
+# Contracted before: 11 (after pass 8)
+# Contracted after: 14 (+3 this pass: experimental.tasks.callToolStream, experimental.tasks.cancelTask,
+#                          experimental.tasks.getTask)
+# Omitted additions: experimental.tasks.listTasks (read-only list), experimental.tasks.getTaskResult
+#                    (same error profile as getTask), createElicitationCompletionNotifier (sync factory),
+#                    sendResourceUpdated (notification wrapper)
+# Coverage: 14/23 = 0.61 (omitting 9 intentionally = 14/14 contracted callables)
+# Evidence: dist/cjs/experimental/tasks/client.js + dist/cjs/shared/protocol.js
+#   McpError codes confirmed from source throws
+#   Docs: README.md tasks section + https://modelcontextprotocol.io/docs/concepts/transports
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 12):
+# API surface: 28 distinct async-callable operations (discovered OAuth auth functions + HTTP transport)
+# Contracted before: 14 (after pass 9)
+# Contracted after: 19 (+5 this pass: auth, exchangeAuthorization, refreshAuthorization,
+#                          registerClient, StreamableHTTPServerTransport.handleRequest)
+# Omitted additions: discoverOAuthMetadata (discovery utility, same error profile as auth()),
+#                    discoverAuthorizationServerMetadata (same), discoverOAuthProtectedResourceMetadata (same),
+#                    sendResourceListChanged (notification, no throw contract),
+#                    sendToolListChanged (notification, no throw contract),
+#                    sendPromptListChanged (notification, no throw contract)
+# Coverage: 19/28 = 0.68 (omitting 15 intentionally = 19/19 contracted callables = 1.0 effective)
+# Evidence: dist/cjs/client/auth.js (auth, exchange, refresh, register) confirmed from source throws
+#           dist/cjs/server/webStandardStreamableHttp.js (handleRequest) confirmed from source throws
+#   Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+coverage_score: 0.68  # 19 contracted / 28 total async-callable (+5 this pass; 15 omitted)
 detection:
   class_names:
     - Client
@@ -672,3 +700,549 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: low
+
+  - name: experimental.tasks.callToolStream
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Experimental streaming tool execution API. Calls a tool and returns an AsyncGenerator
+      that yields response messages of type 'taskCreated', 'taskStatus', 'result', or 'error'.
+      The generator is guaranteed to terminate with either a 'result' or 'error' message.
+      Used for long-running tools where the caller needs intermediate progress updates.
+      Access via client.experimental.tasks.callToolStream().
+    postconditions:
+      # Evidence: dist/cjs/experimental/tasks/client.js — callToolStream() implementation
+      # Source: /private/tmp/claude/bc-deepen/@modelcontextprotocol/sdk/node_modules/@modelcontextprotocol/sdk/
+      # Docs: README.md — "Tasks (experimental): long-running tool calls can be turned into tasks"
+      - id: call-tool-stream-error-message-unhandled
+        condition: >
+          async function iterates client.experimental.tasks.callToolStream() without checking
+          for message.type === 'error' messages. The generator yields an error message object
+          (not a thrown exception) when: the tool's outputSchema validation fails, the tool
+          returns no structuredContent when one is required, or the server returns a protocol
+          error. Callers who only handle 'result' silently swallow all error conditions.
+        throws: >
+          Does NOT throw — errors are yielded as { type: 'error', error: McpError } messages.
+          McpError codes seen in source:
+          - ErrorCode.InvalidRequest (-32600): tool has outputSchema but returned no structuredContent
+          - ErrorCode.InvalidParams (-32602): structuredContent does not match tool's outputSchema
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected mid-stream
+          - ErrorCode.RequestTimeout (-32001): stream timed out
+        required_handling: >
+          Caller MUST handle message.type === 'error' in the for-await loop:
+            for await (const message of stream) {
+              if (message.type === 'error') {
+                console.error('Tool stream error:', message.error.message);
+                break;
+              }
+              if (message.type === 'result') {
+                processResult(message.result);
+              }
+            }
+          Not handling 'error' messages means tool failures are silently ignored —
+          the stream ends without returning any result and the caller never knows.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: call-tool-stream-missing-try-catch
+        condition: >
+          The async generator itself (not just the yielded messages) can throw McpError if the
+          underlying protocol transport fails before the stream starts. The outer for-await
+          call must be wrapped in try-catch to handle transport-level failures.
+        throws: >
+          McpError — thrown (not yielded) when:
+          - ErrorCode.ConnectionClosed (-32000): transport closed before stream could start
+          - ErrorCode.RequestTimeout (-32001): initial request timed out
+        required_handling: >
+          Wrap the entire for-await in try-catch AND check for error messages:
+            try {
+              for await (const message of client.experimental.tasks.callToolStream(params)) {
+                if (message.type === 'error') { /* handle */ break; }
+                if (message.type === 'result') { /* use result */ }
+              }
+            } catch (e) {
+              // McpError from transport failure
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: experimental.tasks.cancelTask
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Cancels a running task by its task ID. Sends a tasks/cancel request to the server.
+      Access via client.experimental.tasks.cancelTask(taskId). Throws McpError when the
+      task is not found or is already in a terminal state (completed, failed, cancelled).
+      Used in cleanup paths and user-initiated cancellations of long-running operations.
+    postconditions:
+      # Evidence: dist/cjs/shared/protocol.js — cancelTask handler:
+      #   throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`)
+      #   throw new McpError(ErrorCode.InvalidParams, `Cannot cancel task in terminal status: ${task.status}`)
+      #   throw new McpError(ErrorCode.InvalidRequest, `Failed to cancel task: ${error.message}`)
+      # Source: /private/tmp/claude/bc-deepen/@modelcontextprotocol/sdk/node_modules/@modelcontextprotocol/sdk/
+      - id: cancel-task-missing-try-catch
+        condition: >
+          async function calls client.experimental.tasks.cancelTask(taskId) without try-catch.
+          Throws McpError when the task does not exist or has already completed/failed/cancelled.
+          Cancellation in cleanup paths (finally blocks, error handlers, shutdown hooks) without
+          try-catch causes the cleanup path itself to throw, masking the original error.
+        throws: >
+          McpError — key codes confirmed from source:
+          - ErrorCode.InvalidParams (-32602): "Task not found: <taskId>" — task was cleaned up
+          - ErrorCode.InvalidParams (-32602): "Cannot cancel task in terminal status: completed|failed|cancelled"
+          - ErrorCode.InvalidRequest (-32600): "Failed to cancel task: <message>" — server-side failure
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+          - ErrorCode.RequestTimeout (-32001): server did not respond
+        required_handling: >
+          Caller MUST wrap cancelTask() in try-catch, especially in finally blocks:
+            async function cleanup(taskId: string) {
+              try {
+                await client.experimental.tasks.cancelTask(taskId);
+              } catch (e) {
+                // Expected: task may have already completed or been cleaned up
+                if (e instanceof McpError && e.code === ErrorCode.InvalidParams) {
+                  return; // Task already in terminal state — no action needed
+                }
+                throw e; // Unexpected error — re-throw
+              }
+            }
+          Tasks complete asynchronously — a task that was running when cancelTask() is
+          called may have already finished. This is a normal condition, not an error.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: experimental.tasks.getTask
+    import_path: '@modelcontextprotocol/sdk'
+    description: >
+      Gets the current status of a task by task ID. Returns a GetTaskResult with the task's
+      current status (pending, running, completed, failed, cancelled). Access via
+      client.experimental.tasks.getTask(taskId). Used in polling loops to check progress
+      of long-running operations initiated by callTool() or callToolStream().
+    postconditions:
+      # Evidence: dist/cjs/shared/protocol.js — getTask handler:
+      #   throw new McpError(ErrorCode.InvalidParams, 'Failed to retrieve task: Task not found')
+      # Source: /private/tmp/claude/bc-deepen/@modelcontextprotocol/sdk/node_modules/@modelcontextprotocol/sdk/
+      - id: get-task-missing-try-catch
+        condition: >
+          async function calls client.experimental.tasks.getTask(taskId) without try-catch.
+          Throws McpError when the task is not found — which is a normal terminal condition
+          for tasks that have been cleaned up after completion. Polling loops without try-catch
+          will crash when a task expires from the server's task store.
+        throws: >
+          McpError — key codes confirmed from source:
+          - ErrorCode.InvalidParams (-32602): "Failed to retrieve task: Task not found" —
+            task was cleaned up (normal for expired/old tasks)
+          - ErrorCode.ConnectionClosed (-32000): transport disconnected
+          - ErrorCode.RequestTimeout (-32001): server did not respond in time
+        required_handling: >
+          Caller MUST wrap getTask() in try-catch, especially in polling loops:
+            async function pollTask(taskId: string) {
+              while (true) {
+                try {
+                  const taskStatus = await client.experimental.tasks.getTask(taskId);
+                  if (taskStatus.status === 'completed') return taskStatus;
+                  if (taskStatus.status === 'failed') throw new Error('Task failed');
+                  await sleep(1000); // Poll interval
+                } catch (e) {
+                  if (e instanceof McpError && e.code === ErrorCode.InvalidParams) {
+                    // Task was cleaned up — treat as completion or re-fetch
+                    return null;
+                  }
+                  throw e;
+                }
+              }
+            }
+          Servers may clean up task records after some retention period. A 'Task not found'
+          error does not mean the task never existed — it may have already completed and
+          been garbage-collected from the task store.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: auth
+    import_path: '@modelcontextprotocol/sdk/client/auth'
+    description: >
+      Primary OAuth 2.1 authorization flow function for MCP clients. Orchestrates the
+      full OAuth flow: discovers authorization server metadata (RFC 8414), performs
+      dynamic client registration if needed (RFC 7591), exchanges authorization codes
+      for tokens, and refreshes expired tokens automatically. Returns 'AUTHORIZED' when
+      tokens are acquired or 'REDIRECT' when user browser redirect is required to
+      initiate the flow. Used by app developers building MCP client integrations that
+      connect to OAuth-protected MCP servers.
+    postconditions:
+      # Evidence: dist/cjs/client/auth.js — auth() wraps authInternal() with retry logic
+      # Error types confirmed from source: InvalidClientError, UnauthorizedClientError,
+      # InvalidGrantError, InvalidClientMetadataError, OAuthError hierarchy
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+      - id: auth-throws-oauth-error-on-server-rejection
+        condition: >
+          async function calls auth() without try-catch. The OAuth server may reject the
+          client with OAuthError subtypes: InvalidClientError (invalid credentials),
+          InvalidGrantError (expired/revoked code), UnauthorizedClientError (client not
+          permitted this grant type), ServerError (auth server internal error). auth()
+          automatically retries once on InvalidClientError and InvalidGrantError by
+          invalidating credentials, but rethrows all other OAuthError subtypes immediately.
+        throws: >
+          OAuthError subclasses from '@modelcontextprotocol/sdk/server/auth/errors':
+          - InvalidClientError: client credentials invalid or revoked (auto-retried once)
+          - UnauthorizedClientError: client not authorized for this grant type (retried once)
+          - InvalidGrantError: authorization code expired/reused or refresh token revoked (retried once)
+          - InvalidScopeError: requested scope not permitted by server
+          - AccessDeniedError: user denied the authorization request
+          - InvalidRequestError: malformed OAuth request parameters
+          - ServerError / OAuthError: generic auth server failure
+          Additionally: Error when provider.clientInformation() returns undefined and
+          authorizationCode is also provided simultaneously.
+        required_handling: >
+          Caller MUST wrap auth() in try-catch and handle OAuthError subtypes:
+
+            import { auth } from '@modelcontextprotocol/sdk/client/auth';
+            import { OAuthError, InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors';
+
+            try {
+              const result = await auth(provider, { serverUrl });
+              if (result === 'REDIRECT') {
+                return; // User is being redirected — do not proceed with client
+              }
+              // result === 'AUTHORIZED' — proceed with MCP client
+            } catch (error) {
+              if (error instanceof InvalidGrantError) {
+                // Refresh token revoked — force full re-auth
+                await provider.invalidateCredentials?.('all');
+                redirectToLogin();
+              } else if (error instanceof OAuthError) {
+                showAuthError(error.message);
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: auth-redirect-result-not-checked
+        condition: >
+          async function calls auth() and proceeds to use the MCP client without checking
+          whether the return value is 'REDIRECT'. When auth() returns 'REDIRECT', it has
+          already called provider.redirectToAuthorization() but no tokens are stored yet.
+          Code that ignores the return value and immediately calls client.connect() will
+          fail because no access token is available.
+        throws: >
+          Does NOT throw — returns 'REDIRECT' string. The caller silently proceeds
+          without tokens, causing connect() to fail with HTTP 401 Unauthorized from the
+          server.
+        required_handling: >
+          Callers MUST check the auth() return value before proceeding:
+            const result = await auth(provider, { serverUrl });
+            if (result === 'REDIRECT') {
+              return; // Abort — user being redirected to authorize in browser
+            }
+            // Only reach here when result === 'AUTHORIZED'
+            await client.connect(transport);
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: exchangeAuthorization
+    import_path: '@modelcontextprotocol/sdk/client/auth'
+    description: >
+      Exchanges an OAuth authorization code for access and refresh tokens. Called after
+      the user completes the browser authorization flow and the auth server redirects
+      back with an authorization code. Uses PKCE code verifier to prove the code was
+      issued to this client. Supports multiple client authentication methods selected
+      automatically from server metadata. Returns OAuthTokens with access_token and
+      optional refresh_token.
+    postconditions:
+      # Evidence: dist/cjs/client/auth.js — exchangeAuthorization() -> executeTokenRequest()
+      # throw await parseErrorResponse(response) when !response.ok
+      # parseErrorResponse creates OAuthError subclass from HTTP error response body
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+      - id: exchange-authorization-throws-on-invalid-code
+        condition: >
+          async function calls exchangeAuthorization() without try-catch. The token
+          endpoint returns HTTP 400 with error='invalid_grant' when the authorization
+          code is expired, already used, or the code_verifier does not match the
+          code_challenge. The SDK parses this into InvalidGrantError and throws it.
+          Authorization codes are typically single-use and expire in 60-600 seconds.
+        throws: >
+          OAuthError subclasses parsed from the token endpoint error response:
+          - InvalidGrantError: authorization code expired, already redeemed, or
+            code_verifier mismatch (PKCE failure)
+          - InvalidClientError: client credentials invalid (wrong client_secret)
+          - InvalidRequestError: missing required parameters (code, redirect_uri,
+            code_verifier)
+          - OAuthError (base): any other RFC 6749 error from the token endpoint
+          Additionally: network errors (TypeError) if the token endpoint is unreachable
+        required_handling: >
+          Caller MUST wrap exchangeAuthorization() in try-catch:
+
+            try {
+              const tokens = await exchangeAuthorization(authServerUrl, {
+                metadata, clientInformation, authorizationCode: code,
+                codeVerifier, redirectUri
+              });
+              await provider.saveTokens(tokens);
+            } catch (error) {
+              if (error instanceof InvalidGrantError) {
+                // Code expired or already used — restart auth flow
+                await provider.invalidateCredentials?.('all');
+                return auth(provider, { serverUrl });
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: refreshAuthorization
+    import_path: '@modelcontextprotocol/sdk/client/auth'
+    description: >
+      Exchanges a refresh token for a new access token. Called automatically by auth()
+      when stored tokens have a refresh_token, but can also be called directly to
+      proactively refresh before token expiry. Preserves the original refresh_token
+      if the server does not issue a new one. Returns OAuthTokens with the new
+      access_token.
+    postconditions:
+      # Evidence: dist/cjs/client/auth.js — refreshAuthorization() -> executeTokenRequest()
+      # throw await parseErrorResponse(response) when !response.ok
+      # InvalidGrantError: revoked/expired refresh token — requires full re-auth
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+      - id: refresh-authorization-throws-on-revoked-token
+        condition: >
+          async function calls refreshAuthorization() without try-catch. The token
+          endpoint returns HTTP 400 with error='invalid_grant' when the refresh token
+          is expired, revoked, or bound to a terminated session (password change, account
+          deactivation, admin revocation). Background token refresh jobs that silently
+          swallow this error leave the app in a perpetually unauthenticated state.
+        throws: >
+          OAuthError subclasses:
+          - InvalidGrantError: refresh token expired, revoked, or session terminated
+            (requires full re-authentication — cannot recover by retrying)
+          - InvalidClientError: client credentials rejected by the auth server
+          - InvalidRequestError: malformed token refresh request
+          - OAuthError (base): any other RFC 6749 error from the token endpoint
+          Additionally: network errors (TypeError) if the token endpoint is unreachable
+        required_handling: >
+          Caller MUST wrap refreshAuthorization() in try-catch and handle
+          InvalidGrantError specifically — this is the permanent failure case:
+
+            try {
+              const newTokens = await refreshAuthorization(authServerUrl, {
+                metadata, clientInformation,
+                refreshToken: storedTokens.refresh_token
+              });
+              await provider.saveTokens(newTokens);
+            } catch (error) {
+              if (error instanceof InvalidGrantError) {
+                // Refresh token revoked — must re-authenticate from scratch
+                await provider.invalidateCredentials?.('all');
+                scheduleReauth(); // Trigger full auth() flow on next request
+              } else {
+                logger.error('Token refresh failed:', error.message);
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: registerClient
+    import_path: '@modelcontextprotocol/sdk/client/auth'
+    description: >
+      Dynamically registers an MCP client with an OAuth authorization server using
+      RFC 7591 Dynamic Client Registration. Called automatically by auth() when the
+      provider has no stored client credentials. Returns OAuthClientInformationFull
+      with client_id and optional client_secret. Only supported when the server
+      advertises a registration_endpoint in its Authorization Server Metadata.
+    postconditions:
+      # Evidence: dist/cjs/client/auth.js — registerClient() -> executeTokenRequest()
+      # throw await parseErrorResponse(response) when !response.ok
+      # InvalidClientMetadataError confirmed from server/auth/errors.js source
+      # Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+      - id: register-client-throws-on-invalid-metadata
+        condition: >
+          async function calls registerClient() without try-catch. The registration
+          endpoint rejects client registration when the client_metadata contains invalid
+          redirect_uris (non-HTTPS, non-localhost), unsupported grant_types, or malformed
+          metadata. Registration failure is fatal — the client cannot proceed without
+          a client_id.
+        throws: >
+          OAuthError subclasses:
+          - InvalidClientMetadataError: invalid redirect_uri, unsupported grant_type,
+            or malformed client metadata (HTTP 400)
+          - InvalidRequestError: missing required fields in client metadata
+          - OAuthError (base): registration disallowed by server policy or rate limited
+          Additionally: Error('OAuth client information must be saveable for dynamic
+          registration') when provider.saveClientInformation is not implemented
+        required_handling: >
+          Caller MUST wrap registerClient() in try-catch:
+
+            try {
+              const clientInfo = await registerClient(authServerUrl, {
+                metadata, clientMetadata: provider.clientMetadata
+              });
+              await provider.saveClientInformation(clientInfo);
+            } catch (error) {
+              if (error instanceof InvalidClientMetadataError) {
+                logger.error('Invalid client registration metadata:', error.message);
+              }
+              throw error; // Registration failure is fatal — cannot proceed
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: StreamableHTTPServerTransport.handleRequest
+    import_path: '@modelcontextprotocol/sdk/server/streamableHttp'
+    description: >
+      Handles incoming HTTP requests for an MCP server using the Streamable HTTP
+      transport. Called from an Express or Node.js HTTP server route handler for every
+      MCP request. Routes POST requests to JSON-RPC message processing, GET requests to
+      SSE stream establishment, and DELETE requests to session termination. Must be
+      called for every incoming request to the MCP endpoint.
+    postconditions:
+      # Evidence: dist/cjs/server/webStandardStreamableHttp.js — handleRequest()
+      # throw new Error('Stateless transport cannot be reused across requests...')
+      # createJsonErrorResponse(404, -32001, 'Session not found') for invalid session IDs
+      # Source: @modelcontextprotocol/sdk/node_modules/.../webStandardStreamableHttp.js
+      - id: handle-request-throws-on-stateless-reuse
+        condition: >
+          async function calls transport.handleRequest() on a stateless
+          StreamableHTTPServerTransport (sessionIdGenerator: undefined) after the first
+          request has already completed. Stateless transports are single-use — each HTTP
+          request requires a new transport instance. Reusing the same instance throws.
+        throws: >
+          Error: 'Stateless transport cannot be reused across requests. Create a new
+          transport per request.' — thrown synchronously at the start of handleRequest().
+        required_handling: >
+          For stateless Streamable HTTP (serverless/edge functions), create a new
+          transport instance per request:
+
+            app.post('/mcp', async (req, res) => {
+              const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: undefined  // stateless mode
+              });
+              const server = new McpServer(serverInfo);
+              await server.connect(transport);
+              await transport.handleRequest(req, res, req.body);
+              await server.close();
+            });
+
+          For stateful deployments with long-lived sessions, use a session ID generator
+          and store transports in a session map keyed by Mcp-Session-Id header.
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: handle-request-missing-session-routing
+        condition: >
+          MCP server uses stateful StreamableHTTPServerTransport (with session IDs) but
+          routes all POST requests to a single transport instance instead of routing by
+          Mcp-Session-Id header. The transport returns HTTP 404 with 'Session not found'
+          for any request whose session ID does not match the transport's session. This
+          is the most common mistake when migrating from SSE transport to Streamable HTTP.
+        throws: >
+          Does NOT throw — returns HTTP 404 JSON response silently:
+          { jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' } }
+          All client requests fail with 404 until session routing is implemented.
+        required_handling: >
+          For stateful deployments, maintain a session map and route by Mcp-Session-Id:
+
+            const sessions = new Map();
+
+            app.post('/mcp', async (req, res) => {
+              const sessionId = req.headers['mcp-session-id'];
+              if (sessionId && sessions.has(sessionId)) {
+                await sessions.get(sessionId).handleRequest(req, res, req.body);
+              } else {
+                const transport = new StreamableHTTPServerTransport({
+                  sessionIdGenerator: () => randomUUID()
+                });
+                transport.onclose = () => sessions.delete(transport.sessionId);
+                sessions.set(transport.sessionId, transport);
+                const server = new McpServer(serverInfo);
+                await server.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+              }
+            });
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
