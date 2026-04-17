@@ -1,24 +1,32 @@
 /**
  * @vercel/blob Ground-Truth Fixture
  * Postcondition IDs:
- *   blob-put-no-try-catch                 (put)
- *   blob-del-no-try-catch                 (del)
- *   blob-list-no-try-catch                (list)
- *   blob-head-no-try-catch                (head)
- *   blob-head-access-error                (head)
- *   blob-copy-no-try-catch                (copy)
- *   blob-copy-source-not-found            (copy)
- *   blob-get-null-not-checked             (get)
- *   blob-get-no-try-catch                 (get)
- *   blob-handle-upload-missing-auth-check (handleUpload)
- *   blob-handle-upload-no-try-catch       (handleUpload)
- *   blob-create-multipart-no-try-catch    (createMultipartUpload)
- *   blob-upload-part-no-try-catch         (uploadPart)
- *   blob-upload-part-minimum-size         (uploadPart)
- *   blob-complete-multipart-no-try-catch  (completeMultipartUpload)
+ *   blob-put-no-try-catch                              (put)
+ *   blob-del-no-try-catch                              (del)
+ *   blob-list-no-try-catch                             (list)
+ *   blob-head-no-try-catch                             (head)
+ *   blob-head-access-error                             (head)
+ *   blob-copy-no-try-catch                             (copy)
+ *   blob-copy-source-not-found                         (copy)
+ *   blob-get-null-not-checked                          (get)
+ *   blob-get-no-try-catch                              (get)
+ *   blob-handle-upload-missing-auth-check              (handleUpload)
+ *   blob-handle-upload-no-try-catch                    (handleUpload)
+ *   blob-create-multipart-no-try-catch                 (createMultipartUpload)
+ *   blob-upload-part-no-try-catch                      (uploadPart)
+ *   blob-upload-part-minimum-size                      (uploadPart)
+ *   blob-complete-multipart-no-try-catch               (completeMultipartUpload)
+ *   blob-upload-missing-handle-url                     (upload)
+ *   blob-upload-token-fetch-failed                     (upload)
+ *   blob-upload-client-token-expired                   (upload)
+ *   blob-generate-client-token-browser-env             (generateClientTokenFromReadWriteToken)
+ *   blob-generate-client-token-invalid-token           (generateClientTokenFromReadWriteToken)
+ *   blob-create-multipart-uploader-no-try-catch        (createMultipartUploader)
+ *   blob-create-multipart-uploader-plain-object-body   (createMultipartUploader)
+ *   blob-create-folder-no-try-catch                    (createFolder)
  */
-import { put, del, list, head, copy, get, createMultipartUpload, uploadPart, completeMultipartUpload } from '@vercel/blob';
-import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
+import { put, del, list, head, copy, get, createMultipartUpload, uploadPart, completeMultipartUpload, createMultipartUploader, createFolder } from '@vercel/blob';
+import { handleUpload, upload, generateClientTokenFromReadWriteToken, type HandleUploadBody } from '@vercel/blob/client';
 
 // 1. put() without try-catch (SHOULD_FIRE)
 async function gt_put_missing(path: string, content: Buffer) {
@@ -266,6 +274,132 @@ async function gt_complete_multipart_safe(pathname: string, parts: Array<{etag: 
     return blob.url;
   } catch (err) {
     console.error('completeMultipartUpload failed:', err);
+    throw err;
+  }
+}
+
+// ─── upload() (client-side) ───────────────────────────────────────────────────
+
+// 22. upload() without try-catch — token fetch failure (SHOULD_FIRE when scanner detects client upload)
+// NOTE: No scanner detector yet for upload() from @vercel/blob/client — concern queued
+// @expect-violation: blob-upload-token-fetch-failed
+// @expect-violation: blob-upload-client-token-expired
+async function gt_upload_no_try_catch(pathname: string, file: File) {
+  // SCANNER_GAP: blob-upload-token-fetch-failed — upload() throws BlobError if server
+  // handleUpload route returns non-2xx (e.g., auth redirect returns HTML instead of JSON)
+  // No scanner rule yet — concern queued for bc-scanner-upgrade
+  const blob = await upload(pathname, file, {
+    access: 'public',
+    handleUploadUrl: '/api/upload',
+  });
+  return blob.url;
+}
+
+// 23. upload() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_upload_safe(pathname: string, file: File) {
+  try {
+    // SHOULD_NOT_FIRE: upload() inside try-catch
+    const blob = await upload(pathname, file, {
+      access: 'public',
+      handleUploadUrl: '/api/upload',
+    });
+    return blob.url;
+  } catch (err) {
+    console.error('Client upload failed:', err);
+    throw err;
+  }
+}
+
+// ─── generateClientTokenFromReadWriteToken() ─────────────────────────────────
+
+// 24. generateClientTokenFromReadWriteToken() without try-catch (SHOULD_FIRE when scanner detects)
+// NOTE: No scanner detector yet for generateClientTokenFromReadWriteToken() — concern queued
+// @expect-violation: blob-generate-client-token-invalid-token
+async function gt_generate_client_token_no_try_catch(pathname: string) {
+  // SCANNER_GAP: blob-generate-client-token-invalid-token — throws BlobError if
+  // BLOB_READ_WRITE_TOKEN is missing or malformed (storeId extraction fails)
+  // No scanner rule yet — concern queued for bc-scanner-upgrade
+  const clientToken = await generateClientTokenFromReadWriteToken({
+    pathname,
+    onUploadCompleted: {
+      callbackUrl: '/api/upload/complete',
+    },
+  });
+  return clientToken;
+}
+
+// 25. generateClientTokenFromReadWriteToken() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_generate_client_token_safe(pathname: string) {
+  try {
+    // SHOULD_NOT_FIRE: generateClientTokenFromReadWriteToken() inside try-catch
+    const clientToken = await generateClientTokenFromReadWriteToken({
+      pathname,
+      onUploadCompleted: {
+        callbackUrl: '/api/upload/complete',
+      },
+    });
+    return clientToken;
+  } catch (err) {
+    console.error('Token generation failed:', err);
+    throw err;
+  }
+}
+
+// ─── createMultipartUploader() ───────────────────────────────────────────────
+
+// 26. createMultipartUploader() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-create-multipart-uploader-no-try-catch
+async function gt_create_multipart_uploader_missing(pathname: string, chunks: Buffer[]) {
+  // SHOULD_FIRE: blob-create-multipart-uploader-no-try-catch — factory throws on auth/network error
+  const uploader = await createMultipartUploader(pathname, { access: 'public' });
+  const parts = await Promise.all(chunks.map((chunk, i) => uploader.uploadPart(i + 1, chunk)));
+  return await uploader.complete(parts);
+}
+
+// 27. createMultipartUploader() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_create_multipart_uploader_safe(pathname: string, chunks: Buffer[]) {
+  try {
+    // SHOULD_NOT_FIRE: createMultipartUploader() with try-catch
+    const uploader = await createMultipartUploader(pathname, { access: 'public' });
+    const parts = [];
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        const part = await uploader.uploadPart(i + 1, chunks[i]);
+        parts.push(part);
+      } catch (partErr) {
+        console.error(`Part ${i + 1} upload failed:`, partErr);
+        throw partErr;
+      }
+    }
+    return await uploader.complete(parts);
+  } catch (err) {
+    console.error('Multipart upload failed:', err);
+    throw err;
+  }
+}
+
+// ─── createFolder() ──────────────────────────────────────────────────────────
+
+// 28. createFolder() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-create-folder-no-try-catch
+async function gt_create_folder_missing(folderPath: string) {
+  // SHOULD_FIRE: blob-create-folder-no-try-catch — throws on auth failure or network error
+  const folder = await createFolder(folderPath);
+  return folder.url;
+}
+
+// 29. createFolder() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_create_folder_safe(folderPath: string) {
+  try {
+    // SHOULD_NOT_FIRE: createFolder() inside try-catch
+    const folder = await createFolder(folderPath);
+    return folder.url;
+  } catch (err) {
+    console.error('createFolder failed:', err);
     throw err;
   }
 }

@@ -1,11 +1,22 @@
 package: '@vercel/blob'
 semver: '>=0.19.0'
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-13'
+last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
-coverage_score: 0.79
+# Depth pass 2026-04-16 (deepen-stream-2 pass 10):
+# API surface: 16 distinct async-callable functions (server + client exports)
+# Contracted before: 10 (put, del, list, head, get, copy, handleUpload, createMultipartUpload,
+#                         uploadPart, completeMultipartUpload)
+# Contracted after: 14 (+4 this pass: upload, generateClientTokenFromReadWriteToken,
+#                         createMultipartUploader, createFolder)
+# Omitted: 6 (client multipart functions with same profiles as server versions, getDownloadUrl sync,
+#              getPayloadFromClientToken sync, client.put with same profile as upload)
+# Coverage: 14/16 = 0.88 (before: 10/16 = 0.63 uncorrected)
+# Evidence: @vercel/blob source — dist/client.cjs + dist/chunk-WCA6LLLU.cjs
+#   https://vercel.com/docs/vercel-blob/using-blob-sdk
+coverage_score: 0.88
 functions:
   - name: put
     import_path: '@vercel/blob'
@@ -372,6 +383,298 @@ functions:
           parts), or BlobServiceNotAvailable.
         sources:
           - https://vercel.com/docs/storage/vercel-blob/using-blob-sdk
+  - name: upload
+    import_path: '@vercel/blob/client'
+    description: >
+      Client-side upload function for browser environments. Unlike server-side put(), upload() fetches
+      a client token from the server's handleUpload route before uploading. This is the primary browser
+      upload API for Vercel Blob. Requires handleUploadUrl pointing to a server route that implements
+      handleUpload(). Throws BlobError if handleUploadUrl is missing, if the token fetch fails, or if
+      the blob storage API rejects the upload.
+
+    postconditions:
+      # Evidence: dist/client.cjs lines 56-90 — upload() wraps createPutMethod with getToken()
+      # that calls retrieveClientToken() which fetches from handleUploadUrl.
+      # Error confirmed: BlobError("Failed to retrieve the client token") if server returns non-2xx.
+      # Source: https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads
+      - id: blob-upload-missing-handle-url
+        condition: >
+          handleUploadUrl option is not provided to upload(). This is a required parameter —
+          upload() cannot work without a server route to fetch a client token from.
+        throws: "BlobError: client/`upload` requires the 'handleUploadUrl' parameter"
+        required_handling: >
+          Caller MUST always provide handleUploadUrl. This error throws synchronously during
+          options validation before any network request is made — it is a programming error,
+          not a runtime failure. Add a validation check at component initialization time.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/client.cjs retrieveClientToken() — if server returns non-2xx, throws
+      # BlobError("Failed to retrieve the client token"). Also throws if JSON parse fails.
+      - id: blob-upload-token-fetch-failed
+        condition: >
+          The handleUploadUrl server route returns a non-2xx response (auth failure, server error,
+          route not found), or the response body is not valid JSON containing clientToken.
+          Common causes: missing authentication middleware on the handleUpload route, route
+          misconfiguration, or server returning HTML error page instead of JSON.
+        throws: "BlobError: Failed to retrieve the client token"
+        required_handling: >
+          Caller MUST wrap upload() in try-catch. The token fetch is the first network request
+          in the upload flow — if it fails, the upload never starts. Common mistake: the
+          handleUpload route is protected by auth middleware that redirects unauthenticated
+          requests to /login (HTML, not JSON), causing this error. Ensure the route returns
+          JSON even on auth failure.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/client.cjs extraChecks validates disallowed options
+      # Source: BlobError("client/`upload` doesn't allow `addRandomSuffix`, `cacheControlMaxAge`,
+      #   `allowOverwrite` or `ifMatch`. Configure these options at the server side...")
+      - id: blob-upload-server-only-options-used
+        condition: >
+          Caller passes addRandomSuffix, cacheControlMaxAge, allowOverwrite, or ifMatch to upload().
+          These options are only valid for server-side put(). They must be configured in
+          onBeforeGenerateToken on the server side, not in the client-side upload() call.
+        throws: "BlobError: client/`upload` doesn't allow `addRandomSuffix`, `cacheControlMaxAge`, `allowOverwrite` or `ifMatch`. Configure these options at the server side when generating client tokens."
+        required_handling: >
+          Move storage configuration options to the server-side onBeforeGenerateToken callback
+          in your handleUpload route. Do not pass them to upload() on the client.
+          The client token embeds these settings from the server at token-generation time.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: dist/chunk-WCA6LLLU.cjs requestApi() — all storage API errors propagate
+      # BlobClientTokenExpiredError thrown when token TTL exceeded (default 1 hour).
+      - id: blob-upload-client-token-expired
+        condition: >
+          The client token has expired (default TTL: 1 hour from generateClientTokenFromReadWriteToken
+          call). This happens when: the user keeps the file picker open for more than an hour before
+          clicking upload, or when tokens are pre-generated and cached longer than their TTL.
+        throws: "BlobClientTokenExpiredError: Client token has expired."
+        required_handling: >
+          Caller MUST catch BlobClientTokenExpiredError separately from other errors and prompt
+          the user to retry (which will generate a fresh token). Do not treat expired token as
+          a permanent failure. The BlobClientTokenExpiredError class is exported from
+          '@vercel/blob/client' for instanceof checks.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/api.ts'
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: generateClientTokenFromReadWriteToken
+    import_path: '@vercel/blob/client'
+    description: >
+      Server-side function that generates a client token from a read-write token. The client token
+      is a short-lived credential (default TTL: 1 hour) that grants the browser permission to upload
+      to a specific pathname with specific constraints. Must be called from a server environment —
+      throws if called from the browser. Used internally by handleUpload(), but also exported for
+      manual client token generation workflows.
+
+    postconditions:
+      # Evidence: dist/client.cjs generateClientTokenFromReadWriteToken() lines 257-295
+      # Confirmed: typeof window !== 'undefined' check throws BlobError("must be called from a server environment")
+      - id: blob-generate-client-token-browser-env
+        condition: >
+          generateClientTokenFromReadWriteToken() is called from a browser environment
+          (where typeof window !== 'undefined'). This function requires server-side crypto
+          to sign the token payload and must never be called client-side as it would
+          expose the BLOB_READ_WRITE_TOKEN to users.
+        throws: 'BlobError: "generateClientTokenFromReadWriteToken" must be called from a server environment'
+        required_handling: >
+          Never call generateClientTokenFromReadWriteToken() in client-side code (React components,
+          browser scripts, client-side Next.js pages). It must only be called in server-side code:
+          API routes, Server Actions, getServerSideProps, or route handlers in Next.js App Router.
+          The read-write token must never be exposed to the browser.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      # Evidence: dist/client.cjs lines 268-281
+      # Confirmed: token.split("_")[3] must exist, else throws BlobError("Invalid `token`...")
+      - id: blob-generate-client-token-invalid-token
+        condition: >
+          The BLOB_READ_WRITE_TOKEN is missing, malformed (doesn't contain the expected storeId
+          segment after the 4th underscore), or the token option is passed but invalid.
+          The token format is: vercel_blob_rw_<storeId>_<secret>.
+        throws: 'BlobError: Invalid `token` parameter (if token option given) or Invalid `BLOB_READ_WRITE_TOKEN`'
+        required_handling: >
+          Caller MUST wrap generateClientTokenFromReadWriteToken() in try-catch.
+          This commonly fails in development when BLOB_READ_WRITE_TOKEN is not pulled via
+          `vercel env pull`. Validate the environment variable is set at application startup.
+          When this throws inside handleUpload(), the entire upload route fails with 500.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/client.cjs lines 263-267 — ifMatch + allowOverwrite: false conflict
+      # Source confirmed: throws BlobError("ifMatch and allowOverwrite: false are contradictory")
+      - id: blob-generate-client-token-conflicting-options
+        condition: >
+          Both ifMatch and allowOverwrite: false are specified in the token options. These options
+          are contradictory: ifMatch implies a conditional overwrite (allowOverwrite must be true),
+          but allowOverwrite: false forbids overwrites entirely.
+        throws: "BlobError: ifMatch and allowOverwrite: false are contradictory. ifMatch is used for conditional overwrites, which requires allowOverwrite to be true."
+        required_handling: >
+          When using ifMatch for optimistic concurrency control, either omit allowOverwrite
+          (the SDK will auto-set it to true) or explicitly pass allowOverwrite: true.
+          Do not combine ifMatch with allowOverwrite: false.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createMultipartUploader
+    import_path: '@vercel/blob'
+    description: >
+      Convenience wrapper around the three-phase multipart upload API. Returns an uploader object
+      with uploadPart() and complete() methods that share the same upload session (key + uploadId)
+      automatically. Simpler than manually calling createMultipartUpload/uploadPart/completeMultipartUpload
+      because session state is managed internally. Same error surface as createMultipartUpload() for
+      the initial call, plus uploadPart() and complete() errors on method calls.
+
+    postconditions:
+      # Evidence: dist/chunk-WCA6LLLU.cjs createCreateMultipartUploaderMethod() — calls createMultipartUpload
+      # then returns uploader object. Same error surface as createMultipartUpload for the factory call.
+      - id: blob-create-multipart-uploader-no-try-catch
+        condition: >
+          createMultipartUploader() throws BlobAccessError (auth failure), BlobServiceRateLimited
+          (rate limit), BlobServiceNotAvailable (network failure / fetch failed), or BlobUnknownError.
+          The initial call creates the upload session — if it fails, no session is created and no
+          cleanup is needed.
+        throws: BlobAccessError, BlobServiceRateLimited, BlobServiceNotAvailable, or BlobUnknownError.
+        required_handling: >
+          Caller MUST wrap the createMultipartUploader() call in try-catch.
+          The returned uploader object's uploadPart() and complete() methods also throw and must
+          each be individually caught. A failed uploadPart() does not automatically abort the session —
+          the session remains open until complete() is called or it expires server-side.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/multipart/create-uploader.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/chunk-WCA6LLLU.cjs uploader.uploadPart() — isPlainObject check
+      # Source: BlobError("Body must be a string, buffer or stream. You sent a plain JavaScript object...")
+      - id: blob-create-multipart-uploader-plain-object-body
+        condition: >
+          uploader.uploadPart() is called with a plain JavaScript object as the body
+          (e.g., { content: 'data' }). The body must be a string, Buffer, ReadableStream,
+          File, or Blob. This is a runtime validation error that throws synchronously.
+        throws: "BlobError: Body must be a string, buffer or stream. You sent a plain JavaScript object, double check what you're trying to upload."
+        required_handling: >
+          Ensure the body passed to uploader.uploadPart() is a proper binary or text type.
+          Common mistake: passing a JS object that represents file metadata instead of the
+          actual file content. Convert to Buffer, Blob, or ReadableStream before uploading.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/multipart/create-uploader.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createFolder
+    import_path: '@vercel/blob'
+    description: >
+      Creates a virtual folder in the Vercel Blob store by creating a zero-byte blob with a trailing
+      slash pathname. Vercel Blob has no real concept of folders — the file browser on Vercel.com
+      displays folders based on trailing slashes in pathnames. The resulting url can be used with del()
+      to delete the folder marker. Throws same error types as put().
+
+    postconditions:
+      # Evidence: dist/chunk-WCA6LLLU.cjs createFolder() — calls requestApi() via PUT
+      # Same error surface as put() — BlobAccessError, BlobStoreSuspendedError, BlobUnknownError, etc.
+      - id: blob-create-folder-no-try-catch
+        condition: >
+          createFolder() throws BlobAccessError (auth failure / missing token),
+          BlobStoreSuspendedError (store has been suspended), BlobStoreNotFoundError
+          (store in token references deleted store), BlobServiceRateLimited,
+          BlobServiceNotAvailable (network failure), or BlobUnknownError.
+        throws: BlobAccessError, BlobStoreSuspendedError, BlobStoreNotFoundError, BlobServiceRateLimited, BlobServiceNotAvailable, or BlobUnknownError.
+        required_handling: >
+          Caller MUST wrap createFolder() in try-catch. Although folder creation is typically
+          a one-time setup operation, failures in file browser features must be handled to
+          surface errors to users rather than silently creating an incomplete folder hierarchy.
+          The returned url should be stored if the folder needs to be deleted later.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/create-folder.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - All functions require BLOB_READ_WRITE_TOKEN env var (set automatically on Vercel, must be set manually in dev)
   - 'BlobAccessError: missing/invalid token. BlobUnknownError: network/API failures.'
@@ -384,6 +687,13 @@ notes:
   - 'Multipart upload: createMultipartUpload → uploadPart (5MB min per part) → completeMultipartUpload'
   - BlobServiceRateLimited includes retryAfter property (seconds) from Retry-After header
   - copy() does NOT preserve contentType or cacheControlMaxAge from source blob
+  - upload() is the client-side upload API (browser) — requires handleUploadUrl to fetch a client token
+  - generateClientTokenFromReadWriteToken() MUST be called server-side only — never in browser code
+  - createMultipartUploader() is a convenience wrapper — manages key+uploadId state internally
+  - createFolder() creates a virtual folder (trailing-slash blob) — Vercel Blob has no real folders
+  - 'BlobClientTokenExpiredError: token TTL expired (default 1 hour). Retry the upload to get a fresh token.'
+  - 'BlobPathnameMismatchError: client token pathname does not match upload() pathname'
+  - 'BlobStoreSuspendedError: store suspended by Vercel — contact support'
 tags:
   - vercel
   - blob
