@@ -5,11 +5,20 @@
 # git exits 0). Without try-catch, unhandled errors crash the async call chain.
 package: "simple-git"
 semver: ">=3.32.3"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.48  # 10 contracted / 21 total async-callable (11 intentionally omitted)
+# Depth pass 2026-04-16 (deepen-stream-2 pass 10):
+# API surface: ~50 distinct methods on SimpleGit interface; 21 meaningfully async-callable
+#   (read-only list/query methods like log, branch, status, diff, tags, getRemotes counted but omitted)
+# Contracted before: 4 (push, pull, clone, merge)
+# Contracted after: 10 (+6 this pass: fetch, commit, checkout, rebase, raw, clean)
+# Omitted: 11 (see functions_intentionally_omitted in deepen-index.json)
+# Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+#   node_modules source: /dist/cjs/index.js — GitResponseError, TaskConfigurationError confirmed
 
 detection:
   factory_methods:
@@ -175,10 +184,352 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: fetch
+    import_path: "simple-git"
+    description: >
+      Fetches from a remote repository, updating the local object database with
+      remote refs. Used as: git.fetch(remote?, branch?, options?) or git.fetch().
+      Makes a network connection to the remote — all network and authentication
+      failure modes apply. Commonly used in sync workers, CI pipelines, and
+      auto-update workflows.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — fetch uses straightThroughStringTask / makeFetchHandler
+      # Network operation confirmed — fetch makes outbound TCP/SSH connection
+      - id: simple-git-fetch-missing-try-catch
+        condition: >
+          async function calls git.fetch() or git.fetch(remote, branch) without
+          wrapping in try-catch. Throws GitError on network failure, SSH/HTTPS
+          authentication failure, remote not found, or git binary not installed.
+          Common in background sync workers that run fetch periodically.
+        throws: >
+          GitError — on any failure: network error (ECONNREFUSED, ETIMEDOUT),
+          SSH auth failure ("Permission denied (publickey)"), HTTPS auth failure
+          ("remote: Repository not found", "could not read Username for ..."),
+          remote reference not found ("couldn't find remote ref <branch>"),
+          or git not installed ("ENOENT: no such file or directory, git").
+        required_handling: >
+          Caller MUST wrap git.fetch() in try-catch.
+
+          Minimum handling:
+            try {
+              await git.fetch('origin', 'main');
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Fetch failed:', err.message);
+              }
+              throw err;
+            }
+
+          For background sync workers, consider retry with exponential backoff on
+          network errors, but treat auth errors as non-retryable alerts.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-fetch"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: commit
+    import_path: "simple-git"
+    description: >
+      Commits staged changes with a message. Used as:
+      git.commit(message, files?, options?).
+      Can fail when: the working tree is clean (nothing to commit), user identity
+      is not configured (user.name / user.email not set), pre-commit hooks fail,
+      or the commit message is empty (git rejects it).
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — commit uses straightThroughStringTask, GitError on non-zero exit
+      - id: simple-git-commit-missing-try-catch
+        condition: >
+          async function calls git.commit() without wrapping in try-catch.
+          Common failure in CI/CD automation scripts and git-sync workers:
+          if there are no staged changes, git exits non-zero and GitError is thrown.
+          Also fails when git identity (user.name, user.email) is not configured
+          in the environment — common in Docker containers and CI runners.
+        throws: >
+          GitError — on any failure:
+          "nothing to commit" (exit code 1 when nothing staged),
+          "Please tell me who you are" (user.name / user.email not configured),
+          "Aborting commit due to empty commit message" (empty message string),
+          pre-commit hook failure (non-zero exit from .git/hooks/pre-commit).
+        required_handling: >
+          Caller MUST wrap git.commit() in try-catch.
+
+          Pattern for idempotent commit workflows:
+            try {
+              const result = await git.commit('chore: automated update');
+              if (result.commit) {
+                console.log('Committed:', result.commit);
+              }
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('nothing to commit')) {
+                console.log('Nothing to commit, skipping');
+                return; // not a fatal error
+              }
+              throw err; // rethrow unexpected errors
+            }
+
+          Also configure git identity before committing in CI:
+            await git.addConfig('user.name', 'Bot');
+            await git.addConfig('user.email', 'bot@example.com');
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-commit"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: checkout
+    import_path: "simple-git"
+    description: >
+      Checks out a branch, tag, or revision. Used as:
+      git.checkout(what, options?), git.checkoutBranch(name, startPoint),
+      git.checkoutLocalBranch(name). Fails on: dirty working tree (local
+      modifications would be overwritten), branch not found, ref not found.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — checkout task at line 2051-2082, uses GitError on non-zero
+      - id: simple-git-checkout-missing-try-catch
+        condition: >
+          async function calls git.checkout(), git.checkoutBranch(), or
+          git.checkoutLocalBranch() without wrapping in try-catch.
+          Fails when working tree has uncommitted changes that would be overwritten,
+          when the ref/branch does not exist, or when there are file permission
+          issues in the working directory.
+        throws: >
+          GitError — on any failure:
+          "Your local changes to the following files would be overwritten by checkout" (dirty tree),
+          "error: pathspec '...' did not match any file(s) known to git" (ref not found),
+          "A branch named '...' already exists" (checkoutLocalBranch / checkoutBranch on existing),
+          "fatal: reference is not a tree" (invalid commit hash).
+        required_handling: >
+          Caller MUST wrap git.checkout() in try-catch.
+
+          Minimum handling:
+            try {
+              await git.checkout(targetBranch);
+            } catch (err) {
+              if (err instanceof GitError) {
+                if (err.message.includes('would be overwritten')) {
+                  // Stash first or abort
+                  console.error('Dirty working tree, cannot checkout:', err.message);
+                }
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-checkout"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: rebase
+    import_path: "simple-git"
+    description: >
+      Rebases the current branch. Used as: git.rebase(options?).
+      DANGEROUS: On conflict or failure, git leaves the repo in "rebasing" state
+      with a detached HEAD. Without error handling, subsequent git operations fail
+      with "You are in the middle of a rebase" until the rebase is aborted or
+      continued. Unlike merge conflicts, rebase conflicts do NOT throw
+      GitResponseError — they throw GitError with git exit code 1.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js line 4455 — rebase uses straightThroughStringTask2,
+      #   non-zero exit → GitError (NOT GitResponseError like merge)
+      - id: simple-git-rebase-missing-try-catch
+        condition: >
+          async function calls git.rebase() without wrapping in try-catch.
+          Rebase conflicts leave the repo in a partially-rebased state (detached HEAD,
+          .git/rebase-merge/ directory exists). All subsequent git operations on the
+          same instance fail with "fatal: It seems that there is already a rebase-merge
+          directory, and I wonder if you are in the middle of another rebase."
+          This is the most dangerous uncaught error pattern — it corrupts the working
+          repo state for all future operations.
+        throws: >
+          GitError — on rebase conflict (exit code 1), upstream diverged, or any
+          git failure. Unlike git.merge(), rebase does NOT throw GitResponseError<T>
+          with a structured conflicts array — the conflict details are only in
+          err.message (git stderr output). Common messages:
+          "CONFLICT (content): Merge conflict in <file>",
+          "error: could not apply <sha>... <message>",
+          "Cannot rebase: You have unstaged changes" (dirty tree).
+        required_handling: >
+          Caller MUST wrap git.rebase() in try-catch AND abort on failure to restore
+          the repo to a usable state:
+
+            try {
+              await git.rebase(['origin/main']);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Rebase failed, aborting:', err.message);
+                // CRITICAL: abort to restore the repo to pre-rebase state
+                try {
+                  await git.rebase(['--abort']);
+                } catch (abortErr) {
+                  console.error('Rebase abort also failed:', abortErr.message);
+                }
+              }
+              throw err;
+            }
+
+          Always run rebase on a clean working tree (check git.status() first).
+          Never use git.rebase() in automated workflows without abort handling.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-rebase"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: raw
+    import_path: "simple-git"
+    description: >
+      Executes any arbitrary git command. Used as:
+      git.raw(commands, options?) or git.raw('command', 'arg1', ...).
+      The raw command runs any git subcommand — errors from the git binary
+      are propagated as GitError when git exits with non-zero and printed
+      to stderr. Used for advanced operations not covered by the structured API
+      (bisect, cherry-pick, worktree, sparse-checkout, etc.).
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — raw() uses straightThroughStringTask;
+      #   "When the git process returns a non-zero signal on exit and it printed something
+      #   to stderr, the command will be treated as an error"
+      - id: simple-git-raw-missing-try-catch
+        condition: >
+          async function calls git.raw() without wrapping in try-catch.
+          Because raw() runs arbitrary git commands, any git failure propagates.
+          Commonly used for cherry-pick (can fail on conflicts), worktree operations
+          (can fail on path conflicts), bisect, sparse-checkout, and other advanced
+          operations — all of which can fail and need explicit handling.
+        throws: >
+          GitError — when git exits non-zero and printed to stderr. The .message
+          property contains git's stderr output verbatim. Unlike structured methods,
+          raw() never throws GitResponseError — always GitError.
+          Examples: "CONFLICT" from cherry-pick, "fatal: not a git repository",
+          "error: unknown switch `z'" from invalid flags.
+        required_handling: >
+          Caller MUST wrap git.raw() in try-catch.
+
+          Minimum handling:
+            try {
+              const result = await git.raw(['cherry-pick', commitHash]);
+              console.log('Cherry-pick succeeded:', result);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Git command failed:', err.message);
+                // For cherry-pick, may need: await git.raw(['cherry-pick', '--abort'])
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: clean
+    import_path: "simple-git"
+    description: >
+      Removes untracked files from the working tree. Used as:
+      git.clean(CleanOptions.FORCE) or git.clean(CleanOptions.FORCE + CleanOptions.RECURSIVE).
+      DESTRUCTIVE: deleted files cannot be recovered without external backup.
+      SPECIAL: clean() throws TaskConfigurationError (a subclass of GitError) when
+      called without the required FORCE or DRY_RUN mode — this is a pre-execution
+      validation, not a git process failure.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — cleanWithOptionsTask throws TaskConfigurationError
+      #   CONFIG_ERROR_MODE_REQUIRED: 'Git clean mode parameter ("n" or "f") is required'
+      #   CONFIG_ERROR_INTERACTIVE_MODE: "Git clean interactive mode is not supported"
+      #   CONFIG_ERROR_UNKNOWN_OPTION: "Git clean unknown option found in: "
+      - id: simple-git-clean-missing-try-catch
+        condition: >
+          async function calls git.clean() without wrapping in try-catch.
+          Most common failure: calling git.clean() without the required FORCE or
+          DRY_RUN mode — throws TaskConfigurationError synchronously (before git runs).
+          Also fails when git exits non-zero (permission errors, path issues).
+        throws: >
+          TaskConfigurationError (extends GitError) — thrown immediately (before git runs)
+          when the mode is missing or invalid:
+          'Git clean mode parameter ("n" or "f") is required',
+          'Git clean interactive mode is not supported',
+          'Git clean unknown option found in: ...'
+
+          GitError — thrown when the underlying git process fails (permission denied,
+          path does not exist, etc.).
+        required_handling: >
+          Caller MUST wrap git.clean() in try-catch AND always specify mode:
+
+            import { simpleGit, CleanOptions } from 'simple-git';
+
+            try {
+              // DRY_RUN first to preview what would be deleted
+              const preview = await git.clean(CleanOptions.DRY_RUN + CleanOptions.RECURSIVE);
+              console.log('Would delete:', preview);
+
+              // Then FORCE to actually delete
+              await git.clean(CleanOptions.FORCE + CleanOptions.RECURSIVE);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Git clean failed:', err.message);
+              }
+              throw err;
+            }
+
+          WARNING: git.clean() permanently deletes untracked files. Always preview
+          with CleanOptions.DRY_RUN before running with CleanOptions.FORCE in
+          production automation.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-clean"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "All SimpleGit async methods can throw GitError (base) or GitResponseError<T> (with parsed git output)"
   - "GitResponseError extends GitError and adds .git property with parsed content"
-  - "merge() is special: throws even when git exits 0 if conflicts are detected"
+  - "TaskConfigurationError extends GitError — thrown before git runs, for bad API usage (e.g. clean without mode)"
+  - "merge() is special: throws GitResponseError<MergeSummary> even when git exits 0 if conflicts detected"
+  - "rebase() is NOT special like merge() — uses straightThroughStringTask, always throws GitError on conflict"
+  - "raw() always throws GitError (never GitResponseError) — no structured parser output"
   - "CVE-2026-28292 (CVSS 9.8): RCE via case-sensitivity bypass in protocol.allow — affected 3.15.0-3.32.2, fixed in 3.32.3"
   - "simpleGit() factory function is synchronous — errors occur on first async call, not at construction"
   - "Real-world evidence: activepieces/git-sync-handler.ts calls git.push() without try-catch"
+  - "clean() requires FORCE or DRY_RUN mode — omitting throws TaskConfigurationError (synchronous, before git runs)"
+  - "rebase conflicts leave repo in rebasing state — always call git.rebase(['--abort']) in catch block"
