@@ -18,6 +18,8 @@
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+// Note: GoogleAIFileManager and GoogleAICacheManager are in @google/generative-ai/server
+// but re-exported from the main package in some versions. Using type-only imports for fixtures.
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
@@ -281,3 +283,75 @@ export function sendMessageCatchChain(message: string) {
     throw err;
   });
 }
+
+// ─── 22. batchEmbedContents — bare call, no try-catch ────────────────────────
+// @expect-violation: batch-network-error
+
+export async function batchEmbedNoCatch(texts: string[]) {
+  const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+  // SHOULD_FIRE: batch-network-error — batchEmbedContents makes HTTP call, no try-catch
+  // Entire batch fails atomically on rate-limit (429) or auth error (403)
+  const result = await embeddingModel.batchEmbedContents({
+    requests: texts.map(text => ({
+      content: { role: 'user', parts: [{ text }] },
+    })),
+  });
+  return result.embeddings.map(e => e.values);
+}
+
+// ─── 23. batchEmbedContents — try-catch present ───────────────────────────────
+// @expect-clean
+
+export async function batchEmbedWithCatch(texts: string[]) {
+  const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+  try {
+    // SHOULD_NOT_FIRE: batchEmbedContents inside try-catch — batch-network-error satisfied
+    const result = await embeddingModel.batchEmbedContents({
+      requests: texts.map(text => ({
+        content: { role: 'user', parts: [{ text }] },
+      })),
+    });
+    return result.embeddings.map(e => e.values);
+  } catch (err) {
+    // Rate limit or auth error — log and rethrow
+    throw err;
+  }
+}
+
+// ─── 24. batchEmbedContents — class method, no try-catch ─────────────────────
+// @expect-violation: batch-network-error
+
+class EmbeddingService {
+  private model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
+
+  constructor() {
+    this.model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+  }
+
+  async embedDocuments(texts: string[]) {
+    // SHOULD_FIRE: batch-network-error — class method, no try-catch
+    // This is the most common pattern in RAG pipelines — bulk indexing without error handling
+    const result = await this.model.batchEmbedContents({
+      requests: texts.map(text => ({
+        content: { role: 'user', parts: [{ text }] },
+      })),
+    });
+    return result.embeddings;
+  }
+
+  async embedDocumentsSafe(texts: string[]) {
+    try {
+      // SHOULD_NOT_FIRE: class method with try-catch
+      const result = await this.model.batchEmbedContents({
+        requests: texts.map(text => ({
+          content: { role: 'user', parts: [{ text }] },
+        })),
+      });
+      return result.embeddings;
+    } catch (err) {
+      throw err;
+    }
+  }
+}
+
+export const embeddingService = new EmbeddingService();

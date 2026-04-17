@@ -1,10 +1,28 @@
 package: "@google/generative-ai"
 semver: ">=0.11.0 <1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83
+# Depth pass 2026-04-16 (deepen-stream-1 pass 11):
+# API surface: 12 distinct async-callable operations across GenerativeModel, ChatSession,
+#              GoogleAIFileManager, GoogleAICacheManager
+# Contracted before: 6 (generateContent, generateContentStream, sendMessage, sendMessageStream,
+#                        embedContent, countTokens)
+# Contracted after: 10 (+4 this pass: batchEmbedContents, GoogleAIFileManager.uploadFile,
+#                         GoogleAICacheManager.create, GoogleAICacheManager.update)
+# Omitted: 8 (getHistory read-only, listFiles read-only, getFile read-only, deleteFile cleanup,
+#              GoogleAICacheManager.list read-only, GoogleAICacheManager.get read-only,
+#              GoogleAICacheManager.delete cleanup, startChat sync factory)
+# Coverage: 10/12 = 0.83 (contracted/total-omitted = 10/12)
+# Evidence: TypeScript declarations at node_modules/@google/generative-ai/dist/generative-ai.d.ts
+#   + dist/src/server/file-manager.d.ts + dist/src/server/cache-manager.d.ts
+#   + compiled JS at dist/index.js + dist/server/index.js (error hierarchy confirmed)
+#   + Official docs: https://ai.google.dev/gemini-api/docs/troubleshooting (HTTP status codes)
+#   + File API limits: https://ai.google.dev/gemini-api/docs/file-prompting-strategies
+#   + Context Caching: https://ai.google.dev/gemini-api/docs/caching
 
 # NOTE: This package reached EOL November 30, 2025 (replaced by @google/genai).
 # Still in widespread production use at version 0.11.x–0.24.x.
@@ -245,3 +263,295 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: batchEmbedContents
+    import_path: "@google/generative-ai"
+    description: >
+      Generates embedding vectors for an array of content inputs in a single API call.
+      Called on a GenerativeModel instance. More efficient than calling embedContent()
+      in a loop, but the entire batch fails if any request exceeds quotas or is invalid.
+      Used in RAG pipelines, document indexing, and semantic search ingestion workflows.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/index.js:1318 (batchEmbedContents)
+      # Error hierarchy confirmed: GoogleGenerativeAIFetchError thrown for all HTTP errors
+      # Docs: https://ai.google.dev/gemini-api/docs/troubleshooting (HTTP status codes)
+      # Docs: https://ai.google.dev/gemini-api/docs/embeddings (token limits per model)
+      - id: batch-network-error
+        condition: >
+          Any HTTP error during the batch embedding request: invalid API key (403),
+          rate limit exceeded (429), server error (500/503), network timeout, or
+          invalid request parameters (400).
+        throws: >
+          GoogleGenerativeAIFetchError with .status (HTTP code) and .statusText.
+          Key statuses: 400 (INVALID_ARGUMENT — malformed request or input exceeds
+          token limit; 2048 tokens for text-embedding-001, 8192 for embedding-001),
+          403 (PERMISSION_DENIED — invalid API key), 429 (RESOURCE_EXHAUSTED — rate limit
+          or tokens-per-minute quota exceeded), 500 (INTERNAL — unexpected server error),
+          503 (UNAVAILABLE — service overloaded).
+        required_handling: >
+          Caller MUST wrap batchEmbedContents() in try-catch. Batch embedding pipelines
+          commonly run without try-catch because individual embedContent() calls are
+          wrapped but the batch variant is not. A 429 on a large batch means ALL
+          embeddings failed — retry with exponential backoff or reduce batch size.
+
+          try {
+            const result = await model.batchEmbedContents({ requests: chunks });
+            return result.embeddings;
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError) {
+              if (err.status === 429) {
+                // Rate limit — retry with backoff or split batch
+              }
+              throw new Error(`Embedding batch failed: ${err.status} ${err.statusText}`);
+            }
+            throw err;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+          - "https://ai.google.dev/gemini-api/docs/embeddings"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: batch-input-validation
+        condition: >
+          Any individual request in the batch has invalid content: text exceeds model
+          token limit, unsupported content type, or both ttlSeconds and expireTime
+          specified (GoogleGenerativeAIRequestInputError from input validation).
+        throws: >
+          GoogleGenerativeAIRequestInputError (subclass of GoogleGenerativeAIError)
+          thrown synchronously before any network call when input validation fails.
+          GoogleGenerativeAIFetchError with status 400 (INVALID_ARGUMENT) when
+          validation fails on the server side.
+        required_handling: >
+          The try-catch required for batch-network-error also handles input errors.
+          In RAG pipelines, catch and log which chunk failed, skip it, and continue
+          with the rest of the batch rather than halting the entire ingestion run.
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/embeddings"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: GoogleAIFileManager.uploadFile
+    import_path: "@google/generative-ai/server"
+    description: >
+      Uploads a file (as a Buffer or file path string) to the Gemini Files API for
+      use in multimodal generation requests. Files are stored for 48 hours and are
+      subject to a 20 GB per-project quota. Uploaded files enter PROCESSING state
+      before becoming ACTIVE — callers must poll getFile() until state === ACTIVE
+      before referencing the file URI in generation requests. The upload itself makes
+      two HTTP requests (metadata then binary data). Throws on auth, quota, or size errors.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/src/server/file-manager.d.ts
+      # Source: dist/server/index.js:328 (uploadFile multipart POST implementation)
+      # File limits: https://ai.google.dev/gemini-api/docs/file-prompting-strategies
+      # Error types: GoogleGenerativeAIFetchError (all HTTP errors)
+      - id: upload-network-error
+        condition: >
+          HTTP error during the multipart upload: invalid API key (403), file too large
+          (400 when exceeding 2 GB limit or 50 MB PDF limit), storage quota exceeded
+          (403 or 429 when the 20 GB project quota is full), server error (500/503),
+          unsupported MIME type (400), or network failure.
+        throws: >
+          GoogleGenerativeAIFetchError with .status and .statusText.
+          Key statuses: 400 (file too large, invalid MIME type, malformed request),
+          403 (invalid API key OR quota exceeded — check statusText to distinguish),
+          429 (RESOURCE_EXHAUSTED — rate limit), 500/503 (server error).
+        required_handling: >
+          Caller MUST wrap uploadFile() in try-catch. File upload errors are silent
+          in systems that fire-and-forget the upload before a generation call.
+          Also: uploadFile() returning does NOT mean the file is ready — poll
+          fileManager.getFile(file.name) until file.state === FileState.ACTIVE before
+          using the file URI in a generateContent() call.
+
+          try {
+            const uploadResult = await fileManager.uploadFile(buffer, { mimeType: 'image/jpeg' });
+            // Wait for processing
+            let file = uploadResult.file;
+            while (file.state === FileState.PROCESSING) {
+              await new Promise(r => setTimeout(r, 5000));
+              file = await fileManager.getFile(file.name);
+            }
+            if (file.state === FileState.FAILED) {
+              throw new Error('File processing failed');
+            }
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError) {
+              console.error('Upload failed:', err.status, err.statusText);
+            }
+            throw err;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/file-prompting-strategies"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-file-processing-failed
+        condition: >
+          uploadFile() succeeds (returns without throwing) but the returned
+          FileMetadataResponse.state is PROCESSING — callers who immediately use the
+          file URI without polling for ACTIVE state will get an error from generateContent().
+          If the file transitions to state === FAILED, the file is unusable.
+        throws: >
+          GoogleGenerativeAIFetchError (from generateContent()) when a PROCESSING or
+          FAILED file URI is referenced in a multimodal generation request.
+          The file upload itself does NOT throw in this case.
+        required_handling: >
+          Caller MUST poll getFile(file.name) after upload until file.state === FileState.ACTIVE.
+          Check file.state === FileState.FAILED and throw a meaningful error if processing
+          failed (e.g., corrupted video, unsupported codec).
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/file-prompting-strategies"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: GoogleAICacheManager.create
+    import_path: "@google/generative-ai/server"
+    description: >
+      Creates a new context cache (cached content) for use in generateContent() calls.
+      Context caching reduces latency and cost by caching repeated large prompts (system
+      instructions, long documents) across multiple generation requests. Requires a minimum
+      of 1024–4096 tokens (model-dependent) to be eligible for caching. Throws on
+      validation errors (missing model, conflicting TTL fields) before the network call,
+      and on HTTP errors (quota, auth, invalid config) during the API call.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/src/server/cache-manager.d.ts
+      # Source: dist/server/index.js:492 (GoogleAICacheManager.create implementation)
+      # Input validation: GoogleGenerativeAIRequestInputError thrown for missing model
+      #   and for specifying both ttlSeconds and expireTime simultaneously
+      # Docs: https://ai.google.dev/gemini-api/docs/caching
+      - id: cache-create-validation-error
+        condition: >
+          createOptions.model is not provided, OR both ttlSeconds and expireTime are
+          specified simultaneously (must choose one or neither).
+        throws: >
+          GoogleGenerativeAIRequestInputError thrown synchronously before any network call.
+          Messages:
+          - "Cached content must contain a `model` field."
+          - "You cannot specify both `ttlSeconds` and `expireTime` when creating a content
+            cache. You must choose one."
+        required_handling: >
+          Caller MUST wrap create() in try-catch. Input validation errors are thrown
+          synchronously — they indicate a programming error in how the cache is configured.
+          Ensure model is always specified and only one TTL format is used.
+
+          try {
+            const cache = await cacheManager.create({
+              model: 'models/gemini-1.5-flash',
+              contents: systemContents,
+              ttlSeconds: 3600,
+            });
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIRequestInputError) {
+              console.error('Cache config error:', err.message);
+            } else if (err instanceof GoogleGenerativeAIFetchError) {
+              console.error('Cache API error:', err.status, err.statusText);
+            }
+            throw err;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/caching"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: cache-create-api-error
+        condition: >
+          HTTP error during cache creation: model not found (404), insufficient tokens
+          to meet minimum caching threshold (400), rate limit (429), auth error (403),
+          or server error (500/503).
+        throws: >
+          GoogleGenerativeAIFetchError with .status and .statusText.
+          Key status 400 (FAILED_PRECONDITION) when the cached content doesn't meet the
+          minimum token count for the model (Gemini 1.5 Flash: 1024 tokens,
+          Gemini 1.5 Pro: 4096 tokens). Creating a cache with too few tokens results
+          in a confusing 400 error that callers often miss.
+        required_handling: >
+          The try-catch required for cache-create-validation-error also handles API errors.
+          For status 400 with FAILED_PRECONDITION: increase the amount of content being
+          cached or switch to a non-caching approach for small prompts.
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/caching"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: GoogleAICacheManager.update
+    import_path: "@google/generative-ai/server"
+    description: >
+      Updates the TTL or expireTime of an existing content cache. Used to extend
+      cache lifetime before it expires. Throws if the cache name is invalid or missing,
+      or on HTTP errors.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/src/server/cache-manager.d.ts
+      # Source: dist/server/index.js:557 (update implementation)
+      # Validation: GoogleGenerativeAIError thrown for invalid name format
+      # Docs: https://ai.google.dev/gemini-api/docs/caching
+      - id: cache-update-not-found
+        condition: >
+          The cache name is not found (deleted, expired, or never existed), or the name
+          format is invalid (must contain a "/" separator per source validation at
+          dist/server/index.js:587).
+        throws: >
+          GoogleGenerativeAIFetchError with status 404 (NOT_FOUND) when the cache
+          no longer exists — common when a cache expires between the time it was
+          created and when update() is called to extend its TTL.
+          GoogleGenerativeAIError thrown synchronously for invalid name format.
+        required_handling: >
+          Caller MUST wrap update() in try-catch. Cache expiration is a normal lifecycle
+          event — a 404 from update() means the window to extend the cache has passed
+          and a new cache must be created.
+
+          try {
+            await cacheManager.update(cache.name, { cachedContent: { ttlSeconds: 7200 } });
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError && err.status === 404) {
+              // Cache expired — recreate it
+              cache = await cacheManager.create({ ... });
+            } else {
+              throw err;
+            }
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/caching"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
