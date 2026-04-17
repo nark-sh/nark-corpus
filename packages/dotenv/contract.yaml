@@ -1,16 +1,19 @@
 package: dotenv
 semver: '>=1.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-02'
+last_verified: '2026-04-17'
 status: production
 evidence_quality: confirmed
+coverage_score: 1.00
 functions:
   - name: config
     import_path: dotenv
     description: >
-      Reads a .env file, parses the contents, and assigns values to process.env. Returns an object with either a
-      'parsed' key (success) or an 'error' key (failure).
+      Reads a .env file (or an encrypted .env.vault file when DOTENV_KEY is present), parses the
+      contents, and assigns values to process.env. Returns an object with either a 'parsed' key
+      (success) or an 'error' key (failure) when loading plain .env files. When DOTENV_KEY is set
+      and vault mode is active, throws typed errors instead of returning error objects.
     postconditions:
       - id: missing-env-file
         condition: .env file does not exist or cannot be read
@@ -44,6 +47,92 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+      - id: vault-invalid-dotenv-key
+        # Evidence: lib/main.js _instructions() and decrypt() — confirmed from source
+        # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        condition: >
+          DOTENV_KEY is set but is malformed (wrong URI format, missing key part, missing
+          environment part, or key is shorter than 64 hex characters)
+        throws: >
+          Error with code 'INVALID_DOTENV_KEY'. Messages include: "Wrong format. Must be in valid
+          uri format like dotenv://:key_1234@dotenvx.com/...", "Missing key part", "Missing
+          environment part", "It must be 64 characters long (or more)".
+        required_handling: >
+          When using .env.vault with DOTENV_KEY, callers MUST wrap config() in a try-catch block.
+          In vault mode config() throws (does not return {error}). A malformed key causes an
+          immediate exception that will crash the process if uncaught.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: vault-environment-not-found
+        # Evidence: lib/main.js _instructions() — confirmed from source
+        # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        condition: >
+          DOTENV_KEY references an environment (e.g. 'production') but the corresponding
+          DOTENV_VAULT_PRODUCTION key is not found in the .env.vault file
+        throws: >
+          Error with code 'NOT_FOUND_DOTENV_ENVIRONMENT'. Message: "Cannot locate environment
+          DOTENV_VAULT_<ENVIRONMENT> in your .env.vault file."
+        required_handling: >
+          Wrap config() in try-catch when using vault mode. This error occurs when the vault was
+          built for a different environment than the key references. Common during deployments
+          when DOTENV_KEY from staging is accidentally used in production.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: vault-decryption-failed
+        # Evidence: lib/main.js decrypt() — confirmed from source
+        # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        condition: >
+          DOTENV_KEY is syntactically valid but does not decrypt the vault ciphertext
+          (wrong key for the environment, rotated key no longer matches)
+        throws: >
+          Error with code 'DECRYPTION_FAILED'. Message: "Please check your DOTENV_KEY".
+        required_handling: >
+          Wrap config() in try-catch when using vault mode. This is the most common vault error
+          in production — it occurs when the DOTENV_KEY env var is stale or belongs to a different
+          environment's vault. Application starts with no secrets loaded.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: vault-missing-data
+        # Evidence: lib/main.js _parseVault() — confirmed from source
+        # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        condition: >
+          The .env.vault file exists (detected because DOTENV_KEY is set) but its contents
+          cannot be parsed (empty file, corrupted, wrong format)
+        throws: >
+          Error with code 'MISSING_DATA'. Message: "Cannot parse <vaultPath> for an unknown reason".
+        required_handling: >
+          Wrap config() in try-catch when using vault mode. A corrupted or empty vault file
+          causes an immediate throw. Secrets are not loaded.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
       - id: success
         condition: .env file is found and parsed successfully
         returns: Object with 'parsed' key containing the parsed key-value pairs
@@ -85,28 +174,86 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: configDotenv
+    import_path: dotenv
+    description: >
+      Loads .env file contents into process.env (or a custom processEnv object). Unlike config(),
+      configDotenv() always reads plain .env files and never attempts vault/encrypted .env.vault
+      decryption, even if DOTENV_KEY is set. Supports multiple files via path array. Returns
+      {parsed, error} — does not throw. Added in dotenv v16+.
+    postconditions:
+      # Evidence: lib/main.js configDotenv() — confirmed from source
+      # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+      - id: configdotenv-file-not-found
+        condition: One or more paths in options.path do not exist or cannot be read
+        returns: >
+          Object with 'error' property set to the last filesystem error encountered. The 'parsed'
+          key is still present with whatever keys were successfully loaded from other files.
+        required_handling: >
+          Caller MUST check result.error. When path is an array, configDotenv() continues
+          loading remaining files on error (lastError tracking) but the final result includes
+          the error from the last failed file. Silently missing .env files are a common
+          misconfiguration in containerized deployments.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+      - id: configdotenv-partial-load-on-multi-path
+        condition: >
+          options.path is an array of multiple file paths and some exist while others do not
+        returns: >
+          Object with 'parsed' containing keys from successfully loaded files only. 'error' is
+          set to the last error from any failed file even if other files loaded successfully.
+        required_handling: >
+          When using multiple paths, callers relying on all files being present MUST validate
+          result.error AND verify all expected keys exist in result.parsed. The presence of
+          result.error does not mean zero keys were loaded.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
   - name: parse
     import_path: dotenv
     description: >
-      Parses a .env-format string or Buffer into a key-value object. Does not assign values to process.env. Throws on
-      invalid syntax.
+      Parses a .env-format string or Buffer into a key-value object. Does not assign values to
+      process.env. Uses regex-based parsing that silently skips malformed lines rather than
+      throwing. Returns an empty or partial object for completely invalid input.
     postconditions:
-      - id: throws-on-invalid-syntax
-        condition: input string contains invalid .env syntax
-        throws: Error describing the parse failure
+      # Evidence: lib/main.js parse() — uses LINE regex, never throws, returns {} on no matches
+      # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+      # NOTE: The prior contract version stated parse() throws on invalid syntax. This is INCORRECT.
+      # The source code uses a regex (LINE) and simply skips non-matching lines silently.
+      - id: parse-silent-skip-on-malformed-lines
+        condition: Input string contains lines that do not match the KEY=VALUE pattern
+        returns: >
+          Plain object containing only the lines that did match. Malformed lines are silently
+          dropped. Return value may be an empty object if no lines match.
         required_handling: >
-          Caller MUST wrap parse() in a try-catch block. Unlike config(), parse() throws exceptions rather than
-          returning an error object.
+          Callers MUST NOT rely on parse() throwing to detect malformed input. Silent partial
+          parsing means the returned object may be missing expected keys without any error signal.
+          Callers that need strict validation must implement their own key-presence checks after
+          calling parse().
         sources:
-          - https://github.com/motdotla/dotenv#parse
-          - https://www.npmjs.com/package/dotenv
-        severity: error
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: warning
         business_impact:
-          incident_label: DOWNTIME
-          production_behavior: immediate_exception
-          visibility: visible
-          user_experience: service_unavailable
-          incident_cost_range: medium
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
       - id: success
         condition: input is a valid .env-format string or Buffer
         returns: Plain object with string keys and string values
@@ -120,11 +267,13 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         required_handling: No action required — use the returned value as needed.
+
   - name: populate
     import_path: dotenv
     description: >
-      Assigns parsed key-value pairs onto a target object (typically process.env), respecting the override option. Does
-      not read from disk.
+      Assigns parsed key-value pairs onto a target object (typically process.env), respecting the
+      override option. Does not read from disk. Throws synchronously if the parsed argument is not
+      an object.
     postconditions:
       - id: no-override-by-default
         condition: a key already exists on the target object and override is not set to true
@@ -141,3 +290,73 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+      - id: populate-object-required
+        # Evidence: lib/main.js populate() — confirmed from source
+        # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        condition: The parsed argument passed to populate() is not an object (e.g. null, string, number)
+        throws: >
+          Error with code 'OBJECT_REQUIRED'. Message: "Please check the processEnv argument
+          being passed to populate".
+        required_handling: >
+          Callers that build the parsed input dynamically (e.g. from JSON.parse of untrusted
+          input) MUST validate the input is an object before calling populate(). Passing null
+          or a primitive throws synchronously and bypasses any surrounding error handling that
+          only catches async errors.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: decrypt
+    import_path: dotenv
+    description: >
+      Decrypts an AES-256-GCM encrypted ciphertext string using a hex key string. Used internally
+      by config() vault mode. Also exported for callers who need to decrypt vault ciphertexts
+      programmatically. Throws typed errors for invalid keys or decryption failures.
+    postconditions:
+      # Evidence: lib/main.js decrypt() — confirmed from source
+      # Source: https://github.com/motdotla/dotenv/blob/master/lib/main.js
+      - id: decrypt-invalid-key-length
+        condition: >
+          keyStr is shorter than 64 hex characters (the last 64 chars are sliced for the AES key;
+          a shorter string produces an invalid 32-byte key)
+        throws: >
+          Error with code 'INVALID_DOTENV_KEY'. Message: "It must be 64 characters long (or more)".
+        required_handling: >
+          Callers MUST wrap decrypt() in try-catch. This error indicates the DOTENV_KEY was
+          truncated or corrupted. Attempting decryption with a short key will crash the process.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: decrypt-wrong-key
+        condition: >
+          keyStr is the correct length but does not decrypt the ciphertext (wrong environment key,
+          key rotation mismatch, or ciphertext tampered with)
+        throws: >
+          Error with code 'DECRYPTION_FAILED'. Message: "Please check your DOTENV_KEY".
+          Internally triggered by AES-GCM authentication tag verification failure
+          ("Unsupported state or unable to authenticate data").
+        required_handling: >
+          Wrap decrypt() in try-catch. This is the most actionable error — it means the key and
+          ciphertext do not correspond. Common during key rotation when old ciphertext is paired
+          with a new key. Silent swallowing of this error leaves secrets unloaded.
+        sources:
+          - https://github.com/motdotla/dotenv/blob/master/lib/main.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
