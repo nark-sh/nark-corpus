@@ -111,17 +111,17 @@ export async function loadWithDestructuredWithCatch(data: Uint8Array) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getPageNoCatch(buffer: ArrayBuffer) {
-  // SHOULD_FIRE: getpage-invalid-page-number — Error("Invalid page request.") unhandled
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  // SHOULD_FIRE: getpage-invalid-page-number — Error("Invalid page request.") unhandled
   const page = await doc.getPage(1);
   return page.pageNumber;
 }
 
 export async function getPageInLoopNoCatch(buffer: ArrayBuffer) {
-  // SHOULD_FIRE: getpage-invalid-page-number — off-by-one error (0-indexed) unhandled
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
   for (let i = 0; i < doc.numPages; i++) {
     // Common bug: using 0-based index (should be i+1)
+    // SHOULD_FIRE: getpage-invalid-page-number — off-by-one error (0-indexed) unhandled
     const page = await doc.getPage(i);
     console.log(page.pageNumber);
   }
@@ -148,9 +148,9 @@ export async function getPageWithCatch(buffer: ArrayBuffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function extractTextNoCatch(buffer: ArrayBuffer) {
-  // SHOULD_FIRE: gettextcontent-no-try-catch — UnknownErrorException/AbortException unhandled
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
   const page = await doc.getPage(1);
+  // SHOULD_FIRE: gettextcontent-no-try-catch — UnknownErrorException/AbortException unhandled
   const textContent = await page.getTextContent();
   return textContent.items.map((item: any) => item.str).join(" ");
 }
@@ -177,11 +177,11 @@ export async function extractTextWithCatch(buffer: ArrayBuffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderPageNoCatch(buffer: ArrayBuffer, canvas: any) {
-  // SHOULD_FIRE: render-no-try-catch — RenderingCancelledException unhandled
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
   const page = await doc.getPage(1);
   const viewport = page.getViewport({ scale: 1.0 });
   const renderTask = page.render({ canvas, viewport });
+  // SHOULD_FIRE: render-no-try-catch — RenderingCancelledException unhandled
   await renderTask.promise;
 }
 
@@ -211,8 +211,8 @@ export async function renderPageWithCatch(buffer: ArrayBuffer, canvas: any) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function saveDocumentNoCatch(buffer: ArrayBuffer) {
-  // SHOULD_FIRE: savedocument-no-try-catch — worker error during serialization unhandled
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  // SHOULD_FIRE: savedocument-no-try-catch — worker error during serialization unhandled
   const bytes = await doc.saveDocument();
   return bytes;
 }
