@@ -1,11 +1,11 @@
 package: superagent
 semver: ">=3.7.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.91
+coverage_score: 1.0
 
 detection:
   factory_methods:
@@ -192,6 +192,92 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pipe
+    import_path: "superagent"
+    description: >
+      Streams an HTTP response directly to a writable stream (e.g., a file, an HTTP response,
+      or any Node.js Writable). Bypasses buffering entirely — the request result never enters
+      the Promise chain. pipe() calls .end() internally and returns the destination stream
+      (not a Promise), so await and try-catch provide NO protection against request errors.
+      All errors are emitted as Node.js 'error' events on either the Request object (network/
+      HTTP errors) or on the destination stream (decompression errors). If no 'error' listener
+      is registered, Node.js throws an uncaught exception and crashes the process.
+    postconditions:
+      # Evidence: lib/node/index.js lines 423-454 — pipe() calls this.end() internally
+      #   req.on('error') → this.callback(error) → this.emit('error', error) [lines 769, 855]
+      #   decompresser.on('error') → stream.emit('error', error) [line 446]
+      # Evidence: lib/request-base.js lines 243-270 — then() calls this.end() to create Promise
+      #   pipe() bypasses then() entirely → this._fullfilledPromise is never created
+      # Evidence: lib/node/index.js line 958 — if (this.piped) return; skips normal callback path
+      # Evidence: https://forwardemail.github.io/superagent/#piping — "It's not possible to mix
+      #   pipes and callbacks or promises" + "You should NOT attempt to pipe the result of .end()"
+      - id: pipe-errors-not-promise-rejections
+        condition: >
+          Any error during a piped request: network failure, DNS resolution error, connection
+          refused, HTTP 4xx/5xx response, or timeout. Unlike awaited superagent calls, piped
+          requests bypass the Promise chain entirely — .pipe() returns the destination stream
+          immediately, not a Promise.
+        throws: >
+          Does NOT throw or reject a Promise. Errors are emitted as 'error' events:
+          (1) Network/HTTP errors: emitted on the Request object via req.emit('error', err)
+              where err.status is set for HTTP errors, absent for network/DNS errors.
+          (2) Decompression errors (gzip/deflate responses): emitted on the destination stream
+              via stream.emit('error', err). err.code='Z_BUF_ERROR' (truncated gzip) is
+              silently swallowed by superagent; other zlib errors propagate to dest stream.
+          If no 'error' listener is registered, Node.js throws an uncaught exception and
+          may crash the process.
+        required_handling: >
+          MUST register an 'error' event listener on the Request object before calling pipe().
+          Try-catch and async/await provide zero protection — errors bypass them silently,
+          leaving the destination stream in an incomplete state with no indication of failure.
+          Correct pattern: const req = superagent.get(url); req.on('error', handler); req.pipe(dest);
+          Also register 'error' on the destination stream for decompression errors:
+          dest.on('error', (err) => { /* handle decompression errors */ });
+        sources:
+          - "https://forwardemail.github.io/superagent/#piping"
+          - "https://forwardemail.github.io/superagent/#error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: lib/node/index.js line 889-896 — _emitResponse() sets response.pipe to throw
+      #   "end() has already been called, so it's too late to start piping"
+      # Evidence: lib/node/index.js line 423 — pipe() calls this.end() internally
+      # Evidence: lib/request-base.js line 249 — then() calls self.end() internally
+      # Evidence: https://forwardemail.github.io/superagent/#piping — "You should NOT attempt to
+      #   pipe the result of .end() or the Response object"
+      - id: pipe-cannot-be-mixed-with-promise
+        condition: >
+          Calling .pipe() after .then()/.catch()/await on the same request, or attempting to
+          pipe the Response object (res.pipe()) received in an .end() callback. Common mistake:
+          const res = await superagent.get(url); res.pipe(stream) — pipe() belongs on the
+          Request, not the Response, and await has already consumed the response via end().
+        throws: >
+          Synchronous Error with message "end() has already been called, so it's too late to
+          start piping" when pipe() is called on the Response object after end() has run.
+          If pipe() is called on the Request after await (same request), behavior is undefined
+          and data may be silently lost without any error.
+        required_handling: >
+          Use EITHER streaming OR promise/callback — never both on the same request.
+          Streaming: const req = superagent.get(url); req.on('error', h); req.pipe(stream);
+          Promise:   const res = await superagent.get(url); process(res.body);
+          If a response must be both processed and streamed, buffer first then write manually.
+        sources:
+          - "https://forwardemail.github.io/superagent/#piping"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
           incident_cost_range: medium
 
   - name: agent
