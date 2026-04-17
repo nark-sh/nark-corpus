@@ -1,12 +1,28 @@
 package: "@langchain/openai"
 semver: ">=0.1.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83  # 5 contracted / 6 total async-callable (1 intentionally omitted: getNumTokensFromMessages)
 # Audit 2026-04-13: 15 repos scanned, 1 violation across 1 repo (invoke).
 # scan-langchain-openai-2026-04-13.json. FP check: 0/20 type-A FPs (0% rate). Confirmed.
+# Depth pass 2026-04-17 (deepen-stream-1 pass 3):
+#   API surface: 6 async-callable functions
+#   Previously contracted: 3 (ChatOpenAI.invoke, embedDocuments/embedQuery, _call/DallEAPIWrapper)
+#   Added: ChatOpenAI.stream (2 postconditions), ChatOpenAI.moderateContent (1 postcondition)
+#   Omitted: getNumTokensFromMessages (pure local token counting, no API calls, no throws)
+#   Coverage: 5/6 = 0.83 (effective 5/5 = 1.0 excluding intentionally omitted)
+#   Key findings:
+#     (1) stream() has TWO error points: at await model.stream() AND inside for-await-of;
+#         a try-catch around only await model.stream() does NOT catch mid-stream failures.
+#     (2) moderateContent() failure should be fail-safe (block content) not fail-open;
+#         rate-limit exhaustion creates a safety bypass vector.
+#   Evidence sources confirmed from @langchain/openai installed package source:
+#     dist/chat_models/completions.js — completionWithRetry(), _streamResponseChunks()
+#     dist/chat_models/base.js — moderateContent(), wrapOpenAIClientError calls
+#     dist/utils/client.js — wrapOpenAIClientError() error type mapping
 
 description: >
   OpenAI integrations for LangChain.js. Provides ChatOpenAI, OpenAIEmbeddings,
@@ -121,3 +137,186 @@ functions:
           incident_cost_range: medium
         sources:
           - https://github.com/langchain-ai/langchainjs/issues/1547
+
+  - name: ChatOpenAI.stream
+    import_path: "@langchain/openai"
+    description: >
+      Returns an IterableReadableStream of AIMessageChunk tokens for streaming
+      chat completions. The stream() call makes an async connection to the OpenAI
+      API via completionWithRetry(), which wraps errors using wrapOpenAIClientError().
+      Errors can be thrown at two distinct points: (1) during await model.stream() —
+      connection/auth errors thrown before any tokens arrive; (2) during
+      for-await-of iteration — mid-stream network failures thrown while reading chunks.
+      A try-catch only around await model.stream() will NOT catch mid-stream errors.
+    patterns:
+      - "ChatOpenAI"
+      - "AzureChatOpenAI"
+      - "BaseChatOpenAI"
+    postconditions:
+      # Evidence: confirmed from @langchain/openai dist/chat_models/completions.js
+      # completionWithRetry() wraps all errors with wrapOpenAIClientError()
+      # stream() calls super.stream() -> _streamResponseChunks() -> completionWithRetry()
+      # Source: /private/tmp/claude/bc-deepen/@langchain/openai/node_modules/@langchain/openai/dist/chat_models/completions.js
+      # Source: /private/tmp/claude/bc-deepen/@langchain/openai/node_modules/@langchain/openai/dist/utils/client.js
+      - id: stream-connection-error
+        condition: >
+          await model.stream(input) is called without try-catch. Connection errors —
+          auth failure, rate limiting, invalid model, or network timeout — occur
+          before any chunks are received and throw at the await model.stream() call
+          site. This is a separate error vector from mid-stream failures.
+        throws: >
+          TimeoutError (name === 'TimeoutError', wraps APIConnectionTimeoutError) —
+          connection timeout before stream established.
+          openai.AuthenticationError (status === 401, lc_error_code: 'MODEL_AUTHENTICATION') —
+          invalid or missing OPENAI_API_KEY.
+          openai.RateLimitError (status === 429, lc_error_code: 'MODEL_RATE_LIMIT') —
+          API rate limit exceeded at request time.
+          openai.NotFoundError (status === 404, lc_error_code: 'MODEL_NOT_FOUND') —
+          invalid model name.
+          ContextOverflowError (extends Error, from @langchain/core/errors) —
+          input exceeds context window; thrown when error message includes
+          'context_length_exceeded', 'exceeds the context window', or 'maximum context length'.
+          All confirmed from wrapOpenAIClientError() in dist/utils/client.js source.
+        required_handling: >
+          Wrap await model.stream(input) in try-catch:
+
+            try {
+              const stream = await model.stream(input);
+              for await (const chunk of stream) {
+                process.stdout.write(chunk.content);
+              }
+            } catch (error) {
+              if (error.name === 'TimeoutError') {
+                console.error('Stream connection timed out');
+              } else if (error.lc_error_code === 'MODEL_RATE_LIMIT' || error.status === 429) {
+                console.error('Rate limited — retry with backoff');
+              } else if (error.lc_error_code === 'MODEL_AUTHENTICATION' || error.status === 401) {
+                console.error('Invalid API key');
+              } else if (error instanceof ContextOverflowError) {
+                console.error('Input too long — reduce context');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/chat_models/completions.ts"
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/utils/client.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: confirmed from @langchain/openai dist/chat_models/completions.js
+      # _streamResponseChunks(): streamIterable = await this.completionWithRetry(params)
+      # then: for await (const data of streamIterable) — network failures mid-stream throw here
+      # The await model.stream() try-catch does NOT protect the for-await-of body.
+      - id: stream-iteration-error
+        condition: >
+          The for-await-of loop iterating over the stream returned by model.stream()
+          is not wrapped in try-catch. Mid-stream network failures — connection drops,
+          server disconnects, read timeouts — throw during iteration, not during the
+          initial await model.stream() call. A try-catch around await model.stream()
+          alone will NOT catch these errors.
+        throws: >
+          Same error types as stream-connection-error but thrown during iteration:
+          TimeoutError (name === 'TimeoutError') — connection dropped mid-stream.
+          openai.APIConnectionError — TCP connection lost while receiving chunks.
+          These are NOT caught by a try-catch placed only around await model.stream().
+        required_handling: >
+          The try-catch must wrap BOTH the stream() call AND the for-await-of loop:
+
+            // ❌ WRONG — catches connection errors but NOT mid-stream failures:
+            const stream = await model.stream(input);  // only this line is protected
+            for await (const chunk of stream) {         // throws here are NOT caught
+              process.stdout.write(chunk.content);
+            }
+
+            // ✅ CORRECT — catches all streaming errors:
+            try {
+              const stream = await model.stream(input);
+              for await (const chunk of stream) {
+                process.stdout.write(chunk.content);
+              }
+            } catch (error) {
+              console.error('Streaming failed:', error);
+              throw error;
+            }
+
+          In Next.js streaming API routes, use ReadableStream with proper error handling
+          rather than relying on try-catch implicitly closing the response.
+        sources:
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/chat_models/completions.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: ChatOpenAI.moderateContent
+    import_path: "@langchain/openai"
+    description: >
+      Calls the OpenAI Moderation API (omni-moderation-latest by default) to check
+      whether content violates OpenAI's content policy. Returns an
+      OpenAI.ModerationCreateResponse with a results[] array containing per-text
+      flagged status and category scores. Used as a safety gate before processing
+      or storing user-generated content. Internally calls this.client.moderations.create()
+      wrapped by wrapOpenAIClientError() — same error profile as invoke().
+    patterns:
+      - "ChatOpenAI"
+      - "AzureChatOpenAI"
+      - "BaseChatOpenAI"
+    postconditions:
+      # Evidence: confirmed from dist/chat_models/base.js moderateContent() implementation:
+      # this.caller.call(async () => { try { return await this.client.moderations.create(...) }
+      #   catch (e) { throw wrapOpenAIClientError(e); } })
+      # Source: /private/tmp/claude/bc-deepen/@langchain/openai/node_modules/@langchain/openai/dist/chat_models/base.js
+      - id: moderation-network-error
+        condition: >
+          model.moderateContent(text) is called without try-catch in a content
+          safety gate. If the OpenAI Moderation API is unavailable (rate limit,
+          auth failure, or network error), the call throws and the safety check
+          is skipped entirely — allowing unmoderated content to proceed unless
+          the caller handles the error as a blocking failure.
+        throws: >
+          TimeoutError (name === 'TimeoutError') — API connection timed out.
+          openai.AuthenticationError (status === 401, lc_error_code: 'MODEL_AUTHENTICATION') —
+          invalid or missing OPENAI_API_KEY; moderation silently skipped if not caught.
+          openai.RateLimitError (status === 429, lc_error_code: 'MODEL_RATE_LIMIT') —
+          moderation API rate limited; high-volume content pipelines are most affected.
+          openai.InternalServerError (status === 5xx) — OpenAI service unavailable.
+          All confirmed from wrapOpenAIClientError() in dist/utils/client.js and
+          dist/chat_models/base.js moderateContent() source.
+        required_handling: >
+          Caller MUST wrap moderateContent() in try-catch and treat API failures
+          as blocking errors, not silent passes. The safety consequence of swallowing
+          errors (allowing unmoderated content) is more severe than service downtime.
+
+            try {
+              const moderation = await model.moderateContent(userText);
+              if (moderation.results[0].flagged) {
+                return { error: 'Content policy violation', flagged: true };
+              }
+            } catch (error) {
+              // Moderation API failed — fail safe: block the content
+              console.error('Moderation API unavailable:', error);
+              return { error: 'Content moderation unavailable', flagged: true };
+              // Alternative: rethrow to surface as 503 to caller
+            }
+
+          DO NOT default to allowing content on moderation failure — this creates
+          a bypass vector where attackers can exhaust the moderation rate limit
+          to force content policy bypass.
+        sources:
+          - "https://platform.openai.com/docs/api-reference/moderations/create"
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/chat_models/base.ts"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
