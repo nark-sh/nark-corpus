@@ -1,10 +1,33 @@
+# react-hook-form — React form management library with validation.
+# The primary async surface is handleSubmit() (which re-throws errors from onValid callbacks),
+# trigger() (which awaits async custom validators without try-catch), and the Form component
+# (which calls fetch() when the action prop is set).
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 4):
+# API surface: 6 async-callable functions/methods
+#   handleSubmit — CONTRACTED (3 postconditions)
+#   useFormContext — CONTRACTED (2 postconditions)
+#   useFieldArray — CONTRACTED (1 postcondition)
+#   trigger() — NEW: 2 postconditions
+#   Form (action prop) — NEW: 2 postconditions
+#   async defaultValues — NEW: 1 postcondition
+# Omitted: useController (not async), useFormState (read-only), useWatch (read-only)
+# Coverage: 6/6 non-omitted = 100% effective coverage (6/9 total = 0.67)
+# Evidence sources confirmed from:
+#   dist/index.esm.mjs line 2272-2327 — handleSubmit re-throws onValidError
+#   dist/index.esm.mjs line 1996-2036 — trigger() awaits validators without try-catch
+#   dist/index.esm.mjs line 709-775 — Form component fetch() with onError callback
+#   https://react-hook-form.com/docs/useform/trigger
+#   https://react-hook-form.com/docs/useform/handlesubmit
 package: react-hook-form
 semver: ^7.0.0
-contract_version: 1.0.0
+contract_version: "1.1.0"
 maintainer: behavioral-contracts
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.67  # 6 contracted / 9 total exports (3 omitted: useController, useFormState, useWatch)
+# Note: effective coverage (contracted/non-omitted) = 6/6 = 1.0
 description: |
   React Hook Form is a performant, flexible, and extensible forms library with easy-to-use validation.
   This contract focuses on error handling requirements for async form submissions, context usage, and validation errors.
@@ -238,6 +261,270 @@ functions:
           incident_cost_range: medium
         sources:
           - https://react-hook-form.com/docs/usefieldarray
+
+  - name: trigger
+    import_path: "react-hook-form"
+    description: >
+      Manually triggers form or input validation. Returns Promise<boolean> — true if all
+      validated fields pass, false if any field fails. Used for multi-step forms, dependent
+      field validation, or pre-submission validation checks. Critical: if a custom async
+      validator function throws an error (e.g., a network call that fails), trigger() rejects
+      with that error — there is no try-catch in the validation executor.
+    postconditions:
+      # Evidence: dist/index.esm.mjs line 1330-1344 — validate functions called with `await`
+      # but no surrounding try-catch. If validate() throws, the error propagates up through
+      # executeBuiltInValidation → trigger() → causes the Promise returned by trigger() to reject.
+      # Source: https://react-hook-form.com/docs/useform/register (validate option)
+      # Source: https://react-hook-form.com/docs/useform/trigger
+      - id: trigger-async-validator-throws
+        condition: >
+          A field is registered with a custom async validate function (via register(name, { validate }))
+          that throws an error rather than returning a string message. This is common when the validate
+          function makes a network call (e.g., checking email uniqueness via API) and that call fails.
+          trigger() awaits the validate function but has no try-catch: any thrown error propagates
+          directly out of trigger() as an unhandled Promise rejection.
+        throws: >
+          Whatever the custom validator throws — typically Error, TypeError, or network-related errors.
+          Not a react-hook-form specific error type: the thrown value is re-thrown as-is.
+        required_handling: >
+          When using async custom validators that make network calls, wrap the network call in
+          try-catch INSIDE the validator function and return an error message string instead of
+          throwing:
+
+            register('email', {
+              validate: async (value) => {
+                try {
+                  const res = await fetch(`/api/check-email?email=${value}`);
+                  const { taken } = await res.json();
+                  return taken ? 'Email already in use' : true;
+                } catch (error) {
+                  // ✅ Return message string — do NOT let the error propagate
+                  return 'Could not verify email availability';
+                }
+              }
+            });
+
+          If calling trigger() externally and you cannot control all validators:
+
+            try {
+              const isValid = await trigger('email');
+            } catch (error) {
+              // ✅ Catch validator errors at the call site
+              console.error('Validation failed:', error);
+            }
+        sources:
+          - "https://react-hook-form.com/docs/useform/trigger"
+          - "https://react-hook-form.com/docs/useform/register"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: dist/index.esm.mjs lines 1996-2036 — trigger() returns the boolean result
+      # but callers often fail to await it or check the return value.
+      # Source: https://react-hook-form.com/docs/useform/trigger
+      - id: trigger-result-not-awaited
+        condition: >
+          trigger() is called but the returned Promise<boolean> is not awaited before using
+          the validation result to gate further logic. A common antipattern in multi-step forms:
+          trigger the current step's fields, then immediately proceed to the next step without
+          waiting for the async validation to complete. Because trigger() is async (it awaits
+          schema resolvers and custom validators), calling it synchronously gives undefined,
+          not the validation result.
+        throws: >
+          Does not throw — but the validation result is a pending Promise, so boolean checks
+          like `if (trigger('email'))` always evaluate to truthy (a Promise object is truthy)
+          even when validation fails.
+        required_handling: >
+          Always await trigger() before using the result:
+
+            // Multi-step form — validate before advancing step
+            const handleNextStep = async () => {
+              // ✅ Await the result
+              const isValid = await trigger(['firstName', 'email']);
+              if (!isValid) return; // validation failed — stay on current step
+              setStep(step + 1);
+            };
+
+          Incorrect pattern:
+            const isValid = trigger('email'); // ❌ Returns Promise, not boolean
+            if (isValid) { ... }             // ❌ Always true (Promise is truthy)
+        sources:
+          - "https://react-hook-form.com/docs/useform/trigger"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: Form
+    import_path: "react-hook-form"
+    description: >
+      The Form component manages form submission including optional network requests. When the
+      action prop is provided, Form makes a native fetch() call to submit form data to that URL.
+      onError is called when the response status indicates failure (4xx/5xx) OR when the fetch
+      itself throws a network error. onSuccess is called on successful responses. If neither
+      onError nor onSuccess is provided and the network call fails, the error is silently swallowed
+      internally (hasError is set but the component has no visible feedback).
+    postconditions:
+      # Evidence: dist/index.esm.mjs line 709-775 — Form component submit() function
+      # Makes fetch(String(action), {...}) in a try-catch block. Network errors caught at
+      # line 762: `catch (error) { hasError = true; onError && onError({ error }); }`
+      # HTTP errors detected at line 751: `if (response && (!validateStatus ? response.status < 200 || response.status >= 300 : ...))`
+      # Source: https://react-hook-form.com/docs/useform (Form component section)
+      - id: form-network-error-no-feedback
+        condition: >
+          The Form component is used with an action prop (which triggers a fetch() call) but
+          without an onError callback. When the network request fails (DNS failure, connection
+          refused, timeout) OR returns an HTTP error status (4xx/5xx), the error is caught
+          internally and hasError is set, but without onError the user receives no feedback.
+          The form's isSubmitSuccessful becomes false and a 'root.server' field error is set,
+          but if no UI renders formState.errors.root.server, the failure is invisible.
+        throws: >
+          Does not throw externally — the Form component internally catches all fetch errors.
+          The onError callback receives either { response: Response } for HTTP errors or
+          { error: unknown } for network-level failures. Without onError, the error is silently dropped.
+        required_handling: >
+          Always provide onError when using Form with action prop to handle both network failures
+          and HTTP error responses:
+
+            <Form
+              action="/api/submit"
+              method="post"
+              control={control}
+              onSuccess={({ response }) => {
+                toast.success('Form submitted successfully');
+              }}
+              onError={({ response, error }) => {
+                if (error) {
+                  // Network failure (no response)
+                  toast.error('Network error — please check your connection');
+                } else if (response) {
+                  // HTTP error response
+                  toast.error(`Submission failed: ${response.status} ${response.statusText}`);
+                }
+              }}
+            >
+              {/* fields */}
+            </Form>
+
+          Alternatively, render formState.errors.root.server in the UI to show server errors:
+            {errors.root?.server && (
+              <p className="error">Server error: {errors.root.server.type}</p>
+            )}
+        sources:
+          - "https://react-hook-form.com/docs/useform"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: dist/index.esm.mjs line 712 — Form internally calls control.handleSubmit().
+      # The handleSubmit wrapper re-throws errors from the onSubmit callback (line 2327).
+      # When Form's onSubmit prop is async and throws, that error propagates through handleSubmit
+      # and out of the Form's submit() function — but submit() is the form's onSubmit handler,
+      # and React will surface it as an unhandled rejection if not caught at the React event boundary.
+      - id: form-onsubmit-unhandled-error
+        condition: >
+          The Form component's onSubmit prop is an async function that throws (or rejects),
+          and the error is not caught. The Form component internally wraps onSubmit in
+          control.handleSubmit(), which re-throws errors from the onValid callback at
+          source line 2327: `if (onValidError) { throw onValidError; }`.
+          This error propagates out of the Form's submit handler and becomes an unhandled
+          Promise rejection if React's error boundary or the caller does not catch it.
+        throws: >
+          Whatever the onSubmit callback throws — network errors, API errors, or any Error
+          thrown during async form processing.
+        required_handling: >
+          Wrap async operations in the onSubmit callback with try-catch:
+
+            <Form
+              action="/api"
+              control={control}
+              onSubmit={async ({ data, event, formData }) => {
+                try {
+                  await processFormData(data);
+                } catch (error) {
+                  // ✅ Catch inside onSubmit — don't let it propagate
+                  toast.error('Form processing failed');
+                }
+              }}
+            />
+        sources:
+          - "https://react-hook-form.com/docs/useform"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: useForm
+    import_path: "react-hook-form"
+    description: >
+      The primary hook that initializes the form. When defaultValues is provided as an async
+      function (returning a Promise), useForm calls it internally and uses reset() once the
+      Promise resolves. The form's formState.isLoading is true while the async defaults are
+      loading. If the async defaultValues function throws or rejects, there is no documented
+      error callback — the rejection is unhandled and isLoading may remain true indefinitely.
+    postconditions:
+      # Evidence: https://react-hook-form.com/docs/useform
+      # "async defaultValues: async () => fetch('/api-endpoint')" example in docs.
+      # The library calls reset() internally once resolved, but does not document error handling
+      # for rejected async defaultValues. Source inspection of dist/index.esm.mjs shows no
+      # try-catch around the async defaultValues call.
+      # Source: https://react-hook-form.com/docs/useform (defaultValues section)
+      - id: async-default-values-unhandled-rejection
+        condition: >
+          useForm is initialized with an async defaultValues function that makes a network call
+          (e.g., fetching user profile data from an API), and that call fails. The async
+          defaultValues function throws or its Promise rejects. React Hook Form does not
+          document an error callback for this case and internally has no try-catch around
+          the async defaultValues invocation.
+          The result: the form remains in isLoading state, never displays default values,
+          and the unhandled rejection may crash the component or produce silent empty form behavior.
+        throws: >
+          Unhandled Promise rejection propagating from the async defaultValues function.
+          Callers see: formState.isLoading stays true, no form defaults are populated,
+          and the rejection may surface as React "Unhandled Rejection" in dev mode.
+        required_handling: >
+          Wrap the async defaultValues fetch in a try-catch and provide fallback values:
+
+            const { register, handleSubmit, formState: { isLoading } } = useForm({
+              defaultValues: async () => {
+                try {
+                  const response = await fetch('/api/user/profile');
+                  if (!response.ok) throw new Error('Failed to load profile');
+                  return await response.json();
+                } catch (error) {
+                  // ✅ Return safe fallback values instead of rejecting
+                  console.error('Could not load default values:', error);
+                  return { name: '', email: '' }; // Fallback defaults
+                }
+              }
+            });
+
+            // Always show loading state to users
+            if (isLoading) return <Spinner />;
+        sources:
+          - "https://react-hook-form.com/docs/useform"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
 notes: |
   Common anti-patterns observed in real codebases:
 

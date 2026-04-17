@@ -177,3 +177,126 @@ export function fieldArrayWithHandleSubmit() {
   append({ name: 'new item' });
   remove(0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. trigger() — trigger-async-validator-throws
+//    Custom async validator throws instead of returning string message
+// ─────────────────────────────────────────────────────────────────────────────
+
+declare const checkEmailAvailability: (email: string) => Promise<boolean>;
+
+export async function triggerWithThrowingValidator() {
+  const form = useForm<FormData>();
+
+  // Register a field with an async validator that throws (no internal try-catch)
+  form.register('email', {
+    validate: async (value: string) => {
+      // ❌ Network call without try-catch — if this throws, trigger() rejects
+      const available = await checkEmailAvailability(value);
+      return available || 'Email already in use';
+    }
+  });
+
+  // @expect-violation: trigger-async-validator-throws
+  // SHOULD_FIRE: trigger() called with a validator that can throw — no outer try-catch
+  const isValid = await form.trigger('email');
+  return isValid;
+}
+
+export async function triggerWithThrowingValidatorAndCatch() {
+  const form = useForm<FormData>();
+
+  form.register('email', {
+    validate: async (value: string) => {
+      try {
+        const available = await checkEmailAvailability(value);
+        return available || 'Email already in use';
+      } catch (error) {
+        // ✅ Validator catches internally — trigger() won't reject
+        return 'Could not verify email availability';
+      }
+    }
+  });
+
+  // @expect-clean
+  // SHOULD_NOT_FIRE: validator wraps its network call in try-catch
+  try {
+    const isValid = await form.trigger('email');
+    return isValid;
+  } catch (error) {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. trigger() — trigger-result-not-awaited
+//    trigger() called without await — result is Promise, not boolean
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function triggerResultNotAwaited() {
+  const form = useForm<FormData>();
+
+  const handleNextStep = () => {
+    // @expect-violation: trigger-result-not-awaited
+    // SHOULD_FIRE: trigger() not awaited — result is Promise (always truthy), validation ignored
+    const isValid = form.trigger('email');
+    if (isValid) {
+      console.log('advancing step');
+    }
+  };
+
+  return handleNextStep;
+}
+
+export async function triggerResultAwaited() {
+  const form = useForm<FormData>();
+
+  const handleNextStep = async () => {
+    // @expect-clean
+    // SHOULD_NOT_FIRE: trigger() properly awaited
+    const isValid = await form.trigger('email');
+    if (isValid) {
+      console.log('advancing step');
+    }
+  };
+
+  return handleNextStep;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. useForm async defaultValues — async-default-values-unhandled-rejection
+//    async defaultValues function that can throw
+// ─────────────────────────────────────────────────────────────────────────────
+
+declare const fetchUserProfile: () => Promise<{ name: string; email: string }>;
+
+export function useFormWithAsyncDefaultsNoErrorHandling() {
+  // @expect-violation: async-default-values-unhandled-rejection
+  // SHOULD_FIRE: async defaultValues function can throw — no try-catch inside
+  const form = useForm<FormData>({
+    defaultValues: async () => {
+      const profile = await fetchUserProfile();
+      return { name: profile.name, email: profile.email };
+    }
+  });
+
+  return form;
+}
+
+export function useFormWithAsyncDefaultsWithFallback() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: async defaultValues function has try-catch with fallback
+  const form = useForm<FormData>({
+    defaultValues: async () => {
+      try {
+        const profile = await fetchUserProfile();
+        return { name: profile.name, email: profile.email };
+      } catch (error) {
+        console.error('Could not load profile defaults:', error);
+        return { name: '', email: '' };
+      }
+    }
+  });
+
+  return form;
+}
