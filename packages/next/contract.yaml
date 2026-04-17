@@ -1,28 +1,102 @@
-package: next
-semver: ^16.0.0
-contract_version: "1.0.0"
+# next — Next.js App Router API behavioral contracts.
+# Primary APIs: Route Handlers (GET/POST/etc), redirect(), notFound(), cookies(), headers(),
+# unstable_cache(), revalidatePath(), revalidateTag(), Server Actions.
+#
+# CRITICAL behavioral patterns confirmed from Next.js 16.x docs and source:
+# 1. redirect() and notFound() THROW errors internally (they are control-flow exceptions).
+#    Wrapping them in try-catch silently swallows them — the redirect/404 never executes.
+#    Error codes confirmed from source:
+#    - redirect() throws Error with digest: "NEXT_REDIRECT;push|replace;<url>;<statusCode>;"
+#    - notFound() throws Error with digest: "NEXT_HTTP_ERROR_FALLBACK;404"
+#    Both return `never` in TypeScript but actually throw at runtime.
+#
+# 2. cookies() and headers() are ASYNC in Next.js 15+ (returned Promise, not direct value).
+#    Forgetting await is a very common upgrade bug.
+#
+# 3. Server Actions must NOT swallow errors — unhandled throws propagate as 500 responses
+#    with internal error messages leaked to client in dev mode.
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 6):
+# API surface: 9 async-callable operations (7 intentionally omitted client/declarative APIs)
+# Contracted before: 1 (GET route handler)
+# Contracted after: 9 (+8 this pass: redirect, permanentRedirect, notFound, cookies,
+#                      headers, POST/PUT/DELETE/PATCH Server Actions, unstable_cache,
+#                      revalidatePath, revalidateTag)
+# Omitted: 7 (client-side hooks and declarative directives with no error contracts)
+# Coverage: 9/9 = 1.0 (effective contracted/non-omitted)
+# Evidence sources confirmed from:
+#   https://nextjs.org/docs/app/api-reference/functions/redirect (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/api-reference/functions/not-found (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/api-reference/functions/cookies (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/api-reference/functions/headers (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/api-reference/functions/unstable_cache (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/api-reference/functions/revalidateTag (fetched 2026-04-17)
+#   https://nextjs.org/docs/app/getting-started/mutating-data (fetched 2026-04-17)
+#   node_modules/next/dist/client/components/redirect.js (source confirmed throw)
+#   node_modules/next/dist/client/components/not-found.js (source confirmed throw)
+#   node_modules/next/dist/client/components/redirect-error.d.ts (error type)
+#   node_modules/next/dist/client/components/http-access-fallback/http-access-fallback.d.ts
+package: "next"
+semver: ">=13.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 1.0  # 9 contracted / 9 non-omitted async-callable functions
 
 detection:
   type_names:
     - NextRequest
     - NextResponse
+  import_paths:
+    - "next/navigation"
+    - "next/headers"
+    - "next/cache"
+    - "next/server"
 
 functions:
   - name: GET
     import_path: "next/server"
-    description: "API route handler"
+    description: "HTTP GET route handler in Next.js App Router. Also applies to POST, PUT, DELETE, PATCH, HEAD, OPTIONS route handlers."
     postconditions:
-      # Evidence: 0 violations in scan-next-2026-04-03.json (87/100 repos errored during TS compilation)
-      # Partial evidence — high error rate due to Next.js-specific TypeScript configs
+      # Evidence: https://nextjs.org/docs/app/building-your-application/routing/route-handlers
+      # Evidence: https://nextjs.org/docs/app/getting-started/mutating-data
+      # Confirmed: unhandled async errors return 500 with error details exposed in dev
       - id: route-handler-no-error-handling
-        condition: "async operation in route handler throws"
-        throws: "Unhandled error returns 500 with stack trace exposed"
-        description: "API route handlers must handle async errors"
-        required_handling: "Wrap async operations in try-catch and return appropriate error responses"
+        condition: >
+          An async operation in the route handler throws an error and there is no
+          try-catch wrapping the operation. This includes database calls, external API
+          calls, authentication checks, and any other async operations inside the
+          handler function body.
+        throws: >
+          The unhandled error propagates as a 500 Internal Server Error response.
+          In development, the error message and stack trace may be included in the
+          response body. In production, a generic error message is returned but the
+          error is logged server-side.
+        required_handling: >
+          Caller MUST wrap async operations in try-catch and return appropriate error
+          responses. The standard pattern:
+
+            export async function GET(request: NextRequest) {
+              try {
+                const data = await fetchDataFromDB();
+                return Response.json({ data });
+              } catch (error) {
+                console.error('Route handler error:', error);
+                return Response.json(
+                  { error: 'Internal server error' },
+                  { status: 500 }
+                );
+              }
+            }
+
+          For Server Actions, errors thrown propagate to the client as action errors.
+          Use try-catch inside Server Actions to return structured error state instead
+          of throwing, which allows client-side error handling with useActionState.
+        sources:
+          - "https://nextjs.org/docs/app/building-your-application/routing/route-handlers"
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -30,6 +104,766 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
-        rationale: "Unhandled errors return 500 with stack traces exposed in response"
+
+  - name: redirect
+    import_path: "next/navigation"
+    description: >
+      Redirects the user to another URL. Can be used in Server Components, Route
+      Handlers, Server Actions, and Middleware. Returns `never` in TypeScript.
+      CRITICAL: redirect() works by THROWING an internal error — it is a control-flow
+      exception, not a normal function return. This means it MUST NOT be called inside
+      a try-catch block, or the redirect will be silently swallowed.
+      Confirmed from next/dist/client/components/redirect.js source:
+      `throw getRedirectError(url, type, RedirectStatusCode.TemporaryRedirect)`.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/redirect (fetched 2026-04-17)
+      # Official docs: "redirect throws an error so it should be called OUTSIDE the try block"
+      # Source confirmed: throws Error with digest "NEXT_REDIRECT;push|replace;<url>;<statusCode>;"
+      # isRedirectError() and isHTTPAccessFallbackError() are the check functions
+      - id: redirect-inside-try-catch
+        condition: >
+          redirect(url) is called inside a try-catch block. Since redirect() internally
+          throws a RedirectError (Error with digest="NEXT_REDIRECT;..."), the catch block
+          intercepts the throw and the redirect never executes. The request continues
+          rendering normally after the catch block, typically causing unexpected behavior
+          (duplicate renders, missing redirects on auth flows).
+
+          This is one of the most common Next.js App Router bugs — developers call
+          redirect() inside a try block thinking it "might fail", not knowing that
+          redirect() itself IS the throw.
+
+          Common buggy pattern:
+            try {
+              const user = await getUser(id);
+              if (!user) redirect('/login');  // ← NEVER EXECUTES redirect!
+            } catch (error) {
+              // This catch intercepts the redirect throw
+              console.error(error); // ← logs "Error: NEXT_REDIRECT" instead!
+            }
+        throws: >
+          RedirectError — Error object with digest: "NEXT_REDIRECT;push|replace;<url>;<statusCode>;"
+          where statusCode is 307 (temporary) or 308 (permanent).
+          Type: `Error & { digest: string }` where digest matches /^NEXT_REDIRECT;/
+          Use `import { isRedirectError } from 'next/dist/client/components/redirect-error'`
+          to check if a caught error is a redirect (and re-throw it if so).
+          CONSTANT: REDIRECT_ERROR_CODE = "NEXT_REDIRECT" (from redirect-error.d.ts)
+        required_handling: >
+          Call redirect() OUTSIDE the try block. The confirmed correct pattern from
+          official Next.js docs and source:
+
+            // ✅ CORRECT — redirect outside try-catch
+            async function fetchTeam(id: string) {
+              const res = await fetch('https://...');
+              if (!res.ok) return undefined;
+              return res.json();
+            }
+
+            export default async function Profile({ params }) {
+              const { id } = await params;
+              const team = await fetchTeam(id);
+
+              if (!team) {
+                redirect('/login');  // ← outside any try-catch
+              }
+
+              return <div>{team.name}</div>;
+            }
+
+            // ✅ If try-catch is required, re-throw redirect errors:
+            try {
+              const result = await doSomething();
+              redirect('/success');
+            } catch (error) {
+              if (isRedirectError(error)) throw error;  // ← re-throw redirects!
+              console.error('Actual error:', error);
+            }
+
+            // ❌ WRONG — redirect inside try-catch (redirect silently swallowed)
+            try {
+              const user = await getUser();
+              if (!user) redirect('/login');
+            } catch (error) {
+              // This catches the redirect throw!
+            }
         sources:
-          - "https://nextjs.org/docs/app/building-your-application/routing/route-handlers"
+          - "https://nextjs.org/docs/app/api-reference/functions/redirect"
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: permanentRedirect
+    import_path: "next/navigation"
+    description: >
+      Redirects the user to another URL with a permanent (308) redirect. Same
+      control-flow mechanism as redirect() — it THROWS internally.
+      Used in Server Components, Route Handlers, and Server Actions.
+      Confirmed from next/dist/client/components/redirect.js source:
+      `throw getRedirectError(url, type, RedirectStatusCode.PermanentRedirect)`.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/redirect (fetched 2026-04-17)
+      # Same behavioral contract as redirect() — throws NEXT_REDIRECT error
+      # Status code is 308 (permanent) vs 307 (temporary)
+      - id: permanent-redirect-inside-try-catch
+        condition: >
+          permanentRedirect(url) is called inside a try-catch block. Like redirect(),
+          permanentRedirect() internally throws a RedirectError (digest starts with
+          "NEXT_REDIRECT;"). The catch block intercepts the throw and the 308 redirect
+          never executes.
+
+          This is especially problematic for URL canonicalization and SEO redirects
+          where missing the redirect causes duplicate content or broken navigation.
+        throws: >
+          RedirectError — Error object with digest: "NEXT_REDIRECT;push|replace;<url>;308;"
+          (status code 308 = permanent redirect)
+          Same error type as redirect() — digest starts with REDIRECT_ERROR_CODE ("NEXT_REDIRECT")
+          Use isRedirectError() to detect and re-throw.
+        required_handling: >
+          Call permanentRedirect() OUTSIDE any try-catch block, or re-throw if caught:
+
+            // ✅ CORRECT
+            if (isOldUrl) {
+              permanentRedirect('/new-canonical-url');  // outside try-catch
+            }
+
+            // ✅ If inside try-catch, re-throw:
+            try {
+              await processRedirect();
+              permanentRedirect('/destination');
+            } catch (error) {
+              if (isRedirectError(error)) throw error;
+              handleActualError(error);
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/permanentRedirect"
+          - "https://nextjs.org/docs/app/api-reference/functions/redirect"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: notFound
+    import_path: "next/navigation"
+    description: >
+      Renders the not-found.js UI for a route segment and sets the HTTP status to 404.
+      CRITICAL: notFound() works by THROWING an internal error — same mechanism as
+      redirect(). MUST NOT be called inside try-catch or the 404 will be silently swallowed.
+      Confirmed from next/dist/client/components/not-found.js source:
+      `throw error` where error.digest = "NEXT_HTTP_ERROR_FALLBACK;404".
+      The error code constant is HTTP_ERROR_FALLBACK_ERROR_CODE = "NEXT_HTTP_ERROR_FALLBACK".
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/not-found (fetched 2026-04-17)
+      # Confirmed from not-found.js source: digest = "NEXT_HTTP_ERROR_FALLBACK;404"
+      # isHTTPAccessFallbackError() checks for this error type (same family as forbidden/unauthorized)
+      - id: not-found-inside-try-catch
+        condition: >
+          notFound() is called inside a try-catch block. Since notFound() internally
+          throws an Error with digest="NEXT_HTTP_ERROR_FALLBACK;404", the catch block
+          intercepts the throw and the 404 page is never rendered. The request continues
+          rendering normally, typically serving a 200 response with undefined/empty data
+          instead of the proper 404 page.
+
+          This is a critical security issue for resource authorization: if a user
+          requests a resource that belongs to another user, calling notFound() inside
+          a try-catch silently renders the page with null data rather than returning 404.
+
+          Common buggy pattern in resource guard:
+            try {
+              const post = await db.post.findFirst({ where: { id, userId } });
+              if (!post) notFound();  // ← NEVER executes notFound!
+              return <PostPage post={post} />;
+            } catch (error) {
+              // Catches the notFound throw — continues rendering with post=undefined
+            }
+        throws: >
+          HTTPAccessFallbackError — Error object with digest: "NEXT_HTTP_ERROR_FALLBACK;404"
+          Type: `Error & { digest: string }` where digest = "NEXT_HTTP_ERROR_FALLBACK;404"
+          CONSTANT: HTTP_ERROR_FALLBACK_ERROR_CODE = "NEXT_HTTP_ERROR_FALLBACK"
+          Use `import { isHTTPAccessFallbackError } from 'next/dist/client/components/http-access-fallback/http-access-fallback'`
+          to check if a caught error is a not-found error.
+          Note: Same error family handles forbidden() and unauthorized() (different status codes).
+        required_handling: >
+          Call notFound() OUTSIDE the try block. The confirmed correct pattern:
+
+            // ✅ CORRECT
+            export default async function Page({ params }) {
+              const { id } = await params;
+              const user = await fetchUser(id);
+
+              if (!user) {
+                notFound();  // ← outside any try-catch
+              }
+
+              return <UserProfile user={user} />;
+            }
+
+            // ✅ If try-catch is required, re-throw notFound errors:
+            try {
+              const post = await db.post.findUnique({ where: { id } });
+              if (!post) notFound();
+            } catch (error) {
+              if (isHTTPAccessFallbackError(error)) throw error;  // ← re-throw!
+              console.error('DB error:', error);
+            }
+
+            // ❌ WRONG — notFound inside try-catch
+            try {
+              const resource = await getResource(id);
+              if (!resource) notFound();  // silently swallowed!
+            } catch (e) { ... }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/not-found"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: cookies
+    import_path: "next/headers"
+    description: >
+      Reads (and writes, in Server Actions/Route Handlers) HTTP cookies. Returns
+      a ReadonlyRequestCookies instance. ASYNC since Next.js 15 — must be awaited.
+      In Server Components: read-only. In Server Actions/Route Handlers: read+write.
+      Calling cookies() opts the route into dynamic rendering (cannot be statically generated).
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/cookies (fetched 2026-04-17)
+      # Official docs: "cookies is an asynchronous function that returns a promise.
+      # You must use async/await or React's use function to access cookies."
+      # Version change: "In version 14 and earlier, cookies was a synchronous function."
+      - id: cookies-not-awaited
+        condition: >
+          cookies() is called without await in a Next.js 15+ application. Since
+          cookies() became async in Next.js 15, not awaiting it returns a Promise
+          object rather than the actual cookie store. Operations on the unresolved
+          Promise (like .get('token')) return undefined, causing auth checks to
+          silently fail and all cookie reads to return undefined.
+
+          This is an extremely common upgrade bug when migrating from Next.js 14 to 15.
+          TypeScript may not catch this because the old synchronous API was compatible
+          with both sync and async access patterns.
+
+          Common buggy pattern (works in Next.js 14, silently broken in 15+):
+            const token = cookies().get('session-token')?.value;
+            // cookies() returns Promise, .get() is undefined on Promise, token is undefined
+            if (!token) redirect('/login');  // ← redirect fires on every request!
+        throws: >
+          Does not throw — silently returns undefined for all .get()/.has() calls
+          because you're operating on a Promise object, not the resolved ReadonlyRequestCookies.
+          This is a type confusion bug, not an exception.
+          In strict TypeScript mode, the type checker should catch this if the project
+          properly uses the Next.js 15 type definitions (cookies() returns Promise<ReadonlyRequestCookies>).
+        required_handling: >
+          ALWAYS await cookies() in Next.js 15+:
+
+            // ✅ CORRECT (Next.js 15+)
+            import { cookies } from 'next/headers'
+
+            export default async function Page() {
+              const cookieStore = await cookies();
+              const theme = cookieStore.get('theme');
+              return '...';
+            }
+
+            // ✅ In Server Actions:
+            export async function handleAction() {
+              'use server'
+              const cookieStore = await cookies();
+              cookieStore.set('session', token);
+            }
+
+            // ❌ WRONG (Next.js 14 pattern, broken in 15+)
+            const cookieStore = cookies();  // returns Promise, not store!
+            const token = cookieStore.get('auth-token');  // undefined!
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/cookies"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: cookies-set-in-server-component
+        condition: >
+          cookieStore.set() or cookieStore.delete() is called in a Server Component
+          (not in a Server Action or Route Handler). Setting cookies is not supported
+          during Server Component rendering — it requires a response phase where
+          Set-Cookie headers can be set, which only occurs in Route Handlers and
+          Server Actions.
+        throws: >
+          Error thrown at runtime: "Cookies can only be modified in a Server Action or
+          Route Handler." Next.js enforces this restriction to prevent incorrect
+          cookie modification during the React render phase.
+        required_handling: >
+          Move cookie.set() and cookie.delete() calls into Server Actions or Route
+          Handlers. Reading cookies is fine in Server Components:
+
+            // ✅ Reading in Server Component — OK
+            const cookieStore = await cookies();
+            const theme = cookieStore.get('theme');
+
+            // ✅ Writing in Server Action — OK
+            export async function updateTheme(theme: string) {
+              'use server'
+              const cookieStore = await cookies();
+              cookieStore.set('theme', theme);
+            }
+
+            // ❌ Writing in Server Component — throws at runtime
+            export default async function Page() {
+              const cookieStore = await cookies();
+              cookieStore.set('visited', 'true');  // ← throws!
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/cookies"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: headers
+    import_path: "next/headers"
+    description: >
+      Reads HTTP request headers as a read-only Headers object. ASYNC since Next.js 15.
+      Available in Server Components, Server Actions, Route Handlers, and Middleware.
+      Commonly used for: auth token forwarding, user-agent detection, IP address
+      extraction, locale detection. Opts the route into dynamic rendering.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/headers (fetched 2026-04-17)
+      # "headers is an asynchronous function that returns a promise. You must use async/await"
+      # "In version 14 and earlier, headers was a synchronous function"
+      - id: headers-not-awaited
+        condition: >
+          headers() is called without await in a Next.js 15+ application. The result
+          is a Promise object rather than the actual ReadonlyHeaders instance. Calling
+          .get() on the unresolved Promise returns undefined for all header reads,
+          including Authorization headers used for API authentication.
+
+          Critical auth security bug: if the Authorization header is read without
+          await, auth tokens are undefined and downstream auth checks may pass
+          incorrectly or fail in unexpected ways.
+
+          Common buggy pattern (works in Next.js 14, silently broken in 15+):
+            const authorization = headers().get('authorization');
+            // headers() returns Promise, .get() is undefined, authorization is undefined
+            if (!authorization) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        throws: >
+          Does not throw — silently returns null/undefined for all .get()/.has() calls.
+          This is a type confusion bug, not a runtime exception.
+          TypeScript with proper Next.js 15 types should catch this at compile time.
+        required_handling: >
+          ALWAYS await headers() in Next.js 15+:
+
+            // ✅ CORRECT (Next.js 15+)
+            import { headers } from 'next/headers'
+
+            export default async function Page() {
+              const headersList = await headers();
+              const userAgent = headersList.get('user-agent');
+              return '...';
+            }
+
+            // ✅ Forwarding auth header in Route Handler:
+            export async function GET() {
+              const headersList = await headers();
+              const authorization = headersList.get('authorization');
+              const res = await fetch('https://api.example.com/data', {
+                headers: { authorization }
+              });
+              return Response.json(await res.json());
+            }
+
+            // ❌ WRONG (Next.js 14 pattern — broken in 15+)
+            const authorization = headers().get('authorization');  // undefined!
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/headers"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: POST
+    import_path: "next/server"
+    description: >
+      HTTP POST route handler in Next.js App Router. Also applies to PUT, DELETE,
+      PATCH Server Actions with 'use server' directive. These functions receive
+      FormData or JSON request bodies and perform data mutations. Server Actions
+      are async functions declared with 'use server' that run on the server and
+      can be called from Client Components.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/getting-started/mutating-data (fetched 2026-04-17)
+      # Official docs: "Server Functions are reachable via direct POST requests, not just
+      # through your application's UI. Always verify authentication and authorization
+      # inside every Server Function."
+      - id: server-action-missing-auth-check
+        condition: >
+          A Server Action (`'use server'` function) performs data mutation without
+          verifying the user's authentication and authorization before the mutation.
+          Server Actions are reachable via direct POST HTTP requests — any user can
+          call them directly with crafted requests, not just through the application UI.
+          Without auth checks, Server Actions are unauthenticated mutation endpoints.
+
+          Common buggy pattern (no auth check):
+            export async function deletePost(formData: FormData) {
+              'use server'
+              const id = formData.get('id') as string;
+              await db.post.delete({ where: { id } });  // ← no auth check!
+              revalidatePath('/posts');
+            }
+        throws: >
+          Does not throw — the mutation succeeds for any caller, including malicious
+          direct POST requests. This is an authorization bypass vulnerability, not
+          an exception. The impact is unauthorized data modification or deletion.
+        required_handling: >
+          EVERY Server Action that modifies data MUST verify authentication and
+          authorization before performing the mutation:
+
+            // ✅ CORRECT — auth check before mutation
+            export async function deletePost(formData: FormData) {
+              'use server'
+              const session = await auth();
+              if (!session?.user) {
+                throw new Error('Unauthorized');
+              }
+
+              const id = formData.get('id') as string;
+
+              // Also verify ownership — not just authentication
+              const post = await db.post.findFirst({
+                where: { id, userId: session.user.id }
+              });
+              if (!post) notFound();
+
+              await db.post.delete({ where: { id } });
+              revalidatePath('/posts');
+            }
+
+            // ❌ WRONG — no auth check
+            export async function deletePost(formData: FormData) {
+              'use server'
+              const id = formData.get('id') as string;
+              await db.post.delete({ where: { id } });  // anyone can delete!
+            }
+        sources:
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
+          - "https://nextjs.org/docs/app/guides/data-security"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: server-action-redirect-in-try-catch
+        condition: >
+          A Server Action calls redirect() inside a try-catch block. Since redirect()
+          throws a RedirectError, the catch block intercepts it and the redirect never
+          executes. The action returns normally after the catch, sending no redirect
+          to the client.
+
+          This is the most common try-catch antipattern in Server Actions — developers
+          wrap the entire action body in try-catch for error handling, then call redirect()
+          or notFound() as control flow inside it.
+        throws: >
+          RedirectError (digest: "NEXT_REDIRECT;...") — thrown by redirect() but caught
+          by the surrounding try-catch. The redirect is silently suppressed.
+        required_handling: >
+          Call redirect() and notFound() AFTER the try-catch block, or re-throw them
+          if caught:
+
+            // ✅ CORRECT — redirect after try-catch
+            export async function createPost(formData: FormData) {
+              'use server'
+              const session = await auth();
+              if (!session?.user) throw new Error('Unauthorized');
+
+              let postId: string;
+              try {
+                const post = await db.post.create({
+                  data: { title: formData.get('title') as string }
+                });
+                postId = post.id;
+              } catch (error) {
+                console.error('DB error:', error);
+                return { error: 'Failed to create post' };
+              }
+
+              // redirect OUTSIDE the try-catch
+              revalidatePath('/posts');
+              redirect(`/posts/${postId}`);
+            }
+
+            // ❌ WRONG — redirect inside try-catch
+            export async function createPost(formData: FormData) {
+              'use server'
+              try {
+                const post = await db.post.create({ ... });
+                redirect(`/posts/${post.id}`);  // ← swallowed by catch!
+              } catch (error) {
+                console.error(error);  // logs "NEXT_REDIRECT" error!
+              }
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/redirect"
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: unstable_cache
+    import_path: "next/cache"
+    description: >
+      Caches the result of an expensive async function (e.g., database queries) across
+      multiple requests. The cached function is called on cache miss; on cache hit,
+      the stored result is returned without calling the function. Cache entries are
+      tagged and can be invalidated via revalidateTag(). Note: deprecated in Next.js 16
+      in favor of the 'use cache' directive, but still widely used in production apps.
+      CRITICAL: headers() and cookies() CANNOT be called inside an unstable_cache()
+      callback — they are request-scoped but the cache is shared across requests.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/unstable_cache (fetched 2026-04-17)
+      # "Accessing uncached data sources such as headers or cookies inside a cache scope
+      # is not supported. If you need this data inside a cached function use headers
+      # outside of the cached function and pass the required uncached data in as an argument."
+      - id: unstable-cache-context-api-inside
+        condition: >
+          headers() or cookies() is called inside an unstable_cache() callback function.
+          The cache callback runs in a different execution context than the request —
+          it may run at a future time or in a different request's context. Calling
+          request-scoped APIs inside the cache scope will either throw or return
+          stale/incorrect data from a different request.
+
+          Common buggy pattern:
+            const getCachedData = unstable_cache(
+              async (userId) => {
+                const cookieStore = await cookies();  // ← called inside cache scope!
+                const token = cookieStore.get('token')?.value;
+                return fetchData(userId, token);
+              },
+              ['user-data']
+            );
+        throws: >
+          May throw an error about accessing request-scoped APIs outside request context,
+          or silently return cookies/headers from a different request (stale data from
+          cache generation time). Behavior depends on whether the function is being
+          called for cache population or cache retrieval.
+        required_handling: >
+          Read headers/cookies OUTSIDE the cache callback, then pass the values as
+          arguments to the cached function:
+
+            // ✅ CORRECT — read cookies outside cache scope, pass as argument
+            export async function getUserData(userId: string) {
+              const cookieStore = await cookies();
+              const token = cookieStore.get('auth-token')?.value;
+
+              const getCachedData = unstable_cache(
+                async (uid: string, authToken: string) => {
+                  // Now token is passed in as an argument — no request API needed
+                  return fetchData(uid, authToken);
+                },
+                [userId, 'user-data'],
+                { tags: ['user-data'], revalidate: 60 }
+              );
+
+              return getCachedData(userId, token ?? '');
+            }
+
+            // ❌ WRONG — cookies() inside cache scope
+            const getCachedData = unstable_cache(
+              async (userId) => {
+                const cookieStore = await cookies();  // ← not allowed inside cache!
+                return fetchData(userId, cookieStore.get('token')?.value);
+              },
+              ['user-data']
+            );
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/unstable_cache"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: revalidatePath
+    import_path: "next/cache"
+    description: >
+      Invalidates the Next.js cache for a specific URL path. Should be called after
+      data mutations to ensure the next page render fetches fresh data. Synchronous —
+      does not return a Promise. Can only be called in Server Functions and Route
+      Handlers (not in Client Components or middleware).
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/revalidateTag (fetched 2026-04-17)
+      # revalidatePath/revalidateTag cannot be called in Client Components
+      # Both must be called before redirect() in Server Actions
+      - id: revalidate-after-redirect
+        condition: >
+          revalidatePath() or revalidateTag() is called AFTER redirect() in a Server
+          Action. Since redirect() throws a control-flow exception, any code after
+          redirect() never executes. revalidatePath() called after redirect() will
+          never run, meaning the cache is not invalidated and stale data is served
+          after the redirect.
+
+          Common buggy pattern:
+            export async function updatePost(formData: FormData) {
+              'use server'
+              await db.post.update({ ... });
+              redirect('/posts');        // ← throws here
+              revalidatePath('/posts'); // ← NEVER EXECUTES!
+            }
+        throws: >
+          redirect() throws RedirectError — all code after redirect() is unreachable.
+          revalidatePath() called after redirect() is dead code.
+        required_handling: >
+          ALWAYS call revalidatePath() or revalidateTag() BEFORE redirect() in Server
+          Actions:
+
+            // ✅ CORRECT — revalidate before redirect
+            export async function updatePost(formData: FormData) {
+              'use server'
+              const session = await auth();
+              if (!session?.user) throw new Error('Unauthorized');
+
+              await db.post.update({
+                where: { id: formData.get('id') as string },
+                data: { title: formData.get('title') as string }
+              });
+
+              revalidatePath('/posts');  // ← revalidate BEFORE redirect
+              redirect('/posts');       // ← throws (that's ok, happens after revalidate)
+            }
+
+            // ❌ WRONG — revalidate after redirect
+            export async function updatePost(formData: FormData) {
+              'use server'
+              await db.post.update({ ... });
+              redirect('/posts');        // throws
+              revalidatePath('/posts'); // dead code — never runs!
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/revalidatePath"
+          - "https://nextjs.org/docs/app/api-reference/functions/redirect"
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: revalidateTag
+    import_path: "next/cache"
+    description: >
+      Invalidates Next.js cache entries with a specific cache tag. Used with
+      `fetch(url, { next: { tags: ['tag'] } })` or `cacheTag('tag')` inside
+      `'use cache'` functions. Like revalidatePath(), must be called before
+      redirect() in Server Actions or it won't execute.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/revalidateTag (fetched 2026-04-17)
+      # Same ordering constraint as revalidatePath — must be before redirect()
+      # Also: single-argument form revalidateTag(tag) is DEPRECATED in Next.js 16
+      - id: revalidate-tag-after-redirect
+        condition: >
+          revalidateTag() is called after redirect() in a Server Action. Same dead code
+          problem as revalidatePath() — redirect() throws, so revalidateTag() never
+          executes. Tagged cache entries remain stale after the redirect.
+        throws: >
+          redirect() throws RedirectError — code after redirect() is unreachable.
+        required_handling: >
+          Call revalidateTag() BEFORE redirect():
+
+            // ✅ CORRECT
+            export async function publishPost(postId: string) {
+              'use server'
+              await db.post.update({ where: { id: postId }, data: { published: true } });
+              revalidateTag('posts');    // ← before redirect
+              revalidateTag('feed');     // ← multiple tags ok
+              redirect('/posts');
+            }
+
+            // ❌ WRONG
+            export async function publishPost(postId: string) {
+              'use server'
+              await db.post.update({ ... });
+              redirect('/posts');       // throws
+              revalidateTag('posts');   // dead code!
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/revalidateTag"
+          - "https://nextjs.org/docs/app/getting-started/mutating-data"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: revalidate-tag-deprecated-single-arg
+        condition: >
+          revalidateTag(tag) is called with only one argument (no profile/second argument).
+          In Next.js 16, the single-argument form is deprecated. The two-argument form
+          revalidateTag(tag, profile) is now required, where profile is typically 'max'
+          for stale-while-revalidate semantics.
+          The old form causes blocking revalidation (cache miss on next request) instead
+          of the preferred stale-while-revalidate behavior.
+        throws: >
+          Does not throw — the deprecated form still works but produces different
+          (less efficient) cache behavior: blocking revalidation instead of
+          stale-while-revalidate. TypeScript compilation may warn about this signature.
+        required_handling: >
+          Use the two-argument form with 'max' profile for stale-while-revalidate:
+
+            // ✅ CORRECT (Next.js 16+)
+            revalidateTag('posts', 'max');
+
+            // ✅ For immediate expiration (e.g., webhooks):
+            revalidateTag('posts', { expire: 0 });
+
+            // ⚠️ DEPRECATED (blocks next request until cache refreshed)
+            revalidateTag('posts');  // single arg is deprecated
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/revalidateTag"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+notes:
+  - "redirect() and notFound() throw control-flow exceptions — MUST be called outside try-catch, or re-throw when caught"
+  - "redirect() digest: 'NEXT_REDIRECT;push|replace;<url>;<statusCode>;' — use isRedirectError() to detect"
+  - "notFound() digest: 'NEXT_HTTP_ERROR_FALLBACK;404' — use isHTTPAccessFallbackError() to detect"
+  - "cookies() and headers() are async in Next.js 15+ — always await them"
+  - "cookies().set() and cookies().delete() require Server Action or Route Handler context (not Server Components)"
+  - "headers() and cookies() CANNOT be called inside unstable_cache() callbacks — pass values as arguments"
+  - "revalidatePath() and revalidateTag() MUST be called BEFORE redirect() in Server Actions — code after redirect() is unreachable"
+  - "Every Server Action that mutates data MUST verify authentication before the mutation"
+  - "revalidateTag(tag) single-arg form is deprecated in Next.js 16 — use revalidateTag(tag, 'max') instead"
+  - "Server Actions are reachable via direct POST requests — always check auth inside"
