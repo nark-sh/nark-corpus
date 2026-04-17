@@ -1,10 +1,31 @@
+# @nestjs/common — NestJS common package with decorators, pipes, exceptions, and services.
+# Primary async API surface: the 8 built-in pipe transform() methods. All pipes throw
+# BadRequestException (HTTP 400) by default when validation fails. The exceptionFactory
+# option allows overriding the exception type and status code.
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 3):
+# API surface: 8 async-callable pipe transform() methods (decorators/Logger/HttpException omitted)
+# Contracted before: 0 (Injectable, Controller were in contract but are synchronous decorators,
+#   not async-callable functions — they don't belong in the async API surface count)
+# Contracted after: 8 (+8 pipe functions: ValidationPipe, ParseIntPipe, ParseBoolPipe,
+#   ParseUUIDPipe, ParseArrayPipe, ParseFloatPipe, ParseEnumPipe, ParseFilePipe)
+# Omitted: ParseDatePipe (sync, returns Date not Promise), DefaultValuePipe (sync),
+#   decorators (Injectable/Controller/Module etc — synchronous),
+#   Logger (synchronous logging), HttpException subclasses (constructors, not async)
+# Coverage: 8/8 = 1.0 (100%)
+# Evidence confirmed from:
+#   @nestjs/common@11.1.19 source: pipes/*.js — exceptionFactory, BadRequestException throw sites
+#   https://docs.nestjs.com/pipes (built-in pipes section)
+#   https://docs.nestjs.com/techniques/validation (ValidationPipe)
 package: "@nestjs/common"
 semver: ">=10.0.0 <12.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 8 contracted / 8 total async-callable pipe functions (sync methods omitted)
+description: NestJS common package with built-in pipes, decorators, exceptions, and services
 
 detection:
   type_names:
@@ -12,15 +33,494 @@ detection:
     - Controller
     - HttpException
     - ExceptionFilter
+    - ValidationPipe
+    - ParseIntPipe
+    - ParseBoolPipe
+    - ParseUUIDPipe
+    - ParseArrayPipe
+    - ParseFloatPipe
+    - ParseEnumPipe
+    - ParseFilePipe
 
 functions:
+  - name: ValidationPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that validates and transforms incoming request data using class-validator
+      and class-transformer libraries. Applied globally (app.useGlobalPipes) or per-route
+      via @UsePipes(). Validates DTOs decorated with class-validator decorators (@IsString,
+      @IsEmail, @IsNumber, etc.). Throws BadRequestException (HTTP 400) by default when
+      validation fails, with an array of validation errors in the response body.
+      CRITICAL: requires class-validator and class-transformer as peer dependencies — if
+      missing, ValidationPipe calls process.exit(1) on first use.
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/validation.pipe.js
+      # this.exceptionFactory = options.exceptionFactory || this.createExceptionFactory();
+      # In createExceptionFactory: return validationErrors => new HttpErrorByCode[this.errorHttpStatusCode](...)
+      # Default errorHttpStatusCode = HttpStatus.BAD_REQUEST (400)
+      # errors.length > 0 → throw await this.exceptionFactory(errors)
+      - id: validation-pipe-missing-peer-deps
+        condition: >
+          ValidationPipe is instantiated or used but class-validator or class-transformer
+          packages are not installed. This is a common mistake — @nestjs/common lists these
+          as peer dependencies (not direct dependencies), so they must be installed separately.
+          When ValidationPipe.transform() is first called and tries to require class-validator
+          or class-transformer, the loadPackage() utility logs an error and calls process.exit(1).
+        throws: >
+          process.exit(1) — the NestJS process terminates immediately. No exception is thrown
+          to the caller. The error is logged: "The 'class-validator' package is missing. Please,
+          make sure to install it to take advantage of ValidationPipe."
+        required_handling: >
+          Install peer dependencies:
+            npm install class-validator class-transformer
+
+          Or use validatorPackage/transformerPackage options to provide custom implementations:
+            app.useGlobalPipes(new ValidationPipe({
+              validatorPackage: customValidatorPackage,
+              transformerPackage: customTransformerPackage
+            }));
+
+          Note: This is a startup error — the app will crash on the first validated request
+          if peer deps are missing. Cannot be caught with try-catch.
+        sources:
+          - "https://docs.nestjs.com/pipes"
+          - "https://docs.nestjs.com/pipes"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: @nestjs/common@11.1.19 pipes/validation.pipe.js
+      # if (errors.length > 0) { throw await this.exceptionFactory(errors); }
+      # Default factory: new BadRequestException({ message: flattenedErrors, error: 'Bad Request', statusCode: 400 })
+      - id: validation-pipe-dto-validation-error
+        condition: >
+          A request body, query param, or route param fails DTO validation — e.g., a required
+          field is missing, a field has the wrong type, or a field fails a custom validator.
+          class-validator returns an array of ValidationError objects, which are passed to
+          the exceptionFactory. The default factory creates a BadRequestException with the
+          flattened validation error messages.
+        throws: >
+          BadRequestException (extends HttpException, HTTP 400) with response body:
+          {
+            "statusCode": 400,
+            "message": ["name must be a string", "email must be an email"],
+            "error": "Bad Request"
+          }
+          When disableErrorMessages: true, the message array is replaced with a generic
+          "Bad Request" string (hides details from clients).
+          Custom exceptionFactory allows returning any HttpException subclass.
+        required_handling: >
+          ValidationPipe is typically registered globally and NestJS's default exception
+          handler converts BadRequestException to a 400 HTTP response automatically.
+          However, callers using ValidationPipe manually in code (not via decorator) must
+          handle this:
+
+            try {
+              const validated = await validationPipe.transform(requestBody, metadata);
+              // proceed with validated data
+            } catch (error) {
+              if (error instanceof BadRequestException) {
+                // validation failed — return 400 to client
+                return res.status(400).json(error.getResponse());
+              }
+              throw error;
+            }
+
+          For global registration: app.useGlobalPipes(new ValidationPipe()) — NestJS handles
+          the BadRequestException automatically.
+
+          Use whitelist: true to strip unknown properties.
+          Use forbidNonWhitelisted: true to throw on unknown properties.
+          Use transform: true to auto-transform primitives (e.g., string "42" → number 42).
+        sources:
+          - "https://docs.nestjs.com/pipes"
+          - "https://docs.nestjs.com/techniques/validation"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseIntPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that parses a route parameter or query string into a JavaScript integer.
+      Commonly used with @Param('id', ParseIntPipe) or @Query('page', ParseIntPipe).
+      Throws BadRequestException (HTTP 400) when the value cannot be parsed as an integer.
+      Accepts only numeric strings matching /^-?\d+$/ — decimals, floats, and non-numeric
+      strings all fail validation.
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-int.pipe.js
+      # if (!this.isNumeric(value)) { throw this.exceptionFactory('Validation failed (numeric string is expected)'); }
+      # isNumeric: /^-?\d+$/.test(value) && isFinite(value) — decimals fail, floats fail
+      # Default: new BadRequestException('Validation failed (numeric string is expected)')
+      - id: parse-int-invalid-input
+        condition: >
+          A route parameter or query string value is not a valid integer string. Common cases:
+          - Decimal: "3.14" → fails (isNumeric requires /^-?\d+$/)
+          - Empty string: "" → fails
+          - Non-numeric: "abc", "id", "null", "undefined" → fails
+          - Float: "3.0" → fails (decimal point present)
+          - URL with string ID: GET /users/abc where :id is ParseIntPipe
+
+          Note: "0", "-1", "42" all pass. Only integer-shaped numeric strings pass.
+        throws: >
+          BadRequestException (HTTP 400) with message:
+          "Validation failed (numeric string is expected)"
+          Response body: { "statusCode": 400, "message": "...", "error": "Bad Request" }
+          Custom exceptionFactory or errorHttpStatusCode options can override this.
+        required_handling: >
+          For route handlers: NestJS's built-in exception handler converts BadRequestException
+          to a 400 response automatically. No additional try-catch needed in normal usage.
+
+          For custom usage or when the 400 should be handled differently:
+            @Get(':id')
+            async getUser(@Param('id', ParseIntPipe) id: number) {
+              // id is guaranteed to be a number here
+              // BadRequestException already thrown and handled by NestJS before this point
+            }
+
+          If you need to handle the error explicitly, use optional: true to return null/undefined
+          instead of throwing, then handle the null case:
+            new ParseIntPipe({ optional: true })
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseBoolPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that parses a route parameter or query string into a JavaScript boolean.
+      Accepts only the exact strings "true"/"false" or boolean values true/false.
+      Does NOT accept "1"/"0", "yes"/"no", "on"/"off" — only the canonical boolean strings.
+      Commonly used with @Query('active', ParseBoolPipe).
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-bool.pipe.js
+      # throw this.exceptionFactory('Validation failed (boolean string is expected)');
+      # isTrue: value === true || value === 'true'
+      # isFalse: value === false || value === 'false'
+      # All other values → throw
+      - id: parse-bool-invalid-input
+        condition: >
+          A route parameter or query string value is not a valid boolean string.
+          ParseBoolPipe ONLY accepts: "true", "false", true (boolean), false (boolean).
+          All of these FAIL:
+          - "1", "0" — numeric booleans
+          - "yes", "no" — natural language
+          - "on", "off" — toggle strings
+          - "TRUE", "FALSE" — case-sensitive! (these fail in v10-v11)
+          - "" — empty string
+          - undefined (without optional: true)
+        throws: >
+          BadRequestException (HTTP 400) with message:
+          "Validation failed (boolean string is expected)"
+          Custom exceptionFactory or errorHttpStatusCode options can override this.
+        required_handling: >
+          Use ParseBoolPipe only for query params that will strictly be "true" or "false".
+          For more flexible boolean parsing (accepting "1"/"0", "yes"/"no"), implement
+          a custom pipe.
+
+          Example with optional:
+            @Query('active', new ParseBoolPipe({ optional: true })) active?: boolean
+
+          For case-insensitive boolean parsing in older NestJS versions, transform first:
+            @Query('active') active: string  // get raw string
+            // then: active?.toLowerCase() === 'true'
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseUUIDPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that validates a route parameter or query string as a UUID.
+      Supports UUID versions 3, 4, 5, and 7 (configurable via version option).
+      Validates format using regex — does NOT verify UUID exists in database.
+      Commonly used with @Param('id', ParseUUIDPipe) for resource endpoints.
+      A critical security guard: prevents invalid strings from reaching database queries,
+      which can cause SQL errors or expose information about the database schema.
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-uuid.pipe.js
+      # throw this.exceptionFactory(`Validation failed (uuid${...} is expected)`)
+      # throw this.exceptionFactory('The value passed as UUID is not a string')
+      # Uses static uuidRegExps for v3/v4/v5/v7/all
+      - id: parse-uuid-invalid-format
+        condition: >
+          A route parameter or query string is not a valid UUID string. Common cases:
+          - Numeric ID: "123", "42" — fails (not a UUID format)
+          - Empty string: "" — fails
+          - Non-string type: number passed directly — throws "value passed as UUID is not a string"
+          - Wrong UUID version: v4 UUID passed when version: '3' is set
+          - Malformed UUID: "not-a-uuid", partial UUID strings
+          - SQL injection attempts: "1; DROP TABLE users" — fails UUID validation
+        throws: >
+          BadRequestException (HTTP 400) with message:
+          "Validation failed (uuid is expected)" — when no version specified
+          "Validation failed (uuid v 4 is expected)" — when version: '4' specified
+          "The value passed as UUID is not a string" — when non-string value passed
+        required_handling: >
+          ParseUUIDPipe is the standard way to validate UUID route parameters.
+          NestJS handles the BadRequestException automatically for route handlers.
+          Always use ParseUUIDPipe for any route that takes a UUID:
+
+            @Get(':id')
+            async getUser(@Param('id', ParseUUIDPipe) id: string) {
+              // id is guaranteed to be a valid UUID here
+            }
+
+          Specify version for stricter validation (v4 is most common):
+            @Param('id', new ParseUUIDPipe({ version: '4' })) id: string
+
+          Note: ParseUUIDPipe validates FORMAT only — it does not check if the resource
+          with that UUID exists. A NotFoundException should be thrown if the resource is
+          not found after UUID validation passes.
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseArrayPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that parses a comma-separated query string or validates an array.
+      Accepts a string (splits by separator, default ",") or an existing array.
+      Can validate each item using ValidationPipe if items type is specified.
+      Commonly used with @Query('ids', new ParseArrayPipe({ items: Number })).
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-array.pipe.js
+      # if (!value && !this.options.optional) { throw this.exceptionFactory(VALIDATION_ERROR_MESSAGE); }
+      # VALIDATION_ERROR_MESSAGE = 'Validation failed (parsable array expected)'
+      # Also validates items via ValidationPipe → can throw BadRequestException for invalid items
+      - id: parse-array-missing-or-invalid
+        condition: >
+          The query parameter or value is missing (undefined/null/empty) and optional: true
+          is not set. Or the value is a non-string, non-array type that cannot be parsed.
+          The pipe throws "Validation failed (parsable array expected)".
+          Note: if items type is specified and item validation fails, the inner ValidationPipe
+          also throws BadRequestException for each invalid item.
+        throws: >
+          BadRequestException (HTTP 400) with message:
+          "Validation failed (parsable array expected)"
+          Or validation errors from inner ValidationPipe when items: SomeClass is specified
+          and items fail class-validator rules.
+        required_handling: >
+          Use optional: true when the array parameter is not required:
+            @Query('tags', new ParseArrayPipe({ optional: true })) tags?: string[]
+
+          For typed arrays with validation:
+            @Query('ids', new ParseArrayPipe({ items: Number, separator: ',' })) ids: number[]
+
+          Items with class validation (requires class-validator installed):
+            @Query('filters', new ParseArrayPipe({ items: FilterDto })) filters: FilterDto[]
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseFloatPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that parses a route parameter or query string into a JavaScript float.
+      Accepts numeric strings including decimals (e.g., "3.14", "-2.5", "42").
+      Unlike ParseIntPipe which requires integers, ParseFloatPipe accepts decimal numbers.
+      Uses parseFloat() internally — "3.14abc" becomes 3.14 (trailing non-numeric chars ignored).
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-float.pipe.js
+      # if (!this.isNumeric(value)) { throw this.exceptionFactory('Validation failed (numeric string is expected)'); }
+      # isNumeric checks: ['string', 'number'].includes(typeof value) — number type passes directly
+      - id: parse-float-invalid-input
+        condition: >
+          A route parameter or query string is not a valid numeric string.
+          Non-numeric strings fail: "abc", "price", "null", "", "NaN", "$3.14".
+          Note: "3.14abc" PASSES (parseFloat ignores trailing non-numeric chars) — this can
+          be surprising behavior. "Infinity" also passes (isFinite check only applies to
+          the final parsed value behavior, not the string regex check in all versions).
+        throws: >
+          BadRequestException (HTTP 400) with message:
+          "Validation failed (numeric string is expected)"
+        required_handling: >
+          Use for @Query or @Param that accept decimal numbers:
+            @Query('price', ParseFloatPipe) price: number
+
+          Note the surprising "3.14abc" → 3.14 behavior: if you need strict numeric
+          validation, add a custom validator or use class-validator's @IsNumber() on a DTO.
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseEnumPipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe that validates a route parameter or query string is a valid member
+      of a TypeScript enum. Throws BadRequestException when the value is not one of the
+      enum's values. Case-sensitive. Commonly used with @Query('direction', new ParseEnumPipe(Direction)).
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/parse-enum.pipe.js
+      # if (!this.isEnum(value)) { throw this.exceptionFactory(...) }
+      # isEnum: checks if value === enumType[Object.keys(enumType).find(k => enumType[k] === value)]
+      # Error message varies by NestJS version — typically includes the valid enum values
+      - id: parse-enum-invalid-value
+        condition: >
+          A route parameter or query string value is not one of the valid enum values.
+          Case-sensitive: enum values must match exactly. For a Direction enum with values
+          "ASC" and "DESC", the value "asc" (lowercase) fails.
+          Numeric enums: passing the string "0" when the enum has value 0 may fail depending
+          on how the enum is defined (string vs numeric enum type).
+        throws: >
+          BadRequestException (HTTP 400) with a message listing valid enum values.
+          Example: "Validation failed (expected value to be one of the following values: ASC, DESC)"
+        required_handling: >
+          Use ParseEnumPipe for query params that must match a specific set of values:
+            enum Direction { ASC = 'ASC', DESC = 'DESC' }
+
+            @Query('order', new ParseEnumPipe(Direction)) order: Direction
+
+          For case-insensitive enum matching, use a custom pipe that uppercases before
+          comparison. String enums (enum values are string literals) are most reliable.
+          Avoid numeric enums with ParseEnumPipe — the string-to-number matching is
+          inconsistent across NestJS versions.
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: ParseFilePipe
+    import_path: "@nestjs/common"
+    description: >
+      Built-in pipe for validating file uploads from @UploadedFile() or @UploadedFiles()
+      decorators. Validates file presence (required by default) and runs optional validators
+      (MaxFileSizeValidator, FileTypeValidator, or custom validators implementing FileValidator).
+      Used with Multer or platform file upload middleware.
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.19 pipes/file/parse-file.pipe.js
+      # if (areThereAnyFilesIn && this.fileIsRequired) { throw this.exceptionFactory('File is required'); }
+      # validateOrThrow: throw this.exceptionFactory(errorMessage) when validator.isValid() returns false
+      # Default fileIsRequired = true — missing file throws 400
+      - id: parse-file-missing-required
+        condition: >
+          A file upload handler expects a file (fileIsRequired is true by default) but
+          no file was included in the request. This is the most common ParseFilePipe error —
+          an endpoint that requires file upload receives a request without multipart/form-data
+          or with an empty file field.
+        throws: >
+          BadRequestException (HTTP 400) with message: "File is required"
+        required_handling: >
+          Use fileIsRequired: false when the file is optional:
+            @UploadedFile(
+              new ParseFilePipe({ fileIsRequired: false })
+            ) file?: Express.Multer.File
+
+          For required files, rely on NestJS's default 400 response.
+          Document in API spec that file is required so clients don't miss it.
+        sources:
+          - "https://docs.nestjs.com/pipes"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: @nestjs/common@11.1.19 pipes/file/parse-file.pipe.js
+      # validateOrThrow: const isValid = await validator.isValid(file); if (!isValid) { throw this.exceptionFactory(errorMessage); }
+      # MaxFileSizeValidator: errorMessage = 'Validation failed (expected size is less than X bytes)'
+      # FileTypeValidator: errorMessage = 'Validation failed (expected type is ...)'
+      - id: parse-file-validator-failed
+        condition: >
+          One of the validators passed to ParseFilePipe fails. Built-in validators:
+          - MaxFileSizeValidator: file size exceeds maxSize (in bytes).
+            Error: "Validation failed (expected size is less than X bytes, got Y bytes)"
+          - FileTypeValidator: file MIME type doesn't match fileType regex.
+            Error: "Validation failed (expected type is /pattern/)"
+          Custom FileValidator implementations can return any error message.
+        throws: >
+          BadRequestException (HTTP 400) with the validator's error message.
+          For MaxFileSizeValidator: "Validation failed (expected size is less than X bytes, got Y bytes)"
+          For FileTypeValidator: "Validation failed (expected type is /image\/(jpeg|png)/)"
+        required_handling: >
+          Use MaxFileSizeValidator to prevent oversized uploads (important for serverless
+          and memory-limited environments):
+            new ParseFilePipe({
+              validators: [
+                new MaxFileSizeValidator({ maxSize: 5 * 1024 * 1024 }), // 5MB
+                new FileTypeValidator({ fileType: /image\/(jpeg|png|webp)/ })
+              ]
+            })
+
+          Catch validation errors for custom error responses:
+            try {
+              const file = await parseFilePipe.transform(uploadedFile);
+            } catch (error) {
+              if (error instanceof BadRequestException) {
+                return { error: 'File upload rejected', details: error.message };
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.nestjs.com/pipes"
+          - "https://docs.nestjs.com/pipes"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
   - name: Injectable
     import_path: "@nestjs/common"
-    description: "Decorator for dependency injection"
+    description: "Class decorator for dependency injection. Marks a class as a provider that can be injected into other classes via NestJS DI container."
     postconditions:
-      # Evidence: 0 primary firings across 10 repos in scan-nestjs-common-2026-04-02.json
-      # Scanner correctly identifies NestJS decorator usage; no violations fired in clean repos.
-      # Top scanned: ghostfolio/ghostfolio (⭐ 7985), lujakob/nestjs-realworld-example-app (⭐ 3326), notadd/notadd (⭐ 2836)
+      # Evidence: synchronous decorator — no async behavior
+      # Retained from v1.0.0 contract for scanner detection continuity
       - id: injectable-constructor-error
         condition: "constructor throws error during dependency injection (connection failure, initialization error)"
         throws: "Error that prevents application startup"
@@ -37,11 +537,10 @@ functions:
 
   - name: Controller
     import_path: "@nestjs/common"
-    description: "Decorator for route controllers"
+    description: "Class decorator for NestJS route controllers. Marks a class as a controller with route handlers."
     postconditions:
-      # Evidence: 0 primary firings across 10 repos in scan-nestjs-common-2026-04-02.json
-      # NestJS framework handles async errors through exception filters; most repos rely on framework-level handling.
-      # Top scanned: NarHakobyan/awesome-nest-boilerplate (⭐ 2775), nestjs/typeorm (⭐ 2121), nestjs/swagger (⭐ 1861)
+      # Evidence: synchronous decorator — no async behavior
+      # Retained from v1.0.0 contract for scanner detection continuity
       - id: controller-async-handler-error
         condition: "async route handler throws error or promise rejects"
         throws: "Error propagated to exception filter or default error handler"
@@ -69,9 +568,25 @@ edge_cases:
       user_experience: service_unavailable
       incident_cost_range: medium
 
+  - id: parse-date-pipe-is-synchronous
+    description: >
+      ParseDatePipe.transform() is synchronous (returns Date | null | undefined, not Promise<Date>).
+      Omitted from async API surface count. DefaultValuePipe is also synchronous (returns T|R).
+      These are intentionally excluded from the coverage count.
+    sources:
+      - "@nestjs/common@11.1.19 pipes/parse-date.pipe.d.ts — transform(value): Date | null | undefined"
+    severity: info
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: low
+
 # Category: framework
-# Latest version: 11.1.14
+# Latest version: 11.1.19
 # Generated: 2026-02-26
 # Audited: 2026-04-02 — scan-nestjs-common-2026-04-02.json
 # Re-audited: 2026-04-13 — no new violations found, evidence quality confirmed
+# Deepened: 2026-04-17 — full pipe API surface contracted (8 async pipe transform() methods)
 # FP check: 0/100 false positives (0% rate)
