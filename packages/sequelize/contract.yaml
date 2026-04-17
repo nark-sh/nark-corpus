@@ -2,10 +2,10 @@ package: sequelize
 semver: ">=6.28.1"
 contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.92
+coverage_score: 0.97
 
 # CRITICAL SECURITY NOTE:
 # sequelize has 6 CVEs in versions < 6.28.1:
@@ -70,6 +70,9 @@ detection:
 
     # Raw queries
     - ".query("
+
+    # Schema inspection
+    - ".describe("
 
 functions:
   - name: authenticate
@@ -1268,6 +1271,64 @@ functions:
           The UPDATE to clear deletedAt may fail mid-flight.
         sources:
           - "https://sequelize.org/docs/v6/core-concepts/paranoid/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── LOW PRIORITY: Schema Inspection ──
+
+  - name: describe
+    import_path: "sequelize"
+    description: >
+      Runs a DESCRIBE (or equivalent) query on the model's table and returns
+      a hash of column names mapped to their types and constraints. Used in
+      health checks, migration verification scripts, and debugging tools.
+      Delegates to QueryInterface.describeTable() which executes a real
+      database query.
+    postconditions:
+      # Evidence: sequelize/lib/dialects/abstract/query-interface.js lines 150-179
+      # Source code confirmed: describeTable() throws generic Error (NOT SequelizeError)
+      # when the table does not exist. ER_NO_SUCH_TABLE is caught and re-thrown as
+      # new Error("No description found for ..."). Other DB errors are rethrown as-is.
+      # https://github.com/sequelize/sequelize/blob/main/src/dialects/abstract/query-interface.ts
+      - id: describe-table-not-found
+        condition: "The model's table does not exist in the database"
+        throws: >
+          Error — 'No description found for "<tableName>" table. Check the
+          table name and schema; remember, they _are_ case sensitive.'
+          NOTE: This is a generic Error, NOT a SequelizeDatabaseError.
+          The error is NOT an instance of Sequelize.DatabaseError.
+          Catching with instanceof Sequelize.BaseError will NOT catch it.
+        required_handling: >
+          Caller MUST use try/catch and check error.message, not instanceof.
+          describe() is commonly called in migration scripts and health checks
+          to verify schema state. An uncaught table-not-found error crashes
+          the script and makes migration status ambiguous.
+          Example safe pattern: catch (error) { if (error.message.includes('No description found')) { ... } }
+        sources:
+          - "https://github.com/sequelize/sequelize/blob/main/src/dialects/abstract/query-interface.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: describe-connection-error
+        condition: "Database connection failure during DESCRIBE query"
+        throws: "DatabaseError, ConnectionError (SequelizeDatabaseError, SequelizeConnectionError)"
+        required_handling: >
+          Caller MUST catch database and connection errors.
+          describe() executes a real SQL query — it is not a local metadata
+          lookup. A downed database or lost connection throws the same
+          DatabaseError/ConnectionError hierarchy as findAll() or create().
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/getting-started/"
         severity: error
         business_impact:
           incident_label: DOWNTIME
