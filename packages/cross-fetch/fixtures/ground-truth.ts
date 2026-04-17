@@ -2,11 +2,15 @@
  * cross-fetch Ground-Truth Fixture
  *
  * Each call site annotated // SHOULD_FIRE or // SHOULD_NOT_FIRE.
- * Contract postcondition IDs: network-error
+ * Contract postcondition IDs: network-error, http-error-unchecked, abort-error,
+ *   json-parse-error, json-body-consumed-twice, text-abort-mid-stream,
+ *   text-body-consumed-twice
  *
  * Key rules:
- *   - await fetch() without try-catch → SHOULD_FIRE
+ *   - await fetch() without try-catch → SHOULD_FIRE (network-error)
  *   - await fetch() inside try-catch → SHOULD_NOT_FIRE
+ *   - response.text() without try-catch after body already read → SHOULD_FIRE (text-body-consumed-twice)
+ *   - response.text() with response.clone() before reading → SHOULD_NOT_FIRE
  */
 
 import fetch from 'cross-fetch';
@@ -66,6 +70,45 @@ export async function fetchWithAbortAndCatch(url: string) {
     return await response.text();
   } catch (error) {
     clearTimeout(id);
+    throw error;
+  }
+}
+
+// ─── 6. response.text() called after body already consumed ─────────────────────
+// @expect-violation: text-body-consumed-twice
+
+export async function textBodyConsumedTwice(url: string) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    // First read consumes the body stream
+    const rawText = await response.text();
+    console.log('Raw response length:', rawText.length);
+    // TODO(scanner): text-body-consumed-twice — calling text() again on the same response
+    // after body is already disturbed will throw TypeError "body used already".
+    // No scanner detection rule exists yet — queued in upgrade-concerns.json.
+    const textAgain = await response.text();
+    return textAgain;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ─── 7. response.text() with clone() — correct pattern ────────────────────────
+// @expect-clean
+
+export async function textWithClone(url: string) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    // SHOULD_NOT_FIRE: clone response before reading to allow multiple reads
+    const responseClone = response.clone();
+    const rawText = await response.text();
+    console.log('Raw response length:', rawText.length);
+    // Second read on clone — safe
+    const textFromClone = await responseClone.text();
+    return textFromClone;
+  } catch (error) {
     throw error;
   }
 }

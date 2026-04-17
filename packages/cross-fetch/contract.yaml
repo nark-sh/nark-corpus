@@ -16,6 +16,16 @@
 #   https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch
 #   https://developer.mozilla.org/en-US/docs/Web/API/Response/json
 #   https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 5):
+# Gap found in response.text(): missing text-body-consumed-twice postcondition.
+# response.json() had json-body-consumed-twice but text() was missing the equivalent.
+# Evidence: MDN https://developer.mozilla.org/en-US/docs/Web/API/Response/text confirms
+#   TypeError thrown when "body is disturbed or locked".
+#   node-fetch/lib/index.js consumeBody() line 344: same TypeError path for all body methods.
+# Added: text-body-consumed-twice postcondition to response.text()
+# Postconditions: 7 → 8 (+1 this pass)
+# Coverage: 3/6 = 0.50 (same function count, new postcondition on existing function)
 package: cross-fetch
 semver: ">=3.0.0 <5.0.0"
 contract_version: "1.1.0"
@@ -24,7 +34,7 @@ last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
 coverage_score: 0.50  # 3 contracted / 6 total async-callable (3 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 3/3 = 1.0
+# Note: effective coverage (contracted/non-omitted) = 3/3 = 1.0; postconditions: 8
 description: Universal WHATWG Fetch API polyfill for Node, browsers, and React Native
 
 functions:
@@ -337,12 +347,72 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/text
+      # "TypeError: Thrown when the response body is disturbed or locked"
+      # https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#locked_and_disturbed_streams
+      # Confirmed: node-fetch/lib/index.js consumeBody():
+      #   if (this[INTERNALS].disturbed) {
+      #     return Body.Promise.reject(new TypeError(`body used already for: ${this.url}`))
+      #   }
+      # This is the same "body disturbed" error as json-body-consumed-twice — applies
+      # to all body-read methods (json, text, blob, arrayBuffer). Commonly hit when
+      # response.text() is used for debug logging before response.json() parses the body.
+      - id: text-body-consumed-twice
+        condition: >
+          response.text() is called after any other body-read method (json(), blob(),
+          arrayBuffer(), text()) has already consumed the response body on the same
+          Response object. Response bodies are ReadableStream objects — once read
+          (disturbed), they cannot be re-read. Common patterns that trigger this:
+          - Reading the body once as text for logging, then attempting to parse as JSON
+          - Middleware/interceptors that read the body before the handler does
+          - Calling response.text() twice (e.g., validating content before processing)
+          - Using text() as a fallback after json() throws a parse error on the same response
+        throws: >
+          TypeError with message "body used already for: <url>" (node-fetch/cross-fetch Node.js).
+          In browser: "Failed to execute 'text' on 'Response': body stream already read".
+          In browser: also may throw TypeError "body is disturbed or locked".
+          Cross-environment: always a TypeError.
+        required_handling: >
+          Use response.clone() before reading the body if you need to read it multiple times:
+
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+
+            // Clone BEFORE first read if you need the body in two places
+            const responseForLog = response.clone();
+
+            try {
+              const text = await response.text();
+              // Process text...
+              return text;
+            } catch (error) {
+              // Safe: responseForLog was cloned before body was read
+              const rawContent = await responseForLog.text().catch(() => '<unreadable>');
+              console.error('text() failed, raw content:', rawContent.slice(0, 200));
+              throw error;
+            }
+
+          Alternative: read the body once, then use the string for all purposes.
+          Do NOT read the original response body after already reading it — clone first.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/text"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#locked_and_disturbed_streams"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/clone"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - "fetch() is the only import from cross-fetch — Request, Response, Headers are also exported but are constructors"
   - "cross-fetch wraps node-fetch@2.x on Node.js. On browsers, it uses the native fetch."
   - "FetchError (node-fetch) vs DOMException (browser): error.type === 'system' for network errors"
   - "response.ok shorthand: status >= 200 && status < 300. Always check before reading body."
   - "AbortError.name === 'AbortError' is the cross-environment check (works in both Node.js node-fetch and browsers)"
-  - "response.blob(), response.arrayBuffer(), response.formData() omitted — same error profile as response.text()"
+  - "response.blob(), response.arrayBuffer(), response.formData() omitted — same error profile as response.text() (AbortError mid-stream, body-consumed-twice TypeError)"
   - "cross-fetch v4+ only supports the ponyfill pattern — import fetch from 'cross-fetch'"
   - "Alternative: many projects use cross-fetch to polyfill fetch in Node.js 16 and below; Node.js 18+ has native fetch"
+  - "text-body-consumed-twice and json-body-consumed-twice are the same underlying error (consumeBody() TypeError) — affects all body methods"
