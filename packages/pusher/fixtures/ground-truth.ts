@@ -5,9 +5,12 @@
  * Derived from the pusher contract spec, NOT V1 behavior.
  *
  * Contracted functions (all from import "pusher"):
- *   - pusher.trigger()       postcondition: api-error
- *   - pusher.triggerBatch()  postcondition: api-error
- *   - pusher.sendToUser()    postcondition: api-error
+ *   - pusher.trigger()                     postcondition: api-error
+ *   - pusher.triggerBatch()                postcondition: api-error
+ *   - pusher.sendToUser()                  postcondition: api-error
+ *   - pusher.terminateUserConnections()    postcondition: terminate-api-error
+ *   - pusher.get()                         postcondition: get-api-error
+ *   - pusher.post()                        postcondition: post-api-error
  *
  * pusher uses 2-level property chains (instance.method), detected directly.
  */
@@ -119,5 +122,104 @@ export async function sendToUserSilentWithCatch(userId: string, payload: object)
   } catch (err) {
     // Notification failure does not abort the primary operation
     console.error('Notification failed for user:', userId, err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. terminateUserConnections
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: terminate-api-error
+export async function terminateUserNoCatch(userId: string) {
+  // SHOULD_FIRE: terminate-api-error — terminateUserConnections rejects with RequestError
+  // on Pusher API failure (401/403/5xx/network). Used in ban flows — if this fails,
+  // the user remains connected despite being banned. No try-catch.
+  await pusher.terminateUserConnections(userId);
+}
+
+// @expect-clean
+export async function terminateUserWithCatch(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: terminateUserConnections inside try-catch with error handling
+    await pusher.terminateUserConnections(userId);
+  } catch (err) {
+    if (err instanceof Pusher.RequestError) {
+      // Log and retry — user may still be connected
+      console.error('Failed to terminate connections for', userId, err.status);
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+export async function terminateUserWithRetryQueue(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: terminateUserConnections with error handling + retry queuing
+    await pusher.terminateUserConnections(userId);
+  } catch (err) {
+    // Log but don't crash — queue for retry, log security gap
+    console.error('Connection termination failed, queuing retry for user:', userId, err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. get
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: get-api-error
+export async function getChannelsNoCatch() {
+  // SHOULD_FIRE: get-api-error — get() rejects with RequestError on any HTTP failure.
+  // Common: 400 when requesting user_count on non-presence channel, 401/403 auth failure.
+  const response = await pusher.get({ path: '/channels', params: { info: 'user_count' } });
+  return response.json();
+}
+
+// @expect-clean
+export async function getChannelsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: get() inside try-catch
+    const response = await pusher.get({ path: '/channels', params: { filter_by_prefix: 'presence-', info: 'user_count' } });
+    if (response.status === 200) {
+      return response.json();
+    }
+  } catch (err) {
+    if (err instanceof Pusher.RequestError) {
+      if (err.status === 400) {
+        // Invalid attribute for channel type
+        console.error('Invalid channel attribute requested:', err.body);
+      } else {
+        console.error('Pusher GET failed:', err.status, err.body);
+      }
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. post
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: post-api-error
+export async function postEventNoCatch(path: string, body: object) {
+  // SHOULD_FIRE: post-api-error — post() rejects with RequestError on API failure.
+  // HTTP 413 when payload exceeds 10KB limit. No try-catch.
+  const response = await pusher.post({ path, body: JSON.stringify(body) });
+  return response.json();
+}
+
+// @expect-clean
+export async function postEventWithCatch(path: string, body: object) {
+  try {
+    // SHOULD_NOT_FIRE: post() inside try-catch with 413 handling
+    const response = await pusher.post({ path, body: JSON.stringify(body) });
+    return response.json();
+  } catch (err) {
+    if (err instanceof Pusher.RequestError) {
+      if (err.status === 413) {
+        throw new Error('Pusher payload too large — must be under 10KB');
+      }
+      console.error('Pusher POST failed:', err.status, err.body);
+    }
+    throw err;
   }
 }

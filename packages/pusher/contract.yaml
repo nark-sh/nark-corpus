@@ -129,9 +129,169 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: terminateUserConnections
+    import_path: "pusher"
+    description: >
+      Terminates all active WebSocket connections for a specific authenticated user.
+      Used in ban, logout, or revocation flows where a user must be immediately
+      disconnected from Pusher channels. The termination ends current connections
+      only — the user can reconnect unless their authentication endpoint is also
+      blocked. Returns a Promise that rejects with Pusher.RequestError on failure.
+
+    postconditions:
+      # Evidence: https://pusher.com/docs/channels/server_api/terminating-user-connections/
+      # Source confirmed: lib/pusher.js validates userId then calls this.post()
+      # post() calls requests.send() which wraps all HTTP 4xx/5xx in Pusher.RequestError
+      - id: terminate-api-error
+        condition: >
+          Any API or network failure: authentication error (401/403 from Pusher API),
+          server error (5xx), network timeout, or connection failure. Also throws
+          synchronous plain Error for empty or non-string userId before any HTTP call.
+        throws: >
+          Pusher.RequestError for API/network failures (status, body, url properties).
+          Plain Error ("Invalid user id: '...'") for empty string or non-string userId —
+          thrown synchronously before any network request.
+        required_handling: >
+          Caller MUST wrap in try-catch. terminateUserConnections() is typically called in
+          ban/kick flows after a DB write. If the call fails (Pusher outage, auth error),
+          the user may remain connected despite being banned in the database — a security gap.
+
+          try {
+            await pusher.terminateUserConnections(userId);
+          } catch (err) {
+            if (err instanceof Pusher.RequestError) {
+              // Log and consider queuing for retry — user may still be connected
+              console.error('Failed to terminate connections for', userId, err.status);
+              await scheduleRetry(userId);
+            }
+            throw err;
+          }
+
+          Important: terminateUserConnections() disconnects existing sessions but does NOT
+          prevent reconnection. Pair with blocking the user's authentication endpoint.
+        sources:
+          - "https://pusher.com/docs/channels/server_api/terminating-user-connections/"
+          - "https://github.com/pusher/pusher-http-node/blob/master/lib/pusher.js#L175"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+  - name: get
+    import_path: "pusher"
+    description: >
+      Makes an authenticated GET request to the Pusher REST API. Used to query
+      channel state: occupied channels, user counts on presence channels, or
+      users subscribed to a channel. Lower-level than trigger() — requires
+      constructing the path and params manually.
+
+    postconditions:
+      # Evidence: https://pusher.com/docs/channels/library_auth_reference/rest-api/
+      # Source confirmed: lib/pusher.js get() → requests.send() → throws RequestError on status >= 400
+      # HTTP 400 for invalid attribute (e.g. user_count on non-presence channel)
+      # HTTP 401 for auth failure, 403 for disabled app or quota exceeded
+      - id: get-api-error
+        condition: >
+          Any API or network failure: authentication error (401), forbidden (403, app disabled
+          or quota exceeded), bad request (400, e.g. requesting user_count on non-presence
+          channel), server error (5xx), or network failure/timeout.
+        throws: >
+          Pusher.RequestError with status (HTTP code), body (API error text), url (request URL).
+          Plain Error thrown synchronously if reserved param keys (auth_key, auth_timestamp,
+          auth_version, auth_signature, body_md5) are included in params — throws before any
+          network request.
+        required_handling: >
+          Caller MUST wrap in try-catch. get() is typically used to fetch presence channel
+          data or verify channel state before performing an action. A 400 from requesting
+          user_count on a non-presence channel is a programming error; 401/403 indicate
+          misconfigured credentials.
+
+          try {
+            const response = await pusher.get({ path: '/channels', params: { filter_by_prefix: 'presence-', info: 'user_count' } });
+            if (response.status === 200) {
+              const body = await response.json();
+              // use body.channels
+            }
+          } catch (err) {
+            if (err instanceof Pusher.RequestError) {
+              if (err.status === 400) {
+                // Invalid params — likely programming error (e.g., user_count on public channel)
+              }
+              console.error('Pusher GET failed:', err.status, err.body);
+            }
+            throw err;
+          }
+        sources:
+          - "https://pusher.com/docs/channels/library_auth_reference/rest-api/#get-channels-fetch-info-for-multiple-channels"
+          - "https://github.com/pusher/pusher-http-node/blob/master/lib/requests.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: post
+    import_path: "pusher"
+    description: >
+      Makes an authenticated POST request to the Pusher REST API. Low-level method
+      used internally by terminateUserConnections() and other SDK methods. Rarely
+      called directly by application code — most operations should use the higher-level
+      trigger(), triggerBatch(), or sendToUser() methods.
+
+    postconditions:
+      # Evidence: lib/pusher.js post() → requests.send() → throws RequestError on status >= 400
+      # Same error path as get() — both call requests.send()
+      # Reserved param key guard throws synchronously before network call
+      - id: post-api-error
+        condition: >
+          Any API or network failure: authentication error (401/403), bad request (400),
+          payload too large (413, event data exceeds 10KB limit), server error (5xx),
+          or network failure. Throws synchronously for reserved param keys in params.
+        throws: >
+          Pusher.RequestError for all HTTP 4xx/5xx responses and network errors.
+          Plain Error synchronously for reserved params (auth_key, auth_timestamp, etc.)
+          before any network call. Note: HTTP 413 is returned when event data exceeds
+          the 10KB Pusher payload limit — relevant when posting custom event payloads.
+        required_handling: >
+          Caller MUST wrap in try-catch. post() is most commonly called indirectly via
+          terminateUserConnections() — see that function's error handling guidance.
+          If calling post() directly, validate path correctness and payload size first.
+
+          try {
+            const response = await pusher.post({ path: '/events', body: JSON.stringify(payload) });
+          } catch (err) {
+            if (err instanceof Pusher.RequestError) {
+              if (err.status === 413) {
+                // Payload too large — split or compress
+              }
+              console.error('Pusher POST failed:', err.status, err.body);
+            }
+            throw err;
+          }
+        sources:
+          - "https://pusher.com/docs/channels/library_auth_reference/rest-api/"
+          - "https://github.com/pusher/pusher-http-node/blob/master/lib/requests.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+metadata:
+  last_verified: "2026-04-17"
+  evidence_quality: confirmed
+  coverage_score: 0.83  # 5 contracted / 6 total async-callable (terminateUserConnections, get, post added; get/post are LOW priority but contracted for completeness)
+
 notes:
   - "pusher uses its own RequestError class (not a standard Error subclass) — check instanceof Pusher.RequestError"
-  - "err.status is the HTTP status code (403=auth, 429=rate limit) or undefined for network errors"
+  - "err.status is the HTTP status code (401=auth, 403=disabled/quota, 429=rate limit, 413=payload too large) or undefined for network errors"
   - "err.body contains the raw Pusher API response body — useful for debugging"
   - "No auto-retry — every failure immediately rejects the Promise"
   - "trigger() accepts string or string[] for channel — up to 100 channels per call"
@@ -139,3 +299,6 @@ notes:
   - "Default: no timeout configured — network hangs can block workers indefinitely"
   - "sendToUser() requires client-side user authentication (pusher-js authenticateUser)"
   - "RequestError and WebHookError properly exported as TypeScript types since v5.3.2"
+  - "terminateUserConnections() disconnects current sessions only — pair with blocking auth endpoint to prevent reconnection"
+  - "get() HTTP 400 for invalid attribute on wrong channel type (e.g. user_count on non-presence channel)"
+  - "post() HTTP 413 when event payload exceeds 10KB Pusher limit"
