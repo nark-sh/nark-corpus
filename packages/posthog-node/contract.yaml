@@ -1,15 +1,25 @@
 # capture(), identify(), alias(), groupIdentify() are fire-and-forget — they queue events internally and NEVER throw. Correct to call without try-catch.
-# Only the async network methods (getFeatureFlag, isFeatureEnabled, getAllFlags, shutdown) need error handling.
-# PostHog SDK does not define typed error subclasses for feature flag failures (unlike stripe or groq-sdk). Catch generic Error.
-# If PostHog API is unreachable, getFeatureFlag/isFeatureEnabled return undefined (not throw) in some versions — behavior depends on SDK version and configuration. Use try-catch to be safe.
-# Local evaluation (with personal API key) still makes an initial network call to fetch flag definitions. getAllFlags with local evaluation is not network-free.
+# captureImmediate(), identifyImmediate(), aliasImmediate() are async but catch errors internally — they NEVER throw to the caller.
+# reloadFeatureFlags() catches errors internally via .catch() in loadFeatureFlags() — it does NOT propagate errors to the caller.
+# waitForLocalEvaluationReady() returns false on timeout (does not throw) — does not need try-catch.
+# The async network methods that CAN throw: getFeatureFlag, isFeatureEnabled, getAllFlags, getAllFlagsAndPayloads,
+#   getFeatureFlagPayload, getFeatureFlagResult, flush, shutdown, getRemoteConfigPayload.
+# PostHog SDK v5+ uses PostHogFetchHttpError and PostHogFetchNetworkError from @posthog/core for network errors.
+# Feature flag methods also return FeatureFlagError enum values in error state rather than throwing in some paths.
+# Local evaluation (with personal API key) still makes an initial network call to fetch flag definitions.
 package: posthog-node
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 1.0
+# Coverage calculation: 9 contracted / 9 non-omitted (17 total - 8 intentionally omitted = 9) = 1.0
+# Previously contracted (4): getFeatureFlag, isFeatureEnabled, getAllFlags, shutdown
+# Added this pass (5): getAllFlagsAndPayloads, getFeatureFlagPayload, getFeatureFlagResult, flush, getRemoteConfigPayload
+# Intentionally omitted (8): reloadFeatureFlags, waitForLocalEvaluationReady, captureImmediate,
+#   identifyImmediate, aliasImmediate, captureExceptionImmediate, enable, disable
 
 functions:
   - name: getFeatureFlag
@@ -135,32 +145,350 @@ functions:
     description: >
       Flushes all pending events from the queue and shuts down the PostHog client.
       Should be called before process exit to ensure events are not lost.
-      Takes an optional timeoutMs parameter (default: 30000ms).
+      Takes an optional shutdownTimeoutMs parameter (default: 30000ms). Internally
+      calls _shutdown() which races a Promise.race between flushing and a timeout.
+      In serverless environments (Lambda, Vercel, Cloudflare Workers) use the
+      waitUntil option instead, which wraps the flush promise automatically.
 
     postconditions:
-      - id: flush-error
+      # Evidence: posthog-node/src/client.ts _shutdown() source — timeout throws a string rejection:
+      # reject('Timeout while shutting down PostHog. Some events may not have been sent.')
+      # Network errors (PostHogFetchHttpError, PostHogFetchNetworkError) are caught internally by _shutdown()
+      # and only rethrown if they are NOT PostHog fetch errors (non-network errors propagate).
+      # Sources: /private/tmp/claude/bc-deepen/posthog-node/node_modules/@posthog/core/dist/posthog-core-stateless.mjs
+      - id: shutdown-timeout-error
         condition: >
-          Network failure during flush, timeout exceeded, or queue processing error
+          Flush does not complete within shutdownTimeoutMs (default 30 seconds) — all
+          pending events cannot be delivered before the timeout fires.
         throws: >
-          Error or unhandled Promise rejection if the flush fails or times out.
+          String rejection: 'Timeout while shutting down PostHog. Some events may not have been sent.'
+          Note: This is a string, not an Error instance — typeof err === 'string'.
+          In Node.js, unhandled string rejections still trigger unhandledRejection events.
         required_handling: >
-          Caller SHOULD wrap in try-catch. shutdown() failures during app teardown
-          are non-critical (events may be lost) but unhandled rejections can interfere
-          with graceful shutdown in Node.js.
+          Caller SHOULD wrap in try-catch. Shutdown timeout means queued analytics events
+          are lost — not a business-critical failure, but unhandled rejections interfere with
+          process exit in Node.js and signal graceful shutdown success to orchestrators.
 
           Recommended handling:
             try {
               await posthog.shutdown();
             } catch (err) {
-              console.error('PostHog shutdown failed:', err);
-              // Continue with process exit — non-critical
+              console.error('PostHog shutdown timed out, some events may be lost:', err);
+              // Non-critical — continue with process exit
             }
         sources:
           - "https://posthog.com/docs/libraries/node"
         severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: getAllFlagsAndPayloads
+    import_path: "posthog-node"
+    description: >
+      Retrieves all feature flag values AND their JSON payloads for a given distinct ID
+      in a single network call. Returns an object with featureFlags (Record) and
+      featureFlagPayloads (Record). Used when multiple flags with configuration payloads
+      need to be evaluated at once — more efficient than calling getFeatureFlagPayload()
+      separately for each flag. getAllFlags() is a thin wrapper around this method.
+
+    postconditions:
+      # Evidence: posthog-node/src/client.ts getAllFlagsAndPayloads() source — calls
+      # super.getFeatureFlagsAndPayloadsStateless() which makes HTTPS POST to PostHog API.
+      # Same network error surface as getAllFlags() which wraps this method.
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/posthog-node/dist/client.js:428-490
+      - id: get-all-flags-and-payloads-network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable, API key
+          invalid, rate limit exceeded, or any server-side error (5xx) when fetching
+          all flags and payloads in a single batch call.
+        throws: >
+          PostHogFetchHttpError — thrown on HTTP error responses (non-2xx status codes).
+            Properties: .response (Response object), .name === 'PostHogFetchHttpError'.
+          PostHogFetchNetworkError — thrown on network/fetch failures.
+            Properties: .error (underlying Error), .name === 'PostHogFetchNetworkError'.
+          Both are exported from @posthog/core (dependency of posthog-node).
+        required_handling: >
+          Caller MUST wrap in try-catch. getAllFlagsAndPayloads() makes a live network
+          call and rejects on failure. Particularly dangerous in initialization code
+          where flag payloads drive configuration — uncaught rejection crashes the
+          entire startup flow or request handler.
+
+          Minimum handling:
+            try {
+              const { featureFlags, featureFlagPayloads } = await posthog.getAllFlagsAndPayloads(userId);
+              const config = featureFlagPayloads['ui-config'];
+              return { flags: featureFlags, config };
+            } catch (err) {
+              console.error('Failed to fetch flags and payloads:', err);
+              return { flags: {}, config: null }; // Safe default
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: getFeatureFlagPayload
+    import_path: "posthog-node"
+    description: >
+      Fetches the JSON payload associated with a feature flag for a given distinct ID.
+      Returns the parsed payload (any JSON value) or undefined if the flag has no
+      payload or the flag is not found. Delegates to _getFeatureFlagResult() internally —
+      same network surface as getFeatureFlag(). Payloads are arbitrary JSON values
+      (objects, arrays, strings, numbers) used for remote configuration.
+
+    postconditions:
+      # Evidence: posthog-node/src/client.ts getFeatureFlagPayload() source:
+      # const result = await this._getFeatureFlagResult(key, distinctId, ...)
+      # _getFeatureFlagResult calls the same PostHog API as getFeatureFlag.
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/posthog-node/dist/client.js:387-398
+      - id: get-feature-flag-payload-network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable, API key
+          invalid, rate limit exceeded, or server-side error during flag payload fetch.
+        throws: >
+          PostHogFetchHttpError or PostHogFetchNetworkError (from @posthog/core).
+          Same error types as getFeatureFlag(). Note: returns undefined (not throws)
+          when the flag exists but has no payload — only network/auth failures throw.
+        required_handling: >
+          Caller MUST wrap in try-catch. Payload failures are particularly dangerous
+          because callers often use payloads for dynamic configuration — an uncaught
+          rejection means configuration loading fails entirely, potentially crashing
+          the service or leaving it with no configuration at all.
+
+          Minimum handling:
+            try {
+              const payload = await posthog.getFeatureFlagPayload('ui-config', userId);
+              const config = payload as { theme: string } ?? { theme: 'default' };
+              return config;
+            } catch (err) {
+              console.error('Failed to fetch flag payload:', err);
+              return { theme: 'default' }; // Fall back to default config
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: getFeatureFlagResult
+    import_path: "posthog-node"
+    description: >
+      Fetches both the feature flag value AND its payload in a single call. Returns a
+      FeatureFlagResult object with .enabled (boolean), .value (FeatureFlagValue), and
+      .payload (JsonType|null) fields. More efficient than calling getFeatureFlag() and
+      getFeatureFlagPayload() separately. Returns undefined if distinctId is missing.
+
+    postconditions:
+      # Evidence: posthog-node/src/client.ts getFeatureFlagResult() source:
+      # return this._getFeatureFlagResult(key, resolvedDistinctId, ...) — same internal
+      # method as getFeatureFlagPayload and getFeatureFlag. Same network error surface.
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/posthog-node/dist/client.js:396-413
+      - id: get-feature-flag-result-network-error
+        condition: >
+          Network failure, PostHog API unreachable, API key invalid, rate limit exceeded,
+          or server-side error during the combined flag+payload fetch.
+        throws: >
+          PostHogFetchHttpError or PostHogFetchNetworkError (from @posthog/core).
+          Same error types as getFeatureFlag() and getFeatureFlagPayload().
+        required_handling: >
+          Caller MUST wrap in try-catch. getFeatureFlagResult() makes a live network call
+          when local evaluation is unavailable. The combined nature of the result means
+          both feature gating and configuration data are unavailable on failure.
+
+          Minimum handling:
+            try {
+              const result = await posthog.getFeatureFlagResult('checkout-v2', userId);
+              if (result?.enabled) {
+                return result.payload as CheckoutConfig ?? defaultConfig;
+              }
+              return defaultConfig;
+            } catch (err) {
+              console.error('Feature flag result fetch failed:', err);
+              return defaultConfig; // Fall back gracefully
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: flush
+    import_path: "posthog-node"
+    description: >
+      Explicitly flushes all queued events to the PostHog API. Events captured via
+      capture()/identify() are queued internally and sent in batches. flush() forces
+      immediate delivery. Critical in serverless environments (Lambda, Vercel Edge,
+      Cloudflare Workers) where the process may be frozen before the auto-flush timer
+      fires. In serverless, prefer the waitUntil option over manual flush() calls.
+
+    postconditions:
+      # Evidence: @posthog/core/dist/posthog-core-stateless.mjs _flush() source:
+      # Calls fetchWithRetry() which throws PostHogFetchHttpError on non-2xx HTTP responses
+      # and PostHogFetchNetworkError on network failures. The outer flush() propagates these.
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/@posthog/core/dist/posthog-core-stateless.mjs:590-600
+      - id: flush-network-error
+        condition: >
+          Network failure during batch send, HTTP error response from PostHog API (non-2xx),
+          or event payload too large (413 — triggers automatic batch size reduction and retry,
+          but ultimately throws if still failing). After retry exhaustion, error propagates.
+        throws: >
+          PostHogFetchHttpError — on HTTP error responses from PostHog API.
+            Properties: .response (Response), .name === 'PostHogFetchHttpError'.
+            Note: 413 errors trigger batch size halving before finally propagating.
+          PostHogFetchNetworkError — on network/fetch failures.
+            Properties: .error (underlying Error), .name === 'PostHogFetchNetworkError'.
+        required_handling: >
+          Caller SHOULD wrap in try-catch for serverless flush patterns. Flush failures
+          mean analytics events are lost — not business-critical, but unhandled rejections
+          crash serverless request handlers or interfere with graceful shutdown.
+
+          Minimum handling:
+            try {
+              await posthog.flush();
+            } catch (err) {
+              console.error('PostHog flush failed, events may be lost:', err);
+              // Non-critical — continue normal execution
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: getRemoteConfigPayload
+    import_path: "posthog-node"
+    description: >
+      Fetches and decrypts a remote config payload by flag key. Requires a personalApiKey
+      to be set in the PostHog client options (throws synchronously if missing).
+      Used for server-side configuration that should be kept private from the client.
+      Returns the parsed JSON payload or undefined if the flag is not found.
+
+    postconditions:
+      # Evidence: posthog-node/src/client.ts getRemoteConfigPayload() source:
+      # if (!this.options.personalApiKey) throw new Error('Personal API key is required...')
+      # Then: const response = await this._requestRemoteConfigPayload(flagKey) — network call
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/posthog-node/dist/client.js:404-413
+      - id: get-remote-config-missing-personal-api-key
+        condition: >
+          PostHog client is instantiated without a personalApiKey option (or with a
+          project API key that starts with 'phc_' rather than a personal key starting
+          with 'phx_'). getRemoteConfigPayload() throws synchronously before any network call.
+        throws: >
+          Error: 'Personal API key is required for remote config payload decryption'
+          (synchronous throw — not a Promise rejection, but wrapping in try-catch handles both).
+        required_handling: >
+          Caller MUST wrap in try-catch AND ensure personalApiKey is configured. Missing
+          key configuration causes every getRemoteConfigPayload() call to throw, crashing
+          the feature entirely on first use.
+
+          Minimum handling:
+            try {
+              const config = await posthog.getRemoteConfigPayload('server-config');
+              return config as ServerConfig ?? defaultConfig;
+            } catch (err) {
+              if (err instanceof Error && err.message.includes('Personal API key')) {
+                console.error('PostHog misconfiguration: personalApiKey required for remote config');
+              } else {
+                console.error('Failed to fetch remote config:', err);
+              }
+              return defaultConfig;
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: get-remote-config-network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable, API key
+          unauthorized (403), or server-side error during remote config fetch.
+        throws: >
+          PostHogFetchHttpError or PostHogFetchNetworkError (from @posthog/core).
+          Same network error types as other PostHog async methods.
+        required_handling: >
+          Caller MUST wrap in try-catch. Remote config fetch failures mean the application
+          runs with stale or default configuration — critical if the config controls
+          behavior that affects all users.
+
+          Same try-catch block as missing-personal-api-key handles both error cases.
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+intentionally_omitted:
+  - name: reloadFeatureFlags
+    reason: >
+      reloadFeatureFlags() internally calls loadFeatureFlags() which uses .catch() to swallow
+      all errors (logs them in debug mode only). The method NEVER propagates errors to the caller
+      — confirmed from posthog-node/dist/extensions/feature-flags/feature-flags.js:340-345.
+      No try-catch is required or effective.
+
+  - name: waitForLocalEvaluationReady
+    reason: >
+      waitForLocalEvaluationReady() returns false (boolean) on timeout rather than throwing.
+      The Promise resolves to boolean — true if ready within timeoutMs, false if timed out.
+      No error propagation — confirmed from posthog-node/dist/client.js:227-240.
+
+  - name: captureImmediate
+    reason: >
+      captureImmediate() catches its own errors internally via .catch((err) => { if (err) console.error(err); })
+      — errors are logged but NEVER thrown to the caller. Same fire-and-forget semantics
+      as capture() from the caller's perspective — confirmed from posthog-node/dist/client.js:501-525.
+
+  - name: identifyImmediate
+    reason: >
+      identifyImmediate() delegates to identifyStatelessImmediate() which handles errors internally.
+      No documented error propagation to the caller. Same fire-and-forget pattern as identify().
+
+  - name: aliasImmediate
+    reason: >
+      aliasImmediate() delegates to aliasStatelessImmediate() which handles errors internally.
+      No documented error propagation to the caller. Same fire-and-forget pattern as alias().
+
+  - name: captureExceptionImmediate
+    reason: >
+      captureExceptionImmediate() is error-tracking infrastructure — a niche use case.
+      The SDK documents it as the preferred way to capture exceptions, not a method
+      that itself requires try-catch. Adoption in the corpus is minimal.
+
+  - name: enable
+    reason: >
+      enable() is an admin toggle to enable/disable the PostHog client entirely.
+      Used only in test setups or admin flows. No meaningful error contract beyond
+      the generic PostHog network error surface already contracted in getFeatureFlag.
+
+  - name: disable
+    reason: >
+      disable() is the inverse of enable() — same reasoning. No unique error contract.

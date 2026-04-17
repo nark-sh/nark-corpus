@@ -9,10 +9,17 @@
  *   - getFeatureFlag: postcondition network-error — requires try-catch
  *   - isFeatureEnabled: postcondition network-error — requires try-catch
  *   - getAllFlags: postcondition network-error — requires try-catch
- *   - shutdown: postcondition flush-error — warning, try-catch recommended
+ *   - getAllFlagsAndPayloads: postcondition get-all-flags-and-payloads-network-error — requires try-catch
+ *   - getFeatureFlagPayload: postcondition get-feature-flag-payload-network-error — requires try-catch
+ *   - getFeatureFlagResult: postcondition get-feature-flag-result-network-error — requires try-catch
+ *   - flush: postcondition flush-network-error — warning, try-catch recommended
+ *   - shutdown: postcondition shutdown-timeout-error — warning, try-catch recommended
+ *   - getRemoteConfigPayload: postconditions get-remote-config-missing-personal-api-key
+ *                             and get-remote-config-network-error — requires try-catch
  *
- * Fire-and-forget methods (capture, identify, alias, groupIdentify) are
- * intentionally NOT contracted — they never throw by design.
+ * Fire-and-forget methods (capture, identify, alias, groupIdentify, captureImmediate,
+ * identifyImmediate, aliasImmediate) are intentionally NOT contracted — they never
+ * propagate errors to the caller by design.
  */
 
 import { PostHog } from 'posthog-node';
@@ -153,3 +160,143 @@ class PostHogService {
 }
 
 export { PostHogService };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. getAllFlagsAndPayloads
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: get-all-flags-and-payloads-network-error
+export async function getAllFlagsAndPayloadsNoCatch() {
+  // SHOULD_FIRE: get-all-flags-and-payloads-network-error — network call without try-catch
+  const { featureFlags, featureFlagPayloads } = await posthog.getAllFlagsAndPayloads(userId);
+  return { featureFlags, featureFlagPayloads };
+}
+
+// @expect-clean
+export async function getAllFlagsAndPayloadsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: get-all-flags-and-payloads-network-error — wrapped in try-catch
+    const { featureFlags, featureFlagPayloads } = await posthog.getAllFlagsAndPayloads(userId, {
+      personProperties: { plan: 'enterprise' },
+    });
+    return { featureFlags, featureFlagPayloads };
+  } catch (err) {
+    console.error('getAllFlagsAndPayloads failed:', err);
+    return { featureFlags: {}, featureFlagPayloads: {} };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. getFeatureFlagPayload
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: get-feature-flag-payload-network-error
+export async function getFeatureFlagPayloadNoCatch() {
+  // SHOULD_FIRE: get-feature-flag-payload-network-error — network call without try-catch
+  const payload = await posthog.getFeatureFlagPayload('ui-config', userId);
+  return payload;
+}
+
+// @expect-clean
+export async function getFeatureFlagPayloadWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: get-feature-flag-payload-network-error — wrapped in try-catch
+    const payload = await posthog.getFeatureFlagPayload('ui-config', userId);
+    return payload ?? null;
+  } catch (err) {
+    console.error('getFeatureFlagPayload failed:', err);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. getFeatureFlagResult
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: get-feature-flag-result-network-error
+export async function getFeatureFlagResultNoCatch() {
+  // SHOULD_FIRE: get-feature-flag-result-network-error — network call without try-catch
+  const result = await posthog.getFeatureFlagResult('checkout-v2', userId);
+  return result;
+}
+
+// @expect-clean
+export async function getFeatureFlagResultWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: get-feature-flag-result-network-error — wrapped in try-catch
+    const result = await posthog.getFeatureFlagResult('checkout-v2', userId);
+    return result;
+  } catch (err) {
+    console.error('getFeatureFlagResult failed:', err);
+    return undefined;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. flush
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: flush-network-error
+export async function flushNoCatch() {
+  // SHOULD_FIRE: flush-network-error — flush makes network calls and can throw, no try-catch
+  await posthog.flush();
+}
+
+// @expect-clean
+export async function flushWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flush-network-error — wrapped in try-catch
+    await posthog.flush();
+  } catch (err) {
+    console.error('PostHog flush failed, events may be lost:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. getRemoteConfigPayload
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: get-remote-config-missing-personal-api-key
+// @expect-violation: get-remote-config-network-error
+export async function getRemoteConfigPayloadNoCatch() {
+  // SHOULD_FIRE: get-remote-config-missing-personal-api-key + get-remote-config-network-error
+  // — getRemoteConfigPayload throws synchronously without personalApiKey, or on network failure
+  const config = await posthog.getRemoteConfigPayload('server-config');
+  return config;
+}
+
+// @expect-clean
+export async function getRemoteConfigPayloadWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch handles both sync throw and async rejection
+    const config = await posthog.getRemoteConfigPayload('server-config');
+    return config ?? null;
+  } catch (err) {
+    console.error('getRemoteConfigPayload failed:', err);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. Fire-and-forget async methods — should NEVER fire (not contracted)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function captureImmediateNoCatch() {
+  // SHOULD_NOT_FIRE: captureImmediate catches errors internally, never propagates to caller
+  await posthog.captureImmediate({
+    distinctId: userId,
+    event: 'payment_completed',
+    properties: { amount: 99.99 },
+  });
+}
+
+export async function reloadFeatureFlagsNoCatch() {
+  // SHOULD_NOT_FIRE: reloadFeatureFlags swallows errors internally via .catch() in loadFeatureFlags()
+  await posthog.reloadFeatureFlags();
+}
+
+export async function waitForLocalEvaluationReadyNoCatch() {
+  // SHOULD_NOT_FIRE: waitForLocalEvaluationReady returns false on timeout (not throw)
+  const ready = await posthog.waitForLocalEvaluationReady(5000);
+  return ready;
+}
