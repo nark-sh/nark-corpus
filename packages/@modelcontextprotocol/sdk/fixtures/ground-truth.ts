@@ -894,8 +894,7 @@ async function gt_stdioServerStart_proper(server: McpServer) {
 async function gt_sendLoggingMessage_noCapability() {
   // ❌ No logging capability declared — sendLoggingMessage silently drops messages
   const server = new McpServer({ name: 'my-server', version: '1.0.0' });
-  // SHOULD_FIRE: send-logging-message-capability-not-set
-  // Message is silently discarded; no exception, no warning
+  // SHOULD_FIRE: send-logging-message-capability-not-set — no logging capability; message silently dropped
   await server.sendLoggingMessage({ level: 'error', data: 'critical failure' });
 }
 
@@ -931,6 +930,6 @@ async function gt_sendLoggingMessage_notConnected() {
     { capabilities: { logging: {} } }
   );
   // ❌ No connect() call before sendLoggingMessage — throws Error('Not connected')
-  // SHOULD_FIRE: send-logging-message-not-connected
+  // SHOULD_FIRE: send-logging-message-not-connected — no try-catch; throws Error('Not connected') before transport is set
   await server.sendLoggingMessage({ level: 'info', data: 'starting up' });
 }
