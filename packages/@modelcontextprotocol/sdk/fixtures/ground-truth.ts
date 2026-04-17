@@ -30,6 +30,11 @@
  *   - StreamableHTTPClientTransport.finishAuth()    postcondition: finish-auth-throws-no-provider, finish-auth-throws-authorization-failed
  *   - StreamableHTTPClientTransport.terminateSession() postcondition: terminate-session-throws-on-server-error
  *   - WebStandardStreamableHTTPServerTransport.handleRequest() postcondition: web-transport-stateless-reuse-throws, web-transport-missing-session-routing
+ *   - WebSocketClientTransport.start()       postcondition: websocket-transport-already-started, websocket-transport-connection-failed
+ *   - SSEClientTransport.start()             postcondition: sse-transport-no-auth-provider, sse-transport-connection-error
+ *   - SSEServerTransport.handlePostMessage() postcondition: sse-handle-post-content-type-error, sse-handle-post-dns-rebinding-blocked
+ *   - StdioServerTransport.start()           postcondition: stdio-server-transport-already-started
+ *   - McpServer.sendLoggingMessage()         postcondition: send-logging-message-capability-not-set, send-logging-message-not-connected
  *
  * Detection path: instance tracking (new Client() → instanceMap) →
  *   ThrowingFunctionDetector fires client.connect() →
@@ -45,6 +50,9 @@ import { auth, exchangeAuthorization, refreshAuthorization, registerClient, OAut
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
+import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { OAuthTokens, OAuthClientInformationMixed, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -750,4 +758,179 @@ async function gt_webTransportPerRequest_proper(request: Request, serverInfo: an
     console.error('Transport error:', error);
     return new Response('Internal Server Error', { status: 500 });
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 48. WebSocketClientTransport.start() — no try-catch (violation)
+// @expect-violation: websocket-transport-connection-failed
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_websocketStart_violation(serverUrl: URL) {
+  const transport = new WebSocketClientTransport(serverUrl);
+  const client = new Client({ name: 'test-client', version: '1.0.0' });
+  // SHOULD_FIRE: websocket-transport-connection-failed — no try-catch; WebSocket connection may fail
+  await client.connect(transport);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 49. WebSocketClientTransport.start() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_websocketStart_proper(serverUrl: URL) {
+  const transport = new WebSocketClientTransport(serverUrl);
+  const client = new Client({ name: 'test-client', version: '1.0.0' });
+  try {
+    // SHOULD_NOT_FIRE
+    await client.connect(transport);
+  } catch (error) {
+    // WebSocket connection failed — server unreachable or bad URL
+    console.error('WebSocket MCP connection failed:', (error as Error).message);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 50. SSEClientTransport.start() — no try-catch (violation)
+// @expect-violation: sse-transport-connection-error
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sseClientStart_violation(serverUrl: URL) {
+  const transport = new SSEClientTransport(serverUrl);
+  const client = new Client({ name: 'test-client', version: '1.0.0' });
+  // SHOULD_FIRE: sse-transport-connection-error — no try-catch; SseError on connection failure
+  await client.connect(transport);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 51. SSEClientTransport.start() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sseClientStart_proper(serverUrl: URL) {
+  const transport = new SSEClientTransport(serverUrl);
+  const client = new Client({ name: 'test-client', version: '1.0.0' });
+  try {
+    // SHOULD_NOT_FIRE
+    await client.connect(transport);
+  } catch (error) {
+    const sseErr = error as any;
+    if (sseErr.code !== undefined) {
+      // SseError — SSE connection failed with HTTP status
+      console.error(`SSE connection failed (HTTP ${sseErr.code}):`, sseErr.message);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 52. SSEServerTransport.handlePostMessage() — no try-catch (violation)
+// @expect-violation: sse-handle-post-content-type-error
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sseHandlePost_violation(
+  transport: SSEServerTransport,
+  req: any,
+  res: any
+) {
+  // SHOULD_FIRE: sse-handle-post-content-type-error — no try-catch; throws on wrong Content-Type
+  await transport.handlePostMessage(req, res);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 53. SSEServerTransport.handlePostMessage() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sseHandlePost_proper(
+  transport: SSEServerTransport,
+  req: any,
+  res: any
+) {
+  try {
+    // SHOULD_NOT_FIRE
+    await transport.handlePostMessage(req, res);
+  } catch (error) {
+    console.error('SSE POST handler error:', (error as Error).message);
+    if (!res.headersSent) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 54. StdioServerTransport.start() — no try-catch (violation)
+// @expect-violation: stdio-server-transport-already-started
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_stdioServerStart_violation(server: McpServer) {
+  const transport = new StdioServerTransport();
+  // SHOULD_FIRE: stdio-server-transport-already-started — no try-catch on double-connect
+  await server.connect(transport);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 55. StdioServerTransport.start() — with try-catch (proper)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_stdioServerStart_proper(server: McpServer) {
+  const transport = new StdioServerTransport();
+  try {
+    // SHOULD_NOT_FIRE
+    await server.connect(transport);
+  } catch (error) {
+    console.error('Failed to start stdio server transport:', (error as Error).message);
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 56. McpServer.sendLoggingMessage() — capability not set (silent failure)
+// @expect-violation: send-logging-message-capability-not-set
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sendLoggingMessage_noCapability() {
+  // ❌ No logging capability declared — sendLoggingMessage silently drops messages
+  const server = new McpServer({ name: 'my-server', version: '1.0.0' });
+  // SHOULD_FIRE: send-logging-message-capability-not-set
+  // Message is silently discarded; no exception, no warning
+  await server.sendLoggingMessage({ level: 'error', data: 'critical failure' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 57. McpServer.sendLoggingMessage() — capability set, proper usage
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sendLoggingMessage_withCapability() {
+  // ✅ Logging capability declared — messages are delivered
+  const server = new McpServer(
+    { name: 'my-server', version: '1.0.0' },
+    { capabilities: { logging: {} } }
+  );
+  const transport = new StdioServerTransport();
+  try {
+    await server.connect(transport);
+    // SHOULD_NOT_FIRE — capability set, server connected, inside try-catch
+    await server.sendLoggingMessage({ level: 'info', data: 'server ready' });
+  } catch (error) {
+    console.error('Server error:', (error as Error).message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 58. McpServer.sendLoggingMessage() — not connected (throws)
+// @expect-violation: send-logging-message-not-connected
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_sendLoggingMessage_notConnected() {
+  const server = new McpServer(
+    { name: 'my-server', version: '1.0.0' },
+    { capabilities: { logging: {} } }
+  );
+  // ❌ No connect() call before sendLoggingMessage — throws Error('Not connected')
+  // SHOULD_FIRE: send-logging-message-not-connected
+  await server.sendLoggingMessage({ level: 'info', data: 'starting up' });
 }

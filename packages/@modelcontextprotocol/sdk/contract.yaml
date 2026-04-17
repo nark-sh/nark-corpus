@@ -5,6 +5,9 @@ maintainer: corpus-team
 last_verified: '2026-04-16'
 status: production
 evidence_quality: confirmed
+# Pass 1 deepen-stream-2 2026-04-16: +6 functions (WebSocketClientTransport.start, SSEClientTransport.start,
+# SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode,
+# ProxyOAuthServerProvider.exchangeRefreshToken). Coverage: 0.72 → 0.74.
 # Depth pass 2026-04-16 (deepen-stream-2 pass 8):
 # API surface: ~20 distinct async-callable operations across Client, McpServer, Server
 # Contracted before: 3 (connect, callTool, listTools)
@@ -60,7 +63,40 @@ evidence_quality: confirmed
 #           dist/cjs/client/streamableHttp.js (finishAuth UnauthorizedError, terminateSession StreamableHTTPError)
 #           dist/cjs/server/webStandardStreamableHttp.js (stateless reuse error + session routing)
 #   Spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
-coverage_score: 0.72  # 23 contracted / 32 total async-callable (+4 this pass: StdioClientTransport.start, StreamableHTTPClientTransport.finishAuth, terminateSession, WebStandardStreamableHTTPServerTransport.handleRequest; 15 omitted)
+#
+# Depth pass 2026-04-16 (deepen-stream-2 pass 1):
+# API surface: 39 distinct async-callable operations (discovered WebSocket + SSE transports +
+#              server auth providers + server stdio transport)
+# Contracted before: 23 (after pass 13)
+# Contracted after: 29 (+6 this pass: WebSocketClientTransport.start, SSEClientTransport.start,
+#                          SSEServerTransport.handlePostMessage, StdioServerTransport.start,
+#                          ProxyOAuthServerProvider.exchangeAuthorizationCode,
+#                          ProxyOAuthServerProvider.exchangeRefreshToken)
+# Omitted additions: SSEServerTransport.start (deprecated, same 'already-started' pattern as StdioServerTransport.start),
+#                    createMcpExpressApp/mcpAuthRouter (sync factories, no throw contract),
+#                    ClientCredentialsProvider/PrivateKeyJwtProvider methods (sync data storage),
+#                    withOAuth/completable (sync factories)
+# Coverage: 29/39 = 0.74 → effective: 29/24 (contracted/non-omitted) after 15 existing + new omissions
+# Evidence: dist/cjs/client/websocket.js (already-started throw + WebSocket onerror rejection)
+#           dist/cjs/client/sse.js (UnauthorizedError + SseError confirmed from source)
+#           dist/cjs/server/sse.js (content-type throw + DNS rebinding 403 + onerror pattern)
+#           dist/cjs/server/stdio.js (already-started throw confirmed from source)
+#           dist/cjs/server/auth/providers/proxyProvider.js (ServerError throws confirmed from source)
+#   Spec: https://modelcontextprotocol.io/docs/concepts/transports
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 1):
+# API surface: 39 distinct async-callable operations (re-enumerated v1.29.0, same as deepen-stream-2 pass 1)
+# Contracted before: 29 (after deepen-stream-2 pass 1)
+# Contracted after: 30 (+1 this pass: McpServer.sendLoggingMessage)
+# New functions in v1.29.0 vs prior enumeration: client/websocket.d.ts, server/auth/router.d.ts,
+#   server/auth/providers/proxyProvider.d.ts (all already contracted or sync factories)
+# Omitted additions: withOAuth (sync factory), createMcpExpressApp (sync factory),
+#                    hostHeaderValidation (sync middleware factory), listRoots already contracted
+# Coverage: 30/39 = 0.77
+# Evidence: dist/cjs/server/index.js:418-427 (sendLoggingMessage silent failure on missing capability)
+#           dist/cjs/shared/protocol.js:793-797 (notification() throws Error('Not connected'))
+#   Spec: https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/logging
+coverage_score: 0.77  # 30 contracted / 39 total async-callable (+7 this pass: WebSocketClientTransport.start, SSEClientTransport.start, SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode, ProxyOAuthServerProvider.exchangeRefreshToken, McpServer.sendLoggingMessage); 17 now omitted
 detection:
   class_names:
     - Client
@@ -1575,4 +1611,471 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: WebSocketClientTransport.start
+    import_path: '@modelcontextprotocol/sdk/client/websocket'
+    description: >
+      Connects a WebSocket-based MCP client transport to an MCP server. Uses the 'mcp'
+      WebSocket subprotocol. This is a non-deprecated transport alternative to
+      StreamableHTTPClientTransport for environments where WebSocket connections are
+      preferred (e.g., long-lived agent loops, embedded runtimes). connect() on a Client
+      instance calls start() automatically — do not call start() manually when using Client.
+    postconditions:
+      # Evidence: dist/cjs/client/websocket.js — throws 'WebSocketClientTransport already started!'
+      #           on duplicate start(), and rejects with WebSocket onerror event on connection failure
+      #           Spec: https://modelcontextprotocol.io/docs/concepts/transports (custom transports)
+      - id: websocket-transport-already-started
+        condition: >
+          async function calls transport.start() when the transport was already started
+          (i.e. start() called twice, or called manually when Client.connect() was already
+          used). The _socket field is already set, so start() throws synchronously (before
+          any await), rejecting the returned Promise.
+        throws: >
+          Error('WebSocketClientTransport already started! If using Client class, note
+          that connect() calls start() automatically.')
+        required_handling: >
+          Never call transport.start() manually when using the Client class — Client.connect()
+          calls it. For manual transport use, ensure start() is called exactly once:
+
+            const transport = new WebSocketClientTransport(new URL('wss://mcp.example.com'));
+            // Let Client manage lifecycle:
+            const client = new Client(clientInfo);
+            await client.connect(transport); // calls start() internally
+
+            // Do NOT also call:
+            // await transport.start(); // throws AlreadyStarted
+        sources:
+          - https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/websocket.ts
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: websocket-transport-connection-failed
+        condition: >
+          async function calls transport.start() (or client.connect()) without try-catch.
+          The WebSocket connection fails — the server is unreachable, the URL is wrong,
+          TLS verification fails, the server rejects the 'mcp' subprotocol, or the network
+          is unavailable. The WebSocket onerror event fires and the Promise rejects with the
+          underlying connection error.
+        throws: >
+          Error from WebSocket onerror — the exact message depends on the runtime and
+          network error. Common: ECONNREFUSED, ENOTFOUND, TLS certificate errors, or
+          'WebSocket error: ...' with the event JSON.
+        required_handling: >
+          Wrap connect() in try-catch and handle connection failures as unrecoverable:
+
+            try {
+              await client.connect(transport);
+            } catch (error) {
+              // WebSocket connection failed — server unreachable, bad URL, or TLS error
+              console.error('MCP connection failed:', error.message);
+              process.exit(1); // or surface error to user
+            }
+        sources:
+          - https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/websocket.ts
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: SSEClientTransport.start
+    import_path: '@modelcontextprotocol/sdk/client/sse'
+    description: >
+      Connects an SSE-based MCP client transport to an MCP server (deprecated transport —
+      use StreamableHTTPClientTransport for new implementations, but many deployed MCP
+      servers still use SSE). Establishes a GET connection for SSE events and uses
+      separate POST requests for sending. Throws SseError on connection failure, and
+      UnauthorizedError when the server requires OAuth and no auth provider is configured.
+      During the SSE-to-StreamableHTTP migration period, clients often need to support
+      both transports by falling back from StreamableHTTPClientTransport to SSEClientTransport.
+    postconditions:
+      # Evidence: dist/cjs/client/sse.js — throws UnauthorizedError('No auth provider') at line 34,
+      #           rejects with SseError on SSE connection failure at line 97,
+      #           throws 'already started' at line 136
+      #           Spec: https://modelcontextprotocol.io/docs/concepts/transports#backwards-compatibility
+      - id: sse-transport-no-auth-provider
+        condition: >
+          async function calls client.connect(sseTransport) without try-catch, and the
+          MCP server returns HTTP 401 Unauthorized to the initial SSE GET request.
+          The transport attempts OAuth auth flow but no authProvider is configured in
+          SSEClientTransportOptions. UnauthorizedError is thrown.
+        throws: >
+          UnauthorizedError('No auth provider') from '@modelcontextprotocol/sdk/client/auth'.
+          Thrown when the server requires authentication but the client transport was
+          constructed without an authProvider.
+        required_handling: >
+          Configure an authProvider when connecting to OAuth-protected MCP servers,
+          or catch UnauthorizedError to detect auth requirements:
+
+            try {
+              const transport = new SSEClientTransport(serverUrl, { authProvider });
+              await client.connect(transport);
+            } catch (error) {
+              if (error instanceof UnauthorizedError) {
+                // Server requires OAuth — configure an authProvider or redirect user
+                console.error('Server requires authentication');
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: sse-transport-connection-error
+        condition: >
+          async function calls client.connect(sseTransport) without try-catch, and the
+          SSE connection to the server fails. The EventSource connection fires an error
+          event — server unreachable, HTTP error status (4xx/5xx), or network failure.
+          The transport rejects with SseError containing the HTTP status code and message.
+        throws: >
+          SseError(code: number | undefined, message: string, event: ErrorEvent)
+          from '@modelcontextprotocol/sdk/client/sse'. The code field is the HTTP
+          status code if available (e.g., 404, 500), or undefined for network errors.
+        required_handling: >
+          Wrap connect() in try-catch. For migration from SSE to StreamableHTTP, catch
+          SseError to trigger SSE fallback after StreamableHTTP fails:
+
+            try {
+              await client.connect(streamableTransport);
+            } catch {
+              // Fall back to legacy SSE transport
+              try {
+                const sseTransport = new SSEClientTransport(serverUrl);
+                await client.connect(sseTransport);
+              } catch (error) {
+                if (error instanceof SseError) {
+                  console.error(`SSE connection failed (HTTP ${error.code}): ${error.message}`);
+                }
+                throw error;
+              }
+            }
+        sources:
+          - https://modelcontextprotocol.io/docs/concepts/transports#backwards-compatibility
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: SSEServerTransport.handlePostMessage
+    import_path: '@modelcontextprotocol/sdk/server/sse'
+    description: >
+      Handles incoming POST requests that send JSON-RPC messages from MCP clients to
+      the legacy SSE server transport. In the deprecated SSE transport, the client
+      establishes an SSE connection via GET and sends messages via separate POST requests
+      routed to this handler. Must be wired into an Express (or similar) route for the
+      POST endpoint. Throws or returns HTTP error responses for content-type mismatches
+      and DNS rebinding violations. Note: SSEServerTransport is deprecated — prefer
+      StreamableHTTPServerTransport for new implementations.
+    postconditions:
+      # Evidence: dist/cjs/server/sse.js:
+      #   Line 93: throw new Error(message) — when SSE connection not yet established
+      #   Line 98: res.writeHead(403) + onerror — DNS rebinding validation failure
+      #   Line 114: throw new Error('Unsupported content-type: ${ct.type}') — non-JSON POST
+      - id: sse-handle-post-content-type-error
+        condition: >
+          The MCP client sends a POST request to the SSE endpoint with a
+          Content-Type other than 'application/json' (e.g., 'text/plain',
+          'multipart/form-data', or missing Content-Type). The transport throws an
+          error indicating the unsupported content type — this unhandled error can
+          crash a raw Node.js HTTP server or bubble as an unhandled rejection.
+        throws: >
+          Error('Unsupported content-type: <type>') — where <type> is the actual
+          Content-Type header value received. Thrown inside handlePostMessage() before
+          any JSON parsing is attempted.
+        required_handling: >
+          Wrap handlePostMessage() in a try-catch inside your POST route handler,
+          and return an appropriate HTTP error response:
+
+            app.post('/messages', async (req, res) => {
+              try {
+                await transport.handlePostMessage(req, res);
+              } catch (error) {
+                console.error('POST handler error:', error.message);
+                if (!res.headersSent) {
+                  res.status(400).json({ error: error.message });
+                }
+              }
+            });
+        sources:
+          - https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/sse.ts
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: sse-handle-post-dns-rebinding-blocked
+        condition: >
+          DNS rebinding protection is enabled (enableDnsRebindingProtection: true) on the
+          SSEServerTransport and an incoming POST request has a Host header that does not
+          match any entry in allowedHosts. The transport writes HTTP 403 to the response
+          and fires the onerror callback — but does NOT throw from handlePostMessage().
+          Code that relies on the throw to detect rejections will silently lose requests.
+        throws: >
+          Does NOT throw — instead writes HTTP 403 response and calls
+          this.onerror?.(new Error(validationError)). The onerror callback receives
+          an Error with the DNS rebinding rejection message.
+        required_handling: >
+          Attach an onerror handler to the transport to log DNS rebinding rejections,
+          and do NOT rely on try-catch alone for security-rejection detection:
+
+            transport.onerror = (err) => {
+              console.error('Transport security rejection:', err.message);
+              // Increment security metrics / alert on repeated violations
+            };
+        sources:
+          - https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/sse.ts
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: StdioServerTransport.start
+    import_path: '@modelcontextprotocol/sdk/server/stdio'
+    description: >
+      Starts the stdio server transport by attaching listeners to stdin. In the MCP
+      stdio transport model, the server reads JSON-RPC messages from stdin and writes
+      responses to stdout. This transport is used when building MCP servers that are
+      launched as subprocesses by an MCP client (e.g., Claude Desktop, Cursor). The
+      Server class (and McpServer) calls start() automatically via connect() — do not
+      call start() manually. Throws if started more than once.
+    postconditions:
+      # Evidence: dist/cjs/server/stdio.js:
+      #   Line 34: throw new Error('StdioServerTransport already started!')
+      #   Line 70: return new Promise(resolve => { ... }) — resolves immediately
+      - id: stdio-server-transport-already-started
+        condition: >
+          async function calls server.connect(transport) (or transport.start()) when the
+          StdioServerTransport has already been started. This happens when connect() is
+          called twice on the same server instance, or when start() is called manually
+          after Server.connect() was already used.
+        throws: >
+          Error('StdioServerTransport already started! If using Server class, note that
+          connect() calls start() automatically.')
+        required_handling: >
+          Ensure Server.connect() is called exactly once. For subprocess MCP servers,
+          the canonical pattern is a single connect() at startup:
+
+            const server = new McpServer({ name: 'my-server', version: '1.0.0' });
+            const transport = new StdioServerTransport();
+
+            // At server startup — called once
+            await server.connect(transport);
+
+            // Do NOT call again:
+            // await server.connect(transport); // throws AlreadyStarted
+        sources:
+          - https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/stdio.ts
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: ProxyOAuthServerProvider.exchangeAuthorizationCode
+    import_path: '@modelcontextprotocol/sdk/server/auth/providers/proxyProvider'
+    description: >
+      Proxies an OAuth authorization code exchange to an upstream authorization server.
+      Used when building an MCP server that acts as an OAuth proxy (the MCP server
+      receives the authorization code from the MCP client and exchanges it with the
+      upstream AS on behalf of the client). The ProxyOAuthServerProvider implements
+      OAuthServerProvider by forwarding all OAuth operations to the configured
+      upstream endpoints. Throws ServerError if the upstream token endpoint returns
+      a non-2xx response.
+    postconditions:
+      # Evidence: dist/cjs/server/auth/providers/proxyProvider.js:
+      #   Line 120: throw new errors_js_1.ServerError(`Token exchange failed: ${response.status}`)
+      #   Thrown when upstream returns non-2xx response
+      - id: proxy-exchange-code-upstream-error
+        condition: >
+          async function calls provider.exchangeAuthorizationCode() (called internally by
+          the MCP auth token handler) without handling ServerError. The upstream
+          authorization server returns a non-2xx HTTP response (e.g., 400 invalid_grant,
+          401 invalid_client, 500 server error). ServerError is thrown with the HTTP status
+          code in the message.
+        throws: >
+          ServerError('Token exchange failed: <status>') from
+          '@modelcontextprotocol/sdk/server/auth/errors'.
+          ServerError extends OAuthError with errorCode 'server_error'.
+        required_handling: >
+          When implementing custom token handling around ProxyOAuthServerProvider,
+          catch ServerError and return an appropriate OAuth error response:
+
+            try {
+              const tokens = await provider.exchangeAuthorizationCode(
+                client, authorizationCode, codeVerifier, redirectUri
+              );
+              return tokens;
+            } catch (error) {
+              if (error instanceof ServerError) {
+                // Upstream token endpoint failed — return 502 or OAuth error response
+                throw new InvalidGrantError('Upstream authorization failed');
+              }
+              throw error;
+            }
+
+          Note: the mcpAuthRouter() handles this automatically — only custom token
+          handlers need to catch ServerError manually.
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: ProxyOAuthServerProvider.exchangeRefreshToken
+    import_path: '@modelcontextprotocol/sdk/server/auth/providers/proxyProvider'
+    description: >
+      Proxies an OAuth refresh token exchange to an upstream authorization server. Called
+      when an MCP client presents a refresh token to obtain a new access token. The
+      ProxyOAuthServerProvider forwards the refresh request to the upstream token endpoint.
+      Throws ServerError if the upstream endpoint returns a non-2xx response (e.g., the
+      refresh token is expired, revoked, or the client's credentials are invalid).
+    postconditions:
+      # Evidence: dist/cjs/server/auth/providers/proxyProvider.js:
+      #   Line 149: throw new errors_js_1.ServerError(`Token refresh failed: ${response.status}`)
+      - id: proxy-refresh-token-upstream-error
+        condition: >
+          async function calls provider.exchangeRefreshToken() (called by the MCP auth
+          token handler when grant_type is 'refresh_token') without handling ServerError.
+          The upstream AS returns non-2xx — the refresh token is expired, revoked, or the
+          upstream server is temporarily unavailable (503).
+        throws: >
+          ServerError('Token refresh failed: <status>') from
+          '@modelcontextprotocol/sdk/server/auth/errors'.
+        required_handling: >
+          When the upstream returns a token refresh error, the MCP client's session is
+          effectively expired. Surface this as an authentication failure so the client
+          restarts the OAuth flow:
+
+            try {
+              const tokens = await provider.exchangeRefreshToken(
+                client, refreshToken, scopes
+              );
+              return tokens;
+            } catch (error) {
+              if (error instanceof ServerError) {
+                // Upstream refresh failed — client must re-authorize from scratch
+                throw new InvalidGrantError('Refresh token expired or revoked');
+              }
+              throw error;
+            }
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: McpServer.sendLoggingMessage
+    import_path: '@modelcontextprotocol/sdk/server/mcp'
+    description: >
+      Sends a structured logging message to the connected MCP client via
+      notifications/message. The server must be initialized with
+      capabilities: { logging: {} } for messages to be delivered; without
+      this capability flag the method silently returns undefined without
+      sending anything. Additionally the server must be connected (connect()
+      called) before invoking, otherwise the underlying notification()
+      call throws Error('Not connected').
+    postconditions:
+      - id: send-logging-message-capability-not-set
+        condition: >
+          McpServer is created WITHOUT capabilities.logging enabled, and
+          sendLoggingMessage() is called. The method silently returns undefined — the log
+          message is never delivered to the client. No error is thrown and no warning
+          is emitted. Callers have no way to detect the failure without inspecting
+          server capabilities at runtime.
+          Evidence: dist/cjs/server/index.js — logging guard is falsy, method returns undefined.
+        throws: >
+          Does NOT throw — returns undefined silently. Messages are silently dropped.
+        required_handling: >
+          Declare the logging capability at construction time to ensure messages are delivered:
+
+            // ✅ Declare logging capability at construction time
+            const server = new McpServer(
+              { name: 'my-server', version: '1.0.0' },
+              { capabilities: { logging: {} } }
+            );
+            // Now sendLoggingMessage() will deliver the notification to the client
+            await server.sendLoggingMessage({ level: 'error', data: 'critical failure' });
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/logging
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: send-logging-message-not-connected
+        condition: >
+          sendLoggingMessage() is called before the server is connected to a transport
+          (before connect() completes or after close()). The underlying notification()
+          method throws Error('Not connected') because this._transport is null.
+          Evidence: dist/cjs/shared/protocol.js — notification() checks this._transport.
+        throws: >
+          Error('Not connected') — thrown by the underlying notification() method
+          when this._transport is null.
+        required_handling: >
+          Only call sendLoggingMessage() after server.connect() has completed:
+
+            const server = new McpServer(
+              { name: 'my-server', version: '1.0.0' },
+              { capabilities: { logging: {} } }
+            );
+            const transport = new StdioServerTransport();
+            await server.connect(transport);  // connect first
+
+            // ✅ Safe to call after connect()
+            await server.sendLoggingMessage({ level: 'info', data: 'server ready' });
+        sources:
+          - https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/logging
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
