@@ -1,10 +1,11 @@
 package: bull
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-04-17"  # deepen-stream-2 pass 2: expanded from 2→9 contracted functions
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
+coverage_score: 0.56  # 9 contracted / 16 total async-callable (7 omitted read-only/monitoring)
 
 # Event handler detection NOW SUPPORTED (as of 2026-02-27):
 # The EventListenerAnalyzer can now detect missing event handlers:
@@ -272,3 +273,396 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # Evidence: bull/lib/queue.js Job.create() → queue.isReady().then(() => addJob(...))
+  # Evidence: bull/lib/job.js Job.create() calls addJob which uses Redis pipeline
+  # Redis errors propagate as plain Error objects (from ioredis)
+  - name: Queue.add
+    import_path: "bull"
+    description: >
+      Creates a new job and adds it to the queue. Internally waits for Redis ready
+      state then executes a Lua script to add the job. If the queue is empty the
+      job executes immediately; otherwise it waits. Uses jobId for deduplication —
+      duplicate jobId silently drops the new job (job not added, no error thrown).
+      Returns the Job object including its assigned jobId.
+    postconditions:
+      # Evidence: bull/lib/queue.js Job.create() calls isReady() then addJob() via Redis pipeline
+      # ioredis throws Error objects on connection failure with messages like "Connection is closed."
+      - id: add-redis-connection-error
+        condition: "Queue.add() called when Redis connection is unavailable"
+        severity: error
+        description: >
+          Throws Error when Redis connection is unavailable at the time of add().
+          The error propagates from the ioredis client when the underlying TCP
+          connection is closed, timed out, or the Redis server is unreachable.
+          No job is created. Callers that omit try-catch lose jobs silently.
+        required_handling: >
+          Caller MUST wrap Queue.add() in try-catch and handle the Error.
+          Without error handling, jobs are lost silently with no retry mechanism.
+          Always log the error and implement a fallback (retry queue, dead letter, alert).
+        sources:
+          - "https://github.com/OptimalBits/bull"
+          - "https://github.com/luin/ioredis"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/queue.js Queue.add() — opts.repeat path calls nextRepeatableJob()
+      # Non-repeat path: duplicate jobId silently returns existing job id (no error, no new job)
+      - id: add-duplicate-job-id-silent-drop
+        condition: "Queue.add() called with a jobId that already exists in the queue"
+        severity: warning
+        description: >
+          When a custom jobId is specified and a job with that ID already exists in
+          the queue (waiting or active), Bull silently drops the new job — add()
+          resolves successfully but the job is never added. Callers that rely on
+          add() always creating a new job will find their work silently lost.
+        required_handling: >
+          Caller SHOULD verify job creation by checking the returned Job object or
+          querying job status after add(). For deduplication flows, document the
+          intent explicitly. Do not assume add() always creates a new job.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.addBulk() → Job.createBulk() → multi.exec()
+  # Batch is atomic at the Redis pipeline level — all-or-nothing if connection drops
+  - name: Queue.addBulk
+    import_path: "bull"
+    description: >
+      Adds an array of jobs atomically using a Redis pipeline (multi/exec). All
+      jobs are queued in a single round-trip. If any job's Redis command fails,
+      the exec() rejects and no jobs are confirmed. Note: 'repeat' option is not
+      supported in addBulk (https://github.com/OptimalBits/bull/issues/1731).
+    postconditions:
+      # Evidence: bull/lib/job.js Job.createBulk() — uses multi.exec() which rejects on connection error
+      - id: addbulk-redis-connection-error
+        condition: "Queue.addBulk() called when Redis connection is unavailable"
+        severity: error
+        description: >
+          Throws Error when Redis connection fails during the pipeline exec().
+          Unlike Queue.add() which can partially succeed, addBulk() uses a Redis
+          MULTI/EXEC transaction — if the connection drops mid-pipeline, no jobs
+          are added and the returned promise rejects.
+        required_handling: >
+          Caller MUST wrap Queue.addBulk() in try-catch and handle the Error.
+          On failure, the entire batch is lost — implement retry logic or store
+          the batch for resubmission. Log the error with the batch contents.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/queue.js Queue.addBulk() — no validation on empty array input
+      # Bull will call multi.exec() with zero commands which resolves to empty array — safe
+      # but the real risk: callers assuming each added job can be retried independently
+      - id: addbulk-repeat-option-unsupported
+        condition: "Queue.addBulk() called with jobs that include a repeat option"
+        severity: warning
+        description: >
+          The 'repeat' option in JobOptions is silently stripped from addBulk() jobs.
+          Bull does not process the repeat scheduler for bulk-added jobs
+          (https://github.com/OptimalBits/bull/issues/1731). Jobs that should be
+          repeating will only run once.
+        required_handling: >
+          Do not use the repeat option with addBulk(). Add repeating jobs individually
+          via Queue.add() to ensure the repeat scheduler is engaged.
+        sources:
+          - "https://github.com/OptimalBits/bull/issues/1731"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.close() uses isReady().then(pause(true))
+  # Then disconnects Redis clients: client, subscriber, bclient
+  # Redis disconnect errors are caught and the close still resolves
+  - name: Queue.close
+    import_path: "bull"
+    description: >
+      Gracefully closes all Redis connections for this queue instance. Pauses the
+      local worker (stops accepting new jobs), waits for active jobs to finish
+      (unless doNotWaitJobs=true), then disconnects the Redis client, subscriber,
+      and blocking client. MUST be called on application shutdown to prevent Redis
+      connection leaks and allow clean process exit.
+    postconditions:
+      # Evidence: bull/lib/queue.js — no SIGTERM handler is added automatically by bull
+      # Connection leak from never calling close() confirmed in bull issues
+      - id: close-not-called-on-shutdown
+        condition: "Queue instance created without registering a SIGTERM/shutdown handler that calls Queue.close()"
+        severity: error
+        description: >
+          If Queue.close() is never called during application shutdown, the process
+          will not exit cleanly because ioredis keeps the event loop alive. Redis
+          connections are leaked — each deployment creates orphaned connections until
+          the Redis server's maxclients limit is reached.
+        required_handling: >
+          Caller MUST register process shutdown handlers that call queue.close().
+          Add: process.on('SIGTERM', () => queue.close())
+          and: process.on('SIGINT', () => queue.close())
+          Without this, the process hangs on exit and leaks Redis connections.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/queue.js Queue.close() — when called inside a job handler,
+      # the queue.closing flag defers the actual close until the job completes
+      - id: close-called-mid-job
+        condition: "Queue.close() called while active jobs are still processing"
+        severity: warning
+        description: >
+          Calling Queue.close() from inside a job processor (e.g. in a shutdown signal
+          handler that fires while a job is running) does not immediately terminate.
+          Bull defers the close until the current job finishes. Callers expecting
+          an immediate shutdown will hang until job completion or timeout.
+        required_handling: >
+          Set a timeout for graceful shutdown. If shutdown takes too long, force
+          exit with process.exit(). Document the expected shutdown behavior.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.obliterate() — calls pause() then
+  # scripts.obliterate() in a loop. Throws if active jobs exist and force:false.
+  - name: Queue.obliterate
+    import_path: "bull"
+    description: >
+      Completely and irreversibly destroys a queue and all of its contents — waiting,
+      active, completed, failed, and delayed jobs are all deleted. Requires no active
+      jobs (unless opts.force=true). This operation CANNOT be undone. Commonly used
+      in test teardown; using in production without force guard is dangerous.
+    postconditions:
+      # Evidence: bull/lib/scripts.js obliterate Lua script returns error code when active jobs present
+      # Without force:true, obliterate throws if active jobs exist
+      - id: obliterate-active-jobs-error
+        condition: "obliterate() called without opts.force=true while active jobs are processing"
+        throws: "Error('Cannot obliterate queue that has active jobs, use force option to force obliteration')"
+        required_handling: >
+          Caller MUST wrap obliterate() in try-catch. Drain the queue first (pause, wait
+          for active jobs), or use obliterate({ force: true }) only when data loss is
+          acceptable (test environments). Never call obliterate() in production request
+          handlers without explicit environment guards.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: obliterate() is documented as irreversible — no soft-delete, no undo
+      - id: obliterate-irreversible
+        condition: "obliterate() completes successfully in a production environment without environment guards"
+        throws: "No error — but all queue data is permanently deleted from Redis with no undo"
+        required_handling: >
+          Callers MUST add explicit environment guards: check NODE_ENV !== 'production'
+          before calling obliterate(). Add admin confirmation for any production use.
+          There is no undo — once obliterated, all job history is gone.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/REFERENCE.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.clean() — throws synchronously for
+  # missing grace period or unknown type. Source confirmed from queue.js lines 1313–1326.
+  - name: Queue.clean
+    import_path: "bull"
+    description: >
+      Removes jobs from the queue that are older than a grace period (in milliseconds).
+      Operates on a specific job status type (completed, wait, active, delayed, failed).
+      Returns a promise resolving to an array of removed Job objects. Emits 'cleaned'
+      event on success.
+    postconditions:
+      # Evidence: bull/lib/queue.js — throws new Error('You must define a grace period.')
+      # when grace is undefined or null (line 1313)
+      - id: clean-missing-grace-period
+        condition: "clean() called with grace argument as undefined or null"
+        throws: "Error('You must define a grace period.')"
+        required_handling: >
+          Always provide the grace period as first argument (milliseconds).
+          Example: queue.clean(7 * 24 * 3600 * 1000, 'completed').
+          Wrap in try-catch in maintenance scripts and cron jobs.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/queue.js — throws new Error('Cannot clean unknown queue type ' + type)
+      # for types not in ['completed', 'wait', 'active', 'paused', 'delayed', 'failed']
+      - id: clean-invalid-type
+        condition: "clean() type argument is not one of: 'completed', 'wait', 'active', 'paused', 'delayed', 'failed'"
+        throws: "Error('Cannot clean unknown queue type <type>')"
+        required_handling: >
+          Use 'wait' (not 'waiting') for waiting jobs. Valid type strings are:
+          'completed', 'wait', 'active', 'paused', 'delayed', 'failed'.
+          The monitoring API returns 'waiting' but clean() requires 'wait'.
+          Wrap in try-catch to handle invalid type errors gracefully.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.retry() — error messages from errors.js
+  # RETRY_JOB_NOT_EXIST: "Couldn't retry job: The job doesn't exist"
+  # RETRY_JOB_IS_LOCKED: "Couldn't retry job: The job is locked"
+  # RETRY_JOB_NOT_FAILED: "Couldn't retry job: The job has been already retried or has not failed"
+  - name: Job.retry
+    import_path: "bull"
+    description: >
+      Re-queues a job that is in the 'failed' state for immediate reprocessing.
+      Only operates on failed jobs — throws specific errors for jobs in other states.
+      Commonly used in admin dashboards and dead-letter-queue recovery scripts.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.retry() → scripts.reprocessJob() result codes
+      # result === 0 → RETRY_JOB_NOT_EXIST: "Couldn't retry job: The job doesn't exist"
+      - id: retry-job-not-exist
+        condition: "Job.retry() called on a job that no longer exists in Redis"
+        severity: error
+        description: >
+          Throws Error("Couldn't retry job: The job doesn't exist") when the job
+          has been removed from Redis (expired TTL, manually deleted, or removed
+          via removeOnFail option). Common in retry flows that hold job references
+          from a previous session.
+        required_handling: >
+          Caller MUST wrap Job.retry() in try-catch. Verify job existence before
+          retrying, or handle the not-exist error gracefully in admin retry flows.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/errors.js RETRY_JOB_NOT_FAILED
+      # result === -2 → "Couldn't retry job: The job has been already retried or has not failed"
+      - id: retry-job-not-failed
+        condition: "Job.retry() called on a job that is not in the failed state"
+        severity: error
+        description: >
+          Throws Error("Couldn't retry job: The job has been already retried or has not
+          failed") when retry() is called on a job that is not in the 'failed' state.
+          This includes jobs that are waiting, active, completed, or already being
+          retried by another worker.
+        required_handling: >
+          Caller MUST wrap Job.retry() in try-catch and handle the not-failed error.
+          Check job.getState() before retrying, or catch and ignore this specific error
+          in bulk retry flows.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.finished() → subscribed to global:completed/global:failed
+  # If job fails, rejects with new Error(job.failedReason)
+  # If queue closes while waiting, rejects with "cannot check if job is finished in a closing queue."
+  - name: Job.finished
+    import_path: "bull"
+    description: >
+      Returns a promise that resolves when the job completes successfully (returns the
+      job's return value) or rejects if the job fails (throws Error with the job's
+      failedReason). Subscribes to Redis pub/sub for completion notification. Useful
+      for fire-and-wait patterns where the caller needs the job result synchronously.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.finished() line ~518: reject(new Error(failedReason))
+      # Confirmed: if job transitions to failed state, finished() rejects
+      - id: finished-job-failed
+        condition: "Awaiting Job.finished() when the job transitions to failed state"
+        severity: error
+        description: >
+          Rejects with Error(job.failedReason) when the job fails during processing.
+          The failedReason is the error message from the processor's thrown error.
+          Callers waiting on job.finished() MUST catch this error to avoid unhandled
+          promise rejections that crash the process in Node.js v15+.
+        required_handling: >
+          Caller MUST wrap await job.finished() in try-catch. On rejection, inspect
+          the error message (which equals job.failedReason) and handle accordingly.
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/job.js line ~539: reject("cannot check if job is finished in a closing queue.")
+      - id: finished-queue-closing
+        condition: "Queue.close() is called while job.finished() promise is pending"
+        severity: error
+        description: >
+          Rejects with Error("cannot check if job is finished in a closing queue.")
+          when Queue.close() is called while one or more promises are waiting on
+          job.finished(). The pub/sub subscription is torn down before the job completes.
+        required_handling: >
+          Caller MUST wrap await job.finished() in try-catch. During shutdown, handle
+          the queue-closing rejection gracefully rather than crashing. Consider a
+          timeout pattern: Promise.race([job.finished(), shutdownTimeout]).
+        sources:
+          - "https://github.com/OptimalBits/bull"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
