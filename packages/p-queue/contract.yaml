@@ -2,9 +2,10 @@ package: p-queue
 semver: ">=7.0.0 <10.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
-status: draft
+last_verified: "2026-04-17"
+status: production
 evidence_quality: confirmed
+coverage_score: 0.67  # 6 contracted / 9 total async-callable (2 intentionally omitted)
 
 # Detection rules for analyzer integration
 detection:
@@ -49,3 +50,261 @@ functions:
           visibility: silent
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: addAll
+    import_path: "p-queue"
+    description: >
+      Adds an array of sync or async task functions to the queue. Returns a
+      single Promise that resolves when ALL tasks complete, or rejects
+      immediately when the first task fails (Promise.all semantics).
+      Tasks that were already running continue to execute in the background
+      after the first rejection — there is no cancellation of in-flight work.
+      Source confirmed: addAll() uses Promise.all(functions.map(fn => this.add(fn, options)))
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Evidence: https://github.com/sindresorhus/p-queue/blob/main/source/index.ts
+      - id: addall-unhandled-rejection
+        condition: >
+          queue.addAll(fns) is called without await in a try-catch or without .catch().
+          If any task in the array throws, the entire addAll() promise rejects with the
+          first error. Remaining tasks still execute in the background, but the rejection
+          is unhandled — crashes Node.js or triggers unhandledRejection.
+        throws: "Error (same as add() — any error thrown by any task function)"
+        required_handling: >
+          Caller MUST wrap queue.addAll() in try-catch or chain .catch():
+            try {
+              await queue.addAll(fns);
+            } catch (error) {
+              console.error('Batch failed:', error);
+            }
+          Note: even after catching, background tasks may still be executing.
+          Use await queue.onIdle() if you need all tasks to fully settle.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://github.com/sindresorhus/p-queue/blob/main/source/index.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: addall-partial-failure-background-tasks
+        condition: >
+          queue.addAll(fns) rejects on first task failure. Caller catches the rejection
+          and continues, unaware that remaining tasks from the failed batch are still
+          executing concurrently in the background, consuming queue concurrency slots.
+        throws: "No additional error — remaining tasks silently complete or fail in background"
+        required_handling: >
+          After catching an addAll() rejection, call queue.clear() to prevent queued
+          tasks from starting, and await queue.onIdle() to wait for already-running
+          tasks to complete before proceeding:
+            try {
+              await queue.addAll(fns);
+            } catch (error) {
+              queue.clear();          // stop queued-but-not-started tasks
+              await queue.onIdle();   // wait for in-flight tasks to settle
+              throw error;
+            }
+        sources:
+          - "https://github.com/sindresorhus/p-queue/blob/main/source/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: onIdle
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when queue.size === 0 AND
+      queue.pending === 0 (all queued AND running tasks have completed).
+      Resolves immediately if the queue is already idle. Used as a
+      shutdown signal — await queue.onIdle() to know all work is done.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Evidence: https://github.com/sindresorhus/p-queue/blob/main/source/index.ts
+      # Source: onIdle() awaits #onEvent('idle') — resolves once when idle event fires
+      - id: onidle-resolves-once
+        condition: >
+          await queue.onIdle() is used inside a loop as a "wait for this batch to finish"
+          primitive, expecting it to gate each iteration. Since onIdle() resolves only once
+          per call, a subsequent call may return immediately if the queue is already idle,
+          causing a batch to be skipped without any waiting.
+        required_handling: >
+          Use queue.on('idle', handler) for repeated idle-detection callbacks.
+          For one-shot shutdown: await queue.onIdle() is correct.
+          For pacing batches: schedule tasks incrementally and use onSizeLessThan()
+          for backpressure rather than waiting for full idle between batches.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: onidle-paused-queue-hangs
+        condition: >
+          queue.pause() was called (or autoStart:false constructor option with no queue.start()),
+          and queue.onIdle() is awaited. The queue never processes tasks, so pending tasks never
+          complete, and onIdle() never resolves. There is no timeout built into onIdle().
+        required_handling: >
+          Always ensure the queue is started (queue.start() or autoStart:true default) before
+          awaiting onIdle(). For shutdown sequences:
+            queue.pause();        // stop accepting new tasks
+            queue.clear();        // remove queued-but-not-started tasks
+            await queue.onIdle(); // wait for in-flight tasks to drain
+          Do NOT call queue.pause() before onIdle() if you still have pending tasks —
+          pause() stops NEW tasks from starting but does not affect already-running tasks.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://github.com/sindresorhus/p-queue/blob/main/source/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: onError
+    import_path: "p-queue"
+    description: >
+      Returns a Promise<never> that rejects with the first error thrown by
+      any task in the queue. The returned Promise NEVER resolves — it only
+      rejects. Intended to be used with Promise.race([queue.onError(),
+      queue.onIdle()]) for fail-fast error monitoring.
+      CRITICAL: The Promise returned by add() still rejects independently.
+      Handling onError() does NOT substitute for handling individual add()
+      rejections.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Evidence: https://github.com/sindresorhus/p-queue/blob/main/source/index.ts
+      # Source: onError() uses new Promise((_resolve, reject) => { this.on('error', reject) })
+      - id: onerror-does-not-replace-add-catch
+        condition: >
+          queue.onError() is used as the only error handler — without also handling
+          rejections from individual queue.add() calls. The add() promise still rejects
+          independently; the onError() event-based handler does not absorb it.
+          The README explicitly states: "The promise returned by add() still rejects.
+          You must handle each add() promise to avoid unhandled rejections."
+        required_handling: >
+          Each queue.add() call MUST have its own rejection handling even when
+          using onError() for monitoring. Minimum pattern:
+            queue.add(() => riskyTask()).catch(() => {}); // suppress per-add rejection
+            // AND monitor globally:
+            Promise.race([queue.onError(), queue.onIdle()])
+              .catch(err => { queue.pause(); reportError(err); });
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://github.com/sindresorhus/p-queue/blob/main/source/index.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: onerror-never-resolves-hangs
+        condition: >
+          await queue.onError() is used without being raced against queue.onIdle().
+          queue.onError() returns Promise<never> — it NEVER resolves normally.
+          In a success scenario (no task ever errors), awaiting it blocks forever.
+        required_handling: >
+          Always race onError() against onIdle():
+            try {
+              await Promise.race([queue.onError(), queue.onIdle()]);
+            } catch (error) {
+              queue.pause();
+              throw error;
+            }
+          Never await queue.onError() in isolation.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: onEmpty
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when queue.size === 0 (no more
+      tasks waiting to start). Unlike onIdle(), tasks that are currently
+      executing (queue.pending > 0) may still be running when onEmpty()
+      resolves. Used to detect when the queue has been fully dequeued,
+      not when all work is done.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Evidence: https://github.com/sindresorhus/p-queue/blob/main/source/index.ts
+      # Source: onEmpty() awaits #onEvent('empty') — resolves once when empty event fires
+      - id: onempty-not-all-done
+        condition: >
+          await queue.onEmpty() is used as a "wait for all tasks to complete" signal,
+          then the caller proceeds assuming all work is finished. In fact, tasks already
+          dequeued and executing (queue.pending > 0) continue to run after onEmpty()
+          resolves. The README states: "onEmpty merely signals that the queue is empty,
+          but some promises haven't completed yet."
+        required_handling: >
+          Use await queue.onIdle() (not onEmpty()) to wait for ALL work to finish:
+            await queue.onIdle(); // size === 0 AND pending === 0
+          Use onEmpty() only when you specifically need to know when the queue has
+          been fully dequeued but don't care about in-flight tasks completing.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: onSizeLessThan
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when queue.size < limit.
+      Used for backpressure control to prevent the queue from growing
+      unboundedly. The promise resolves immediately if the current size
+      is already below the limit. Note: only counts waiting tasks, NOT
+      currently executing tasks.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Source: onSizeLessThan awaits #onEvent('next', () => this.#queue.size < limit)
+      - id: onsizelessthan-excludes-pending
+        condition: >
+          queue.onSizeLessThan(limit) is used to enforce a hard cap on total concurrent work
+          (queued + running combined). Since it only checks queue.size (tasks waiting to start)
+          and not queue.pending (tasks currently executing), the total in-flight work can be
+          up to limit + concurrency simultaneously. The README notes: "There could still be
+          up to concurrency jobs already running that this call does not include in its calculation."
+        required_handling: >
+          To limit TOTAL concurrent work (queued + running), check both:
+            await queue.onSizeLessThan(Math.max(0, limit - queue.pending));
+          Or use a lower limit that accounts for the concurrency headroom.
+          For simple backpressure (just prevent unbounded queue growth),
+          onSizeLessThan(N) is correct and sufficient.
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
