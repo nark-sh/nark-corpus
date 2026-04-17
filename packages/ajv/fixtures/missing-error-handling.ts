@@ -198,6 +198,92 @@ function validateArrayWithoutChecking(items: unknown[]): void {
   console.log('All items validated');
 }
 
+/**
+ * VIOLATION: compileAsync() called without loadSchema option configured
+ * @expect-violation: compileasync-no-load-schema
+ * @expect-violation: compileasync-load-schema-rejects
+ */
+async function compileAsyncWithoutLoadSchema(schema: object): Promise<void> {
+  // ❌ VIOLATION: Ajv instance has no loadSchema configured
+  const ajvNoLoad = new Ajv();
+
+  // compileAsync() throws synchronously: "options.loadSchema should be a function"
+  const validate = await ajvNoLoad.compileAsync(schema);
+
+  // No error handling — unhandled rejection crashes Node.js
+  const result = validate({});
+  console.log('Compiled and validated:', result);
+}
+
+/**
+ * VIOLATION: compileAsync() not wrapped in try-catch — promise rejection unhandled
+ * @expect-violation: compileasync-load-schema-rejects
+ * @expect-violation: compileasync-invalid-schema
+ */
+async function compileAsyncWithoutErrorHandling(): Promise<void> {
+  const ajvAsync = new Ajv({
+    loadSchema: async (uri: string) => {
+      const res = await fetch(uri);
+      return res.json();
+    }
+  });
+
+  const schemaWithExternalRef = {
+    type: 'object',
+    properties: {
+      user: { $ref: 'https://example.com/schemas/user.json' }
+    }
+  };
+
+  // ❌ VIOLATION: No try-catch — if loadSchema fails or returns invalid schema,
+  // this promise rejects and crashes the server (unhandled promise rejection)
+  const validate = await ajvAsync.compileAsync(schemaWithExternalRef);
+  const result = validate({});
+  console.log('Validated:', result);
+}
+
+/**
+ * VIOLATION: addSchema() without checking for duplicate $id
+ * @expect-violation: addschema-duplicate-id
+ */
+function addSchemaDuplicateId(): void {
+  const ajvSchemas = new Ajv();
+
+  const userSchema = {
+    $id: 'https://example.com/schemas/user.json',
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name']
+  };
+
+  // ❌ VIOLATION: Calling addSchema twice with the same $id throws:
+  // "schema with key or id already exists"
+  // This is a common bug in server code called on every request
+  ajvSchemas.addSchema(userSchema);
+  ajvSchemas.addSchema(userSchema); // crashes!
+}
+
+/**
+ * VIOLATION: addKeyword() without checking for duplicates
+ * @expect-violation: addkeyword-duplicate-keyword
+ */
+function addKeywordDuplicate(): void {
+  const ajvKwd = new Ajv();
+
+  // ❌ VIOLATION: Adding same custom keyword twice throws:
+  // "Keyword nullable is already defined"
+  const nullableKeyword = {
+    keyword: 'nullable',
+    type: 'object',
+    schemaType: 'boolean',
+    validate: (schema: boolean, data: unknown) => !schema || data !== null,
+    errors: false
+  };
+
+  ajvKwd.addKeyword(nullableKeyword);
+  ajvKwd.addKeyword(nullableKeyword); // crashes on second call!
+}
+
 // Export functions to prevent tree-shaking
 export {
   validateUserWithoutChecking,
@@ -209,5 +295,9 @@ export {
   processUserData,
   validateWithUnusedVariable,
   validateNestedDataWithoutChecking,
-  validateArrayWithoutChecking
+  validateArrayWithoutChecking,
+  compileAsyncWithoutLoadSchema,
+  compileAsyncWithoutErrorHandling,
+  addSchemaDuplicateId,
+  addKeywordDuplicate
 };

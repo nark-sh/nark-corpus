@@ -171,6 +171,86 @@ function conditionalValidation(data: unknown, shouldValidate: boolean): void {
   }
 }
 
+/**
+ * Example 8: compileAsync() with proper error handling
+ * @expect-clean
+ */
+async function compileAsyncWithProperErrorHandling(): Promise<void> {
+  const ajvAsync = new Ajv({
+    // ✅ loadSchema configured before calling compileAsync
+    loadSchema: async (uri: string) => {
+      const res = await fetch(uri);
+      if (!res.ok) throw new Error(`Failed to load schema: ${res.status} ${uri}`);
+      return res.json();
+    }
+  });
+
+  const schemaWithRef = {
+    type: 'object',
+    properties: {
+      user: { $ref: 'https://example.com/schemas/user.json' }
+    }
+  };
+
+  try {
+    // ✅ Awaited inside try-catch to handle promise rejection
+    const validate = await ajvAsync.compileAsync(schemaWithRef);
+    const result = validate({ user: { name: 'Alice' } });
+    if (!result) {
+      console.error('Validation failed:', validate.errors);
+    }
+  } catch (error) {
+    console.error('Schema compilation failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Example 9: addSchema() with idempotency guard
+ * @expect-clean
+ */
+function addSchemaWithDuplicateGuard(): void {
+  const ajvSchemas = new Ajv();
+
+  const userSchema = {
+    $id: 'https://example.com/schemas/user.json',
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name']
+  };
+
+  // ✅ Guard against duplicate registration
+  if (!ajvSchemas.getSchema(userSchema.$id)) {
+    try {
+      ajvSchemas.addSchema(userSchema);
+    } catch (error) {
+      console.error('Failed to add schema:', error);
+      throw error;
+    }
+  }
+}
+
+/**
+ * Example 10: addKeyword() with duplicate guard
+ * @expect-clean
+ */
+function addKeywordWithDuplicateGuard(): void {
+  const ajvKwd = new Ajv();
+
+  const nullableKeyword = {
+    keyword: 'nullable',
+    type: 'object' as const,
+    schemaType: 'boolean' as const,
+    validate: (schema: boolean, data: unknown) => !schema || data !== null,
+    errors: false
+  };
+
+  // ✅ Guard: only register if not already defined
+  if (!ajvKwd.getKeyword('nullable')) {
+    ajvKwd.addKeyword(nullableKeyword);
+  }
+}
+
 // Export functions to prevent tree-shaking
 export {
   validateUserWithProperErrorHandling,
@@ -179,5 +259,8 @@ export {
   validateSchemaBeforeUse,
   validateSchemaComprehensively,
   validateMultipleItemsWithErrorPreservation,
-  conditionalValidation
+  conditionalValidation,
+  compileAsyncWithProperErrorHandling,
+  addSchemaWithDuplicateGuard,
+  addKeywordWithDuplicateGuard
 };

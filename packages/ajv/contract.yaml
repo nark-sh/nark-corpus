@@ -2,9 +2,10 @@ package: ajv
 semver: ">=8.18.0 <10.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.86
 # analyzer_limitation: return_value_pattern
 # Detection is limited: analyzer cannot reliably detect missing return value checks.
 # Historical: False positive rate ~23%, detection rate ~42% on fixtures. Requires dataflow analysis.
@@ -81,6 +82,189 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: compileAsync
+    import_path: "ajv"
+    description: >
+      Asynchronously compiles a JSON schema, loading missing referenced schemas via
+      the loadSchema option. Returns a Promise that resolves to a validation function.
+      Used when schemas reference external schemas that must be fetched at compile time.
+    postconditions:
+      # Evidence: https://ajv.js.org/api.html#compileAsync
+      # Error types confirmed from ajv/dist/core.js source: Error (options.loadSchema not set),
+      # MissingRefError propagated as rejection, schema validation Error
+      - id: compileasync-no-load-schema
+        severity: error
+        condition: >
+          compileAsync() is called without configuring the loadSchema option in Ajv constructor
+        throws: "Error: options.loadSchema should be a function"
+        required_handling: >
+          Caller MUST configure loadSchema in Ajv options before calling compileAsync().
+          The error throws synchronously before the promise is even created.
+          If the schema has external $ref dependencies, loadSchema is mandatory.
+          Use pattern: new Ajv({ loadSchema: async (uri) => fetch(uri).then(r => r.json()) })
+        sources:
+          - "https://ajv.js.org/api.html#compileAsync"
+          - "https://ajv.js.org/guide/managing-schemas.html"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: compileasync-load-schema-rejects
+        severity: error
+        condition: >
+          The loadSchema function rejects (e.g., remote schema URL returns 404/500,
+          network is unavailable, or the schema server is down)
+        throws: "Error (propagated rejection from loadSchema)"
+        required_handling: >
+          Caller MUST await compileAsync() inside a try-catch or attach a .catch() handler.
+          loadSchema failures propagate as promise rejections. In server startup code,
+          unhandled rejections crash Node.js. Cache compiled validators to avoid repeated
+          remote fetches on every request.
+          Use pattern: const validate = await ajv.compileAsync(schema).catch(err => { throw new Error('Schema load failed: ' + err.message); })
+        sources:
+          - "https://ajv.js.org/api.html#compileAsync"
+          - "https://ajv.js.org/guide/managing-schemas.html"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: compileasync-invalid-schema
+        severity: error
+        condition: >
+          The schema (or a schema loaded via loadSchema) is invalid against its meta-schema
+        throws: "Error: schema is invalid"
+        required_handling: >
+          Caller MUST wrap compileAsync() in try-catch. Invalid referenced schemas cause
+          the promise to reject with a descriptive Error. Schemas loaded dynamically from
+          external sources should be pre-validated before being returned from loadSchema.
+          Use pattern: try { const validate = await ajv.compileAsync(schema); } catch (e) { handle(e); }
+        sources:
+          - "https://ajv.js.org/api.html#compileAsync"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: addSchema
+    import_path: "ajv"
+    description: >
+      Adds schema(s) to the Ajv instance without compiling them. Schemas are compiled
+      lazily on first use. Validates the schema against the meta-schema by default.
+      Commonly called at application startup to pre-register all known schemas.
+    postconditions:
+      # Evidence: https://ajv.js.org/api.html#addSchema
+      # Error types confirmed from ajv/dist/core.js: Error (schema id collision at line 466),
+      # Error ($schema must be string at line 253), Error propagated from validateSchema
+      - id: addschema-duplicate-id
+        severity: error
+        condition: >
+          A schema with the same $id or key is added a second time to the same Ajv instance
+        throws: "Error: schema with key or id already exists"
+        required_handling: >
+          Caller MUST check if a schema is already registered before calling addSchema().
+          Duplicate schema registration crashes immediately. This commonly occurs in server
+          code that initializes Ajv in module scope but registers schemas in a function
+          called on every request or startup retry.
+          Use pattern: if (!ajv.getSchema(schema.$id)) { ajv.addSchema(schema); }
+        sources:
+          - "https://ajv.js.org/api.html#addSchema"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: addschema-invalid-schema-throws
+        severity: warning
+        condition: >
+          A schema with invalid structure is added and validateSchema option is true (default).
+          Ajv validates the schema against the meta-schema during addSchema().
+        throws: "Error: schema is invalid"
+        required_handling: >
+          Caller MUST wrap addSchema() in try-catch when registering schemas from untrusted
+          or external sources. Schema validation errors throw synchronously. If registering
+          known static schemas at startup, errors here indicate a developer mistake and
+          should be allowed to crash (fail-fast). For dynamic schemas from user input,
+          validate first using ajv.validateSchema() before calling addSchema().
+        sources:
+          - "https://ajv.js.org/api.html#addSchema"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: addKeyword
+    import_path: "ajv"
+    description: >
+      Registers a custom validation keyword on the Ajv instance. Once registered,
+      the keyword can be used in any schema compiled by this instance. Commonly
+      called at startup when extending Ajv with application-specific validators.
+    postconditions:
+      # Evidence: https://ajv.js.org/api.html#addKeyword
+      # Error types confirmed from ajv/dist/core.js checkKeyword() at lines 555-569:
+      # Error (keyword already defined), Error (invalid name), Error (missing code/validate)
+      - id: addkeyword-duplicate-keyword
+        severity: error
+        condition: >
+          addKeyword() is called with a keyword name that was already registered on this
+          Ajv instance (either a standard JSON Schema keyword or a previously added custom keyword)
+        throws: "Error: Keyword <name> is already defined"
+        required_handling: >
+          Caller MUST check if the keyword is already registered before calling addKeyword().
+          There is no way to redefine or remove keywords once added. Duplicate registration
+          is a common bug in modular server code where multiple modules independently try
+          to register the same shared keyword (e.g., a custom "nullable" keyword registered
+          by two different plugins).
+          Use pattern: if (!ajv.getKeyword(keyword)) { ajv.addKeyword(definition); }
+        sources:
+          - "https://ajv.js.org/api.html#addKeyword"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: addkeyword-invalid-name
+        severity: warning
+        condition: >
+          The keyword name contains invalid characters (must match /^[a-z_$][a-z0-9_$:-]*$/i)
+          or is empty
+        throws: "Error: Keyword <name> has invalid name"
+        required_handling: >
+          Caller MUST use valid keyword names starting with ASCII letter, underscore, or
+          dollar sign, containing only alphanumerics, underscores, hyphens, or colons.
+          Use application-specific prefixes to avoid name collisions with future JSON Schema
+          keywords (e.g., "myapp-nullable" instead of "nullable").
+        sources:
+          - "https://ajv.js.org/api.html#addKeyword"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+# coverage_score: 0.86  # 6 contracted / 7 total (validate, compile, validateSchema, compileAsync, addSchema, addKeyword, constructor)
+# last_deepened: 2026-04-17
 # Category: validation
 # npm: https://www.npmjs.com/package/ajv
 # Repository: https://github.com/ajv-validator/ajv

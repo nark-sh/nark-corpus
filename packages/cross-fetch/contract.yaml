@@ -1,16 +1,40 @@
+# cross-fetch — Universal WHATWG Fetch API polyfill for Node, browsers, and React Native.
+# Wraps node-fetch@2.x on Node.js. The fetch() function is the primary async API.
+# Response body methods (json, text) are also async and can throw independently.
+# Critical behavior: fetch() does NOT reject on HTTP 4xx/5xx — callers must check response.ok.
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 4):
+# API surface: 6 async-callable operations (3 intentionally omitted)
+# Contracted before: 1 (fetch, network-error only)
+# Contracted after: 3 (+2 new functions: response.json, response.text)
+#   Also: 2 new postconditions added to fetch() (http-error-unchecked, abort-error)
+# Omitted: 3 (response.blob — same profile as text; response.arrayBuffer — same;
+#             response.formData — rare in SaaS hot paths)
+# Coverage: 3/6 = 0.50 (effective contracted/non-omitted = 3/3 = 1.0)
+# Evidence sources confirmed from:
+#   node_modules/node-fetch/lib/index.js — FetchError, AbortError, SyntaxError throw sites
+#   https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch
+#   https://developer.mozilla.org/en-US/docs/Web/API/Response/json
+#   https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch
 package: cross-fetch
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.50  # 3 contracted / 6 total async-callable (3 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 3/3 = 1.0
 description: Universal WHATWG Fetch API polyfill for Node, browsers, and React Native
 
 functions:
   - name: fetch
     import_path: "cross-fetch"
-    description: "Makes an HTTP request. Throws TypeError on network failure; does not throw on HTTP errors (4xx/5xx)."
+    description: >
+      Makes an HTTP request. Returns a Promise that resolves with the Response object
+      on any server response (including 4xx/5xx). Only rejects on network failure,
+      bad URL, or abort. Callers MUST check response.ok to detect HTTP errors —
+      this is the most common source of silent failures with this package.
 
     postconditions:
       # Evidence: 13 violations across 4 repos in scan-cross-fetch-2026-04-13.json
@@ -33,3 +57,292 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch
+      # "The promise returned by fetch() will reject on some errors, such as a network error
+      #  or a bad scheme. However, if the server responds with an error like 404, then
+      #  fetch() fulfills with a Response."
+      # Confirmed: node-fetch/lib/index.js never throws for 4xx/5xx — resolves with Response object.
+      # This is the #1 source of silent failures — callers process error responses as success.
+      - id: http-error-unchecked
+        condition: >
+          fetch() is called and the server returns an HTTP error status (4xx or 5xx),
+          but the caller does not check response.ok (or response.status) before processing
+          the response body. fetch() resolves successfully even on 404 Not Found, 401
+          Unauthorized, 500 Internal Server Error, etc. The response.ok property is false
+          for any status outside 200–299, but it must be explicitly checked.
+          This is the most common antipattern: callers call await response.json() on a
+          404 or 500 response, which returns the error body (often HTML error page), then
+          either fail on JSON.parse or silently process the error as data.
+        throws: >
+          Does not throw — fetch() resolves. But: if the error response body is not valid JSON
+          and response.json() is called, SyntaxError is thrown from response.json().
+          If response.ok is not checked, the error response is silently processed as success data.
+        required_handling: >
+          Always check response.ok after fetch() resolves:
+
+            try {
+              const response = await fetch(url);
+              if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+              }
+              const data = await response.json();
+              return data;
+            } catch (error) {
+              console.error('Request failed:', error);
+              throw error;
+            }
+
+          For APIs that return structured error bodies, read the error body explicitly:
+            if (!response.ok) {
+              const errorBody = await response.json().catch(() => null);
+              throw new Error(`HTTP ${response.status}: ${errorBody?.message ?? response.statusText}`);
+            }
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/ok"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch
+      # "AbortError (DOMException): Thrown when the request is aborted via AbortController.abort()"
+      # Confirmed: node-fetch/lib/index.js line 1458:
+      #   let error = new AbortError('The user aborted a request.')
+      #   reject(error)
+      # Note: in node-fetch, AbortError.name === 'AbortError' (custom class, not DOMException)
+      - id: abort-error
+        condition: >
+          fetch() is called with options.signal set to an AbortController's signal,
+          the AbortController is aborted (via controller.abort()) while the request is
+          in-flight, and the caller does not handle the resulting AbortError.
+          This is the standard pattern for implementing request timeouts:
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(), 5000);
+            const response = await fetch(url, { signal: controller.signal });
+          When the timeout fires, the fetch() promise rejects with AbortError.
+          Callers using this timeout pattern but without try-catch cause unhandled rejections.
+        throws: >
+          AbortError (name: 'AbortError') — in node-fetch (used by cross-fetch on Node.js),
+          this is a custom class with name === 'AbortError', NOT a DOMException.
+          Check: error.name === 'AbortError' (not instanceof DOMException).
+          In browser environments, AbortError is a DOMException with name === 'AbortError'.
+          The cross-environment check: error.name === 'AbortError' works in both.
+        required_handling: >
+          Wrap fetch() with signal in a try-catch and handle AbortError separately:
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
+            try {
+              const response = await fetch(url, { signal: controller.signal });
+              clearTimeout(timeoutId);
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              return await response.json();
+            } catch (error) {
+              clearTimeout(timeoutId);
+              if (error.name === 'AbortError') {
+                console.warn('Request timed out or was cancelled');
+                throw new Error('Request timeout');
+              }
+              throw error;
+            }
+
+          Note: intentionally aborting a request (e.g., user cancelled navigation) should be
+          handled gracefully, not re-thrown as an unexpected error.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/AbortController"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: response.json
+    import_path: "cross-fetch"
+    description: >
+      Reads the response body and parses it as JSON. Returns a Promise that resolves
+      with the parsed JavaScript value. Throws SyntaxError when the response body is
+      not valid JSON. This is the second most common source of failures — callers that
+      call response.json() on error responses (HTML error pages), empty responses, or
+      non-JSON APIs receive SyntaxError with "Unexpected token < in JSON at position 0"
+      or similar messages. MUST be called only once per response (body is a stream;
+      reading twice throws TypeError).
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/json
+      # "SyntaxError: Thrown when the response body cannot be parsed as JSON"
+      # "TypeError: Thrown when the response body is disturbed or locked"
+      # Confirmed: node-fetch/lib/index.js line 273:
+      #   return Body.Promise.reject(new FetchError(`invalid json response body at ${url} reason: ${err.message}`, 'invalid-json'))
+      # In node-fetch, JSON parse errors produce FetchError(type='invalid-json'), not native SyntaxError.
+      # In browser environments, response.json() throws SyntaxError (native JSON.parse error).
+      # Cross-environment safe: always catch any error from response.json().
+      - id: json-parse-error
+        condition: >
+          response.json() is called without a try-catch, and the response body is not
+          valid JSON. Common triggers:
+          - HTTP error responses (404/500) that return HTML error pages with
+            "<!DOCTYPE html>" or "<html>" — causes "Unexpected token < in JSON"
+          - APIs that return plain text (e.g., "OK", "Not found") instead of JSON
+          - Empty response bodies (204 No Content) — causes "Unexpected end of JSON input"
+          - APIs that sometimes return JSON and sometimes return plaintext errors
+          This is especially common when response.ok is not checked first — callers
+          blindly call response.json() on 500 Internal Server Error HTML pages.
+        throws: >
+          In browser environments: SyntaxError (native JSON.parse error) with message
+          like "Unexpected token < in JSON at position 0".
+          In Node.js via node-fetch: FetchError with type 'invalid-json' and message
+          "invalid json response body at <url> reason: <parse error>".
+          Both extend Error. Cross-environment safe catch: catch any error from response.json().
+          Check for: error instanceof SyntaxError || error.type === 'invalid-json'
+        required_handling: >
+          Always wrap response.json() in try-catch, or chain .catch():
+
+            try {
+              const response = await fetch(url);
+              if (!response.ok) {
+                // Read body as text first to avoid JSON parse errors on error pages
+                const errorText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errorText.slice(0, 200)}`);
+              }
+              const data = await response.json();
+              return data;
+            } catch (error) {
+              if (error instanceof SyntaxError || error.type === 'invalid-json') {
+                console.error('Response was not valid JSON:', error.message);
+                throw new Error('API returned non-JSON response');
+              }
+              throw error;
+            }
+
+          Best practice: check response.ok before calling response.json() to avoid
+          parsing HTML error pages as JSON.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/json"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/json
+      # "TypeError: Thrown when the response body is disturbed or locked"
+      # Confirmed: node-fetch/lib/index.js line 344:
+      #   return Body.Promise.reject(new TypeError(`body used already for: ${this.url}`))
+      - id: json-body-consumed-twice
+        condition: >
+          response.json() (or any other body method: text(), blob(), etc.) is called
+          a second time on the same Response object. Response bodies are streams — once
+          read, they are consumed. Calling response.json() twice causes the second call
+          to reject with TypeError "body used already". This occurs when:
+          - Logging the response for debugging and then parsing it
+          - Checking the body type before parsing
+          - Multiple middleware/interceptor layers each trying to read the body
+        throws: >
+          TypeError with message "body used already for: <url>" (node-fetch/cross-fetch Node.js).
+          In browser: "Failed to execute 'json' on 'Response': body stream already read".
+        required_handling: >
+          Use response.clone() before reading if the body needs to be read multiple times:
+
+            const response = await fetch(url);
+            const responseClone = response.clone(); // Clone before first read
+
+            // Read original for logging
+            const rawText = await response.text();
+            console.debug('Raw response:', rawText);
+
+            // Parse the clone
+            try {
+              const data = await responseClone.json();
+              return data;
+            } catch (error) {
+              throw new Error(`JSON parse failed: ${error.message}`);
+            }
+
+          In most cases, pick one body method and stick to it. Reserve clone() for
+          debug logging patterns.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/json"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/clone"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: response.text
+    import_path: "cross-fetch"
+    description: >
+      Reads the response body and returns it as a string. Returns a Promise that
+      resolves with the text content. More forgiving than response.json() — any
+      response body can be read as text. However, can still throw if the request
+      was aborted mid-stream or if the body was already consumed. Used when the
+      response is not JSON (e.g., HTML, plain text, XML, CSV).
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch
+      # "After response received but before body read: controller.abort() causes response.text() to throw AbortError"
+      # Confirmed: node-fetch/lib/index.js line 394-397:
+      #   if (err.name === 'AbortError') { reject(err) }
+      - id: text-abort-mid-stream
+        condition: >
+          response.text() is called after fetch() resolves but the AbortController
+          signal is aborted before the body is fully read. This is a two-phase abort:
+          Phase 1 (request): if aborted before response headers, fetch() itself rejects.
+          Phase 2 (body read): if aborted after headers but during body streaming,
+          response.text() rejects with AbortError. Large response bodies are most
+          susceptible — callers that abort after receiving headers but before the body
+          is fully buffered hit this path.
+        throws: >
+          AbortError (name: 'AbortError') — same type as the fetch() abort error.
+          In node-fetch: custom AbortError class. In browser: DOMException.
+          Cross-environment check: error.name === 'AbortError'.
+        required_handling: >
+          Wrap response.text() in the same try-catch as fetch():
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000);
+            try {
+              const response = await fetch(url, { signal: controller.signal });
+              clearTimeout(timeoutId);
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              // response.text() can also throw AbortError if body read is slow
+              const text = await response.text();
+              return text;
+            } catch (error) {
+              clearTimeout(timeoutId);
+              if (error.name === 'AbortError') {
+                throw new Error('Request or body read timed out');
+              }
+              throw error;
+            }
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/AbortController"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+notes:
+  - "fetch() is the only import from cross-fetch — Request, Response, Headers are also exported but are constructors"
+  - "cross-fetch wraps node-fetch@2.x on Node.js. On browsers, it uses the native fetch."
+  - "FetchError (node-fetch) vs DOMException (browser): error.type === 'system' for network errors"
+  - "response.ok shorthand: status >= 200 && status < 300. Always check before reading body."
+  - "AbortError.name === 'AbortError' is the cross-environment check (works in both Node.js node-fetch and browsers)"
+  - "response.blob(), response.arrayBuffer(), response.formData() omitted — same error profile as response.text()"
+  - "cross-fetch v4+ only supports the ponyfill pattern — import fetch from 'cross-fetch'"
+  - "Alternative: many projects use cross-fetch to polyfill fetch in Node.js 16 and below; Node.js 18+ has native fetch"
