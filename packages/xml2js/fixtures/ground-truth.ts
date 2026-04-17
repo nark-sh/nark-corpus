@@ -4,12 +4,18 @@
  *
  * Postcondition IDs from contract.yaml:
  *   parse-error-malformed-xml
+ *   parse-promise-empty-string
+ *   parse-string-callback-error-ignored
+ *   parse-string-no-callback
+ *   build-object-invalid-root-name
+ *   build-object-invalid-xml-chars
+ *   parser-instance-malformed-xml
  *
  * Annotation comments must be immediately above the call site (the await line).
  */
 
 import xml2js from 'xml2js';
-import { parseStringPromise, Parser } from 'xml2js';
+import { parseStringPromise, parseString, Parser } from 'xml2js';
 
 async function parseXmlProtected(xml: string) {
   try {
@@ -67,4 +73,95 @@ async function getUsersFromApi(data: string) {
     data
   )) as Record<string, unknown>;
   return parsedXml;
+}
+
+// ─── parseString (callback-based) ─────────────────────────────────────────────
+
+function parseStringCallbackClean(xml: string) {
+  // SHOULD_NOT_FIRE: checks err before using result
+  parseString(xml, (err, result) => {
+    if (err) {
+      console.error('parse error:', err.message);
+      return;
+    }
+    console.log(result);
+  });
+}
+
+function parseStringCallbackIgnoresError(xml: string) {
+  // SHOULD_FIRE: parse-string-callback-error-ignored — err not checked before using result
+  parseString(xml, (err, result) => {
+    console.log(result.items);
+  });
+}
+
+function parseStringCallbackNoCheck(xml: string) {
+  // SHOULD_FIRE: parse-string-callback-error-ignored — callback receives err but ignores it
+  xml2js.parseString(xml, function(err: Error | null, result: any) {
+    const items = result.items;
+    return items;
+  });
+}
+
+// ─── Builder.buildObject ──────────────────────────────────────────────────────
+
+function buildObjectClean(data: Record<string, unknown>): string {
+  // SHOULD_NOT_FIRE: wrapped in try-catch
+  const builder = new xml2js.Builder();
+  try {
+    return builder.buildObject(data);
+  } catch (err) {
+    console.error('XML build failed:', err);
+    throw err;
+  }
+}
+
+function buildObjectNoTryCatch(data: Record<string, unknown>): string {
+  // SHOULD_FIRE: build-object-invalid-root-name — buildObject can throw, no try-catch
+  const builder = new xml2js.Builder();
+  return builder.buildObject(data);
+}
+
+function buildObjectFromDynamicData(userInput: Record<string, unknown>): string {
+  // SHOULD_FIRE: build-object-invalid-xml-chars — user data may contain invalid XML chars, no try-catch
+  const builder = new xml2js.Builder({ rootName: 'response' });
+  return builder.buildObject(userInput);
+}
+
+// ─── Parser instance parseStringPromise ─────────────────────────────────────
+
+async function parserInstanceClean(xml: string) {
+  // SHOULD_NOT_FIRE: parser instance wrapped in try-catch
+  const parser = new Parser({ explicitArray: false, trim: true });
+  try {
+    const result = await parser.parseStringPromise(xml);
+    return result;
+  } catch (err) {
+    console.error('Parser instance error:', err);
+    return null;
+  }
+}
+
+async function parserInstanceNoErrorHandling(xml: string) {
+  // SHOULD_FIRE: parser-instance-malformed-xml — Parser instance without try-catch
+  const parser = new Parser({ explicitArray: false });
+  const result = await parser.parseStringPromise(xml);
+  return result;
+}
+
+// ─── parsePromise null return on empty string ─────────────────────────────────
+
+async function parseEmptyStringClean(xml: string) {
+  // SHOULD_NOT_FIRE: null-checks the result before accessing properties
+  const result = await parseStringPromise(xml);
+  if (result == null) {
+    return null;
+  }
+  return result.root;
+}
+
+async function parseEmptyStringNoNullCheck(xml: string) {
+  // SHOULD_FIRE: parse-promise-empty-string — result not null-checked, crashes on empty input
+  const result = await parseStringPromise(xml);
+  return result.root.items;
 }

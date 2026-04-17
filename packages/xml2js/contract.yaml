@@ -2,19 +2,31 @@ package: xml2js
 semver: ">=0.5.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.67
 # Evidence: scan-xml2js-2026-04-04.json — 2 repos scanned, 0 affected, 0 violations
 # 23 repos errored (TS compilation), 2 skipped (no tsconfig)
 # FP check: 0/50 repos false-positive-free. FP rate 0%. Confirmed evidence quality.
+# Depth pass 2026-04-17: enumerated full API surface from @types/xml2js index.d.ts
+# and xml2js/lib/parser.js + builder.js + sax dependency source.
+# API surface: 6 callable functions/methods. Contracted: 4. Omitted: 2 (processor utils).
 
 functions:
   - name: parseStringPromise
     import_path: "xml2js"
-    description: "Parse an XML string asynchronously and return a JavaScript object"
+    description: >
+      Parse an XML string asynchronously using the Promise API. Returns a JavaScript
+      object representation of the XML. Rejects with an Error if the XML is malformed.
+      This is the modern preferred API over the callback-based parseString().
 
     postconditions:
+      # Evidence: xml2js/lib/parser.js source — parseStringPromise wraps parseString(cb)
+      # which calls saxParser.write().close(), where onerror emits "error" which reject()s
+      # the promise. Error objects come from sax-js and are generic Error instances.
+      # Source: https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js
+      # Source: https://github.com/isaacs/sax-js (sax dependency)
       - id: parse-error-malformed-xml
         condition: "input XML is malformed, non-well-formed, or cannot be parsed by the SAX parser"
         throws: "Error"
@@ -25,6 +37,157 @@ functions:
         sources:
           - "https://raw.githubusercontent.com/Leonidas-from-XIV/node-xml2js/master/README.md"
           - "https://github.com/Leonidas-from-XIV/node-xml2js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: parse-promise-empty-string
+        condition: "input string is empty or whitespace-only"
+        returns: "null (resolves with null, not an object)"
+        required_handling: >
+          Caller MUST null-check the resolved value before accessing properties.
+          When given an empty or whitespace-only string, parseStringPromise() resolves
+          with null rather than rejecting. Accessing result.someProperty crashes silently
+          as a TypeError in downstream code.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: parseString
+    import_path: "xml2js"
+    description: >
+      Parse an XML string using the Node.js callback pattern. The callback receives
+      (err, result) where err is an Error on parse failure or null on success.
+      Most common pattern in legacy Node.js codebases. The error parameter in the
+      callback is frequently ignored, leading to silent failures.
+
+    postconditions:
+      # Evidence: xml2js/lib/parser.js — parseString(str, cb) registers on("error") handler
+      # that calls cb(err). If cb is not provided or ignores first arg, errors are swallowed.
+      # Source: https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js
+      # sax-js emits error events via strictFail() for: malformed tags, unclosed root,
+      # invalid chars, unmatched closing tags, etc.
+      - id: parse-string-callback-error-ignored
+        condition: "XML is malformed and callback does not check first argument"
+        throws: "Error passed as first callback argument"
+        required_handling: >
+          Caller MUST check the err parameter in the callback before using result.
+          Pattern: parseString(xml, function(err, result) { if (err) { /* handle */ return; } /* use result */ }).
+          Ignoring err causes the callback to proceed with an undefined result object,
+          producing TypeErrors when accessing result properties.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js#usage"
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: parse-string-no-callback
+        condition: "parseString() called without a callback (using it like a synchronous function)"
+        throws: "Error event emitted to process, no caller to handle it"
+        required_handling: >
+          parseString() MUST be called with a callback. Without a callback, parse errors
+          emit an unhandled 'error' event on the Parser (which extends EventEmitter),
+          crashing Node.js with an uncaught error. Use parseStringPromise() for promise-based code.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: buildObject
+    import_path: "xml2js"
+    import_class: "Builder"
+    description: >
+      Synchronously converts a JavaScript object into an XML string. Called on a
+      Builder instance: new xml2js.Builder().buildObject(obj). Throws synchronously
+      on invalid object structure (null root name, invalid XML characters in keys, etc).
+      Commonly called without try-catch since developers expect synchronous functions to be safe.
+
+    postconditions:
+      # Evidence: xml2js/lib/builder.js calls xmlbuilder.create(rootName, ...) which
+      # throws Error("Root element needs a name.") when rootName is undefined/empty.
+      # xmlbuilder/lib/XMLStringifier.js throws Error("Invalid character in name") and
+      # Error("Invalid character in string") for non-XML-safe values in keys/values.
+      # Source: https://github.com/oozcitak/xmlbuilder-js (xmlbuilder dependency)
+      - id: build-object-invalid-root-name
+        condition: "rootObj has no keys or rootName option produces an invalid XML element name"
+        throws: "Error"
+        required_handling: >
+          Caller MUST wrap buildObject() in try-catch. When the input object is empty
+          or the inferred root name is invalid XML (null, undefined, starts with digit,
+          contains invalid chars), xmlbuilder throws "Root element needs a name."
+          This is common when building XML from dynamically-shaped data objects.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/builder.js"
+          - "https://github.com/oozcitak/xmlbuilder-js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: build-object-invalid-xml-chars
+        condition: "object values or keys contain characters illegal in XML (control chars, surrogates)"
+        throws: "Error"
+        required_handling: >
+          Caller MUST wrap buildObject() in try-catch. xmlbuilder validates all element
+          names and text content. Keys with XML-illegal characters throw
+          "Invalid character in name" and values with illegal characters throw
+          "Invalid character in string at index N". Common when serializing user-provided
+          data or database content with binary/control characters.
+        sources:
+          - "https://github.com/oozcitak/xmlbuilder-js/blob/master/lib/XMLStringifier.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Parser.parseStringPromise
+    import_path: "xml2js"
+    import_class: "Parser"
+    description: >
+      Instance method on the Parser class equivalent to the module-level parseStringPromise().
+      Used when callers need to reuse a configured parser instance across multiple parses.
+      Same error behavior as the module-level function: rejects with Error on malformed XML.
+
+    postconditions:
+      # Evidence: xml2js/lib/parser.js Parser.prototype.parseStringPromise wraps parseString
+      # Same reject path as the module-level function.
+      # Source: https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js
+      - id: parser-instance-malformed-xml
+        condition: "XML input is malformed when using a Parser instance"
+        throws: "Error (promise rejection)"
+        required_handling: >
+          Caller MUST wrap parser.parseStringPromise() in try-catch or use .catch().
+          Same error behavior as the module-level parseStringPromise() — rejects with
+          an Error from the underlying sax parser. Not wrapping leads to unhandled
+          promise rejections crashing Node.js in production.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
         severity: error
         business_impact:
           incident_label: DOWNTIME
