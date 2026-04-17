@@ -28,6 +28,7 @@
  *   - Model.findOrBuild()            postcondition: findorbuild-query-failure
  *   - Model.findCreateFind()         postcondition: findcreatefind-validation-error
  *   - instance.restore()             postcondition: instance-restore-not-paranoid
+ *   - instance.increment()           postcondition: instance-increment-db-error
  *
  * Detection path: Sequelize instance tracked →
  *   ThrowingFunctionDetector fires .authenticate()/.models.User.findAll() →
@@ -575,6 +576,27 @@ export async function instanceRestoreWithCatch() {
     await (user as any).restore();
   } catch (err) {
     console.error('instance.restore failed:', err);
+    throw err;
+  }
+}
+
+// ── instance.increment() ──
+
+export async function instanceIncrementNoCatch() {
+  // SHOULD_NOT_FIRE: scanner gap — instance-increment-db-error — instance.increment() throws on DB error. No try-catch.
+  // @expect-violation: instance-increment-db-error
+  const post = await sequelize.models.Post.findByPk(1);
+  await (post as any).increment('viewCount');
+}
+
+export async function instanceIncrementWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: instance.increment() inside try-catch
+  try {
+    const post = await sequelize.models.Post.findByPk(1);
+    await (post as any).increment('viewCount');
+  } catch (err) {
+    console.error('instance.increment failed:', err);
     throw err;
   }
 }

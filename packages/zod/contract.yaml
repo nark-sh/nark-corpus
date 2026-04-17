@@ -2,13 +2,15 @@ package: zod
 semver: ">=3.0.0"
 contract_version: 1.0.0
 maintainer: behavioral-contracts
-last_verified: "2026-04-04"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.75  # 6 contracted / 8 total async-callable (2 intentionally omitted: safeEncodeAsync, safeDecodeAsync)
 description: |
   Zod is a TypeScript-first schema validation library. The parse() and parseAsync()
   methods throw ZodError on validation failure, requiring proper error handling.
   safeParse() and safeParseAsync() return result objects instead of throwing.
+  Zod v4 adds encodeAsync() and decodeAsync() for bidirectional codec transforms.
 functions:
   - name: parse
     import_path: zod
@@ -53,6 +55,47 @@ functions:
           incident_cost_range: medium
         sources:
           - https://github.com/colinhacks/zod#coercion-for-primitives
+      # Evidence: confirmed from @colinhacks/zod v4 source — core.cjs class $ZodAsyncError
+      # Confirmed via execution: schema.refine(async ...).parse('hi') throws $ZodAsyncError
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: parse-async-schema-error
+        condition: >
+          schema.parse() is called on a schema that contains async refinements
+          (.refine(async fn)) or async transforms (.transform(async fn)).
+          The synchronous parse() path detects a pending Promise and throws
+          immediately instead of returning the result.
+        throws: "$ZodAsyncError: Encountered Promise during synchronous parse. Use .parseAsync() instead."
+        description: >
+          Zod's synchronous parse() cannot process async refinements or transforms.
+          When a schema with async validators is called via parse(), Zod throws
+          a $ZodAsyncError synchronously. This is a programmer error, not a
+          validation error — the developer must switch to parseAsync(). The error
+          is NOT a ZodError (it does not have an .issues array) which causes
+          isinstance(error, z.ZodError) checks to fail and the error to propagate
+          unhandled up the call stack.
+        required_handling: |
+          Schemas with async refinements/transforms MUST use parseAsync() or
+          safeParseAsync(). If you have a schema that sometimes has async
+          validators, always use the async variant:
+            // ❌ WRONG
+            const result = schema.parse(data);
+
+            // ✅ CORRECT
+            const result = await schema.parseAsync(data);
+
+          Catch blocks checking `instanceof z.ZodError` will NOT catch this error
+          — it is a plain Error, not a ZodError. Add a separate check or catch all.
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+          - "https://zod.dev/api?id=async-refinements"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
   - name: parseAsync
     import_path: zod
     description: |
@@ -150,6 +193,202 @@ functions:
           incident_cost_range: medium
         sources:
           - https://github.com/colinhacks/zod#safeparse
+  - name: encodeAsync
+    import_path: zod
+    description: |
+      Zod v4 only. Runs the schema's transforms in reverse ("backward" direction)
+      to encode an output value back to its input representation. Asynchronous
+      variant of encode() — required when the schema has async transforms. Throws
+      ZodError on validation failure, and ZodEncodeError if the schema has
+      unidirectional transforms (transforms with no inverse encode path).
+    usage_pattern: |
+      const schema = z.string().transform(async (s) => s.toUpperCase());
+      // encode cannot reverse the transform — throws ZodEncodeError
+      await schema.encodeAsync('HELLO');
+    postconditions:
+      # Evidence: confirmed from zod@4.3.6 source: schemas.cjs line 1617
+      # Confirmed via execution: z.string().transform(s=>s.toUpperCase()).encodeAsync('X')
+      # throws ZodEncodeError: "Encountered unidirectional transform during encode: ZodTransform"
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: encode-async-unidirectional-transform
+        condition: >
+          schema.encodeAsync() is called on a schema containing a .transform() that
+          has no inverse encode function. Zod v4 transforms created with .transform(fn)
+          are unidirectional — they can decode (forward) but cannot encode (backward).
+          Only schemas built with z.transform({ decode, encode }) bidirectional codecs
+          support the encode direction.
+        throws: "ZodEncodeError: Encountered unidirectional transform during encode: ZodTransform"
+        description: >
+          encodeAsync() with direction="backward" encounters a ZodTransform node
+          and throws ZodEncodeError synchronously during the traversal. This is a
+          programmer error — the developer is calling encode() on a schema that
+          was only designed for decoding. The error class is ZodEncodeError, NOT
+          ZodError, so instanceof z.ZodError checks will NOT catch it.
+        required_handling: |
+          Only use encodeAsync() on schemas built with bidirectional codecs:
+            // ❌ WRONG — .transform() is unidirectional
+            const schema = z.string().transform(s => s.toUpperCase());
+            await schema.encodeAsync('HELLO'); // throws ZodEncodeError
+
+            // ✅ CORRECT — z.transform with encode/decode pair
+            const schema = z.transform({
+              decode: (s: string) => s.toUpperCase(),
+              encode: (s: string) => s.toLowerCase(),
+            });
+            await schema.encodeAsync('HELLO'); // works
+
+          Catch blocks MUST handle ZodEncodeError separately from ZodError:
+            try {
+              await schema.encodeAsync(value);
+            } catch (error) {
+              if (error instanceof ZodEncodeError) { /* schema bug */ }
+              if (error instanceof z.ZodError) { /* validation failure */ }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/schemas.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: encode-async-validation-error
+        condition: >
+          schema.encodeAsync() is called with a value that fails the schema's
+          output-side validation. The backward direction still runs validators —
+          if the encoded value does not satisfy the schema, ZodError is thrown.
+        throws: "ZodError with .issues array containing validation failures"
+        description: >
+          encodeAsync() runs the schema in reverse direction. Validators in the
+          schema still execute. If the output value being encoded fails validation
+          (e.g., a number schema receiving a string), ZodError is thrown with
+          the standard .issues array. Unlike the unidirectional transform error,
+          this IS a ZodError catchable via instanceof z.ZodError.
+        required_handling: |
+          Caller MUST catch both ZodEncodeError and ZodError:
+            try {
+              const encoded = await schema.encodeAsync(value);
+            } catch (error) {
+              if (error.name === 'ZodEncodeError') {
+                // Schema design error — transform is not reversible
+                throw new Error('Schema does not support encoding');
+              }
+              if (error instanceof z.ZodError) {
+                // Value failed validation during encode
+                console.error(error.issues);
+              }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: decodeAsync
+    import_path: zod
+    description: |
+      Zod v4 only. Runs the schema's transforms in the forward ("decode") direction
+      asynchronously. Equivalent to parseAsync() but explicitly named for codec
+      clarity. Required when the schema has async transforms or refinements.
+      Throws ZodError on validation or refinement failure.
+    usage_pattern: |
+      const schema = z.string().refine(async (s) => await checkDB(s), { error: 'Not found' });
+      const result = await schema.decodeAsync(inputValue);
+    postconditions:
+      # Evidence: confirmed from zod@4.3.6 source via execution
+      # decodeAsync(5) on z.number().min(10) throws ZodError with code 'too_small'
+      # decodeAsync('hi') on schema with async refine throws ZodError with code 'custom'
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: decode-async-validation-error
+        condition: >
+          schema.decodeAsync() is called with a value that fails the schema's
+          type validation, constraints (min, max, regex, etc.), or synchronous
+          refinements. The async parse path runs all validators and collects
+          issues, then throws ZodError if any issues exist.
+        throws: "ZodError with .issues array describing all validation failures"
+        description: >
+          decodeAsync() is the async variant of decode() / parse(). It runs all
+          validators asynchronously and throws ZodError if the input does not
+          satisfy the schema. The .issues array contains one entry per validation
+          failure with code, path, and message. Unlike parse(), decodeAsync()
+          supports schemas with async refinements — those failures are collected
+          as ZodError issues with code: 'custom'.
+        required_handling: |
+          Caller MUST wrap decodeAsync() in try-catch:
+            try {
+              const result = await schema.decodeAsync(data);
+              // Use result
+            } catch (error) {
+              if (error instanceof z.ZodError) {
+                // Validation failed — inspect error.issues
+                for (const issue of error.issues) {
+                  console.error(issue.path, issue.message);
+                }
+              }
+            }
+          Or use safeDecodeAsync() to get a non-throwing result object.
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+          - "https://zod.dev/api"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: decode-async-refinement-error
+        condition: >
+          schema.decodeAsync() is called on a schema with async refinements
+          (.refine(async fn)) where the refinement rejects or returns false.
+          The rejection is collected as a ZodIssue with code: 'custom' and
+          thrown as a ZodError. Unhandled promise rejections inside async
+          refinements crash the await if not caught by Zod.
+        throws: "ZodError with issue code: 'custom' from the failed async refinement"
+        description: >
+          Async refinements that return false or throw an error cause decodeAsync()
+          to reject with a ZodError. The error's .issues array will contain entries
+          with code: 'custom' and the message from the refinement's error option.
+          If the async refinement itself throws (rather than returning false), Zod
+          catches that and wraps it as a custom issue. This means database errors
+          inside a refinement (e.g., checking uniqueness) produce a ZodError, not
+          the original database error — callers must be aware of this wrapping.
+        required_handling: |
+          When async refinements call external services (DB uniqueness checks,
+          API calls), handle both the ZodError AND consider that the underlying
+          async error has been absorbed:
+            try {
+              const result = await schema.decodeAsync(data);
+            } catch (error) {
+              if (error instanceof z.ZodError) {
+                const customIssues = error.issues.filter(i => i.code === 'custom');
+                // customIssues may reflect DB errors, not just validation failures
+                throw new ValidationError(customIssues);
+              }
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+          - "https://zod.dev/api?id=async-refinements"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - |
     Common anti-pattern: Using parse() without try-catch. Prefer safeParse() for
