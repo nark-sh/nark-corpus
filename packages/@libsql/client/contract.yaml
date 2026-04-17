@@ -3,13 +3,31 @@
 # execute() and batch() make HTTPS requests to Turso's API or a local file.
 # Errors: LibsqlError on any failure (network, auth, SQL errors).
 # The official Next.js with-turso example omits try-catch — widespread anti-pattern.
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 3):
+# API surface: 13 distinct async-callable operations across Client and Transaction interfaces
+# Contracted before: 2 (execute, batch)
+# Contracted after: 8 (+6 this pass: transaction, transaction.commit, transaction.execute,
+#                      migrate, executeMultiple, transaction.rollback)
+# Omitted: 5 (sync — embedded replica niche; transaction.batch — covered by tx.execute semantics;
+#             transaction.executeMultiple — variant of executeMultiple in tx context;
+#             close/reconnect — synchronous, no throws)
+# Coverage: 8/13 = 0.62 (effective contracted/non-omitted = 8/8 = 1.0)
+# Evidence sources confirmed from installed package source:
+#   node_modules/@libsql/client/lib-esm/hrana.js — TRANSACTION_CLOSED, LibsqlBatchError
+#   node_modules/@libsql/client/lib-esm/ws.js — CLIENT_CLOSED, WebSocket errors
+#   node_modules/@libsql/client/lib-esm/http.js — SYNC_NOT_SUPPORTED, ENCRYPTION_KEY_NOT_SUPPORTED
+#   node_modules/@libsql/hrana-client/lib-esm/errors.d.ts — error class hierarchy
+#   https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts
+#   https://docs.turso.tech/sdk/ts/reference
 package: "@libsql/client"
 semver: ">=0.3.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.62  # 8 contracted / 13 total async-callable (5 intentionally omitted)
 
 detection:
   function_names:
@@ -106,11 +124,353 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: transaction
+    import_path: "@libsql/client"
+    description: >
+      Starts an interactive transaction on the libSQL/Turso database. Returns a
+      Transaction object that must be explicitly committed or rolled back. Interactive
+      transactions lock the database for writing until committed or rolled back, with
+      a 5-second timeout enforced by the Turso server. The Transaction object MUST
+      be closed in a finally block to prevent connection leaks.
+    postconditions:
+      # Evidence: source confirmed from hrana.ts — transaction() calls stream.run(BEGIN IMMEDIATE)
+      # which throws mapHranaError() on failure. Docs: https://docs.turso.tech/sdk/ts/reference
+      - id: transaction-not-closed
+        condition: >
+          transaction() is called and the returned Transaction object is not closed
+          in a finally block. If execute() or commit() throws, the transaction
+          remains open and holds a write lock indefinitely (or until the 5-second
+          server timeout expires).
+        throws: >
+          Does not throw at the call site, but open transactions cause subsequent
+          write operations to queue or fail with SQLITE_BUSY while the lock is held.
+          After 5-second server timeout, the connection is forcibly closed.
+        required_handling: >
+          Caller MUST always call transaction.close() in a finally block.
+          This is the canonical pattern from official docs:
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.execute({ sql: 'INSERT INTO orders ...', args: [...] });
+              await tx.execute({ sql: 'UPDATE inventory ...', args: [...] });
+              await tx.commit();
+            } catch (error) {
+              // commit failed or execute failed — log and rethrow
+              console.error('Transaction failed:', error);
+              throw error;
+            } finally {
+              tx.close(); // always close — safe to call if already committed
+            }
+
+          Omitting finally causes write-lock starvation in high-traffic apps.
+        sources:
+          - "https://docs.turso.tech/sdk/ts/reference#transactions"
+          - "https://github.com/tursodatabase/libsql-client-ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: transaction-open-error
+        condition: >
+          transaction() is awaited without try-catch. If the database connection
+          fails during the initial BEGIN IMMEDIATE, the promise rejects with a
+          LibsqlError and the transaction object is never returned.
+        throws: >
+          LibsqlError with code SERVER_ERROR (HTTP transport failure),
+          HRANA_WEBSOCKET_ERROR (WebSocket transport failure),
+          CLIENT_CLOSED (if client was already closed), or SQLITE_ERROR
+          (if BEGIN fails due to schema lock). Confirmed from hrana.js source:
+          mapHranaError() wraps all Hrana errors to LibsqlError.
+        required_handling: >
+          Wrap await client.transaction() in a try/catch:
+
+            try {
+              const tx = await client.transaction("write");
+              // ... use tx ...
+            } catch (error) {
+              if (error instanceof LibsqlError && error.code === 'CLIENT_CLOSED') {
+                // client was closed before transaction opened — reconnect
+                await client.reconnect();
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transaction.commit
+    import_path: "@libsql/client"
+    description: >
+      Commits all changes made in an interactive transaction to the database.
+      Returns a Promise that resolves when the commit is acknowledged by the server.
+      If commit() fails, all changes from the transaction are lost (no partial commit).
+      This is the most critical method in the Transaction interface.
+    postconditions:
+      # Evidence: hrana.js source — commit() calls stream.run("COMMIT")
+      # then closeGracefully(). Throws mapHranaError(e) on failure.
+      # https://github.com/tursodatabase/libsql-client-ts
+      - id: commit-no-try-catch
+        condition: >
+          transaction.commit() is called without try-catch. If the commit fails
+          due to network error, server restart, or connection drop, the promise
+          rejects and all transaction changes are lost silently if the error
+          is not caught and surfaced to the user.
+        throws: >
+          LibsqlError with code SERVER_ERROR (network failure during commit),
+          HRANA_WEBSOCKET_ERROR (WebSocket closed during commit),
+          TRANSACTION_CLOSED (if transaction was already closed — code "TRANSACTION_CLOSED"
+          with message "Cannot commit the transaction because it is already closed").
+          Confirmed from hrana.js: 'throw new LibsqlError("Cannot commit the transaction
+          because it is already closed", "TRANSACTION_CLOSED")'.
+        required_handling: >
+          Caller MUST wrap transaction.commit() in a try/catch. A failed commit
+          means data was NOT persisted even though the application logic ran.
+          This is a critical distinction — the application may believe data was
+          saved when it was not.
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.execute({ sql: '...', args: [...] });
+              await tx.commit(); // MUST be in try block
+            } catch (error) {
+              // commit failure = data was NOT saved
+              console.error('Commit failed — data not persisted:', error);
+              throw error;
+            } finally {
+              tx.close();
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+  - name: transaction.execute
+    import_path: "@libsql/client"
+    description: >
+      Executes a single SQL statement within an interactive transaction. Changes
+      are visible only within the transaction until commit() is called. Has a
+      distinct error behavior from client.execute(): throws TRANSACTION_CLOSED
+      if the transaction has already been committed, rolled back, or closed.
+    postconditions:
+      # Evidence: hrana.js source — checks stream.closed, throws TRANSACTION_CLOSED
+      # 'Cannot execute statements because the transaction is closed'
+      - id: transaction-execute-no-try-catch
+        condition: >
+          transaction.execute() is called without try-catch inside a transaction
+          block. If the statement fails with a SQL error or constraint violation,
+          the error propagates and the transaction may be left open (no automatic
+          rollback on execute failure — caller must explicitly rollback or close).
+        throws: >
+          LibsqlError with code SQLITE_ERROR (SQL syntax, constraint violation
+          e.g. UNIQUE constraint failed), TRANSACTION_CLOSED (if transaction was
+          closed before this call — e.g., timed out by server), SERVER_ERROR
+          (network failure). extendedCode contains SQLite extended error code
+          (e.g., SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE).
+        required_handling: >
+          Caller MUST wrap each transaction.execute() in try-catch and explicitly
+          rollback or let the finally block's close() handle cleanup:
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.execute({ sql: 'INSERT ...', args: [...] }); // throws if UNIQUE violated
+              await tx.commit();
+            } catch (error) {
+              // transaction not auto-rolled back — close() will roll it back
+              throw error;
+            } finally {
+              tx.close(); // rolls back if not committed
+            }
+
+          Note: after execute() throws, the transaction is NOT automatically rolled back.
+          Calling tx.close() in finally handles rollback automatically.
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: migrate
+    import_path: "@libsql/client"
+    description: >
+      Executes a batch of SQL statements with PRAGMA foreign_keys=off before and
+      PRAGMA foreign_keys=on after. Designed for schema migration scripts. Uses
+      deferred transaction mode. If any statement fails, the batch is rolled back
+      and remaining statements are not executed. Same error characteristics as batch().
+    postconditions:
+      # Evidence: http.js source — migrate() calls executeHranaBatch("deferred", version, batch, hranaStmts, true)
+      # The true flag enables the foreign_keys=off wrapper.
+      # https://github.com/tursodatabase/libsql-client-ts
+      - id: migrate-no-try-catch
+        condition: >
+          client.migrate() is called without try-catch in a migration script or
+          startup hook. If a migration statement fails (syntax error, column exists,
+          table already exists), the Promise rejects and remaining statements are not
+          executed, but any previously executed statements in OTHER calls are already
+          committed (migrate is not atomic across multiple migrate() calls).
+        throws: >
+          LibsqlError with code SQLITE_ERROR (most common: table already exists,
+          column already exists, syntax error), SERVER_ERROR (network failure),
+          HRANA_PROTO_ERROR (protocol error). Wraps LibsqlBatchError on individual
+          statement failures with statementIndex indicating which statement failed.
+        required_handling: >
+          Caller MUST wrap migrate() in try/catch to detect failed migrations.
+          In startup initialization, unhandled migration errors crash the process
+          silently in some frameworks (e.g., Next.js swallows module-load errors).
+
+            try {
+              await db.migrate([
+                'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)',
+                'CREATE INDEX IF NOT EXISTS users_email ON users (email)',
+              ]);
+            } catch (error) {
+              console.error('Migration failed:', error.message);
+              if (error instanceof LibsqlBatchError) {
+                console.error('Failed at statement index:', error.statementIndex);
+              }
+              process.exit(1); // abort startup on migration failure
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/http.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: executeMultiple
+    import_path: "@libsql/client"
+    description: >
+      Executes a sequence of SQL statements from a single string, separated by
+      semicolons. Intended for running SQL script files (migrations, dumps). If
+      any statement fails, execution stops at that statement and an error is thrown.
+      Unlike batch(), there is no wrapping transaction — statements are executed
+      sequentially and each is committed immediately (for DDL) or in its own
+      implicit transaction.
+    postconditions:
+      # Evidence: hrana.js executeMultiple() confirmed from source + api.d.ts docs
+      # "If a statement fails, further statements are not executed and this method throws"
+      - id: execute-multiple-no-try-catch
+        condition: >
+          client.executeMultiple() is called without try-catch. If any statement
+          in the SQL string fails, the error is thrown and remaining statements are
+          not executed. Because there is no wrapping transaction, statements that
+          ran before the failure are permanently committed — creating partial execution.
+        throws: >
+          LibsqlError with code SQLITE_ERROR (syntax error, constraint violation,
+          unknown table), SERVER_ERROR (network failure), or HRANA_PROTO_ERROR.
+          Unlike batch(), does NOT throw LibsqlBatchError — there is no statement
+          index in the error.
+        required_handling: >
+          Caller MUST wrap executeMultiple() in try-catch to detect partial execution:
+
+            try {
+              await db.executeMultiple(`
+                CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT);
+                CREATE INDEX IF NOT EXISTS users_email ON users (email);
+                INSERT INTO schema_version (version) VALUES (2);
+              `);
+            } catch (error) {
+              console.error('executeMultiple failed:', error.message);
+              // WARNING: statements before the failure are permanently committed!
+              // You may need to handle partial state manually.
+              throw error;
+            }
+
+          Prefer batch() for programmatic multi-statement operations where you need
+          atomicity. Use executeMultiple() only for SQL scripts where partial execution
+          risk is understood.
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: transaction.rollback
+    import_path: "@libsql/client"
+    description: >
+      Rolls back all changes made in an interactive transaction. Returns a Promise.
+      Unlike close(), rollback() explicitly sends a ROLLBACK statement to the server
+      and awaits acknowledgment. Can throw if the transaction is already closed.
+    postconditions:
+      # Evidence: hrana.js source — rollback() calls stream.run("ROLLBACK").catch(mapHranaError)
+      # TRANSACTION_CLOSED is thrown by commit() already-closed check; rollback uses mapHranaError
+      - id: rollback-already-closed
+        condition: >
+          transaction.rollback() is called after the transaction is already closed
+          (e.g., after close() was already called, or after a server-side timeout
+          forcibly closed the connection). Rollback throws rather than silently
+          succeeding.
+        throws: >
+          LibsqlError with code HRANA_CLOSED_ERROR (if underlying stream was closed
+          by network failure) or SERVER_ERROR (if server rejected the ROLLBACK).
+          Confirmed from mapHranaError() in hrana.js: ClosedError → "HRANA_CLOSED_ERROR".
+        required_handling: >
+          In explicit error handling flows, wrap rollback() in its own try-catch
+          to avoid masking the original error:
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.execute({ sql: '...', args: [...] });
+              await tx.commit();
+            } catch (error) {
+              // Don't let rollback error mask the original error
+              try {
+                await tx.rollback();
+              } catch (rollbackErr) {
+                console.error('Rollback also failed (tx may have already closed):', rollbackErr);
+              }
+              throw error; // rethrow original error
+            } finally {
+              tx.close();
+            }
+
+          In most cases, using tx.close() in a finally block is simpler and equivalent —
+          close() calls rollback internally without throwing.
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
-  - "LibsqlError.code values: SERVER_ERROR (HTTP failure), AUTH_FAILED, SQLITE_ERROR, URL_INVALID"
+  - "LibsqlError.code values: SERVER_ERROR (HTTP failure), AUTH_FAILED, SQLITE_ERROR, URL_INVALID, TRANSACTION_CLOSED, CLIENT_CLOSED, HRANA_CLOSED_ERROR, HRANA_WEBSOCKET_ERROR, HRANA_PROTO_ERROR, INTERNAL_ERROR, SYNC_NOT_SUPPORTED"
+  - "LibsqlBatchError extends LibsqlError with statementIndex field — thrown by batch() and migrate() on per-statement failure"
   - "When using file: URLs (local), network errors don't apply but SQLite errors still throw"
   - "When using Turso remote URLs (libsql://), all network failure modes apply"
-  - "transaction().execute() has same error behavior as client.execute()"
+  - "Interactive transactions lock write access for up to 5 seconds (server-enforced timeout)"
+  - "transaction.close() is synchronous and safe to call in finally — it does not throw"
   - "When used via Drizzle ORM adapter, errors are wrapped by Drizzle — not covered by this contract"
   - "createClient() itself does not throw — it's a synchronous factory function"
   - "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are the standard env var names"
+  - "sync() intentionally omitted — embedded replica feature only (syncUrl config), niche usage"

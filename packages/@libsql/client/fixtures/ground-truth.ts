@@ -120,3 +120,113 @@ const anotherDb = createClient({
   url: "libsql://my-db.turso.io",
   authToken: "token",
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. transaction() — missing finally block → SHOULD_FIRE: transaction-not-closed
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: Scanner rule for transaction-not-closed exists but currently detects
+// ALL transaction() calls regardless of finally block (FP on clean case).
+// KNOWN_FP: line below fires transaction-not-closed on clean cases pending scanner upgrade.
+// See concern queued in upgrade-concerns.json: concern-20260417-libsql-client-deepen-1
+
+export async function transferFundsNoFinally(fromId: number, toId: number, amount: number) {
+  // SHOULD_FIRE: transaction-not-closed — tx.close() not called in finally block
+  const tx = await db.transaction("write");
+  await tx.execute({ sql: "UPDATE accounts SET balance = balance - ? WHERE id = ?", args: [amount, fromId] });
+  await tx.execute({ sql: "UPDATE accounts SET balance = balance + ? WHERE id = ?", args: [amount, toId] });
+  await tx.commit();
+  // Missing: tx.close() in finally block
+}
+
+export async function transferFundsWithFinally(fromId: number, toId: number, amount: number) {
+  // SHOULD_NOT_FIRE: transaction closed in finally block
+  // KNOWN_FP: scanner currently fires transaction-not-closed here — pending scanner upgrade
+  // to detect finally-block tx.close() patterns (concern-20260417-libsql-client-deepen-1)
+  const tx = await db.transaction("write");
+  try {
+    await tx.execute({ sql: "UPDATE accounts SET balance = balance - ? WHERE id = ?", args: [amount, fromId] });
+    await tx.execute({ sql: "UPDATE accounts SET balance = balance + ? WHERE id = ?", args: [amount, toId] });
+    await tx.commit();
+  } catch (error) {
+    console.error("Transaction failed:", error);
+    throw error;
+  } finally {
+    tx.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. migrate() — no try-catch → SHOULD_FIRE: migrate-no-try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function runMigrationsNoCatch() {
+  // SHOULD_FIRE: migrate-no-try-catch — throws LibsqlError on SQL failure; crashes startup
+  await db.migrate([
+    "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    "CREATE INDEX IF NOT EXISTS users_email ON users (email)",
+  ]);
+}
+
+export async function runMigrationsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: migrate() wrapped in try-catch
+    await db.migrate([
+      "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+      "CREATE INDEX IF NOT EXISTS users_email ON users (email)",
+    ]);
+  } catch (error) {
+    console.error("Migration failed:", error);
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. executeMultiple() — no try-catch → SHOULD_FIRE: execute-multiple-no-try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function runSqlScriptNoCatch(sqlScript: string) {
+  // SHOULD_FIRE: execute-multiple-no-try-catch — partial execution risk, no try-catch
+  await db.executeMultiple(sqlScript);
+}
+
+export async function runSqlScriptWithCatch(sqlScript: string) {
+  try {
+    // SHOULD_NOT_FIRE: executeMultiple() inside try-catch
+    await db.executeMultiple(sqlScript);
+  } catch (error) {
+    console.error("SQL script failed (partial execution may have occurred):", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. transaction.commit() — new postcondition without scanner rule yet
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: commit-no-try-catch postcondition added in depth pass 2026-04-17.
+// Scanner detection rule not yet implemented (concern-20260417-libsql-client-deepen-2).
+// Fixture is here for future test coverage once detection is implemented.
+
+export async function commitNoCatch(fromId: number, toId: number, amount: number) {
+  // Future SHOULD_FIRE: commit-no-try-catch (pending scanner rule)
+  const tx = await db.transaction("write");
+  try {
+    await tx.execute({ sql: "UPDATE accounts SET balance = balance - ? WHERE id = ?", args: [amount, fromId] });
+    await tx.commit(); // missing try-catch on commit specifically
+  } finally {
+    tx.close();
+  }
+}
+
+export async function commitWithCatch(fromId: number, toId: number, amount: number) {
+  // Future SHOULD_NOT_FIRE: commit-no-try-catch (pending scanner rule)
+  const tx = await db.transaction("write");
+  try {
+    await tx.execute({ sql: "UPDATE accounts SET balance = balance - ? WHERE id = ?", args: [amount, fromId] });
+    await tx.commit();
+  } catch (error) {
+    console.error("Commit failed — data not persisted:", error);
+    throw error;
+  } finally {
+    tx.close();
+  }
+}
