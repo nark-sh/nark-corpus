@@ -8,9 +8,10 @@ package: "@upstash/qstash"
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.67
 
 detection:
   class_names:
@@ -149,6 +150,436 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: enqueue
+    import_path: "@upstash/qstash"
+    description: >
+      Enqueues a raw message (string, Buffer, etc.) to a named queue for ordered,
+      rate-limited delivery. Non-JSON version of enqueueJSON(). Called on a Queue
+      instance obtained via client.queue({ queueName }). Same error characteristics
+      as enqueueJSON().
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts
+      # Error types confirmed from qstash-js source: http.ts error hierarchy
+      - id: enqueue-api-error
+        condition: >
+          Any HTTP or network failure: invalid token (401), queue not found (404),
+          rate limit exceeded (429), server error (5xx), or network failure.
+          Also throws if no queueName was provided to the Queue constructor.
+        throws: >
+          QstashError (non-2xx HTTP responses). QstashRatelimitError (429 burst),
+          QstashDailyRatelimitError (429 daily). Network errors on connection failure.
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+        required_handling: >
+          Caller MUST wrap queue.enqueue() in try/catch. Uncaught error means the message
+          was never enqueued — the work is silently dropped, never delivered, never retried.
+          Users see no indication their task failed.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts"
+          - "https://upstash.com/docs/qstash/features/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: batch
+    import_path: "@upstash/qstash"
+    description: >
+      Publishes multiple raw messages in a single HTTPS request to the QStash /v2/batch
+      endpoint. Returns an array of PublishResponse — one per message. Each individual
+      message can succeed or fail independently; however, the entire batch call throws
+      if the HTTP request fails at the transport level. Used for high-throughput
+      publishing scenarios to minimize round trips.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/client.ts
+      # Error types confirmed from qstash-js source: http.ts error hierarchy
+      - id: batch-api-error
+        condition: >
+          Any HTTP or network failure at the transport level: invalid token (401),
+          rate limit (429), malformed request (400), server error (5xx), or network failure.
+          The entire batch is unsent — no messages are queued.
+        throws: >
+          QstashError (non-2xx HTTP responses). QstashRatelimitError (429 burst),
+          QstashDailyRatelimitError (429 daily). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.batch() in try/catch. An uncaught batch failure means none
+          of the messages were published. All background jobs in the batch are silently dropped.
+          High-throughput publishers that use batch() for efficiency may lose entire job batches.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/publish"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: batch-empty-array-error
+        condition: >
+          An empty array is passed to batch().
+        throws: >
+          QstashEmptyArrayError extends QstashError. Thrown immediately before any HTTP request.
+        required_handling: >
+          Caller MUST validate the batch array is non-empty before calling batch().
+          QstashEmptyArrayError surfaces immediately — it is a programming error, not a transient failure.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: batchJSON
+    import_path: "@upstash/qstash"
+    description: >
+      Batch publishes multiple messages with JSON-serialized bodies in a single HTTPS
+      request. Utility wrapper around batch() that auto-serializes each body and sets
+      Content-Type: application/json. Returns an array of PublishResponse, one per
+      message. Same error characteristics as batch().
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/client.ts
+      # Error types confirmed from qstash-js source: http.ts error hierarchy
+      - id: batchjson-api-error
+        condition: >
+          Any HTTP or network failure: invalid token (401), rate limit (429),
+          malformed request (400), server error (5xx), or network failure.
+          The entire batch fails atomically — no messages are published on transport-level errors.
+        throws: >
+          QstashError (non-2xx HTTP responses). QstashRatelimitError (429 burst),
+          QstashDailyRatelimitError (429 daily). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.batchJSON() in try/catch. An uncaught failure means the entire
+          batch of background jobs is silently dropped. SaaS apps that use batchJSON() for bulk
+          job submission may lose all queued work without user-facing indication.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/publish"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: batchjson-empty-array-error
+        condition: >
+          An empty array is passed to batchJSON().
+        throws: >
+          QstashEmptyArrayError extends QstashError. Thrown immediately before any HTTP request.
+        required_handling: >
+          Caller MUST ensure the batch array is non-empty before calling batchJSON().
+          This is a programming error that surfaces immediately — easy to catch in tests.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: verify
+    import_path: "@upstash/qstash"
+    description: >
+      Verifies the cryptographic signature on an incoming QStash webhook request.
+      Called by webhook handler endpoints (e.g., Next.js API routes, Express handlers)
+      to authenticate that the request originated from QStash and has not been tampered
+      with. Uses HMAC JWT verification against the QStash signing keys. Throws
+      SignatureError on ANY verification failure — callers must respond 401/403.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/receiver.ts
+      # SignatureError confirmed from qstash-js source
+      - id: verify-signature-error
+        condition: >
+          JWT signature verification fails with both the current signing key and the next signing key.
+          Three cases: (1) JWT signature invalid, (2) URL subject mismatch, (3) body hash mismatch.
+        throws: >
+          SignatureError (subclass of Error) with a descriptive message. Thrown when the request
+          was not sent by QStash, signing keys are misconfigured, or key rotation is in progress.
+        required_handling: >
+          Caller MUST catch SignatureError and return a 401 Unauthorized response.
+          Processing the request payload after a failed verify() is a security vulnerability —
+          attackers can trigger arbitrary background jobs by sending spoofed QStash requests.
+          If the exception propagates, the endpoint returns 500 and QStash retries delivery.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/receiver.ts"
+          - "https://upstash.com/docs/qstash/features/security"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: verify-no-signing-keys
+        condition: >
+          Signing keys cannot be resolved from QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY
+          environment variables or the ReceiverConfig passed to the constructor.
+        throws: >
+          Error("No signing keys available for verification"). This is a misconfiguration error —
+          the Receiver was instantiated without keys.
+        required_handling: >
+          Ensure QSTASH_CURRENT_SIGNING_KEY and QSTASH_NEXT_SIGNING_KEY are set in the environment.
+          All incoming webhook requests will fail verification without these keys — the entire
+          webhook handler is non-functional and background job delivery stops completely.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/receiver.ts"
+          - "https://upstash.com/docs/qstash/features/security"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: schedules.create
+    import_path: "@upstash/qstash"
+    description: >
+      Creates a new QStash schedule that publishes a message to a destination URL
+      on a cron schedule. Called on the client.schedules accessor. Used in SaaS apps
+      to set up recurring background tasks (daily digests, cleanup jobs, periodic syncs).
+      Makes an HTTPS POST to the QStash API. Returns { scheduleId: string }.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts
+      # Error types confirmed from qstash-js source
+      - id: schedules-create-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), invalid cron expression (400), invalid
+          destination URL (422), rate limit exceeded (429), or server error (5xx).
+          Also throws when flowControl is specified without parallelism or ratePerSecond.
+        throws: >
+          QstashError (non-2xx HTTP responses). QstashRatelimitError (429 burst),
+          QstashDailyRatelimitError (429 daily).
+          QstashError("Provide at least one of parallelism or ratePerSecond for flowControl")
+          when flowControl is misconfigured.
+        required_handling: >
+          Caller MUST wrap client.schedules.create() in try/catch. Failure means the recurring
+          job is never created — scheduled tasks (daily emails, cleanup jobs, sync crons) silently
+          fail to register. Users never receive scheduled notifications or automated reports.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts"
+          - "https://upstash.com/docs/qstash/features/schedules"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: queue.upsert
+    import_path: "@upstash/qstash"
+    description: >
+      Creates or updates a QStash queue configuration (parallelism, paused state).
+      Called on a Queue instance obtained via client.queue({ queueName }). Used during
+      app initialization or dynamic queue management to ensure a queue exists with
+      the desired settings.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts
+      - id: queue-upsert-api-error
+        condition: >
+          HTTP failure: invalid token (401), invalid parallelism value (400), rate limit (429),
+          or server error (5xx). Also throws if the Queue instance was created without queueName.
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+        required_handling: >
+          Caller MUST wrap queue.upsert() in try/catch. If uncaught, the queue is not created
+          or updated. Subsequent enqueue() calls may target a non-existent queue or an
+          incorrectly configured one.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts"
+          - "https://upstash.com/docs/qstash/features/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: queue.pause
+    import_path: "@upstash/qstash"
+    description: >
+      Pauses message delivery for a queue, preventing QStash from sending enqueued
+      messages to the destination URL. Called on a Queue instance. Used during
+      deployments, maintenance windows, or error recovery to hold back job delivery.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts
+      - id: queue-pause-api-error
+        condition: >
+          HTTP failure: invalid token (401), queue not found (404), rate limit (429),
+          or server error (5xx). Also throws if queueName is missing from the Queue constructor.
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+        required_handling: >
+          Caller MUST wrap queue.pause() in try/catch. If uncaught, the queue is not paused —
+          during maintenance windows, messages continue delivering to a handler that may be
+          down or being deployed, causing delivery failures and messages entering the DLQ.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: queue.resume
+    import_path: "@upstash/qstash"
+    description: >
+      Resumes message delivery for a paused queue, allowing QStash to process enqueued
+      messages again. Complement to queue.pause(). Must be called after maintenance
+      windows or controlled pauses to restore normal job processing.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts
+      - id: queue-resume-api-error
+        condition: >
+          HTTP failure: invalid token (401), queue not found (404), rate limit (429),
+          or server error (5xx). Also throws if queueName is missing from the Queue constructor.
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+        required_handling: >
+          Caller MUST wrap queue.resume() in try/catch. If uncaught, the queue remains paused
+          after the maintenance window ends. Background jobs pile up but are never delivered —
+          the system silently stalls with jobs accumulating indefinitely without automatic recovery.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/queue.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: schedules.delete
+    import_path: "@upstash/qstash"
+    description: >
+      Deletes an existing QStash schedule by scheduleId, permanently stopping the
+      recurring cron job. Called on client.schedules. Used for cleanup, configuration
+      updates (delete + recreate), or when a feature is disabled.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts
+      - id: schedules-delete-api-error
+        condition: >
+          HTTP failure: invalid token (401), schedule not found (404), rate limit (429),
+          or server error (5xx). Deleting a non-existent scheduleId returns 404 and throws QstashError.
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+        required_handling: >
+          Caller MUST wrap client.schedules.delete() in try/catch. If uncaught, the schedule
+          is not deleted — the recurring cron job continues running after it should have been
+          stopped. Stale background tasks execute, potentially processing data that should
+          no longer be processed.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: schedules.pause
+    import_path: "@upstash/qstash"
+    description: >
+      Pauses an active QStash schedule, preventing message delivery until resumed.
+      Called on client.schedules with a schedule ID. Used during maintenance windows
+      or when temporarily disabling scheduled tasks without deleting them.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts
+      # Error types confirmed from http.ts error hierarchy
+      - id: schedules-pause-api-error
+        condition: >
+          HTTP failure: invalid token (401), schedule not found (404), rate limit (429),
+          or server error (5xx).
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+        required_handling: >
+          Caller MUST wrap client.schedules.pause() in try/catch. If uncaught, the schedule
+          is not paused — the cron job continues running during maintenance, and scheduled tasks
+          execute against a system that may be down or being updated.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: schedules.resume
+    import_path: "@upstash/qstash"
+    description: >
+      Resumes a paused QStash schedule, re-enabling cron delivery. Complement to
+      schedules.pause(). Must be called after maintenance windows to restore
+      scheduled task execution.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts
+      # Error types confirmed from http.ts error hierarchy
+      - id: schedules-resume-api-error
+        condition: >
+          HTTP failure: invalid token (401), schedule not found (404), rate limit (429),
+          or server error (5xx).
+        throws: >
+          QstashError on HTTP failure. QstashRatelimitError (429 burst).
+        required_handling: >
+          Caller MUST wrap client.schedules.resume() in try/catch. If uncaught, the schedule
+          remains paused after the maintenance window — recurring tasks silently stop executing.
+          Daily digests, cleanup jobs, and sync crons never run. Users notice absence of
+          scheduled features rather than an explicit error.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/schedules.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
 notes:
   - "publishJSON/publish make HTTPS calls to QStash API at publish time — always need try-catch"
   - "QStash's retry config (retries: N) applies to MESSAGE DELIVERY, not the publish call itself"
@@ -158,3 +589,6 @@ notes:
   - "Default retries: 0 (no auto-retry at publish time). Configure RetryConfig in Client constructor for retries."
   - "enqueue() is the non-JSON version of enqueueJSON() — same error behavior"
   - "QSTASH_TOKEN env var is the standard name; missing token causes immediate auth error on first call"
+  - "All Queue methods (upsert/pause/resume/delete) throw synchronous Error if queueName is missing from constructor"
+  - "schedules.create() schedules may take up to 60 seconds to activate after creation"
+  - "verify() result (true/false) should be checked — returning false without throwing is not a SignatureError"
