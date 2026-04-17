@@ -8,21 +8,28 @@
  * Key contract rules:
  *   - conn.execute() without try-catch → SHOULD_FIRE: database-error
  *   - conn.transaction() without try-catch → SHOULD_FIRE: database-error
+ *   - conn.refresh() without try-catch → SHOULD_FIRE: refresh-authentication-error, refresh-network-error
  *   - conn.execute() inside try-catch → SHOULD_NOT_FIRE
  *   - conn.transaction() inside try-catch → SHOULD_NOT_FIRE
- *   - connect() itself → SHOULD_NOT_FIRE (factory, synchronous-ish, returns Connection)
+ *   - conn.refresh() inside try-catch → SHOULD_NOT_FIRE
+ *   - connect() itself → SHOULD_NOT_FIRE (synchronous factory, never throws)
  *
  * Contracted postconditions:
  *   database-error: execute() or transaction() throws DatabaseError/TypeError on failure
+ *   unknown-error: execute() or transaction() throws UnknownError (Cloudflare/non-JSON errors)
+ *   refresh-authentication-error: refresh() throws DatabaseError with 401/403
+ *   refresh-network-error: refresh() throws TypeError on network failure
  *
  * Coverage:
  *   - Section 1: bare execute() → SHOULD_FIRE
  *   - Section 2: execute() inside try-catch → SHOULD_NOT_FIRE
  *   - Section 3: bare transaction() → SHOULD_FIRE
  *   - Section 4: transaction() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 5: bare refresh() → SHOULD_FIRE
+ *   - Section 6: refresh() inside try-catch → SHOULD_NOT_FIRE
  */
 
-import { connect } from "@planetscale/database";
+import { connect, Connection } from "@planetscale/database";
 
 const conn = connect({
   host: process.env.DATABASE_HOST!,
@@ -125,6 +132,47 @@ export async function transferFundsWithCatch(
     });
   } catch (error) {
     console.error("Transaction failed, rolled back:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Bare refresh() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: refresh-authentication-error
+// @expect-violation: refresh-network-error
+export async function prewarmConnectionNoCatch(conn: Connection) {
+  // SHOULD_FIRE: refresh-authentication-error, refresh-network-error
+  // refresh() makes an HTTPS request to CreateSession — no try-catch means auth failures
+  // and network errors propagate as unhandled exceptions to callers.
+  await conn.refresh();
+}
+
+// @expect-violation: refresh-authentication-error
+// @expect-violation: refresh-network-error
+export async function initConnectionPoolNoCatch() {
+  // SHOULD_FIRE: bare refresh() in connection pool initialization without error handling
+  const c = connect({
+    host: process.env.DATABASE_HOST!,
+    username: process.env.DATABASE_USERNAME!,
+    password: process.env.DATABASE_PASSWORD!,
+  });
+  await c.refresh();
+  return c;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. refresh() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function prewarmConnectionWithCatch(conn: Connection) {
+  try {
+    // SHOULD_NOT_FIRE: refresh() inside try-catch satisfies all refresh postconditions
+    await conn.refresh();
+  } catch (error) {
+    console.error("Connection pre-warm failed:", error);
     throw error;
   }
 }

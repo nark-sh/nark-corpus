@@ -2,13 +2,26 @@
 # DatabaseError extends Error with status (HTTP status code) and body (VitessError) properties.
 # All execute() and transaction() calls make HTTPS requests to PlanetScale's API.
 # Errors: network failures (TypeError: fetch failed), DatabaseError (non-ok HTTP responses).
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 2):
+# API surface (v1.20.1): 3 async-callable (execute, transaction, refresh) + sync utilities (connect, format, cast)
+# Contracted before: 2 (execute, transaction)
+# Contracted after: 3 (+1 new function: Connection.refresh)
+#   Also: 2 new postconditions added to execute() and transaction() (unknown-error for Cloudflare/non-JSON errors)
+# Omitted: 4 (connect — sync factory, Client.connection — sync factory, format — sync, cast — sync)
+# Coverage: 3/3 async functions = 1.0 (was 2/3 = 0.67)
+# Evidence sources confirmed from:
+#   node_modules/@planetscale/database/dist/index.js — DatabaseError, UnknownError throw sites, refresh() source
+#   https://github.com/planetscale/database-js/blob/main/src/index.ts — source confirmed
+#   https://planetscale.com/docs/tutorials/planetscale-serverless-driver
 package: "@planetscale/database"
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 3/3 async-callable functions contracted (4 sync utilities intentionally omitted)
 
 detection:
   class_names:
@@ -69,6 +82,65 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: @planetscale/database@1.20.1 dist/index.js lines 170-176:
+      #   const isCloudflareStatusCode = response.status >= 520 && response.status <= 530;
+      #   const isCloudflareError = isCloudflareStatusCode || isCloudflareWorker;
+      #   throw new UnknownError(message, context);
+      # UnknownError extends DatabaseError with .context (status, statusText, body, headers).
+      # Triggered when PlanetScale's API returns non-JSON (e.g., Cloudflare error pages).
+      # Using instanceof DatabaseError still catches it — but .context is lost unless you check
+      # specifically for UnknownError.
+      - id: unknown-error
+        condition: >
+          execute() is called and PlanetScale's API returns a non-JSON HTTP response —
+          most commonly Cloudflare infrastructure errors (HTTP 520–530) that return HTML
+          error pages instead of JSON. Also triggered when running inside Cloudflare Workers
+          where the Cloudflare error detection is always active. The UnknownError contains
+          a ResponseContext (status, statusText, truncated body, headers) for debugging.
+          This is distinct from DatabaseError: UnknownError means the PlanetScale API itself
+          was not reached — a Cloudflare proxy or network infrastructure layer returned an error.
+        throws: >
+          UnknownError (extends DatabaseError) with:
+            .name === 'UnknownError'
+            .status = HTTP status code (520–530 for Cloudflare, or other non-2xx)
+            .body.code === 'UNKNOWN'
+            .context = { status, statusText, body (first 4096 chars), headers }
+          Message: "Cloudflare error: HTTP <status>" for Cloudflare-range codes,
+                   "Expected JSON response from database API, got HTTP <status>" otherwise.
+          NOTE: UnknownError IS-A DatabaseError — instanceof DatabaseError catches it.
+          But if you need the .context property for logging, check error.name === 'UnknownError'
+          or error instanceof UnknownError.
+        required_handling: >
+          For apps deployed on Cloudflare Workers or behind Cloudflare proxies,
+          add specific handling for UnknownError to distinguish infrastructure failures
+          from database errors:
+
+            import { DatabaseError } from '@planetscale/database';
+
+            try {
+              const result = await conn.execute('SELECT 1');
+            } catch (error) {
+              if (error instanceof DatabaseError) {
+                if (error.name === 'UnknownError') {
+                  // Cloudflare or infrastructure error — log context for debugging
+                  console.error('Infrastructure error:', error.context);
+                  throw new Error('Database infrastructure unavailable');
+                }
+                // Standard database error (auth, constraint, syntax)
+                console.error('DB error:', error.status, error.body.code);
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/planetscale/database-js/blob/main/src/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
   - name: transaction
     import_path: "@planetscale/database"
     description: >
@@ -116,11 +188,165 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: same UnknownError throw site as execute() — all requests go through postJSON().
+      # transaction() internally calls execute('BEGIN'), execute (user statements), execute('COMMIT')
+      # or execute('ROLLBACK'). Any of these can trigger UnknownError on Cloudflare infrastructure errors.
+      - id: unknown-error
+        condition: >
+          transaction() is called and any of the underlying HTTPS requests (BEGIN, statement execution,
+          COMMIT, or ROLLBACK) receives a non-JSON response from a Cloudflare proxy or infrastructure
+          layer. Because transaction() executes multiple requests, UnknownError can occur at any phase —
+          including during ROLLBACK, which means the rollback itself may not complete cleanly.
+        throws: >
+          UnknownError (extends DatabaseError) — same type as execute()'s unknown-error.
+          If UnknownError occurs during ROLLBACK (in the catch block), the original error is re-thrown
+          by the outer catch, meaning the transaction rollback may have been incomplete.
+          Callers cannot distinguish "rolled back cleanly" from "rollback also failed" unless they
+          check for UnknownError specifically.
+        required_handling: >
+          For Cloudflare-deployed apps, wrap transaction() and check for UnknownError:
+
+            try {
+              await conn.transaction(async (tx) => {
+                await tx.execute('INSERT INTO orders ...', [orderId]);
+                await tx.execute('UPDATE inventory ...', [itemId]);
+              });
+            } catch (error) {
+              if (error instanceof DatabaseError) {
+                if (error.name === 'UnknownError') {
+                  // Infrastructure failure — rollback may not have completed
+                  // Consider manual cleanup or idempotent retry
+                  console.error('Infrastructure error during transaction:', error.context);
+                }
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/planetscale/database-js/blob/main/src/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: @planetscale/database@1.20.1 dist/index.d.ts line 109:
+  #   refresh(): Promise<void>
+  # Evidence: dist/index.js lines 82-84:
+  #   async refresh() { await this.createSession() }
+  # createSession() calls postJSON() to POST /psdb.v1alpha1.Database/CreateSession
+  # — same error profile as execute() (DatabaseError, UnknownError, TypeError).
+  # refresh() is used to pre-warm connections or recover from session expiration.
+  # Sessions in @planetscale/database are used to ensure read-after-write consistency
+  # by maintaining a session token across requests on the same Connection instance.
+  - name: refresh
+    import_path: "@planetscale/database"
+    description: >
+      Refreshes the connection's session token by calling CreateSession on the PlanetScale API.
+      Available on Connection only (not on Client or Transaction). Used to pre-warm a connection
+      before sending queries, or to recover from a stale/expired session. Makes one HTTPS POST
+      to /psdb.v1alpha1.Database/CreateSession. If the session has not been initialized yet,
+      execute() also calls createSession() lazily — refresh() is for explicit pre-warming.
+      After refresh(), the Connection's internal session token is updated.
+
+    postconditions:
+      # Evidence: dist/index.js lines 124-128:
+      #   async createSession() {
+      #     const url = new URL('/psdb.v1alpha1.Database/CreateSession', this.url);
+      #     const { session } = await postJSON(this.config, this.fetch, url);
+      #     this.session = session; return session;
+      #   }
+      # postJSON() can throw DatabaseError (VitessError response), UnknownError (non-JSON response),
+      # or TypeError (network failure). refresh() propagates all of these.
+      - id: refresh-authentication-error
+        condition: >
+          refresh() is called with invalid or expired credentials (wrong username/password in
+          config, or token revoked). PlanetScale returns HTTP 401 Unauthorized or 403 Forbidden
+          with a VitessError JSON body. This is the most common failure path for refresh() — callers
+          using refresh() in connection pools or scheduled jobs may not notice when credentials rotate.
+        throws: >
+          DatabaseError with status 401 or 403. error.body.code will be a Vitess error code
+          (typically 'UNAUTHENTICATED' or 'PERMISSION_DENIED').
+          error.message describes the authentication failure.
+        required_handling: >
+          Wrap refresh() in try/catch. Authentication failures on refresh() indicate a credentials
+          problem that will affect all subsequent execute() calls too — fail fast and alert:
+
+            try {
+              await conn.refresh();
+            } catch (error) {
+              if (error instanceof DatabaseError && (error.status === 401 || error.status === 403)) {
+                console.error('PlanetScale auth failed — check credentials:', error.message);
+                // Do not proceed with queries — all will fail with the same error
+                throw new Error('Database authentication failed');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/planetscale/database-js/blob/main/src/index.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: dist/index.js lines 131-177: postJSON() uses fetch() — network failures throw TypeError.
+      # refresh() propagates TypeError from postJSON() if the PlanetScale host is unreachable.
+      # This is especially relevant in cold-start scenarios where refresh() is called before the first
+      # query to pre-warm the connection — if the network is down, refresh() fails and the caller
+      # may not be prepared to handle the exception.
+      - id: refresh-network-error
+        condition: >
+          refresh() is called but the PlanetScale host is unreachable (DNS failure, TCP connection
+          refused, timeout, or the host is down). The underlying fetch() call throws a TypeError.
+          This is distinct from DatabaseError — it means the HTTP request never completed.
+          Common in: cold-start pre-warming scripts, connection pool initialization, health checks.
+        throws: >
+          TypeError with message like "fetch failed" or "ECONNREFUSED" or "ETIMEDOUT".
+          The error is NOT a DatabaseError — it does not have .status or .body properties.
+          Check: !(error instanceof DatabaseError) to distinguish network failures.
+        required_handling: >
+          Handle both DatabaseError and TypeError from refresh():
+
+            try {
+              await conn.refresh();
+            } catch (error) {
+              if (error instanceof DatabaseError) {
+                // API-level failure (auth, server error)
+                console.error('Session creation failed:', error.status, error.message);
+              } else if (error instanceof TypeError) {
+                // Network-level failure (DNS, connectivity)
+                console.error('Cannot reach PlanetScale:', error.message);
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/planetscale/database-js/blob/main/src/index.ts"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "execute() uses HTTPS transport — all network failure modes apply"
   - "DatabaseError has .status (HTTP code) and .body.code (Vitess error code) for specific handling"
+  - "UnknownError extends DatabaseError — instanceof DatabaseError catches it, but .context is lost"
+  - "UnknownError occurs for Cloudflare infrastructure errors (520-530) or non-JSON API responses"
   - "When used via Prisma/Drizzle adapter, errors are wrapped by the ORM — this contract targets direct usage"
-  - "connect() is a factory function — the execute() on the returned Connection is what needs try-catch"
+  - "connect() is a synchronous factory function — returns a Connection, makes no network calls, never throws"
+  - "Client.connection() is also synchronous — just new Connection(config)"
+  - "Connection.refresh() is the only explicitly async pre-warming method — calls CreateSession endpoint"
+  - "Sessions provide read-after-write consistency — the session token is automatically managed by Connection"
   - "TypeError 'fetch failed' is the common error when database host is unreachable"
   - "PlanetScale changed pricing in 2024; some users migrated, but the package is still widely used"
   - "Scan 2026-04-02: only 2 repos found using this package — low adoption in scanned corpus"
+  - "format() and cast() are synchronous utilities — intentionally omitted from postconditions"
