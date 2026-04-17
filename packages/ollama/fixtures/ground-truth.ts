@@ -111,8 +111,7 @@ export async function embedWithCatch() {
 
 // @expect-violation: pull-no-try-catch
 export async function pullNoCatch() {
-  // SHOULD_FIRE: pull-no-try-catch — ollama.pull() makes HTTP request; throws ResponseError(404) for
-  // unknown model names, ECONNREFUSED when Ollama server is not running, AbortError mid-download
+  // SHOULD_FIRE: pull-no-try-catch — ollama.pull() makes HTTP request; throws ResponseError(404) for unknown model names, ECONNREFUSED when Ollama server is not running, AbortError mid-download
   const response = await ollama.pull({ model: "llama3.2" });
   return response.status;
 }
@@ -135,8 +134,7 @@ export async function pullWithCatch() {
 
 // @expect-violation: create-no-try-catch
 export async function createNoCatch() {
-  // SHOULD_FIRE: create-no-try-catch — ollama.create() throws ResponseError(404) when base model not found;
-  // also throws Error("Creating with a local path is not currently supported from ollama-js") for local paths
+  // SHOULD_FIRE: create-no-try-catch — ollama.create() throws ResponseError(404) when base model not found; also throws Error("Creating with a local path is not currently supported from ollama-js") for local paths
   const response = await ollama.create({
     model: "my-custom-model",
     from: "llama3.2",
@@ -167,8 +165,7 @@ export async function createWithCatch() {
 
 // @expect-violation: show-no-try-catch
 export async function showNoCatch() {
-  // SHOULD_FIRE: show-no-try-catch — ollama.show() throws ResponseError(404) when model not found;
-  // silent failure in capability-check flows where callers assume the model exists
+  // SHOULD_FIRE: show-no-try-catch — ollama.show() throws ResponseError(404) when model not found; silent failure in capability-check flows where callers assume the model exists
   const info = await ollama.show({ model: "llama3.2" });
   return info.details;
 }
@@ -191,8 +188,7 @@ export async function showWithCatch() {
 
 // @expect-violation: delete-no-try-catch
 export async function deleteNoCatch() {
-  // SHOULD_FIRE: delete-no-try-catch — ollama.delete() throws ResponseError(404) when model not found;
-  // common in cleanup flows where model may already have been removed
+  // SHOULD_FIRE: delete-no-try-catch — ollama.delete() throws ResponseError(404) when model not found; common in cleanup flows where model may already have been removed
   const result = await ollama.delete({ model: "old-model" });
   return result.status;
 }
@@ -239,8 +235,7 @@ export async function copyWithCatch() {
 
 // @expect-violation: websearch-no-try-catch
 export async function webSearchNoCatch() {
-  // SHOULD_FIRE: websearch-no-try-catch — ollama.webSearch() throws Error("Query is required") for empty
-  // queries, ResponseError(401) when OLLAMA_API_KEY is missing; calls external ollama.com cloud API
+  // SHOULD_FIRE: websearch-no-try-catch — ollama.webSearch() throws Error("Query is required") for empty queries, ResponseError(401) when OLLAMA_API_KEY is missing; calls external ollama.com cloud API
   const results = await ollama.webSearch({ query: "latest AI news" });
   return results.results;
 }
@@ -268,8 +263,7 @@ export async function webSearchWithCatch() {
 
 // @expect-violation: webfetch-no-try-catch
 export async function webFetchNoCatch() {
-  // SHOULD_FIRE: webfetch-no-try-catch — ollama.webFetch() throws Error("URL is required") for empty URL,
-  // ResponseError(401) when OLLAMA_API_KEY is missing; calls external ollama.com cloud API
+  // SHOULD_FIRE: webfetch-no-try-catch — ollama.webFetch() throws Error("URL is required") for empty URL, ResponseError(401) when OLLAMA_API_KEY is missing; calls external ollama.com cloud API
   const page = await ollama.webFetch({ url: "https://ollama.com" });
   return page.content;
 }

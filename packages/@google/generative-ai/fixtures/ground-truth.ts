@@ -289,8 +289,7 @@ export function sendMessageCatchChain(message: string) {
 
 export async function batchEmbedNoCatch(texts: string[]) {
   const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-  // SHOULD_FIRE: batch-network-error — batchEmbedContents makes HTTP call, no try-catch
-  // Entire batch fails atomically on rate-limit (429) or auth error (403)
+  // SHOULD_FIRE: batch-network-error — batchEmbedContents makes HTTP call, no try-catch; entire batch fails atomically on rate-limit (429) or auth error (403)
   const result = await embeddingModel.batchEmbedContents({
     requests: texts.map(text => ({
       content: { role: 'user', parts: [{ text }] },
@@ -329,8 +328,7 @@ class EmbeddingService {
   }
 
   async embedDocuments(texts: string[]) {
-    // SHOULD_FIRE: batch-network-error — class method, no try-catch
-    // This is the most common pattern in RAG pipelines — bulk indexing without error handling
+    // SHOULD_FIRE: batch-network-error — class method, no try-catch; most common pattern in RAG pipelines — bulk indexing without error handling
     const result = await this.model.batchEmbedContents({
       requests: texts.map(text => ({
         content: { role: 'user', parts: [{ text }] },

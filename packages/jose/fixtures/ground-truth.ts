@@ -120,8 +120,7 @@ export async function importJWKSafely(jwk: Record<string, string>) {
 // @expect-violation: jwt-decrypt-no-try-catch
 
 export async function bareDecryptJwt(token: string, privateKey: Uint8Array) {
-  // SHOULD_FIRE: jwt-decrypt-no-try-catch — jwtDecrypt() without try-catch
-  // Throws JWEDecryptionFailed on wrong key, JWTExpired on expired token
+  // SHOULD_FIRE: jwt-decrypt-no-try-catch — jwtDecrypt() without try-catch; throws JWEDecryptionFailed on wrong key, JWTExpired on expired token
   const { payload } = await jwtDecrypt(token, privateKey);
   return payload;
 }
@@ -143,8 +142,7 @@ export async function decryptJwtSafely(token: string, privateKey: Uint8Array) {
 // @expect-violation: compact-decrypt-no-try-catch
 
 export async function bareCompactDecrypt(jwe: string, key: Uint8Array) {
-  // SHOULD_FIRE: compact-decrypt-no-try-catch — compactDecrypt() without try-catch
-  // Throws JWEDecryptionFailed on authentication tag failure, JWEInvalid on format error
+  // SHOULD_FIRE: compact-decrypt-no-try-catch — compactDecrypt() without try-catch; throws JWEDecryptionFailed on authentication tag failure, JWEInvalid on format error
   const { plaintext } = await compactDecrypt(jwe, key);
   return plaintext;
 }
@@ -166,8 +164,7 @@ export async function compactDecryptSafely(jwe: string, key: Uint8Array) {
 // @expect-violation: import-spki-no-try-catch
 
 export async function bareImportSPKI(pem: string) {
-  // SHOULD_FIRE: import-spki-no-try-catch — importSPKI() without try-catch
-  // Throws TypeError when PEM is malformed or missing -----BEGIN PUBLIC KEY----- header
+  // SHOULD_FIRE: import-spki-no-try-catch — importSPKI() without try-catch; throws TypeError when PEM is malformed or missing -----BEGIN PUBLIC KEY----- header
   return await importSPKI(pem, 'RS256');
 }
 
@@ -187,8 +184,7 @@ export async function importSPKISafely(pem: string) {
 // @expect-violation: import-pkcs8-no-try-catch
 
 export async function bareImportPKCS8(pem: string) {
-  // SHOULD_FIRE: import-pkcs8-no-try-catch — importPKCS8() without try-catch
-  // Throws TypeError when PEM is malformed or missing -----BEGIN PRIVATE KEY----- header
+  // SHOULD_FIRE: import-pkcs8-no-try-catch — importPKCS8() without try-catch; throws TypeError when PEM is malformed or missing -----BEGIN PRIVATE KEY----- header
   return await importPKCS8(pem, 'RS256');
 }
 
@@ -208,8 +204,7 @@ export async function importPKCS8Safely(pem: string) {
 // @expect-violation: compact-verify-no-try-catch
 
 export async function bareCompactVerify(jws: string, key: Uint8Array) {
-  // SHOULD_FIRE: compact-verify-no-try-catch — compactVerify() without try-catch
-  // Throws JWSSignatureVerificationFailed on tampered token, JWSInvalid on format error
+  // SHOULD_FIRE: compact-verify-no-try-catch — compactVerify() without try-catch; throws JWSSignatureVerificationFailed on tampered token, JWSInvalid on format error
   const { payload } = await compactVerify(jws, key);
   return payload;
 }
@@ -231,8 +226,7 @@ export async function compactVerifySafely(jws: string, key: Uint8Array) {
 // @expect-violation: generate-key-pair-no-try-catch
 
 export async function bareGenerateKeyPair() {
-  // SHOULD_FIRE: generate-key-pair-no-try-catch — generateKeyPair() without try-catch
-  // Throws JOSENotSupported for unsupported algorithm or invalid modulusLength
+  // SHOULD_FIRE: generate-key-pair-no-try-catch — generateKeyPair() without try-catch; throws JOSENotSupported for unsupported algorithm or invalid modulusLength
   const { privateKey, publicKey } = await generateKeyPair('RS256');
   return { privateKey, publicKey };
 }

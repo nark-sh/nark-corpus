@@ -110,15 +110,15 @@ export async function lastValueFromKnownSafe() {
 // 5. fromFetch() — missing response.ok check (fromfetch-no-ok-check)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SHOULD_FIRE: fromfetch-network-error-unhandled — fromFetch with no try-catch for network errors
 export async function fromFetchNoOkCheck(url: string): Promise<any> {
+  // SHOULD_FIRE: fromfetch-no-ok-check — fromFetch with no response.ok check
   const response = await firstValueFrom(fromFetch(url));
   return await response.json(); // silently processes 500 error body as data
 }
 
-// SHOULD_FIRE: fromfetch-network-error-unhandled — switchMap fromFetch with no try-catch
 export async function fromFetchWithSwitchMapNoOkCheck(url: string): Promise<any> {
   return await firstValueFrom(
+    // SHOULD_FIRE: fromfetch-no-ok-check — switchMap fromFetch with no response.ok check
     fromFetch(url).pipe(
       switchMap(response => response.json())  // proceeds even if response.ok === false
     )
