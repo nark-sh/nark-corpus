@@ -1,32 +1,104 @@
+# uploadthing — Server-side file upload SDK for web frameworks.
+# UTApi class provides server-side file management for UploadThing storage.
+# Error hierarchy: UploadThingError (code: ErrorCode) — all API/network failures.
+# ErrorCode values: BAD_REQUEST, NOT_FOUND, FORBIDDEN, INTERNAL_SERVER_ERROR,
+#   INTERNAL_CLIENT_ERROR, TOO_LARGE, TOO_SMALL, TOO_MANY_FILES, KEY_TOO_LONG,
+#   URL_GENERATION_FAILED, UPLOAD_FAILED, MISSING_ENV, INVALID_SERVER_CONFIG,
+#   FILE_LIMIT_EXCEEDED.
+#
+# CRITICAL PATTERN: uploadFiles() and uploadFilesFromUrl() return { data, error }
+# per file when called with an array — they do NOT throw for per-file failures.
+# Caller must check the error field on each result. Configuration/network failures
+# still throw UploadThingError at the call level.
+#
+# guardServerOnly(): All UTApi methods call guardServerOnly() at the start, which
+#   throws UploadThingError({ code: "INTERNAL_SERVER_ERROR" }) if called from a browser.
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 4):
+# API surface: 10 distinct async-callable UTApi methods
+# Contracted before: 2 (UTApi.uploadFiles, UTApi.deleteFiles)
+# Contracted after: 8 (+6 this pass: uploadFilesFromUrl, generateSignedURL,
+#                      renameFiles, updateACL, listFiles, getUsageInfo)
+# Omitted: 2 (getFileUrls — deprecated/read-only; getSignedURL — deprecated, use generateSignedURL)
+# Coverage: 8/10 = 0.80 (effective contracted/non-omitted = 8/8 = 1.0)
+# Evidence sources confirmed from installed package source:
+#   uploadthing/server/index.js — UTApi class, all methods
+#   @uploadthing/shared/dist/index.d.ts — ERROR_CODES, UploadThingError class hierarchy
+#   https://docs.uploadthing.com/api-reference/ut-api
+#   https://docs.uploadthing.com/errors
 package: uploadthing
 semver: ">=6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80
+coverage_score: 0.80  # 8 contracted / 10 total async-callable (2 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
+
+detection:
+  class_names:
+    - "UTApi"
 
 functions:
   - name: UTApi.uploadFiles
     import_path: "uploadthing/server"
-    description: "Upload files to UploadThing storage via UTApi server-side SDK"
+    description: >
+      Uploads one or more files to UploadThing storage from the server. When
+      called with an array of files, returns an array of { data, error } results
+      (per-file — does NOT throw for individual file failures). When called with
+      a single file, returns a single { data, error } object. Configuration
+      failures (MISSING_ENV, INVALID_SERVER_CONFIG) throw UploadThingError before
+      any upload begins. Concurrency parameter (1-25) controls parallel uploads.
 
     postconditions:
       # Evidence: 0 primary firings across 16 repos scanned in scan-uploadthing-2026-04-03.json (all errored during scan)
       # FP check: 0/20 FPs in repos without uploadthing (0% rate)
+      # Source confirmed: uploadthing/server/index.js UTApi.uploadFiles() — executeAsync wrapper
+      # throws for configuration errors; per-file errors returned in result.error
       - id: upload-files-no-try-catch
-        condition: "awaited utapi.uploadFiles() call is not wrapped in try/catch"
-        throws: "UploadThingError"
+        condition: >
+          utapi.uploadFiles() is called without try/catch. Configuration failures
+          (UPLOADTHING_TOKEN missing, invalid server config, concurrency out of range 1-25)
+          throw UploadThingError before any upload begins. If called from a browser
+          context, throws UploadThingError({ code: "INTERNAL_SERVER_ERROR" }).
+        throws: >
+          UploadThingError with code MISSING_ENV (UPLOADTHING_TOKEN not set),
+          INVALID_SERVER_CONFIG (malformed token or config), BAD_REQUEST (concurrency
+          outside 1-25 range), or INTERNAL_SERVER_ERROR (called from browser).
+          Confirmed from source: guardServerOnly() throws on browser, concurrency
+          check throws BAD_REQUEST, executeAsync throws on Cause.squash(exit.cause).
         required_handling: >
-          Caller MUST wrap utapi.uploadFiles() in try/catch. The method makes HTTP
-          requests to UploadThing's servers. UploadThingError is thrown for network
-          failures, quota exceeded, invalid file type, and authentication errors.
-          Error codes include: UPLOAD_FAILED, TOO_LARGE, TOO_MANY_FILES, MISSING_ENV,
-          FORBIDDEN, INTERNAL_SERVER_ERROR.
+          Caller MUST wrap utapi.uploadFiles() in try/catch. Additionally, when
+          uploading multiple files, caller MUST check result.error on each response —
+          individual file failures return { data: null, error: { code, message, data } }
+          rather than throwing.
+
+          Minimum handling:
+            try {
+              const responses = await utapi.uploadFiles(files);
+              const uploaded = [];
+              const failed = [];
+              for (const response of Array.isArray(responses) ? responses : [responses]) {
+                if (response.error) {
+                  failed.push(response.error);
+                } else {
+                  uploaded.push(response.data);
+                }
+              }
+              if (failed.length > 0) {
+                console.error('Some files failed to upload:', failed);
+              }
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                console.error('Upload configuration error:', error.code, error.message);
+              }
+              throw error;
+            }
         sources:
+          - https://docs.uploadthing.com/api-reference/ut-api#uploadfiles
           - https://docs.uploadthing.com/errors
-          - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -34,23 +106,176 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      - id: upload-files-result-error-unchecked
+        condition: >
+          utapi.uploadFiles() is called with an array of files and the caller
+          does not check result.error on each returned item. Individual file upload
+          failures (UPLOAD_FAILED, TOO_LARGE, FILE_LIMIT_EXCEEDED) are returned
+          as { data: null, error: { code, message, data } } rather than thrown.
+          Callers that only do `const results = await utapi.uploadFiles(files)`
+          and then access `results[i].data.key` will get TypeError on failed files.
+        throws: >
+          Does NOT throw for per-file failures. Returns { data: null, error: { code, message } }
+          for each failed file. Codes include: UPLOAD_FAILED (S3 upload error),
+          TOO_LARGE (file exceeds size limit — HTTP 413), FILE_LIMIT_EXCEEDED (storage
+          quota exceeded), MISSING_ENV (config issue at file-upload time).
+          Source: uploadthing/server/index.js Effect.match { onFailure: (error) => ({ data: null, error }) }
+        required_handling: >
+          After awaiting uploadFiles(), iterate results and check result.error.
+          Accessing result.data without checking result.error first causes TypeError
+          when data is null.
+
+            const results = await utapi.uploadFiles(files);
+            for (const result of Array.isArray(results) ? results : [results]) {
+              if (result.error !== null) {
+                // Handle per-file failure — result.data is null here
+                logger.error({ code: result.error.code, message: result.error.message });
+                continue;
+              }
+              // Safe to access result.data here
+              await db.files.create({ key: result.data.key, url: result.data.ufsUrl });
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api#uploadfiles
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: UTApi.uploadFilesFromUrl
+    import_path: "uploadthing/server"
+    description: >
+      Downloads a file from a remote URL on the server, then uploads it to
+      UploadThing storage. Distinct from uploadFiles() in that it first makes
+      an outbound HTTP GET to the source URL before uploading. The download step
+      is a separate failure point. Returns same { data, error } structure as
+      uploadFiles(). Explicitly rejects data: URLs with BAD_REQUEST — use
+      uploadFiles() instead.
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api#uploadfilesfromurl
+      # Source confirmed: uploadthing/server/index.js downloadFile() + uploadFile()
+      # data: URL check: if (url.startsWith("data:")) return Effect.fail({ code: "BAD_REQUEST", ... })
+      # HTTP download: Effect.mapError => { code: "BAD_REQUEST", message: "Failed to download requested file" }
+      - id: upload-from-url-no-try-catch
+        condition: >
+          utapi.uploadFilesFromUrl() is called without try/catch. Configuration
+          errors (UPLOADTHING_TOKEN missing, INVALID_SERVER_CONFIG) throw before
+          any download begins. If concurrency is outside 1-25, throws BAD_REQUEST.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), BAD_REQUEST (concurrency outside 1-25).
+          Per-URL failures are returned in result.error rather than thrown.
+          Confirmed from source: executeAsync throws on Cause.squash(exit.cause).
+        required_handling: >
+          Caller MUST wrap utapi.uploadFilesFromUrl() in try/catch.
+          Also MUST check result.error on each response (same pattern as uploadFiles).
+
+            try {
+              const result = await utapi.uploadFilesFromUrl(url);
+              if (result.error) {
+                console.error('Upload from URL failed:', result.error.code);
+                return null;
+              }
+              return result.data;
+            } catch (error) {
+              console.error('Upload configuration error:', error);
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api#uploadfilesfromurl
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upload-from-url-data-url-rejected
+        condition: >
+          uploadFilesFromUrl() is called with a data: URL (e.g., "data:image/png;base64,...").
+          The source code explicitly checks for data: prefix and returns BAD_REQUEST
+          immediately, before any network request. Callers that pass canvas.toDataURL()
+          or file reader results directly will get a per-result error (not thrown).
+        throws: >
+          Does NOT throw — returns { data: null, error: { code: "BAD_REQUEST",
+          message: "Please use uploadFiles() for data URLs. uploadFilesFromUrl()
+          is intended for use with remote URLs only." } }.
+          Confirmed from source: downloadFile() checks url.startsWith("data:") and
+          returns Effect.fail({ code: "BAD_REQUEST", ... }).
+        required_handling: >
+          Check whether the URL is a data URL before calling uploadFilesFromUrl().
+          Use uploadFiles() instead for data URLs or Blob/File objects:
+
+            if (typeof url === 'string' && url.startsWith('data:')) {
+              // Convert data URL to File and use uploadFiles() instead
+              const blob = await fetch(url).then(r => r.blob());
+              return await utapi.uploadFiles(new File([blob], 'file.png'));
+            }
+            return await utapi.uploadFilesFromUrl(url);
+        sources:
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+          - https://docs.uploadthing.com/api-reference/ut-api#uploadfilesfromurl
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
 
   - name: UTApi.deleteFiles
     import_path: "uploadthing/server"
-    description: "Delete files from UploadThing storage via UTApi"
+    description: >
+      Deletes files from UploadThing storage by fileKey or customId. Makes an
+      HTTPS POST to /v6/deleteFiles. Returns { success: boolean, deletedCount: number }.
+      Note: deleteFiles does NOT throw for missing keys — deleting a non-existent
+      key returns success: true with deletedCount: 0. Only throws for authentication
+      or network-level failures.
 
     postconditions:
       # Evidence: 0 primary firings in scan-uploadthing-2026-04-03.json
+      # Source confirmed: uploadthing/server/index.js UTApi.deleteFiles — requestUploadThing("/v6/deleteFiles")
+      # Returns DeleteFileResponse with { success: Boolean, deletedCount: Number }
       - id: delete-files-no-try-catch
-        condition: "awaited utapi.deleteFiles() call is not wrapped in try/catch"
-        throws: "UploadThingError"
+        condition: >
+          utapi.deleteFiles() is called without try/catch. Authentication failures
+          (UPLOADTHING_TOKEN missing or invalid), network failures, and server
+          errors throw UploadThingError.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), FORBIDDEN (invalid API key — HTTP 403), or
+          INTERNAL_SERVER_ERROR (server failure — HTTP 500).
+          Network failures propagate through executeAsync as UploadThingError.
+          Source: requestUploadThing catches ConfigError → INVALID_SERVER_CONFIG.
         required_handling: >
-          Caller MUST wrap utapi.deleteFiles() in try/catch. The method makes HTTP
-          requests to UploadThing's API. Network failures or invalid file keys throw
-          UploadThingError with codes like NOT_FOUND or INTERNAL_SERVER_ERROR.
+          Caller MUST wrap utapi.deleteFiles() in try/catch. A thrown error means
+          no deletion occurred — files remain in storage. Retry with backoff on
+          network failures.
+
+            try {
+              const { success, deletedCount } = await utapi.deleteFiles(fileKeys);
+              if (!success || deletedCount === 0) {
+                // Keys were not found — files may already be deleted or keys are wrong
+                console.warn('No files deleted — keys may not exist');
+              }
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                console.error('Delete failed:', error.code, error.message);
+              }
+              throw error;
+            }
         sources:
           - https://docs.uploadthing.com/errors
           - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -58,3 +283,290 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: UTApi.generateSignedURL
+    import_path: "uploadthing/server"
+    description: >
+      Generates a presigned URL for accessing a private file without making a
+      round-trip to the UploadThing API. Uses HMAC signing with the API key
+      locally. Returns { ufsUrl: string }. Throws BAD_REQUEST immediately for
+      invalid expiresIn values (non-time-string, or > 7 days). Throws
+      INVALID_SERVER_CONFIG if UPLOADTHING_TOKEN is missing. This is the
+      RECOMMENDED alternative to the deprecated getSignedURL().
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api#generatesignedurl
+      # Source confirmed: uploadthing/server/index.js UTApi.generateSignedURL —
+      #   parseTimeToSeconds(expiresIn), isNaN check throws BAD_REQUEST,
+      #   expiresIn > 86400*7 throws BAD_REQUEST.
+      #   ConfigError → INVALID_SERVER_CONFIG via catchTag.
+      - id: generate-signed-url-no-try-catch
+        condition: >
+          utapi.generateSignedURL() is called without try/catch. Throws UploadThingError
+          with BAD_REQUEST for invalid expiresIn parameter (non-time-string, NaN, or
+          greater than 7 days). Throws INVALID_SERVER_CONFIG when UPLOADTHING_TOKEN
+          is missing or malformed.
+        throws: >
+          UploadThingError with code BAD_REQUEST (invalid expiresIn: "expiresIn must
+          be a valid time string, for example '1d', '2 days', or a number of seconds."
+          OR "expiresIn must be less than 7 days (604800 seconds)."),
+          INVALID_SERVER_CONFIG (UPLOADTHING_TOKEN missing or malformed — includes
+          ConfigError cause), MISSING_ENV (token environment variable not set).
+          Confirmed from source: explicit throw new UploadThingError$1 for both checks.
+        required_handling: >
+          Caller MUST wrap utapi.generateSignedURL() in try/catch. Validate
+          expiresIn before passing — invalid values throw immediately.
+
+            try {
+              const { ufsUrl } = await utapi.generateSignedURL(fileKey, {
+                expiresIn: '1 hour'  // valid: '1h', '30 minutes', 3600 (seconds)
+              });
+              return ufsUrl;
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                if (error.code === 'BAD_REQUEST') {
+                  // Invalid expiresIn — fix the parameter
+                  throw new Error(`Invalid signed URL config: ${error.message}`);
+                }
+                if (error.code === 'INVALID_SERVER_CONFIG' || error.code === 'MISSING_ENV') {
+                  // UPLOADTHING_TOKEN not configured
+                  throw new Error('UploadThing not configured');
+                }
+              }
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api#generatesignedurl
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: UTApi.renameFiles
+    import_path: "uploadthing/server"
+    description: >
+      Renames one or more files in UploadThing storage by updating their display
+      names. Accepts fileKey or customId as identifier. Makes an HTTPS POST to
+      /v6/renameFiles. Returns { success: boolean }. Success does NOT guarantee
+      the rename occurred — the API may return success: true even if the file
+      was not found (undocumented behavior; check UploadThing API changelog).
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api
+      # Source confirmed: uploadthing/server/index.js UTApi.renameFiles —
+      #   requestUploadThing("/v6/renameFiles", { updates: Arr.ensure(updates) }, RenameFileResponse)
+      #   RenameFileResponse schema: { success: S.Boolean }
+      - id: rename-files-no-try-catch
+        condition: >
+          utapi.renameFiles() is called without try/catch. Authentication failures
+          (invalid/missing UPLOADTHING_TOKEN), server errors (5xx), and network
+          failures throw UploadThingError.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), FORBIDDEN (invalid API key — HTTP 403), INTERNAL_SERVER_ERROR
+          (UploadThing API failure — HTTP 500).
+          Source: requestUploadThing catches ConfigError → INVALID_SERVER_CONFIG;
+          executeAsync throws on HTTP non-2xx response.
+        required_handling: >
+          Caller MUST wrap utapi.renameFiles() in try/catch. An uncaught error means
+          the rename did not occur. File retains the original name in storage.
+
+            try {
+              const { success } = await utapi.renameFiles([
+                { fileKey: existingKey, newName: 'profile-photo.jpg' }
+              ]);
+              if (!success) {
+                console.warn('Rename reported as unsuccessful');
+              }
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                console.error('Rename failed:', error.code, error.message);
+              }
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: UTApi.updateACL
+    import_path: "uploadthing/server"
+    description: >
+      Updates the Access Control List for one or more files in UploadThing storage.
+      Valid ACL values: "public-read" (accessible without signed URL) or "private"
+      (requires signed URL). Makes an HTTPS POST to /v6/updateACL. Returns
+      { success: boolean }. Applies to files uploaded to apps with per-file ACL
+      enabled in UploadThing settings.
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api
+      # Source confirmed: uploadthing/server/index.js UTApi.updateACL —
+      #   requestUploadThing("/v6/updateACL", { updates }, responseSchema)
+      #   responseSchema: S.Struct({ success: S.Boolean })
+      - id: update-acl-no-try-catch
+        condition: >
+          utapi.updateACL() is called without try/catch. Authentication failures
+          (invalid/missing UPLOADTHING_TOKEN), server errors, and network failures
+          throw UploadThingError. Also throws if the app does not have per-file ACL
+          enabled in UploadThing settings.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), FORBIDDEN (API key invalid OR per-file ACL not enabled
+          for the app — HTTP 403), INTERNAL_SERVER_ERROR (HTTP 500).
+          Source: requestUploadThing catches ConfigError; executeAsync throws on failure.
+        required_handling: >
+          Caller MUST wrap utapi.updateACL() in try/catch. An uncaught error means
+          the ACL change did not apply — files remain at their previous access level.
+          If updating from public to private, uncaught failure leaves files publicly
+          accessible when they should be private.
+
+            try {
+              await utapi.updateACL(fileKeys, 'private');
+            } catch (error) {
+              if (error instanceof UploadThingError && error.code === 'FORBIDDEN') {
+                // Per-file ACL may not be enabled in your UploadThing account
+                throw new Error('Cannot update ACL: check UploadThing app settings');
+              }
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: UTApi.listFiles
+    import_path: "uploadthing/server"
+    description: >
+      Returns a paginated list of files uploaded to the UploadThing app.
+      Accepts limit (default 500) and offset parameters. Returns
+      { files: [...], hasMore: boolean }. Makes an HTTPS POST to /v6/listFiles.
+      The documentation recommends NOT using listFiles as a primary data source —
+      use your own database instead for performance and reliability. Intended for
+      admin panels, auditing, and one-time migrations.
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api
+      # Source confirmed: uploadthing/server/index.js UTApi.listFiles —
+      #   requestUploadThing("/v6/listFiles", { ...opts }, ListFileResponse)
+      #   ListFileResponse includes hasMore: S.Boolean, files: S.Array(...)
+      - id: list-files-no-try-catch
+        condition: >
+          utapi.listFiles() is called without try/catch. Authentication failures,
+          network failures, and server errors throw UploadThingError. Unlike
+          uploadFiles, there is no per-item error structure — the entire call
+          either succeeds or throws.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), FORBIDDEN (invalid API key — HTTP 403), INTERNAL_SERVER_ERROR
+          (UploadThing API failure — HTTP 500).
+          Source: requestUploadThing catches ConfigError; executeAsync throws on failure.
+        required_handling: >
+          Caller MUST wrap utapi.listFiles() in try/catch. In admin panels or migration
+          scripts, an uncaught error halts the process and may leave a partial list.
+
+            try {
+              const { files, hasMore } = await utapi.listFiles({ limit: 100 });
+              // Process files...
+              if (hasMore) {
+                // Fetch next page with offset
+              }
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                console.error('Failed to list files:', error.code, error.message);
+              }
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: UTApi.getUsageInfo
+    import_path: "uploadthing/server"
+    description: >
+      Returns storage quota information for the UploadThing app: totalBytes,
+      appTotalBytes, filesUploaded, limitBytes. Makes an HTTPS POST to
+      /v6/getUsageInfo. Used for storage monitoring, quota enforcement, and
+      displaying usage statistics to users in billing or settings pages.
+
+    postconditions:
+      # Evidence: https://docs.uploadthing.com/api-reference/ut-api
+      # Source confirmed: uploadthing/server/index.js UTApi.getUsageInfo —
+      #   requestUploadThing("/v6/getUsageInfo", {}, GetUsageInfoResponse)
+      #   GetUsageInfoResponse: { totalBytes, appTotalBytes, filesUploaded, limitBytes }
+      - id: get-usage-info-no-try-catch
+        condition: >
+          utapi.getUsageInfo() is called without try/catch. Authentication failures,
+          network failures, and server errors throw UploadThingError. A storage
+          quota check that throws will prevent the caller from knowing whether
+          uploads are allowed — may cause silent over-quota uploads.
+        throws: >
+          UploadThingError with code MISSING_ENV (token not set), INVALID_SERVER_CONFIG
+          (malformed config), FORBIDDEN (invalid API key — HTTP 403), INTERNAL_SERVER_ERROR
+          (UploadThing API failure — HTTP 500).
+          Source: requestUploadThing catches ConfigError; executeAsync throws on failure.
+        required_handling: >
+          Caller MUST wrap utapi.getUsageInfo() in try/catch. In quota-enforcement
+          flows, an uncaught error prevents quota validation — uploads may proceed
+          past quota limits silently.
+
+            try {
+              const { filesUploaded, limitBytes, appTotalBytes } = await utapi.getUsageInfo();
+              const usagePercent = (appTotalBytes / limitBytes) * 100;
+              if (usagePercent > 90) {
+                console.warn(`Storage at ${usagePercent.toFixed(1)}% capacity`);
+              }
+            } catch (error) {
+              if (error instanceof UploadThingError) {
+                // Don't block uploads on monitoring failure — log and continue
+                console.error('Failed to get usage info:', error.message);
+                return null;
+              }
+              throw error;
+            }
+        sources:
+          - https://docs.uploadthing.com/api-reference/ut-api
+          - https://github.com/pingdotgg/uploadthing/blob/main/packages/uploadthing/src/sdk/index.ts
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+notes:
+  - "UPLOADTHING_TOKEN is the env var name (base64-encoded JSON containing apiKey + appId + region)"
+  - "guardServerOnly() throws INTERNAL_SERVER_ERROR if called from browser context (typeof window !== 'undefined')"
+  - "uploadFiles/uploadFilesFromUrl return { data, error } per file — NOT thrown for per-file failures"
+  - "Per-file error codes include: UPLOAD_FAILED, TOO_LARGE (413), FILE_LIMIT_EXCEEDED, MISSING_ENV"
+  - "deleteFiles does NOT throw for missing keys — returns { success: true, deletedCount: 0 } for non-existent keys"
+  - "generateSignedURL does NOT make network calls — signs locally with HMAC using API key from UPLOADTHING_TOKEN"
+  - "expiresIn for generateSignedURL max is 7 days (604800 seconds); >7 days throws BAD_REQUEST immediately"
+  - "getSignedURL intentionally omitted — deprecated (will be removed in v9), same error profile as generateSignedURL"
+  - "getFileUrls intentionally omitted — deprecated, documented as alternative to direct URL construction"
+  - "updateACL requires per-file ACL to be enabled in UploadThing app settings or returns FORBIDDEN"
+  - "All UTApi methods call guardServerOnly() first — cannot be used in browser/Edge runtime without special config"
+  - "concurrency parameter for uploadFiles/uploadFilesFromUrl: must be 1-25 or BAD_REQUEST is thrown"
