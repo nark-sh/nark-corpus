@@ -28,16 +28,28 @@
 #   Confirmed from @libsql/hrana-client/lib-esm/value.js source and
 #   https://raw.githubusercontent.com/tursodatabase/libsql-client-ts/main/packages/libsql-core/src/api.ts
 # Coverage after pass 4: 8 functions + 1 additional postcondition on execute()
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 5):
+# Added 2 postconditions to execute(): execute-invalid-number-arg, execute-invalid-bigint-arg
+#   These cover RangeErrors thrown at argument serialization time (before network request)
+#   when args contain NaN/Infinity or oversized bigint values.
+#   Both transport modes (HTTP via @libsql/hrana-client and local SQLite via sqlite3.js)
+#   throw RangeErrors — not LibsqlErrors — for invalid argument values.
+#   Confirmed from @libsql/client v0.17.2 source:
+#     @libsql/client/lib-esm/sqlite3.js valueToSql()
+#     @libsql/hrana-client/lib-esm/value.js valueToProto()
+# Coverage after pass 5: 8 functions + 3 total postconditions on execute() (7 postconditions on execute alone)
+# API surface: 13 total (8 contracted, 5 intentionally omitted) — no new API surface discovered
 package: "@libsql/client"
 semver: ">=0.3.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
 coverage_score: 0.62  # 8 contracted / 13 total async-callable (5 intentionally omitted)
 # Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
-# Pass 4 added execute-integer-range-error postcondition to existing execute() function entry
+# Pass 5 added execute-invalid-number-arg and execute-invalid-bigint-arg postconditions
 
 detection:
   function_names:
@@ -144,6 +156,128 @@ functions:
           Option 3: Use intMode: "string" to return all integers as strings.
         sources:
           - "https://raw.githubusercontent.com/tursodatabase/libsql-client-ts/main/packages/libsql-core/src/api.ts"
+          - "https://github.com/tursodatabase/libsql-client-ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: @libsql/client/lib-esm/sqlite3.js valueToSql() and
+      #   @libsql/hrana-client/lib-esm/value.js valueToProto() — both check Number.isFinite()
+      #   before serializing numeric arguments and throw RangeError if value is NaN/Infinity.
+      #   Confirmed from installed @libsql/client v0.17.2 source, 2026-04-17.
+      - id: execute-invalid-number-arg
+        condition: >
+          execute() is called with a parameterized query where the args array contains
+          a JavaScript number that is NaN, Infinity, or -Infinity. This occurs when
+          the argument is produced by a calculation that results in an invalid number
+          (e.g., dividing by zero produces Infinity, Math.sqrt(-1) produces NaN,
+          parseFloat of a non-numeric string produces NaN). The RangeError is thrown
+          synchronously during argument serialization, before any network request is made.
+          Applies to all transport modes (HTTP, WebSocket, local SQLite).
+        throws: >
+          RangeError (not LibsqlError) — thrown synchronously from argument serialization
+          in @libsql/client/lib-esm/sqlite3.js (local) or
+          @libsql/hrana-client/lib-esm/value.js (remote) with message:
+          "Only finite numbers (not Infinity or NaN) can be passed as arguments".
+          This is a plain JavaScript RangeError, NOT a LibsqlError — it has no .code property.
+          A catch block that only checks `instanceof LibsqlError` will NOT catch this error.
+          Same error applies to batch() and transaction.execute() when using number args.
+        required_handling: >
+          Validate computed numeric arguments before passing to execute():
+
+            const ratio = numerator / denominator;  // could be Infinity or NaN
+
+            // Guard before using as query argument:
+            if (!Number.isFinite(ratio)) {
+              throw new Error(`Invalid ratio value: ${ratio} — cannot store NaN or Infinity`);
+            }
+
+            try {
+              await db.execute({
+                sql: 'INSERT INTO metrics (ratio) VALUES (?)',
+                args: [ratio]
+              });
+            } catch (error) {
+              if (error instanceof LibsqlError) {
+                console.error('Database error:', error.message, 'code:', error.code);
+              }
+              throw error;
+            }
+
+          Alternatively, catch all error types (not just LibsqlError):
+            } catch (error) {
+              if (error instanceof RangeError) {
+                // Invalid numeric argument — check args for NaN/Infinity
+                throw new Error(`Invalid argument value: ${error.message}`);
+              }
+              if (error instanceof LibsqlError) { ... }
+              throw error;
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/sqlite3.ts"
+          - "https://github.com/tursodatabase/libsql-client-ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: @libsql/client/lib-esm/sqlite3.js valueToSql() and
+      #   @libsql/hrana-client/lib-esm/value.js valueToProto() — both check bigint range
+      #   against minInteger=-9223372036854775808n (-(2^63)) / maxInteger=9223372036854775807n (2^63-1).
+      #   Confirmed from installed @libsql/client v0.17.2 source, 2026-04-17.
+      - id: execute-invalid-bigint-arg
+        condition: >
+          execute() is called with a parameterized query where the args array contains
+          a JavaScript bigint value that exceeds the SQLite INTEGER range (outside
+          -9223372036854775808 to 9223372036854775807, i.e., -2^63 to 2^63-1).
+          SQLite stores integers as signed 64-bit values, so bigint values outside this
+          range cannot be represented. Common trigger: external IDs from systems using
+          128-bit identifiers, or bigint arithmetic that overflows the 64-bit boundary.
+          The RangeError is thrown synchronously before any network request is made.
+        throws: >
+          RangeError (not LibsqlError) — thrown synchronously from argument serialization
+          in @libsql/client/lib-esm/sqlite3.js with message:
+          "bigint is too large to be represented as a 64-bit integer and passed as argument",
+          or in @libsql/hrana-client/lib-esm/value.js (remote transport) with message:
+          "This bigint value is too large to be represented as a 64-bit integer and passed as argument".
+          Note: the two messages differ slightly ("bigint is too large" vs "This bigint value is too large").
+          This is a plain JavaScript RangeError, NOT a LibsqlError — it has no .code property.
+          Same error applies to batch() and transaction.execute() when using bigint args.
+        required_handling: >
+          Validate bigint arguments before passing to execute():
+
+            const externalId = someExternalSystem.getId();  // could be 128-bit ID as bigint
+            const maxSqliteInt = 9223372036854775807n;  // 2^63 - 1
+            const minSqliteInt = -9223372036854775808n; // -(2^63)
+
+            if (externalId > maxSqliteInt || externalId < minSqliteInt) {
+              throw new Error(`ID ${externalId} exceeds SQLite INTEGER range — store as TEXT instead`);
+            }
+
+            try {
+              await db.execute({
+                sql: 'INSERT INTO items (external_id) VALUES (?)',
+                args: [externalId]
+              });
+            } catch (error) {
+              if (error instanceof RangeError) {
+                throw new Error(`Argument bigint out of range: ${error.message}`);
+              }
+              if (error instanceof LibsqlError) { ... }
+              throw error;
+            }
+
+          Note: For IDs that may exceed 64-bit range, use TEXT column type and pass the
+          bigint as a string: args: [externalId.toString()].
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/sqlite3.ts"
           - "https://github.com/tursodatabase/libsql-client-ts"
         severity: warning
         business_impact:

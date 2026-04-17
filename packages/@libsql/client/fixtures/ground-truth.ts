@@ -271,3 +271,97 @@ export async function fetchLargeIdRowWithFullCatch() {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. execute() with NaN/Infinity argument — RangeError at serialization time
+// Postcondition: execute-invalid-number-arg
+// NOTE: Scanner detection rule not yet implemented.
+// This postcondition fires when args contains NaN or Infinity (from computation).
+// RangeError thrown before network request — NOT a LibsqlError.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: execute-invalid-number-arg
+// Future SHOULD_FIRE: execute() passes a computed number that may be NaN/Infinity
+// Only LibsqlError is caught — RangeError from argument validation is missed
+export async function insertMetricNanArg(value: number, divisor: number) {
+  const ratio = value / divisor; // could be Infinity (divisor=0) or NaN (NaN input)
+  try {
+    // SHOULD_FIRE: no validation of ratio before use as arg; only LibsqlError caught
+    await db.execute({
+      sql: "INSERT INTO metrics (name, ratio) VALUES (?, ?)",
+      args: ["my_metric", ratio],
+    });
+    // RangeError thrown synchronously if ratio is NaN or Infinity — not caught here
+  } catch (error) {
+    if (error instanceof Error && error.constructor.name === "LibsqlError") {
+      console.error("DB error:", error.message);
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: validates ratio before using as arg, catching RangeError case
+export async function insertMetricValidatedArg(value: number, divisor: number) {
+  const ratio = value / divisor;
+  if (!Number.isFinite(ratio)) {
+    throw new Error(`Invalid ratio: ${ratio} — NaN or Infinity cannot be stored`);
+  }
+  try {
+    // SHOULD_NOT_FIRE: ratio validated to be finite before use
+    await db.execute({
+      sql: "INSERT INTO metrics (name, ratio) VALUES (?, ?)",
+      args: ["my_metric", ratio],
+    });
+  } catch (error) {
+    console.error("DB error:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. execute() with oversized bigint argument — RangeError at serialization time
+// Postcondition: execute-invalid-bigint-arg
+// NOTE: Scanner detection rule not yet implemented.
+// This postcondition fires when args contains bigint > 2^63-1 or < -(2^63).
+// RangeError thrown before network request — NOT a LibsqlError.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: execute-invalid-bigint-arg
+// Future SHOULD_FIRE: execute() passes a bigint that may exceed SQLite INTEGER range
+// Only generic error caught — no RangeError handling for oversized bigint arg
+export async function insertExternalIdNoCatch(externalId: bigint) {
+  try {
+    // SHOULD_FIRE: no range check on externalId bigint; only generic catch
+    await db.execute({
+      sql: "INSERT INTO items (external_id) VALUES (?)",
+      args: [externalId],
+    });
+    // RangeError if externalId > 9223372036854775807n (2^63-1) — caught only by generic catch below
+  } catch (error) {
+    if (error instanceof Error && error.constructor.name === "LibsqlError") {
+      console.error("DB error:", error.message);
+    }
+    throw error; // RangeError propagates unhandled to caller
+  }
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: validates bigint is in SQLite INTEGER range before use
+export async function insertExternalIdValidated(externalId: bigint) {
+  const maxSqliteInt = 9223372036854775807n;
+  const minSqliteInt = -9223372036854775808n;
+  if (externalId > maxSqliteInt || externalId < minSqliteInt) {
+    throw new Error(`External ID ${externalId} exceeds SQLite INTEGER range — store as TEXT`);
+  }
+  try {
+    // SHOULD_NOT_FIRE: bigint validated before use
+    await db.execute({
+      sql: "INSERT INTO items (external_id) VALUES (?)",
+      args: [externalId],
+    });
+  } catch (error) {
+    console.error("DB error:", error);
+    throw error;
+  }
+}

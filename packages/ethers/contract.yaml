@@ -903,6 +903,141 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: Contract.method
+    import_path: "ethers"
+    description: >
+      Direct invocation of a smart contract method via the Contract proxy: `await contract.transfer(to, amount)`.
+      This is the most common pattern for state-changing contract interactions (ERC-20 transfers,
+      NFT mints, DeFi operations, DAO voting). Returns a ContractTransactionResponse that must
+      then be confirmed via .wait(). Two key failure modes: (1) the contract call is rejected by
+      the EVM (revert / custom error), and (2) the method is called without a signer attached.
+      Both failures are silent if not wrapped in try-catch.
+    patterns:
+      - 'contract\.'
+      - 'await contract\.'
+    postconditions:
+      # Evidence: lib.esm/contract/contract.js:147-157 -- staticCall path:
+      #   assert(canCall(runner), "contract runner does not support calling", "UNSUPPORTED_OPERATION")
+      #   catch (error) { if (isCallException(error) && error.data) { throw contract.interface.makeError(error.data, tx); } }
+      # Evidence: lib.esm/contract/contract.js:161-168 -- send path:
+      #   assert(canSend(runner), "contract runner does not support sending transactions", "UNSUPPORTED_OPERATION")
+      # Evidence: https://docs.ethers.org/v6/api/utils/errors/ -- CALL_EXCEPTION, UNSUPPORTED_OPERATION docs
+      # Evidence: provider-jsonrpc.js:677-729 -- INSUFFICIENT_FUNDS, NONCE_EXPIRED mapped from eth_sendTransaction
+      - id: contract-method-call-exception
+        condition: >
+          A state-changing contract method (e.g., transfer, mint, approve, vote) is called
+          without a try-catch block. The contract reverts due to a custom error or require()
+          failure (e.g., insufficient balance, unauthorized caller, invalid state). The EVM
+          returns revert data which ethers decodes into a CALL_EXCEPTION EthersError.
+          Common in DeFi: transferring more tokens than balance, calling mint() after limit
+          reached, voting twice on same proposal.
+        throws: "EthersError with code CALL_EXCEPTION (error.code === 'CALL_EXCEPTION')"
+        required_handling: >
+          Caller MUST wrap contract method calls in try-catch. Use isError(error, 'CALL_EXCEPTION')
+          to specifically handle contract reverts. Check error.revert?.name for the custom error
+          name and error.reason for the require() message. Distinguish CALL_EXCEPTION (contract
+          rejected the operation) from INSUFFICIENT_FUNDS (insufficient ETH for gas) and
+          NONCE_EXPIRED (transaction management issue).
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+          - "https://docs.ethers.org/v6/api/contract/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: contract-method-no-signer
+        condition: >
+          A state-changing contract method is called on a Contract instance connected
+          to a read-only Provider (not a Signer). Common pattern: `const contract = new Contract(addr, abi, provider)`
+          followed by `await contract.transfer(...)`. The contract runner fails the
+          canSend() check and throws immediately before any RPC call is made.
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION', error.operation === 'sendTransaction')"
+        required_handling: >
+          Caller MUST ensure the Contract is connected to a Signer, not a Provider, when calling
+          state-changing methods. Use `contract.connect(signer)` or pass a Signer to the constructor.
+          For read-only calls (view/pure functions), a Provider is sufficient. Add runtime check:
+          if (!(contract.runner instanceof ethers.Signer)) throw new Error('signer required').
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: provider.send
+    import_path: "ethers"
+    description: >
+      Sends a raw JSON-RPC request to the Ethereum node: `await provider.send(method, params)`.
+      Used for advanced integrations that need methods not exposed via high-level Provider API,
+      such as eth_getProof, trace_transaction, debug_traceTransaction, wallet_addEthereumChain,
+      personal_listAccounts, and custom node methods. Bypasses ethers' high-level error mapping
+      for most methods — errors propagate as UNSUPPORTED_OPERATION (method not found) or
+      UNKNOWN_ERROR. If the provider has been destroyed, throws immediately.
+    postconditions:
+      # Evidence: lib.esm/providers/provider-jsonrpc.js:671-744 -- getRpcError():
+      #   if (unsupported) { return makeError("unsupported operation", "UNSUPPORTED_OPERATION", ...) }
+      #   return makeError("could not coalesce error", "UNKNOWN_ERROR", ...) -- fallthrough
+      # Evidence: lib.esm/providers/provider-jsonrpc.js:760-776 -- send():
+      #   if (this.destroyed) { return Promise.reject(makeError("provider destroyed", "UNSUPPORTED_OPERATION")) }
+      # Evidence: https://docs.ethers.org/v6/api/providers/jsonrpc/#JsonRpcApiProvider-send
+      - id: provider-send-unsupported-method
+        condition: >
+          provider.send() is called without a try-catch and the JSON-RPC method is not
+          supported by the connected node (e.g., calling Infura with 'trace_transaction' which
+          requires Alchemy's trace API, or calling 'eth_getProof' on a light node). The node
+          returns error code -32601 ("Method not found"). ethers maps this to UNSUPPORTED_OPERATION.
+          Also thrown when calling send() after the provider is destroyed.
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION')"
+        required_handling: >
+          Caller MUST wrap provider.send() in try-catch. Use isError(error, 'UNSUPPORTED_OPERATION')
+          to detect unsupported method errors. For provider-capability detection, call a test
+          method before deploying to production and fail fast with a clear configuration error.
+          Consider falling back to alternative providers if the primary RPC lacks the required method.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/jsonrpc/#JsonRpcApiProvider-send"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: provider-send-network-error
+        condition: >
+          provider.send() is called without a try-catch and the RPC call fails due to
+          network connectivity issues (WebSocket disconnect, HTTP timeout, connection refused).
+          These propagate as SERVER_ERROR or NETWORK_ERROR from the underlying transport.
+          Common in serverless functions with cold start network initialization delays.
+        throws: "EthersError with code SERVER_ERROR or NETWORK_ERROR (error.code === 'SERVER_ERROR' | 'NETWORK_ERROR')"
+        required_handling: >
+          Caller MUST wrap provider.send() in try-catch and handle SERVER_ERROR and NETWORK_ERROR
+          separately from UNSUPPORTED_OPERATION. For resilience, implement retry logic with
+          exponential backoff for SERVER_ERROR. For NETWORK_ERROR, verify provider connectivity
+          before making calls or use a FallbackProvider for automatic failover.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/jsonrpc/#JsonRpcApiProvider-send"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -937,10 +1072,11 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-04-16"
+  last_verified: "2026-04-17"
   evidence_quality: confirmed
-  coverage_score: 0.67
-  # 16 contracted functions / 24 total async-callable (11 intentionally omitted, 13 previously contracted)
+  coverage_score: 0.75
+  # 18 contracted functions / 24 total async-callable (11 intentionally omitted)
+  # Coverage: 18/24 = 0.75 (effective: 18 contracted of 13 non-omitted surface = well-covered)
   # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
   #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
   #   provider.waitForTransaction, provider.getLogs
@@ -948,6 +1084,7 @@ metadata:
   #   Contract.queryFilter, wallet.signTypedData
   # Added deepen-stream-2 pass 7: BrowserProvider.getSigner, Wallet.encrypt,
   #   JsonRpcProvider.getSigner
+  # Added deepen-stream-2 pass 8 (2026-04-17): Contract.method, provider.send
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR

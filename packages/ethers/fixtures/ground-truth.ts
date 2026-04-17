@@ -3,6 +3,7 @@
  * Added by deepen-stream-1 pass 2 on 2026-04-16.
  * Updated by deepen-stream-2 pass 4 on 2026-04-17.
  * Updated by deepen-stream-2 pass 7 on 2026-04-16.
+ * Updated by deepen-stream-2 pass 8 on 2026-04-17.
  *
  * Postconditions covered:
  *  - wait-transaction-replaced (TransactionResponse.wait)
@@ -24,6 +25,10 @@
  *  - encrypt-invalid-scrypt-options (Wallet.encrypt)
  *  - encrypt-oom-crash (Wallet.encrypt)
  *  - jsonrpc-getsigner-no-such-account (JsonRpcProvider.getSigner)
+ *  - contract-method-call-exception (Contract.method)
+ *  - contract-method-no-signer (Contract.method)
+ *  - provider-send-unsupported-method (provider.send)
+ *  - provider-send-network-error (provider.send)
  */
 
 import { ethers, isError, Wallet, ContractFactory, BaseContract, BrowserProvider, JsonRpcProvider } from 'ethers';
@@ -414,6 +419,98 @@ async function getJsonRpcSignerSafely(
       error.message === 'invalid account'
     )) {
       throw new Error(`Account index ${accountIndex} not available on this node`);
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// PASS 8 additions: Contract.method, provider.send
+//   (added 2026-04-17)
+// ============================================================
+
+// Helper interface for typed contract method calls
+interface ERC20Contract extends ethers.BaseContract {
+  transfer(to: string, amount: bigint): Promise<ethers.ContractTransactionResponse>;
+  balanceOf(owner: string): Promise<bigint>;
+}
+
+// @expect-violation: contract-method-call-exception
+// @expect-violation: contract-method-no-signer
+async function callContractMethodWithoutErrorHandling(
+  contract: ERC20Contract,
+  recipient: string,
+  amount: bigint
+) {
+  // Missing try-catch -- CALL_EXCEPTION on revert, UNSUPPORTED_OPERATION if no signer
+  const tx = await contract.transfer(recipient, amount);
+  const receipt = await tx.wait();
+  return receipt;
+}
+
+// @expect-violation: provider-send-unsupported-method
+// @expect-violation: provider-send-network-error
+async function sendRawRpcWithoutErrorHandling(
+  provider: JsonRpcProvider,
+  txHash: string
+) {
+  // Missing try-catch -- UNSUPPORTED_OPERATION if node doesn't support trace_transaction,
+  // SERVER_ERROR or NETWORK_ERROR on connectivity failure
+  const trace = await provider.send('trace_transaction', [txHash]);
+  return trace;
+}
+
+// @expect-clean
+async function callContractMethodWithErrorHandling(
+  contract: ERC20Contract,
+  recipient: string,
+  amount: bigint
+) {
+  try {
+    const tx = await contract.transfer(recipient, amount);
+    try {
+      const receipt = await tx.wait();
+      return receipt;
+    } catch (waitError) {
+      if (isError(waitError, 'CALL_EXCEPTION')) {
+        throw new Error(`Transfer reverted: ${waitError.shortMessage}`);
+      }
+      if (isError(waitError, 'TRANSACTION_REPLACED')) {
+        if (waitError.cancelled) {
+          throw new Error('Transfer transaction was cancelled (replaced with lower-gas tx)');
+        }
+        return waitError.receipt;
+      }
+      throw waitError;
+    }
+  } catch (sendError) {
+    if (isError(sendError, 'UNSUPPORTED_OPERATION')) {
+      throw new Error('Contract must be connected to a Signer to send transactions');
+    }
+    if (isError(sendError, 'INSUFFICIENT_FUNDS')) {
+      throw new Error('Insufficient ETH to cover gas for this transfer');
+    }
+    if (isError(sendError, 'NONCE_EXPIRED')) {
+      throw new Error('Transaction nonce already used -- retry with fresh nonce');
+    }
+    throw sendError;
+  }
+}
+
+// @expect-clean
+async function sendRawRpcWithErrorHandling(
+  provider: JsonRpcProvider,
+  txHash: string
+) {
+  try {
+    const trace = await provider.send('trace_transaction', [txHash]);
+    return trace;
+  } catch (error) {
+    if (isError(error, 'UNSUPPORTED_OPERATION')) {
+      throw new Error('This RPC provider does not support trace_transaction -- use Alchemy with trace API enabled');
+    }
+    if (isError(error, 'SERVER_ERROR') || isError(error, 'NETWORK_ERROR')) {
+      throw new Error(`RPC request failed: ${error instanceof Error ? error.message : 'network error'}`);
     }
     throw error;
   }
