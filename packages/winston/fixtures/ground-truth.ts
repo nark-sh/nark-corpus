@@ -130,3 +130,35 @@ export {
   httpTransportViolation, loggerWithHttpViolation,
   httpTransportClean, loggerWithHttpClean,
 };
+
+// =============================================================================
+// configure() and add() — synchronous throws, detectable via ThrowingFunctionDetector
+// =============================================================================
+
+const loggerForConfigureTest = winston.createLogger({ level: 'info', transports: [new winston.transports.Console()] });
+loggerForConfigureTest.on('error', (err: Error) => console.error(err));
+
+// SHOULD_FIRE: configure-throws-on-v2-options — configure() without try-catch throws synchronously on deprecated v2 options
+loggerForConfigureTest.configure({ level: 'debug', transports: [new winston.transports.Console()] });
+
+// SHOULD_NOT_FIRE: configure() wrapped in try-catch — synchronous throw is handled
+try {
+  loggerForConfigureTest.configure({ level: 'debug', transports: [new winston.transports.Console()] });
+} catch (err) {
+  console.error('Logger reconfigure failed:', err);
+}
+
+const loggerForAddTest = winston.createLogger({ level: 'info' });
+loggerForAddTest.on('error', (err: Error) => console.error(err));
+
+// SHOULD_FIRE: add-throws-on-non-objectmode-transport — add() without try-catch throws synchronously on invalid transport
+loggerForAddTest.add(new winston.transports.Console());
+
+// SHOULD_NOT_FIRE: add() wrapped in try-catch — synchronous throw is handled
+try {
+  loggerForAddTest.add(new winston.transports.Console());
+} catch (err) {
+  console.error('Transport add failed:', err);
+}
+
+export { loggerForConfigureTest, loggerForAddTest };
