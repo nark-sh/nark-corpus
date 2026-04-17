@@ -242,5 +242,113 @@ async function waitForJobWithErrorHandling() {
   }
 }
 
+// ============================================================
+// Queue.whenCurrentJobsFinished — VIOLATION CASES
+// ============================================================
+
+// @expect-violation: when-current-jobs-not-awaited-before-close
+async function shutdownWithoutWaitingForJobs() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ Calling close() without first awaiting whenCurrentJobsFinished()
+  // Active jobs are cut off mid-execution → stall on next startup → duplicate processing
+  await queue.close();
+}
+
+// @expect-clean
+async function gracefulShutdownWithWaitForJobs() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  // ✅ Wait for active jobs to finish before closing
+  await queue.whenCurrentJobsFinished();
+  await queue.close();
+}
+
+// ============================================================
+// Queue.removeJobs — VIOLATION CASES
+// ============================================================
+
+// @expect-violation: remove-jobs-no-try-catch
+async function removeJobsWithoutErrorHandling() {
+  const queue = new Queue('cleanup-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — Redis connection errors propagate as unhandled rejections
+  await queue.removeJobs('email-*');
+}
+
+// @expect-clean
+async function removeJobsWithErrorHandling() {
+  const queue = new Queue('cleanup-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    // ✅ Wrapped in try-catch — zero matches silently succeeds, Redis errors are caught
+    await queue.removeJobs('email-*');
+  } catch (err) {
+    console.error('Failed to remove jobs:', err);
+    throw err;
+  }
+}
+
+// ============================================================
+// Job.releaseLock — VIOLATION CASES
+// ============================================================
+
+// @expect-violation: release-lock-no-try-catch
+async function releaseLockWithoutErrorHandling(job: Job) {
+  // ❌ No try-catch — throws Error('Could not release lock for job <id>') if not owner
+  await job.releaseLock();
+}
+
+// @expect-clean
+async function releaseLockWithErrorHandling(job: Job) {
+  try {
+    // ✅ Wrapped in try-catch — handles lock ownership errors gracefully
+    await job.releaseLock();
+  } catch (err: any) {
+    console.error('Could not release lock:', err.message);
+    // Lock expired via TTL — no retry needed
+  }
+}
+
+// ============================================================
+// Job.moveToFailed — VIOLATION CASES
+// ============================================================
+
+// @expect-violation: move-to-failed-no-try-catch
+async function moveToFailedWithoutErrorHandling(job: Job) {
+  // ❌ No try-catch — throws when job missing (-1), wrong state (-3), lock mismatch (-6)
+  await job.moveToFailed({ message: 'Processing error' });
+}
+
+// @expect-clean
+async function moveToFailedWithErrorHandling(job: Job) {
+  try {
+    // ✅ Wrapped in try-catch — handles all finishedErrors codes
+    await job.moveToFailed({ message: 'Processing error' });
+  } catch (err: any) {
+    if (err.message.includes('Missing key')) {
+      // Job was already cleaned up — safe to ignore
+      console.log('Job already removed:', job.id);
+    } else if (err.message.includes('is not in the active state')) {
+      // Job completed via another path — safe to ignore
+      console.log('Job already completed:', job.id);
+    } else {
+      throw err;
+    }
+  }
+}
+
 // Stub for compilation
 async function processWork(data: any) { return data; }

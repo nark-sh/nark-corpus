@@ -2,11 +2,12 @@ package: bull
 semver: ">=3.0.0 <5.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"  # deepen-stream-2 pass 2: expanded from 2→9 contracted functions
+last_verified: "2026-04-17"  # deepen-stream-2 pass 5: expanded from 17→21 contracted functions
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.41  # 9 contracted / 22 total async-callable (13 omitted read-only/monitoring)
-# effective_coverage: 1.0 — 9/9 non-omitted functions contracted
+coverage_score: 0.70  # 21 contracted / 30 total async-callable (13 omitted read-only/monitoring, +4 this pass)
+# effective_coverage: 1.0 — 21/21 non-omitted functions contracted
+# functions_added_this_pass: Queue.whenCurrentJobsFinished, Queue.removeJobs, Job.releaseLock, Job.moveToFailed
 
 # Event handler detection NOW SUPPORTED (as of 2026-02-27):
 # The EventListenerAnalyzer can now detect missing event handlers:
@@ -612,6 +613,395 @@ functions:
           incident_cost_range: low
         evidence_quality: confirmed
 
+  # Evidence: bull/lib/queue.js Queue.prototype.empty() — uses multi.exec() then iterates jobKeys
+  # Not atomic: deletes wait/paused/delayed lists first, then removes individual job hashes in a loop.
+  # Comment in source: "TODO: Use EVAL to make this operation fully atomic."
+  # If process is killed between MULTI/EXEC and job key deletion, orphaned job hashes remain.
+  - name: Queue.empty
+    import_path: "bull"
+    description: >
+      Empties the queue by deleting all waiting, paused, and delayed jobs and their associated
+      Redis keys. Uses a Redis MULTI/EXEC pipeline but is NOT fully atomic — there is a window
+      between deleting the list keys and removing the individual job hashes where a crash
+      can leave zombie jobs in Redis. Returns a promise that resolves after all keys are deleted.
+      CAUTION: This operation is irreversible. All pending jobs are lost.
+    postconditions:
+      # Evidence: bull/lib/queue.js Queue.prototype.empty() source comment:
+      # "Note that if some other process is adding jobs at the same time as emptying,
+      # the queues may not be really empty after this method has executed completely."
+      - id: empty-concurrent-add-race
+        condition: "Queue.empty() called while another process is concurrently adding jobs to the queue"
+        severity: warning
+        description: >
+          Queue.empty() is not atomic — if another process adds a job between the MULTI/EXEC
+          that clears list keys and the subsequent job hash deletion loop, the newly added job
+          may persist with no list entry (zombie job). Bull's own documentation notes:
+          "the queues may not be really empty after this method has executed completely."
+          In multi-process or clustered environments, concurrent add() calls race with empty().
+        required_handling: >
+          Caller SHOULD pause the queue before emptying to prevent concurrent adds.
+          Add: await queue.pause(); await queue.empty(); await queue.resume().
+          In single-process environments without concurrent writers, this is safe.
+          In clustered environments, coordinate empty() with a distributed lock.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+          - "https://raw.githubusercontent.com/OptimalBits/bull/master/REFERENCE.md"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: source comment: "if the method does error between emptying the lists and removing
+      # all the jobs, there will be zombie jobs left in redis."
+      - id: empty-zombie-jobs-on-crash
+        condition: "Queue.empty() called without wrapping in try-catch, and Redis connection drops mid-execution"
+        severity: error
+        description: >
+          Queue.empty() has two phases: (1) MULTI/EXEC to delete list keys, (2) individual
+          DEL commands for each job hash. If Redis connection drops or the process crashes
+          between these phases, job hashes remain orphaned in Redis with no list reference
+          ('zombie jobs'). These zombie jobs consume memory indefinitely and can only be
+          removed by manually scanning Redis with KEYS/SCAN. The source explicitly warns:
+          "if the method does error between emptying the lists and removing all the jobs,
+          there will be zombie jobs left in redis."
+        required_handling: >
+          Caller MUST wrap Queue.empty() in try-catch. On error, scan Redis for orphaned
+          job keys and clean them up. Consider using Queue.obliterate({ force: true }) for
+          a more complete cleanup in test environments, as obliterate uses Lua scripts
+          that are more atomic than empty().
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/repeatable.js Queue.prototype.removeRepeatable() — computes repeatJobKey from
+  # name + RepeatOpts, then calls Lua removeRepeatable script. If key doesn't match, ZREM returns 0
+  # (no error thrown — silent no-op). Common bug: slightly different opts (e.g. timezone, every vs cron)
+  # produces a different key that doesn't match the scheduled job.
+  - name: Queue.removeRepeatable
+    import_path: "bull"
+    description: >
+      Removes a repeating job schedule from the queue. The caller must provide identical
+      name and RepeatOpts that were used when the job was originally added via Queue.add().
+      Internally computes a repeatJobKey from the options and removes the matching Redis sorted
+      set entry plus any pending delayed job for that schedule. If the key does not match
+      (e.g. different cron string, different timezone, different jobId), the operation is a
+      silent no-op — no error is thrown but the repeating job continues to run.
+    postconditions:
+      # Evidence: bull/lib/scripts/removeRepeatable-2.js Lua script:
+      # local millis = redis.call("ZSCORE", KEYS[1], ARGV[2])
+      # if(millis) then ... end  -- silently does nothing if ARGV[2] not in the set
+      # redis.call("ZREM", KEYS[1], ARGV[2]) -- ZREM returns 0 if key not found, no error
+      - id: remove-repeatable-silent-mismatch
+        condition: "removeRepeatable() called with RepeatOpts that do not exactly match the scheduled job's options"
+        severity: error
+        description: >
+          If the name or RepeatOpts passed to removeRepeatable() do not exactly match
+          those used when the repeating job was created, the Lua script's ZSCORE call
+          returns nil and ZREM returns 0 — no error is thrown. The repeating job
+          continues executing indefinitely. Common mismatches:
+          - Different cron string format (e.g. '0 * * * *' vs '0 */1 * * *')
+          - Missing or different timezone field
+          - Different jobId prefix
+          - Different name argument
+          Callers assuming removal was successful will have a scheduling leak.
+        required_handling: >
+          After calling removeRepeatable(), verify removal by calling
+          queue.getRepeatableJobs() and checking that the job no longer appears.
+          Store the exact RepeatOpts used at creation time (e.g. in a database)
+          to ensure they can be reproduced exactly for removal.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/repeatable.js"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts/removeRepeatable-2.js"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/repeatable.js Queue.prototype.removeRepeatableByKey() — same Lua script
+  # as removeRepeatable but uses the key string directly. Key format: "<name>:<id>:<endDate>:<tz>:<cron>"
+  # If the key is stale or misformatted, ZREM returns 0 — silent no-op.
+  - name: Queue.removeRepeatableByKey
+    import_path: "bull"
+    description: >
+      Removes a repeating job schedule identified by its full key string. The key is the
+      string representation returned by getRepeatableJobs() in the 'key' field. Internally
+      uses the same Lua removeRepeatable script as removeRepeatable(). Silently does nothing
+      if the key does not match any scheduled job. This is the preferred removal method when
+      you store the key at creation time, as it avoids option-matching issues.
+    postconditions:
+      # Evidence: bull/lib/repeatable.js — same removeRepeatable Lua script, same silent no-op behavior
+      - id: remove-repeatable-by-key-silent-noop
+        condition: "removeRepeatableByKey() called with a key that no longer exists or was already removed"
+        severity: warning
+        description: >
+          If the repeatJobKey argument does not match any entry in the Redis sorted set
+          (e.g. job was already removed, key was computed incorrectly, or key format has
+          changed across Bull versions), the operation resolves successfully with no action.
+          No error is thrown. Callers that rely on this operation for idempotent cleanup
+          flows (e.g. on worker shutdown) will not detect the double-remove or stale key.
+        required_handling: >
+          For idempotent cleanup, the silent no-op behavior is acceptable by design.
+          For critical schedule removal, verify with queue.getRepeatableJobs() after calling.
+          Log the key being removed so that failed removals can be diagnosed via monitoring.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/repeatable.js"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/scripts.js scripts.updateProgress() — calls updateProgress Redis command,
+  # if code < 0, throws scripts.finishedErrors(code, job.id, 'updateProgress').
+  # finishedErrors(-1) = "Missing key for job <id> updateProgress" (job deleted from Redis)
+  # finishedErrors(-2) = "Missing lock for job <id> updateProgress" (lock expired / stolen)
+  # Common failure mode: long-running jobs with CPU-intensive work lose lock, job restarts on
+  # another worker, original worker's progress() calls start throwing on next call.
+  - name: Job.progress
+    import_path: "bull"
+    description: >
+      Reports progress (0-100) for the currently executing job. When called with a value,
+      updates the job's progress field in Redis and emits a 'progress' event on the queue.
+      When called without arguments, returns the current progress value synchronously (no
+      Redis call). The Redis-writing variant returns a Promise that can reject — callers in
+      job processors often forget to await it or handle its rejection.
+    postconditions:
+      # Evidence: bull/lib/scripts.js scripts.updateProgress() lines ~140-155:
+      # if (code < 0) { throw scripts.finishedErrors(code, job.id, 'updateProgress'); }
+      # finishedErrors(-1): "Missing key for job <id> updateProgress"
+      # finishedErrors(-2): "Missing lock for job <id> updateProgress"
+      - id: progress-job-key-missing
+        condition: "job.progress(value) called after the job has been deleted from Redis (e.g. removeOnComplete/removeOnFail removed it, or Redis eviction)"
+        severity: error
+        description: >
+          Throws Error("Missing key for job <id> updateProgress") when the job's Redis key
+          no longer exists. This happens when removeOnComplete or removeOnFail options are
+          set and the job finished on another worker while this worker was still executing
+          — a race condition in distributed processing. Also happens if Redis evicted the
+          job key due to maxmemory policy. Unhandled, this crashes the job processor and
+          leaves the next job stuck.
+        required_handling: >
+          Callers SHOULD wrap job.progress() in try-catch within the processor function.
+          Alternatively, avoid calling progress() after performing operations that might
+          cause the job to be considered complete (e.g. don't call progress after the
+          business operation that marks success — the job may have been cleaned up).
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/scripts.js finishedErrors(-2): "Missing lock for job <id> updateProgress"
+      # When a job stalls and is picked up by another worker, the original worker's lock is invalid.
+      # Subsequent progress() calls from the stale worker throw -2 lock error.
+      - id: progress-lock-lost
+        condition: "job.progress(value) called after the job's lock has expired or been taken by another worker"
+        severity: error
+        description: >
+          Throws Error("Missing lock for job <id> updateProgress") when the Bull lock on
+          the job has expired (lockStalledInterval elapsed without renewal) or been claimed
+          by another worker that picked up the stalled job. The original worker is now a
+          'zombie processor' — its progress() calls fail but it may continue executing
+          business logic (causing duplicate work). This is a critical split-brain scenario
+          in distributed Bull deployments.
+        required_handling: >
+          Caller SHOULD check for this error in progress() and immediately abort
+          the processor function to prevent further duplicate work:
+          try { await job.progress(50); }
+          catch (err) { if (err.message.includes('Missing lock')) return; throw err; }
+          Increase lockDuration and lockRenewTime to prevent premature lock expiry.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.update() calls scripts.updateData()
+  # scripts.updateData() returns code; if code < 0, throws finishedErrors(code, id, 'updateData')
+  # finishedErrors(-1): "Missing key for job <id> updateData" — job was deleted
+  # finishedErrors(-3): "Job <id> is not in the active state. updateData"
+  - name: Job.update
+    import_path: "bull"
+    description: >
+      Updates the job's data payload in Redis while the job is being processed. This is
+      used to persist intermediate state for long-running jobs (e.g. recording a transaction
+      ID after a payment is charged but before fulfillment is complete). Only works on
+      jobs in the active state — throws if the job is no longer active (completed, failed,
+      or removed). Returns a Promise.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.update() → scripts.updateData()
+      # if (code < 0) { throw scripts.finishedErrors(code, this.id, 'updateData'); }
+      - id: update-job-not-active
+        condition: "job.update(data) called on a job that is no longer in the active state"
+        severity: error
+        description: >
+          Throws Error("Missing key for job <id> updateData") or
+          Error("Job <id> is not in the active state. updateData") when job.update() is
+          called after the job has completed, failed, or been removed from Redis. This
+          occurs in async processor patterns where update() is called after an await that
+          takes long enough for the job to time out and be reprocessed elsewhere, or when
+          removeOnComplete removes the job while update() is still pending.
+        required_handling: >
+          Caller MUST wrap job.update() in try-catch. Store critical intermediate state
+          in external storage (database) rather than relying solely on job.update() —
+          Redis TTL and job removal policies can destroy this data unexpectedly.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.remove() → scripts.remove(queue, job.id)
+  # then checks: if (!removed) { throw new Error('Could not remove job ' + job.id); }
+  # This throws when the job is active (locked by a worker) or already removed.
+  # Active jobs cannot be removed — they must fail/complete first.
+  - name: Job.remove
+    import_path: "bull"
+    description: >
+      Removes a job from the queue and all associated Redis lists (waiting, delayed,
+      completed, failed, etc.). Returns a promise that resolves when the job is removed,
+      or rejects if removal fails (e.g. job is currently active/locked). Commonly used
+      in admin dashboards and dead-letter-queue management flows.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.remove():
+      # scripts.remove(queue, job.id).then(removed => {
+      #   if (removed) { queue.emit('removed', job); }
+      #   else { throw new Error('Could not remove job ' + job.id); }
+      # })
+      - id: remove-active-job-error
+        condition: "job.remove() called on a job that is currently being processed (active/locked)"
+        throws: "Error('Could not remove job <id>')"
+        severity: error
+        description: >
+          Throws Error("Could not remove job <id>") when the job cannot be removed because
+          it is currently locked by an active worker. Bull's Lua remove script returns 0
+          (not removed) for active jobs, causing this error. Common in admin dashboards
+          that allow manual job removal without checking job state first.
+        required_handling: >
+          Caller MUST wrap job.remove() in try-catch. Check job state before removal:
+          const state = await job.getState();
+          if (state !== 'active') { await job.remove(); }
+          For active jobs, consider using queue.pause() to stop new jobs, then wait for
+          the active job to finish before removing it.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.promote() — calls scripts.promote(queue, jobId)
+  # If result === -1: throw new Error('Job ' + jobId + ' is not in a delayed state')
+  # Common use case: admin dashboards that promote jobs from delayed to immediate execution.
+  - name: Job.promote
+    import_path: "bull"
+    description: >
+      Moves a delayed job to the waiting state for immediate execution. Only operates
+      on jobs in the 'delayed' state. Throws a specific error if the job is not delayed.
+      Used in admin interfaces and retry flows where a delayed job needs to run immediately.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.promote():
+      # scripts.promote(queue, jobId).then(result => {
+      #   if (result === -1) { throw new Error('Job ' + jobId + ' is not in a delayed state'); }
+      # })
+      - id: promote-not-delayed-error
+        condition: "job.promote() called on a job that is not in the delayed state"
+        throws: "Error('Job <id> is not in a delayed state')"
+        severity: error
+        description: >
+          Throws Error("Job <id> is not in a delayed state") when promote() is called
+          on a job that is waiting, active, completed, or failed. This is common in
+          admin interfaces where the job state may have changed between when it was
+          retrieved and when promote() is called (TOCTOU race). Also common when a
+          cron-triggered promote fires for a job that already ran or was manually moved.
+        required_handling: >
+          Caller MUST wrap job.promote() in try-catch. Check job.getState() immediately
+          before calling promote() and handle the 'not-delayed' error gracefully:
+          const state = await job.getState();
+          if (state === 'delayed') { await job.promote(); }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/scripts.js scripts.addLog() — calls client.addLog()
+  # result < 0 → throw scripts.finishedErrors(result, jobId, 'addLog')
+  # finishedErrors(-1): "Missing key for job <id> addLog" (job deleted)
+  # finishedErrors(-2): "Missing lock for job <id> addLog" (lock expired)
+  # Called from inside job processors — processors rarely expect log() to throw.
+  - name: Job.log
+    import_path: "bull"
+    description: >
+      Appends a text entry to the job's log in Redis, accessible via Queue.getJobLogs().
+      Called from inside job processors to record execution steps for debugging and
+      monitoring. Returns a Promise that resolves to the number of log entries after
+      the append. This is an async operation — its rejection must be handled or the
+      processor may crash unexpectedly.
+    postconditions:
+      # Evidence: bull/lib/scripts.js scripts.addLog():
+      # if (result < 0) { throw scripts.finishedErrors(result, jobId, 'addLog'); }
+      # finishedErrors(-1): "Missing key for job <id> addLog" (job key not in Redis)
+      - id: log-job-key-missing
+        condition: "job.log(row) called after the job has been deleted from Redis"
+        severity: warning
+        description: >
+          Throws Error("Missing key for job <id> addLog") when the job's Redis key
+          has been deleted (e.g. removeOnComplete removed the job, Redis eviction,
+          or the job was manually obliterated). This is most common in the last steps
+          of a processor when removeOnComplete is enabled — the job completes and is
+          immediately deleted, then a final log() call fails. Since job.log() is
+          usually "fire and forget" without await, the rejection becomes an unhandled
+          promise rejection that crashes the process in Node.js v15+.
+        required_handling: >
+          Caller SHOULD await job.log() and wrap in try-catch, or attach .catch() to
+          the returned promise. Pattern:
+          await job.log('Step complete').catch(err => logger.warn('Log failed:', err.message));
+          This prevents unhandled rejections without blocking the processor.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
   # Evidence: bull/lib/job.js Job.prototype.finished() → subscribed to global:completed/global:failed
   # If job fails, rejects with new Error(job.failedReason)
   # If queue closes while waiting, rejects with "cannot check if job is finished in a closing queue."
@@ -666,4 +1056,256 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.whenCurrentJobsFinished lines 1374-1393
+  # Waits for all this.processing promises; forces bclient reconnect to abort BRPOPLPUSH
+  # If bclientInitialized is false, resolves immediately
+  - name: Queue.whenCurrentJobsFinished
+    import_path: "bull"
+    description: >
+      Returns a promise that resolves when all currently active jobs have finished
+      processing. Forces the blocking Redis client to reconnect to abort pending
+      BRPOPLPUSH calls, then waits for all in-flight job promises to settle. Used in
+      graceful shutdown sequences before calling Queue.close(). Critical for preventing
+      job truncation during process shutdown.
+    postconditions:
+      # Evidence: bull/lib/queue.js Queue.prototype.whenCurrentJobsFinished + close() interaction
+      # Confirmed: close() without whenCurrentJobsFinished() abandons active jobs → stall on restart
+      - id: when-current-jobs-not-awaited-before-close
+        condition: "Queue.close() called without first awaiting Queue.whenCurrentJobsFinished()"
+        severity: error
+        description: >
+          Calling Queue.close() without first awaiting Queue.whenCurrentJobsFinished()
+          cuts off active jobs mid-execution. The worker's processing promises are
+          abandoned and the jobs end up in a stalled state on the next queue startup,
+          triggering Bull's stalled job recovery mechanism which re-queues them for
+          duplicate processing. The correct shutdown sequence is:
+          await queue.whenCurrentJobsFinished(); await queue.close();
+        required_handling: >
+          Caller MUST await queue.whenCurrentJobsFinished() before calling queue.close()
+          in shutdown handlers:
+          process.on('SIGTERM', async () => { await queue.whenCurrentJobsFinished(); await queue.close(); process.exit(0); });
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: No SIGTERM handler = immediate process exit, whenCurrentJobsFinished never called
+      # Bull stall detection re-queues jobs that were active at shutdown → duplicate processing
+      - id: when-current-jobs-no-sigterm-handler
+        condition: "whenCurrentJobsFinished() not called in SIGTERM/SIGINT handler"
+        severity: warning
+        description: >
+          When a Node.js process receives SIGTERM (e.g., Kubernetes pod eviction, Heroku dyno
+          cycling), the default behavior exits immediately. Without a SIGTERM handler that
+          calls whenCurrentJobsFinished(), all active jobs are abandoned and will stall.
+          Bull's stall detection re-queues them on next restart, causing duplicate
+          processing of any jobs that were mid-execution when the process was killed.
+        required_handling: >
+          Register shutdown handlers that call whenCurrentJobsFinished() before exit:
+          process.once('SIGTERM', async () => { await queue.whenCurrentJobsFinished(); await queue.close(); process.exit(0); });
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.removeJobs line 611
+  # Delegates to static Job.remove(queue, pattern) → scripts.removeWithPattern
+  # Uses Redis KEYS pattern matching — O(N) scan, blocks Redis
+  - name: Queue.removeJobs
+    import_path: "bull"
+    description: >
+      Removes all jobs from the queue whose jobId matches the given Redis glob-style
+      pattern (e.g., 'email-*', 'job:123:*'). Uses Redis KEYS scan which is O(N)
+      relative to the number of keys in Redis. Resolves with no return value regardless
+      of how many jobs matched. Emits 'removed' event for each matched job. Does NOT
+      throw if zero jobs match the pattern.
+    postconditions:
+      # Evidence: bull/lib/job.js Job.remove static method lines 150-154
+      # await queue.isReady() → Redis errors propagate; then scripts.removeWithPattern
+      - id: remove-jobs-no-try-catch
+        condition: "await queue.removeJobs(pattern) called without try-catch"
+        severity: error
+        description: >
+          Throws ioredis Error when Redis connection is lost during the pattern scan
+          or when queue.isReady() rejects. Since removeJobs() internally awaits
+          queue.isReady() and executes Redis commands, any Redis disconnection during
+          the operation causes an Error to propagate. Without try-catch, this crashes
+          the calling async function. Pattern matching zero jobs silently succeeds.
+        required_handling: >
+          Caller MUST wrap await queue.removeJobs(pattern) in try-catch. On Redis
+          connection error, log and retry after reconnection. Zero matches is not an error.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: Redis KEYS is O(N) blocking command — confirmed from scripts.removeWithPattern
+      # Bull uses KEYS not SCAN — can block Redis for seconds on large keyspaces
+      - id: remove-jobs-pattern-blocks-redis
+        condition: "Queue.removeJobs(pattern) called with broad pattern on large Redis keyspace"
+        severity: warning
+        description: >
+          Internally uses the Redis KEYS command (not SCAN), which is an O(N) blocking
+          operation that scans all keys in the Redis keyspace. On Redis instances with
+          millions of keys, this blocks all other Redis operations for the duration of
+          the scan. In production queues with high job throughput, calling removeJobs()
+          with broad patterns (e.g., '*') can cause Redis latency spikes affecting all
+          queue workers and other services sharing the Redis instance.
+        required_handling: >
+          Avoid removeJobs() with broad patterns in production during peak load.
+          Prefer Queue.clean() with a specific status and grace period for bulk cleanup.
+          If removeJobs() is required, use narrow patterns or schedule during off-peak hours.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.releaseLock lines 225-230
+  # scripts.releaseLock returns 1 on success, 0 if lock not owned
+  # if (unlocked != 1) { throw new Error('Could not release lock for job ' + this.id); }
+  - name: Job.releaseLock
+    import_path: "bull"
+    description: >
+      Releases the Redis lock held on this job. Only locks owned by the current
+      queue worker instance can be released — releasing a lock owned by a different
+      worker throws an Error. Used in advanced job processing patterns where manual
+      lock management is needed (e.g., passing processing between workers, explicit
+      lock lifecycle control beyond normal process() handler).
+    postconditions:
+      # Evidence: bull/lib/job.js Job.prototype.releaseLock lines 225-230
+      # Confirmed source: if (unlocked != 1) { throw new Error('Could not release lock for job ' + this.id); }
+      - id: release-lock-not-owner
+        condition: "job.releaseLock() called when current worker does not own the job lock"
+        severity: error
+        description: >
+          Throws Error('Could not release lock for job <jobId>') when the lock cannot
+          be released because it is owned by a different worker, has already expired,
+          or was never acquired by the calling instance. This is especially dangerous
+          in multi-worker setups where race conditions can lead to multiple workers
+          believing they own the same lock. The error is thrown within the promise.
+        required_handling: >
+          Caller MUST wrap await job.releaseLock() in try-catch. Only call releaseLock()
+          from within the job's own processor function context or after acquiring the lock
+          via job.takeLock(). Do not call releaseLock() from outside the processing context.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: ioredis errors from Lua script execution propagate directly
+      # Redis connection loss during releaseLock() throws ioredis Error
+      - id: release-lock-no-try-catch
+        condition: "await job.releaseLock() called without try-catch"
+        severity: error
+        description: >
+          Throws ioredis Error when Redis connection is lost during the Lua script
+          execution for lock release. Both Redis connection errors and lock-ownership
+          errors propagate as unhandled rejections without try-catch, crashing the
+          calling async function. On Redis connection error, the lock will expire
+          naturally via its TTL.
+        required_handling: >
+          Caller MUST wrap await job.releaseLock() in try-catch. Log and handle
+          appropriately. On Redis connection error, do not retry — the lock expires
+          via TTL automatically.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.moveToFailed lines 285-349
+  # bull/lib/scripts.js finishedErrors() codes: -1 (missing key), -2 (missing lock),
+  # -3 (not in active state), -6 (lock mismatch)
+  - name: Job.moveToFailed
+    import_path: "bull"
+    description: >
+      Manually moves a job to the failed state. Typically called by Bull's internal
+      processor on job failure, but available for custom error handling flows. If the
+      job has remaining retry attempts and has not been discarded via job.discard(),
+      moves to delayed or retry queue instead of failed. Returns a tuple of
+      [nextJobData, nextJobId] for the next waiting job, or null if none waiting.
+    postconditions:
+      # Evidence: bull/lib/scripts.js finishedErrors() lines 284-300
+      # Confirmed codes: -1 missing key, -3 wrong state, -6 lock mismatch
+      - id: move-to-failed-no-try-catch
+        condition: "await job.moveToFailed(errorInfo) called without try-catch"
+        severity: error
+        description: >
+          Throws Error when the underlying Redis Lua script returns an error code:
+          -1: 'Missing key for job <id>' — job no longer exists in Redis (already cleaned up);
+          -3: 'Job <id> is not in the active state' — job not currently being processed;
+          -6: 'Lock mismatch for job <id>' — called from wrong worker or lock expired.
+          Without try-catch, these propagate as unhandled promise rejections crashing the
+          calling function.
+        required_handling: >
+          Caller MUST wrap await job.moveToFailed({ message: err.message }) in try-catch.
+          On -1 (missing key): job was already cleaned up — log and skip.
+          On -3 (wrong state): job completed via another path — log and skip.
+          On -6 (lock mismatch): another worker took ownership — do not retry.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/job.js moveToFailed lines 297-310
+      # if (attemptsMade < opts.attempts && !_discarded) → retries instead of failing
+      - id: move-to-failed-retry-not-exhausted
+        condition: "job.moveToFailed() called when job still has remaining retry attempts"
+        severity: warning
+        description: >
+          When moveToFailed() is called on a job that has remaining retry attempts
+          (attemptsMade < opts.attempts) and the job was not discarded via job.discard(),
+          Bull does NOT move it to the failed queue. Instead it moves the job to delayed
+          (with backoff) or re-queues for immediate retry. Callers expecting the job to
+          be in 'failed' state immediately may be surprised to find it re-processing.
+          Call job.discard() before job.moveToFailed() to force failure bypassing retries.
+        required_handling: >
+          If the intent is to force the job to the failed state immediately (bypassing
+          retries), call job.discard() first, then job.moveToFailed(). Without discard(),
+          the job will retry per its configured attempts and backoff settings.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
         evidence_quality: confirmed
