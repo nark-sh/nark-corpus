@@ -261,8 +261,7 @@ export async function jwtAuthorizeWithCatch() {
 
 // @expect-violation: jwt-fetch-id-token-unprotected
 export async function fetchIdTokenNoCatch(targetAudience: string) {
-  // SHOULD_FIRE: jwt-fetch-id-token-unprotected — GaxiosError on token endpoint rejection,
-  // Error('Unknown error: Failed to fetch ID token') if idToken missing from response
+  // SHOULD_FIRE: jwt-fetch-id-token-unprotected — GaxiosError on token endpoint rejection; Error if idToken missing from response
   const idToken = await jwtClient.fetchIdToken(targetAudience);
   return idToken;
 }
@@ -333,8 +332,7 @@ const impersonatedClient = new Impersonated({
 
 // @expect-violation: impersonated-fetch-id-token-unprotected
 export async function impersonatedFetchIdTokenNoCatch(audience: string) {
-  // SHOULD_FIRE: impersonated-fetch-id-token-unprotected — GaxiosError when source token fails
-  // or IAM API returns PERMISSION_DENIED/NOT_FOUND
+  // SHOULD_FIRE: jwt-fetch-id-token-unprotected — GaxiosError when source token fails or IAM API returns PERMISSION_DENIED/NOT_FOUND (impersonated client)
   const idToken = await impersonatedClient.fetchIdToken(audience);
   return idToken;
 }

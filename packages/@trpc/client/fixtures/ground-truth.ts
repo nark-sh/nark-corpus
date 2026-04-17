@@ -115,8 +115,7 @@ export async function queryWithCatchHandler(id: string) {
 // @expect-violation: trpc-subscribe-missing-on-error
 // @expect-violation: trpc-subscribe-auth-error-silent
 export function subscribeNoOnError(userId: string) {
-  // SHOULD_FIRE: trpc-subscribe-missing-on-error — no onError provided, all errors silently dropped
-  // SHOULD_FIRE: trpc-subscribe-auth-error-silent — UNAUTHORIZED errors silently dropped
+  // SHOULD_FIRE: trpc-subscribe-missing-on-error — no onError provided, all errors silently dropped; SHOULD_FIRE: trpc-subscribe-auth-error-silent — UNAUTHORIZED errors silently dropped
   const sub = trpc.notifications.subscribe({ userId }, {
     onData(data) {
       console.log('notification:', data);

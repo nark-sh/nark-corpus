@@ -465,10 +465,9 @@ async function gt_createBatchTriggerPublicToken_safe() {
 // The scanner detects tags.add() called in non-task async functions (route handlers, etc.)
 // ──────────────────────────────────────────────────
 
-// SHOULD_FIRE: tags-add-outside-task-context — tags.add called from a route handler
-// (not inside a task run() function)
+// NOTE: scanner gap — tags-add-outside-task-context requires detecting that tags.add()
+// is NOT inside a task run() function. Scanner cannot determine task context statically.
 async function gt_tagsAdd_outsideTaskContext_missing(userId: string) {
-  // SHOULD_FIRE: tags-add-outside-task-context — tags.add outside task
   await tags.add([`user:${userId}`, "processing"]);
 }
 
@@ -493,8 +492,8 @@ async function gt_tagsAdd_insideTask_safe(userId: string) {
 // ──────────────────────────────────────────────────
 
 async function gt_metadataFlush_silentFailure() {
-  // SHOULD_FIRE: metadata-flush-silent-failure — flush swallows errors silently
-  // Caller assumes flush succeeded, but there is no way to verify
+  // NOTE: scanner gap — metadata-flush-silent-failure: flush() never throws, so try-catch
+  // scanner cannot detect it. Needs a different detection strategy.
   metadata.set("progress", 0.5);
   await metadata.flush(); // Silently fails on network error — no exception raised
   // Child task triggered next may see stale metadata

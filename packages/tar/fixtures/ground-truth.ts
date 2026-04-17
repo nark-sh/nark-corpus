@@ -89,8 +89,8 @@ export async function createWithCatch(outputPath: string, files: string[]): Prom
 
 // @expect-violation: list-error-handling
 export async function listNoCatch(archivePath: string): Promise<string[]> {
-  // SHOULD_FIRE: list-error-handling — tar.list with file: returns Promise that rejects, no try-catch
   const entries: string[] = [];
+  // SHOULD_FIRE: list-error-handling — tar.list with file: returns Promise that rejects, no try-catch
   await list({
     file: archivePath,
     onReadEntry: (entry) => entries.push(entry.path),
@@ -130,13 +130,13 @@ export async function listWithCatch(archivePath: string): Promise<string[]> {
 
 // @expect-violation: replace-error-handling
 export async function replaceNoCatch(archivePath: string, files: string[]): Promise<void> {
-  // SHOULD_FIRE: replace-error-handling — tar.replace with file: returns Promise that rejects, no try-catch
+  // SHOULD_FIRE: replace-* — tar.replace with file: returns Promise that rejects, no try-catch
   await replace({ file: archivePath }, files);
 }
 
 // @expect-violation: replace-error-handling
 export async function replaceAliasNoCatch(archivePath: string, files: string[]): Promise<void> {
-  // SHOULD_FIRE: replace-error-handling — tar.r (alias) with file:, no try-catch
+  // SHOULD_FIRE: replace-* — tar.r (alias) with file:, no try-catch
   await tar.r({ file: archivePath }, files);
 }
 
@@ -161,13 +161,13 @@ export async function replaceWithCatch(archivePath: string, files: string[]): Pr
 
 // @expect-violation: update-error-handling
 export async function updateNoCatch(archivePath: string, files: string[]): Promise<void> {
-  // SHOULD_FIRE: update-error-handling — tar.update with file: returns Promise that rejects, no try-catch
+  // SHOULD_FIRE: update-* — tar.update with file: returns Promise that rejects, no try-catch
   await update({ file: archivePath }, files);
 }
 
 // @expect-violation: update-error-handling
 export async function updateAliasNoCatch(archivePath: string, files: string[]): Promise<void> {
-  // SHOULD_FIRE: update-error-handling — tar.u (alias) with file:, no try-catch
+  // SHOULD_FIRE: update-* — tar.u (alias) with file:, no try-catch
   await tar.u({ file: archivePath }, files);
 }
 

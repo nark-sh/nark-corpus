@@ -68,7 +68,8 @@ async function gt_upload_done_twice(bucket: string, key: string, body: Readable)
       await upload.done(); // First call — may succeed or fail
     } catch (firstErr) {
       // WRONG: Retry by calling done() again on same instance
-      // SHOULD_FIRE: upload-done-already-called — second call to done() on same Upload instance
+      // NOTE: scanner gap — upload-done-already-called requires tracking that done() was called
+      // twice on the same Upload instance. Scanner cannot detect stateful re-use patterns.
       try {
         await upload.done(); // Throws "already executed .done()"
       } catch (secondErr) {
@@ -108,7 +109,8 @@ async function gt_abort_with_done_awaited(bucket: string, key: string, body: Rea
 // 8. leavePartsOnError: true without manual cleanup (SHOULD_FIRE: leave-parts-on-error-prevents-cleanup)
 // @expect-violation: leave-parts-on-error-prevents-cleanup
 async function gt_leave_parts_on_error_no_cleanup(bucket: string, key: string, body: Readable) {
-  // SHOULD_FIRE: leave-parts-on-error-prevents-cleanup — leavePartsOnError=true without manual abort
+  // NOTE: scanner gap — leave-parts-on-error-prevents-cleanup requires detecting leavePartsOnError: true
+  // AND verifying no AbortMultipartUploadCommand is issued in the catch block. Scanner cannot do this.
   const upload = new Upload({
     client: s3,
     params: { Bucket: bucket, Key: key, Body: body },

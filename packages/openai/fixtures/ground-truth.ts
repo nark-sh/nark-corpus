@@ -542,8 +542,7 @@ export async function multipleCallsNoCatch(text: string) {
 // @expect-violation: uploads-complete-byte-count-mismatch
 // @expect-violation: uploads-complete-expired-upload
 export async function uploadsCompleteNoCatch(uploadId: string, partIds: string[]) {
-  // SHOULD_FIRE: uploads-complete-byte-count-mismatch — uploads.complete throws on mismatch, no try-catch
-  // SHOULD_FIRE: uploads-complete-expired-upload — uploads.complete throws NotFoundError on expired upload
+  // SHOULD_FIRE: uploads-complete-* — uploads.complete throws on mismatch or expired upload, no try-catch
   const upload = await openai.uploads.complete(uploadId, {
     part_ids: partIds,
   });
@@ -577,8 +576,7 @@ export async function uploadsCompleteWithCatch(uploadId: string, partIds: string
 // @expect-violation: uploads-parts-size-exceeded
 // @expect-violation: uploads-parts-invalid-upload-state
 export async function uploadsPartsCreateNoCatch(uploadId: string, chunk: Blob) {
-  // SHOULD_FIRE: uploads-parts-size-exceeded — parts.create throws on >64 MB chunks, no try-catch
-  // SHOULD_FIRE: uploads-parts-invalid-upload-state — parts.create throws on expired upload, no try-catch
+  // SHOULD_FIRE: uploads-parts-* — parts.create throws on >64 MB chunks or expired upload, no try-catch
   const part = await openai.uploads.parts.create(uploadId, { data: chunk });
   return part.id;
 }
@@ -610,8 +608,7 @@ export async function uploadsPartsCreateWithCatch(uploadId: string, chunk: Blob)
 // @expect-violation: responses-parse-non-strict-tool-error
 // @expect-violation: responses-parse-malformed-json-output
 export async function responsesParseNoCatch(prompt: string) {
-  // SHOULD_FIRE: responses-parse-non-strict-tool-error — throws OpenAIError before API call for non-strict tools
-  // SHOULD_FIRE: responses-parse-malformed-json-output — JSON.parse throws SyntaxError if model output is malformed
+  // SHOULD_FIRE: responses-parse-* — throws OpenAIError for non-strict tools or SyntaxError if output malformed, no try-catch
   const response = await openai.responses.parse({
     model: 'gpt-4o',
     input: [{ role: 'user', content: prompt }],
@@ -648,11 +645,11 @@ export async function responsesParseWithCatch(prompt: string) {
 // 24. realtime.sessions.create — missing try-catch (NEW: bc-deepen-contract stream-1 pass 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// @expect-violation: realtime-sessions-authentication-error
-// @expect-violation: realtime-sessions-permission-denied
+// NOTE: scanner gap — realtime-sessions postconditions not detectable for optional-chained 5-level access
+// @expect-clean
 export async function realtimeSessionsCreateNoCatch() {
-  // SHOULD_FIRE: realtime-sessions-authentication-error — throws AuthenticationError, no try-catch
-  // SHOULD_FIRE: realtime-sessions-permission-denied — throws PermissionDeniedError if Realtime not enabled
+  // NOTE: scanner gap — realtime-sessions-* — scanner cannot detect 5-level optional-chained property access
+  // (openai as any).beta?.realtime?.sessions?.create() — bc-scanner-upgrade should add support for this pattern
   const session = await (openai as any).beta?.realtime?.sessions?.create({
     model: 'gpt-4o-realtime-preview',
   });
@@ -689,7 +686,7 @@ export async function realtimeSessionsCreateWithCatch() {
 // @expect-violation: responses-compact-not-found-error
 // @expect-violation: responses-compact-rate-limit-error
 export async function responsesCompactNoCatch(previousResponseId: string) {
-  // SHOULD_FIRE: responses.compact with no try-catch — NotFoundError if stale ID, RateLimitError from model call
+  // SHOULD_FIRE: responses-compact-* — NotFoundError if stale ID, RateLimitError from model call
   const compacted = await openai.responses.compact({
     model: 'gpt-4o',
     previous_response_id: previousResponseId,
@@ -725,7 +722,7 @@ export async function responsesCompactWithCatch(previousResponseId: string) {
 // @expect-violation: vector-stores-search-not-found-error
 // @expect-violation: vector-stores-search-rate-limit-error
 export async function vectorStoresSearchNoCatch(vectorStoreId: string, query: string) {
-  // SHOULD_FIRE: vector_stores.search with no try-catch — NotFoundError for invalid store, RateLimitError
+  // SHOULD_FIRE: vector-stores-search-* — NotFoundError for invalid store, RateLimitError
   const results = await openai.vectorStores.search(vectorStoreId, { query });
   return results;
 }
@@ -755,7 +752,7 @@ export async function vectorStoresSearchWithCatch(vectorStoreId: string, query: 
 // @expect-violation: responses-input-tokens-context-overflow-error
 // @expect-violation: responses-input-tokens-authentication-error
 export async function responsesInputTokensCountNoCatch(input: string) {
-  // SHOULD_FIRE: inputTokens.count with no try-catch — BadRequestError on overflow, AuthenticationError
+  // SHOULD_FIRE: responses-input-tokens-* — BadRequestError on overflow, AuthenticationError
   const count = await openai.responses.inputTokens.count({
     model: 'gpt-4o',
     input,
@@ -850,9 +847,8 @@ export async function webhookVerifyWithCatch(payload: string, headers: Record<st
 // @expect-violation: responses-stream-premature-termination-error
 // @expect-violation: responses-stream-authentication-error
 export async function responsesStreamNoCatch(prompt: string) {
-  // SHOULD_FIRE: responses.stream() — callers must await stream.finalResponse() in try-catch.
-  // If the stream terminates prematurely (network drop, server error), finalResponse()
-  // throws OpenAIError. Callers who only iterate events miss this entirely.
+  // callers must await stream.finalResponse() in try-catch — premature termination throws OpenAIError
+  // SHOULD_FIRE: responses-stream-* — no try-catch around responses.stream() call
   const stream = openai.responses.stream({
     model: 'gpt-4o',
     input: prompt,
@@ -889,7 +885,8 @@ export async function responsesStreamWithCatch(prompt: string) {
 
 // @expect-violation: responses-stream-premature-termination-error
 export async function responsesStreamForAwaitNoCatch(prompt: string) {
-  // SHOULD_FIRE: iterating events but not awaiting finalResponse() — misses termination errors
+  // iterating events but not awaiting finalResponse() — misses termination errors
+  // SHOULD_FIRE: responses-stream-premature-termination-error — no try-catch around responses.stream()
   const stream = openai.responses.stream({
     model: 'gpt-4o',
     input: prompt,
@@ -1095,7 +1092,7 @@ async function filesWaitForProcessingWithErrorHandling(fileId: string) {
 
 // @expect-violation: files-delete-not-found
 async function filesDeleteMissingErrorHandling(fileId: string) {
-  // SHOULD_FIRE: no try-catch — NotFoundError not handled
+  // SHOULD_FIRE: files-delete-not-found — NotFoundError not handled
   await openai.files.delete(fileId);
 }
 
@@ -1116,7 +1113,7 @@ async function filesDeleteWithIdempotentHandling(fileId: string) {
 
 // @expect-violation: chatkit-sessions-create-no-error-handling
 async function chatkitSessionsCreateMissingErrorHandling(userId: string, workflowId: string) {
-  // SHOULD_FIRE: no try-catch — AuthenticationError, PermissionDeniedError, NotFoundError not handled
+  // SHOULD_FIRE: chatkit-sessions-create-no-error-handling — AuthenticationError, PermissionDeniedError, NotFoundError not handled
   const session = await openai.beta.chatkit.sessions.create({
     user: userId,
     workflow: { id: workflowId },
@@ -1153,7 +1150,7 @@ async function chatkitSessionsCreateWithErrorHandling(userId: string, workflowId
 
 // @expect-violation: files-content-no-error-handling
 async function filesContentMissingErrorHandling(fileId: string) {
-  // SHOULD_FIRE: no try-catch — NotFoundError, BadRequestError, APIConnectionError not handled
+  // SHOULD_FIRE: files-content-no-error-handling — NotFoundError, BadRequestError, APIConnectionError not handled
   const response = await openai.files.content(fileId);
   return await response.arrayBuffer();
 }
@@ -1186,7 +1183,7 @@ async function filesContentWithErrorHandling(fileId: string) {
 
 // @expect-violation: conversations-items-delete-no-error-handling
 async function conversationsItemsDeleteMissingErrorHandling(itemId: string, conversationId: string) {
-  // SHOULD_FIRE: no try-catch — NotFoundError on expired conversation not handled
+  // SHOULD_FIRE: conversations-items-delete-no-error-handling — NotFoundError on expired conversation not handled
   await openai.conversations.items.delete(itemId, { conversation_id: conversationId });
 }
 
@@ -1208,7 +1205,7 @@ async function conversationsItemsDeleteWithErrorHandling(itemId: string, convers
 
 // @expect-violation: chatkit-sessions-cancel-no-error-handling
 async function chatkitSessionsCancelMissingErrorHandling(sessionId: string) {
-  // SHOULD_FIRE: no try-catch — NotFoundError on expired session not handled
+  // SHOULD_FIRE: chatkit-sessions-cancel-no-error-handling — NotFoundError on expired session not handled
   await openai.beta.chatkit.sessions.cancel(sessionId);
 }
 

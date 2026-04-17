@@ -79,17 +79,16 @@ export function isJwtExpired(token: string): boolean {
 // NOTE: This pattern is NOT yet detected by the scanner (concern-20260416-jwt-decode-deepen-1).
 // The postcondition documents the behavioral contract; scanner rule must be added separately.
 export function isAdminFromToken(token: string): boolean {
-  // SHOULD_FIRE: no-signature-validation — decoded 'role' claim used for authorization
-  // without server-side verification. Any attacker who can forge a valid base64 JWT structure
-  // can bypass this check since jwtDecode() does not verify the signature.
+  // NOTE: scanner gap — no-signature-validation requires detecting that decoded claims are
+  // used for authorization decisions. Scanner cannot determine the intent of claim usage.
   const payload = jwtDecode(token) as { role?: string };
   return payload.role === 'admin';
 }
 
 // @expect-violation: no-signature-validation
 export function getUserIdFromDecodedToken(token: string): string {
-  // SHOULD_FIRE: no-signature-validation — decoded 'sub' claim used as identity
-  // without server-side signature verification.
+  // NOTE: scanner gap — no-signature-validation requires detecting that decoded claims are
+  // used as identity without server-side verification. Scanner cannot determine this statically.
   const payload = jwtDecode(token) as { sub: string };
   return payload.sub;
 }

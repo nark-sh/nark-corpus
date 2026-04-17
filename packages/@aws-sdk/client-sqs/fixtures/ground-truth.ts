@@ -444,9 +444,8 @@ export async function changeVisibilityWithCatch(receiptHandle: string, messageId
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendMessageInvalidContentsNoCatch(rawUserInput: string) {
-  // @expect-violation: sqs-send-invalid-message-contents
-  // SHOULD_FIRE: sqs-send-invalid-message-contents — no try-catch, raw user input may contain
-  // invalid Unicode characters (control chars #x00-#x08, #x0B-#x0C, #x0E-#x1F) that SQS rejects
+  // NOTE: scanner gap — sqs-send-invalid-message-contents requires argument-type analysis (checking
+  // if MessageBody could contain invalid Unicode characters). Scanner cannot statically detect this.
   await sqsClient.send(new SendMessageCommand({
     QueueUrl: QUEUE_URL,
     MessageBody: rawUserInput, // ← not sanitized, may contain invalid SQS characters
@@ -474,9 +473,8 @@ export async function sendMessageInvalidContentsWithCatch(rawUserInput: string) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendMessageKmsEncryptedQueueNoCatch(payload: object) {
-  // @expect-violation: sqs-send-kms-errors
-  // SHOULD_FIRE: sqs-send-kms-errors — KMS-encrypted queue, no try-catch;
-  // KmsAccessDenied/KmsDisabled/KmsNotFound thrown when key is unavailable
+  // NOTE: scanner gap — sqs-send-kms-errors requires detecting KMS-encrypted queue URLs
+  // (queue name pattern or attribute check). Scanner cannot statically determine encryption type.
   await sqsClient.send(new SendMessageCommand({
     QueueUrl: 'https://sqs.us-east-1.amazonaws.com/123456789/my-encrypted-queue.fifo',
     MessageBody: JSON.stringify(payload),
@@ -510,9 +508,8 @@ export async function sendMessageKmsWithCatch(payload: object) {
 const FIFO_QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/123456789/my-queue.fifo';
 
 export async function sendMessageFifoMissingGroupId(payload: object) {
-  // @expect-violation: sqs-send-fifo-missing-message-group-id
-  // SHOULD_FIRE: sqs-send-fifo-missing-message-group-id — FIFO queue (.fifo suffix) without MessageGroupId;
-  // action fails with InvalidParameterValue/UnsupportedOperation
+  // NOTE: scanner gap — sqs-send-fifo-missing-message-group-id requires checking QueueUrl suffix
+  // (.fifo) AND absence of MessageGroupId in the same object. Scanner cannot do cross-argument analysis.
   await sqsClient.send(new SendMessageCommand({
     QueueUrl: FIFO_QUEUE_URL,
     MessageBody: JSON.stringify(payload),

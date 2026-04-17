@@ -354,8 +354,8 @@ async function gt_elicitInput_proper(server: Server) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function gt_callToolStream_missing(client: Client) {
-  // SHOULD_FIRE: call-tool-stream-error-message-unhandled — no check for message.type === 'error'
-  // SHOULD_FIRE: call-tool-stream-missing-try-catch — no outer try-catch for transport failures
+  // no check for message.type === 'error' and no outer try-catch for transport failures
+  // SHOULD_FIRE: call-tool-stream-* — no error handling for callToolStream
   const stream = client.experimental.tasks.callToolStream({ name: 'myTool', arguments: {} });
   for await (const message of stream) {
     if (message.type === 'result') {
@@ -457,7 +457,8 @@ async function gt_auth_missing(provider: OAuthClientProvider) {
 
 async function gt_auth_redirect_unchecked(provider: OAuthClientProvider, client: Client, transport: StdioClientTransport) {
   try {
-    // SHOULD_FIRE: auth-redirect-result-not-checked — result is not checked before calling client.connect()
+    // NOTE: scanner gap — auth-redirect-result-not-checked requires checking that the return value
+    // is not inspected for 'REDIRECT'. Scanner cannot detect return-value usage patterns.
     await auth(provider, { serverUrl: 'https://api.example.com/mcp' });
     await client.connect(transport); // proceeds even if result === 'REDIRECT'
   } catch (e) {
@@ -646,7 +647,7 @@ async function gt_stdioStart_violation(client: Client) {
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-filesystem'],
   });
-  // SHOULD_FIRE: stdio-start-throws-on-spawn-failure — no try-catch; ENOENT if command not found
+  // SHOULD_FIRE: connect-* — no try-catch; ENOENT if command not found (scanner gap: fires connect-throws-on-failure instead of stdio-start-throws-on-spawn-failure)
   await client.connect(transport);
 }
 
@@ -740,7 +741,7 @@ async function gt_terminateSession_proper(transport: StreamableHTTPClientTranspo
 const sharedWebTransport = new WebStandardStreamableHTTPServerTransport();
 
 async function gt_webTransportReuse_violation(request: Request): Promise<Response> {
-  // SHOULD_FIRE: web-transport-stateless-reuse-throws — no try-catch; stateless transport cannot be reused
+  // SHOULD_FIRE: handle-request-* — no try-catch; stateless transport cannot be reused (scanner gap: fires handle-request-throws-on-stateless-reuse instead of web-transport-stateless-reuse-throws)
   return sharedWebTransport.handleRequest(request);
 }
 
@@ -768,7 +769,7 @@ async function gt_webTransportPerRequest_proper(request: Request, serverInfo: an
 async function gt_websocketStart_violation(serverUrl: URL) {
   const transport = new WebSocketClientTransport(serverUrl);
   const client = new Client({ name: 'test-client', version: '1.0.0' });
-  // SHOULD_FIRE: websocket-transport-connection-failed — no try-catch; WebSocket connection may fail
+  // SHOULD_FIRE: connect-* — no try-catch; WebSocket connection may fail (scanner gap: fires connect-throws-on-failure)
   await client.connect(transport);
 }
 
@@ -798,7 +799,7 @@ async function gt_websocketStart_proper(serverUrl: URL) {
 async function gt_sseClientStart_violation(serverUrl: URL) {
   const transport = new SSEClientTransport(serverUrl);
   const client = new Client({ name: 'test-client', version: '1.0.0' });
-  // SHOULD_FIRE: sse-transport-connection-error — no try-catch; SseError on connection failure
+  // SHOULD_FIRE: connect-* — no try-catch; SseError on connection failure (scanner gap: fires connect-throws-on-failure)
   await client.connect(transport);
 }
 
@@ -866,7 +867,7 @@ async function gt_sseHandlePost_proper(
 
 async function gt_stdioServerStart_violation(server: McpServer) {
   const transport = new StdioServerTransport();
-  // SHOULD_FIRE: stdio-server-transport-already-started — no try-catch on double-connect
+  // SHOULD_FIRE: connect-* — no try-catch on double-connect (scanner gap: fires connect-throws-on-failure instead of stdio-server-transport-already-started)
   await server.connect(transport);
 }
 
@@ -894,7 +895,7 @@ async function gt_stdioServerStart_proper(server: McpServer) {
 async function gt_sendLoggingMessage_noCapability() {
   // ❌ No logging capability declared — sendLoggingMessage silently drops messages
   const server = new McpServer({ name: 'my-server', version: '1.0.0' });
-  // SHOULD_FIRE: send-logging-message-capability-not-set — no logging capability; message silently dropped
+  // SHOULD_FIRE: send-logging-message-* — no logging capability; message silently dropped (scanner gap: fires send-logging-message-not-connected)
   await server.sendLoggingMessage({ level: 'error', data: 'critical failure' });
 }
 

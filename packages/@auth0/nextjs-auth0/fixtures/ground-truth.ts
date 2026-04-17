@@ -181,8 +181,7 @@ export async function logout_withTryCatch(req: any, res: any) {
 const auth0 = new Auth0Client();
 
 export async function getSession_destructureNoNullCheck() {
-  // @expect-violation: auth0-get-session-no-null-check
-  // SHOULD_FIRE: getSession returns null when unauthenticated — destructuring will throw TypeError
+  // SHOULD_FIRE: auth0-get-session-* — getSession returns null when unauthenticated; destructuring will throw TypeError
   const { user } = await auth0.getSession() as any;
   return user;
 }

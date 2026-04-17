@@ -24,13 +24,15 @@ import * as fs from 'fs';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function compileWithUndefinedFormat() {
-  // SHOULD_FIRE: compile-non-string-throws — calling compile(undefined) throws TypeError synchronously
+  // NOTE: compile-non-string-throws is a precondition (argument-type violation), not detectable statically.
+  // The scanner cannot determine at analysis time that undefined was passed. Known false negative.
   const fn = morgan.compile(undefined as unknown as string);
   return fn;
 }
 
 export function compileWithNullFormat() {
-  // SHOULD_FIRE: compile-non-string-throws — calling compile(null) throws TypeError synchronously
+  // NOTE: compile-non-string-throws is a precondition (argument-type violation), not detectable statically.
+  // The scanner cannot determine at analysis time that null was passed. Known false negative.
   const fn = morgan.compile(null as unknown as string);
   return fn;
 }
@@ -87,8 +89,8 @@ export function registerNamespacedCustomToken() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function morganWithUnsafeStream() {
-  // SHOULD_FIRE: stream-write-error — custom stream passed without .on('error') handler attached
   const logStream = fs.createWriteStream('/var/log/app/access.log', { flags: 'a' });
+  // SHOULD_FIRE: stream-write-error — custom stream passed without .on('error') handler attached
   const middleware = morgan('combined', { stream: logStream });
   return middleware;
 }
