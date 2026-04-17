@@ -2,7 +2,7 @@ package: ethers
 semver: ">=6.0.0 <7.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
 # Depth pass 2026-04-16 (deepen-stream-1 pass 2):
@@ -22,7 +22,20 @@ evidence_quality: confirmed
 #   lib.esm/providers/provider-jsonrpc.js -- INSUFFICIENT_FUNDS, NONCE_EXPIRED, REPLACEMENT_UNDERPRICED
 #   lib.esm/wallet/json-keystore.js -- UNSUPPORTED_OPERATION for invalid cipher
 #   https://docs.ethers.org/v6/api/utils/errors/
-coverage_score: 0.45  # 9 contracted / 20 total async-callable (11 intentionally omitted)
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 4):
+# API surface: 24 distinct async-callable operations (4 more discovered: ContractFactory.deploy,
+#                       Contract.waitForDeployment, Contract.queryFilter, wallet.signTypedData)
+# Contracted before: 9
+# Contracted after: 13 (+4 this pass)
+# Coverage: 13/24 = 0.54
+# Evidence sources confirmed from installed package source (ethers@6.16.0):
+#   lib.esm/contract/factory.js:79 -- UNSUPPORTED_OPERATION when runner lacks sendTransaction
+#   lib.esm/providers/provider-jsonrpc.js:677 -- INSUFFICIENT_FUNDS on deploy
+#   lib.esm/contract/contract.js:681-713 -- waitForDeployment() wraps deployTx.wait()
+#   lib.esm/contract/contract.js:770-798 -- queryFilter() delegates to provider.getLogs()
+#   lib.esm/wallet/base-wallet.js:105-124 -- signTypedData UNSUPPORTED_OPERATION, UNCONFIGURED_NAME
+coverage_score: 0.54  # 13 contracted / 24 total async-callable (11 intentionally omitted)
 
 detection:
   type_names:
@@ -471,6 +484,259 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: ContractFactory.deploy
+    import_path: "ethers"
+    description: >
+      Deploys a smart contract to the network by sending a deployment transaction.
+      Internally calls runner.sendTransaction() so it inherits all transaction-send
+      failure modes. Returns a BaseContract instance before the contract is mined --
+      waitForDeployment() must be called before sending transactions to the new contract.
+    postconditions:
+      # Evidence: lib.esm/contract/factory.js:79 --
+      #   assert(this.runner && typeof(this.runner.sendTransaction) === "function",
+      #     "factory runner does not support sending transactions", "UNSUPPORTED_OPERATION", ...)
+      # Evidence: provider-jsonrpc.js:677 -- makeError("insufficient funds", "INSUFFICIENT_FUNDS")
+      #   triggered when deployer account lacks ETH for gas
+      # Evidence: factory.js:78 -- async deploy() calls runner.sendTransaction(tx)
+      #   which throws all standard sendTransaction errors
+      - id: deploy-insufficient-funds
+        condition: >
+          The deploying account lacks sufficient ETH to cover the deployment gas cost.
+          Contract deployments can be expensive (depends on bytecode size + gas price).
+          Throws before the transaction is broadcast -- account balance is checked by the RPC node.
+        throws: "EthersError with error.code = INSUFFICIENT_FUNDS (InsufficientFundsError)"
+        required_handling: >
+          Caller MUST wrap ContractFactory.deploy() in try-catch. Check isError(error, "INSUFFICIENT_FUNDS")
+          and verify deployer balance before attempting deployment. Consider pre-checking with
+          estimateGas() on the deploy transaction. Uncaught errors crash deployment scripts
+          and dApp setup flows.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#ContractFactory-deploy"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: deploy-unsupported-operation
+        condition: >
+          The runner (signer) attached to the ContractFactory does not support sending transactions.
+          Common when using a Provider (read-only) instead of a Signer, or when the Signer
+          lacks wallet connectivity (e.g., not connected to MetaMask in a browser context).
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION"
+        required_handling: >
+          Caller MUST ensure the ContractFactory is created with a Signer that has sendTransaction
+          capability, not just a Provider. Verify runner type before deployment. Common in
+          server-side scripts where Provider and Signer are confused.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#ContractFactory-deploy"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: Contract.waitForDeployment
+    import_path: "ethers"
+    description: >
+      Waits for a deployed contract to be mined and confirmed on-chain. MUST be called
+      after ContractFactory.deploy() before sending transactions to the new contract address.
+      Internally calls deployTx.wait() which inherits all TransactionResponse.wait() failure modes.
+      If no deployment transaction is available (e.g., contract already deployed), polls provider.
+    postconditions:
+      # Evidence: lib.esm/contract/contract.js:681-713 -- waitForDeployment() calls deployTx.wait()
+      #   which throws TRANSACTION_REPLACED, CALL_EXCEPTION, TIMEOUT (from provider.js wait())
+      # Evidence: contract.js:695 -- assert(provider != null, ..., "UNSUPPORTED_OPERATION", ...)
+      #   when no provider is available for polling block events
+      - id: waitfordeployment-constructor-reverted
+        condition: >
+          The deployment transaction was mined but the contract constructor reverted on-chain.
+          This is a CALL_EXCEPTION from deployTx.wait() -- the transaction consumed gas but
+          the contract was NOT deployed. The contract address will have no code. Common when
+          constructor require() conditions are not met (e.g., invalid initial state, access control).
+        throws: "EthersError with error.code = CALL_EXCEPTION (CallExceptionError) from deployTx.wait()"
+        required_handling: >
+          Caller MUST wrap waitForDeployment() in try-catch. Check isError(error, "CALL_EXCEPTION")
+          to detect constructor revert. Inspect error.revert for decoded revert reason if ABI is known.
+          Uncaught constructor reverts leave application state inconsistent -- deployment scripts
+          assume contract is ready but no code exists at the address.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#BaseContract-waitForDeployment"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: waitfordeployment-transaction-replaced
+        condition: >
+          The deployment transaction was replaced (speed-up or cancel) before being mined.
+          TRANSACTION_REPLACED from deployTx.wait(). Common in scripts that speed-up slow
+          deployments by resubmitting with higher gas, or cancel/retry deployments.
+        throws: "EthersError with error.code = TRANSACTION_REPLACED (TransactionReplacedError)"
+        required_handling: >
+          Caller MUST catch TRANSACTION_REPLACED -- the replacement deployment tx (error.replacement)
+          may have succeeded. Check error.cancelled to determine if deployment was actually cancelled
+          vs speed-up. If error.receipt.status === 1, the replacement succeeded.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: waitfordeployment-unsupported-operation
+        condition: >
+          The contract runner does not have a provider attached. Throws UNSUPPORTED_OPERATION
+          with operation="waitForDeployment" when polling for deployment without a deployment
+          transaction available (e.g., contract attached to an address without a deploy tx).
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION"
+        required_handling: >
+          Ensure the Contract instance was returned from ContractFactory.deploy() (which attaches
+          the deployment tx) OR that the runner has a provider for block polling.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#BaseContract-waitForDeployment"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Contract.queryFilter
+    import_path: "ethers"
+    description: >
+      Queries historic blockchain event logs for a specific contract event. Delegates to
+      provider.getLogs() with the contract address and topic filter applied. Subject to all
+      the same RPC node limitations as getLogs -- large block ranges are commonly rejected.
+      Used for reading event history (Transfer events, Deposit/Withdrawal, etc.).
+    postconditions:
+      # Evidence: lib.esm/contract/contract.js:770-798 -- queryFilter() calls provider.getLogs(filter)
+      #   which inherits SERVER_ERROR from large range rejections (Infura/Alchemy: 10k log limit)
+      # Evidence: contract.js:782 -- assert(provider, ..., "UNSUPPORTED_OPERATION", ...)
+      #   when no provider is attached to the contract runner
+      - id: queryfilter-range-too-large
+        condition: >
+          The block range (fromBlock..toBlock) causes getLogs to return more than 10,000 results,
+          causing Infura, Alchemy, and most public RPC nodes to reject with SERVER_ERROR.
+          Common when querying Transfer events from genesis block or using wide block ranges at startup.
+          Default (fromBlock=0, toBlock="latest") is almost always rejected on mainnet.
+        throws: "EthersError with error.code = SERVER_ERROR (ServerError)"
+        required_handling: >
+          Caller MUST wrap Contract.queryFilter() in try-catch and implement chunked pagination.
+          Use narrow block ranges (e.g., 2000 blocks at a time). Particularly important for
+          indexing flows that process event history at startup -- uncaught errors crash the
+          entire indexing job and leave contract state out of sync.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#BaseContract-queryFilter"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: queryfilter-no-provider
+        condition: >
+          The Contract instance's runner does not have a provider attached. Throws
+          UNSUPPORTED_OPERATION with operation="queryFilter". Common when Contract is
+          instantiated with a bare Signer that has no provider, or with null runner.
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION"
+        required_handling: >
+          Ensure the Contract instance has a provider-connected runner before calling queryFilter.
+          Use contract.connect(providerOrSigner) to attach a provider.
+        sources:
+          - "https://docs.ethers.org/v6/api/contract/#BaseContract-queryFilter"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: wallet.signTypedData
+    import_path: "ethers"
+    description: >
+      Signs EIP-712 typed structured data. Used in permit flows (ERC-2612), Uniswap v3 signatures,
+      gasless transaction approvals, and any protocol requiring off-chain structured data signatures.
+      Throws when the typed data contains ENS names that cannot be resolved (requires provider).
+    postconditions:
+      # Evidence: lib.esm/wallet/base-wallet.js:105-124 -- signTypedData() calls
+      #   TypedDataEncoder.resolveNames() which throws UNSUPPORTED_OPERATION when provider is null
+      #   and ENS names appear in domain/types/value.
+      #   assert(this.provider != null, "cannot resolve ENS names without a provider",
+      #     "UNSUPPORTED_OPERATION", { operation: "resolveName", info: { name } })
+      #   assert(address != null, "unconfigured ENS name", "UNCONFIGURED_NAME", { value: name })
+      - id: signtypeddata-no-provider-for-ens
+        condition: >
+          The typed data contains ENS names (e.g., in domain.verifyingContract or value fields)
+          but the wallet is not connected to a provider. Throws UNSUPPORTED_OPERATION with
+          operation="resolveName". Common in offline signing setups where a bare Wallet is
+          used without a JsonRpcProvider, but the typed data schema references ENS names.
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION"
+        required_handling: >
+          Caller MUST either: (1) ensure the wallet is connected to a provider
+          (wallet.connect(provider)), or (2) resolve all ENS names to addresses before passing
+          to signTypedData. Safest approach is to always connect a provider when using signTypedData
+          with external data that may contain ENS names.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTypedData"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: signtypeddata-unconfigured-ens
+        condition: >
+          The typed data contains an ENS name that resolves to null (unregistered or expired
+          ENS domain). Throws UNCONFIGURED_NAME error. Less common than the no-provider case
+          but can occur in production when user-supplied domain structs contain ENS names.
+        throws: "EthersError with error.code = UNCONFIGURED_NAME"
+        required_handling: >
+          Caller MUST catch UNCONFIGURED_NAME and surface a user-facing error indicating the
+          ENS name is unresolvable. Pre-validate any user-supplied ENS names with provider.resolveName()
+          before passing to signTypedData.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -505,13 +771,15 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-04-16"
+  last_verified: "2026-04-17"
   evidence_quality: confirmed
-  coverage_score: 0.45
-  # 9 contracted functions / 20 total async-callable
-  # Added this pass (deepen-stream-1 pass 2): TransactionResponse.wait, provider.estimateGas,
+  coverage_score: 0.54
+  # 13 contracted functions / 24 total async-callable
+  # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
   #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
   #   provider.waitForTransaction, provider.getLogs
+  # Added deepen-stream-2 pass 4: ContractFactory.deploy, Contract.waitForDeployment,
+  #   Contract.queryFilter, wallet.signTypedData
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR
