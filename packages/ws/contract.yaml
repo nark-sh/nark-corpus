@@ -1,13 +1,27 @@
 package: ws
 semver: ">=8.17.1"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-16"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
+coverage_score: 0.88  # 7 contracted / 8 total async-callable (1 intentionally omitted: createWebSocketStream)
 # Evidence: scan-ws-2026-04-04.json — 0 repos scanned successfully (all 123 errored on TS compilation)
 # 16 repos skipped (no tsconfig). ws repos tend to be plain JS or custom TS setups.
 # FP check: 0/50 repos false-positive-free. FP rate 0%. Confirmed evidence quality.
+# Depth pass 2026-04-16 (deepen-stream-2 pass 3):
+# API surface: 8 async-callable functions (WebSocket, send, close, ping, WebSocketServer,
+#              handleUpgrade, WebSocketServer.close, createWebSocketStream)
+# Contracted before: 4 (WebSocket, send, close, WebSocketServer)
+# Contracted after: 7 (added ping, handleUpgrade, WebSocketServer.close)
+# Omitted: 1 (createWebSocketStream — Duplex stream wrapper, niche use, error contracts
+#              are identical to WebSocket error event already contracted)
+# Coverage: 7/8 = 0.88
+# Evidence sources (all confirmed from source inspection):
+#   websocket.js lines 362-363, 394-395: ping/pong throw synchronously when CONNECTING
+#   websocket-server.js lines 538-553: abortHandshakeOrEmitwsClientError() flow
+#   websocket-server.js lines 163-173: close() callback receives Error when already closed
+#   doc/ws.md: handleUpgrade noServer pattern, wsClientError event, server.close() docs
 
 # CRITICAL SECURITY NOTE:
 # ws has 3 CVEs in versions < 8.17.1:
@@ -354,3 +368,228 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # Evidence: websocket.js lines 362-363, 394-395 — ping() and pong() throw synchronously
+  # when readyState === CONNECTING. Source: https://github.com/websockets/ws/blob/master/lib/websocket.js
+  # Also confirmed from @types/ws index.d.ts and doc/ws.md
+  - name: ping
+    import_path: "ws"
+    description: >
+      Sends a WebSocket ping frame to keep connections alive and detect zombie connections.
+      Primary use case is the heartbeat pattern where servers ping clients and terminate
+      those that don't respond with a pong within a timeout. The callback receives an
+      error if the frame cannot be sent.
+    postconditions:
+      # Evidence: websocket.js lines 362-363 — throws synchronously when CONNECTING
+      # Source: https://github.com/websockets/ws/blob/master/lib/websocket.js#L362
+      - id: ping-before-open
+        condition: >
+          ping() is called while the WebSocket is still in CONNECTING state
+          (readyState === WebSocket.CONNECTING, i.e., before the 'open' event fires).
+        throws: "Error: WebSocket is not open: readyState 0 (CONNECTING)"
+        required_handling: >
+          Caller MUST check readyState before calling ping(), or only send pings
+          after the 'open' event. Heartbeat intervals MUST start in the 'open'
+          event handler, NOT immediately after new WebSocket().
+
+          CORRECT heartbeat pattern:
+            ws.on('open', () => {
+              const heartbeat = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) ws.ping();
+              }, 30000);
+              ws.on('close', () => clearInterval(heartbeat));
+            });
+
+          WRONG (crashes if called before connection is established):
+            ws.ping(); // Throws immediately
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: websocket.js lines 376-378 — sendAfterClose() passes error to callback
+      # when readyState is CLOSING or CLOSED. Callback receives error via process.nextTick.
+      - id: ping-callback-receives-error
+        condition: >
+          ping() is called when connection is CLOSING or CLOSED and a callback is provided.
+          The callback receives an error but no exception is thrown synchronously.
+        throws: >
+          No synchronous throw. If a callback is provided, it receives:
+          Error: WebSocket is not open: readyState X (CLOSING|CLOSED)
+        required_handling: >
+          If using ping() with a callback for error detection, the callback MUST
+          check for error. Heartbeat implementations that check for errors in the
+          ping callback should handle this gracefully rather than logging/crashing.
+          The more reliable pattern is to check readyState === WebSocket.OPEN before pinging.
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: websocket-server.js lines 238-315 — handleUpgrade emits wsClientError
+  # when handshake fails if wsClientError listener exists, otherwise aborts socket.
+  # Source: https://github.com/websockets/ws/blob/master/lib/websocket-server.js#L238
+  # Also confirmed from doc/ws.md handleUpgrade section
+  - name: handleUpgrade
+    import_path: "ws"
+    description: >
+      Manually handles an HTTP upgrade request to establish a WebSocket connection.
+      Used when running in noServer mode — common in Next.js API routes, custom HTTP
+      servers, and server frameworks that manage upgrade events themselves.
+      When called, ws validates the HTTP headers and either upgrades the connection
+      or aborts/emits wsClientError.
+    postconditions:
+      # Evidence: websocket-server.js lines 538-553 — abortHandshakeOrEmitwsClientError()
+      # emits 'wsClientError' when listener exists, otherwise aborts socket directly.
+      - id: handleupgrade-missing-wsclienterror-handler
+        condition: >
+          handleUpgrade() receives an invalid upgrade request (missing or invalid
+          Sec-WebSocket-Key, Sec-WebSocket-Version, Upgrade header, or non-GET method).
+          Server has no 'wsClientError' event listener attached.
+        throws: >
+          No throw. Without a wsClientError listener, ws calls abortHandshake() directly
+          and closes the socket with an HTTP error response (400/405). The upgrade
+          request fails silently from the server application's perspective — no event
+          is emitted, no log is produced.
+        required_handling: >
+          When using noServer mode, ALWAYS attach a wsClientError handler:
+            wss.on('wsClientError', (error, socket, request) => {
+              socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+              socket.destroy();
+            });
+
+          The wsClientError listener is responsible for closing the socket.
+          Without it, malformed upgrade requests are silently dropped with no
+          observability — making debugging impossible in production.
+
+          Critical: The socket MUST be explicitly closed in the wsClientError
+          handler. ws does NOT close it automatically when the event is emitted.
+        sources:
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+          - "https://github.com/websockets/ws/blob/master/lib/websocket-server.js"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: websocket-server.js line 363 comment: "throws if called more than once with same socket"
+      # Also: doc/ws.md notes handleUpgrade is called automatically when not in noServer mode
+      - id: handleupgrade-called-in-non-noserver-mode
+        condition: >
+          handleUpgrade() is called manually when the server was NOT created with
+          noServer: true — i.e., ws is already handling upgrades automatically
+          via its internal server event listeners.
+        throws: >
+          The socket may be handled twice, leading to the completeUpgrade() call
+          throwing Error: "websocket already set on socket" or connection state corruption.
+          Behavior is undefined and may cause hard-to-debug connection failures.
+        required_handling: >
+          handleUpgrade() MUST only be called when using noServer: true mode.
+          When passing a server option or a port option, ws handles upgrades
+          automatically. Do NOT call handleUpgrade() in that case.
+
+          noServer mode example (Next.js API route pattern):
+            const wss = new WebSocketServer({ noServer: true });
+            server.on('upgrade', (req, socket, head) => {
+              wss.handleUpgrade(req, socket, head, (ws) => {
+                wss.emit('connection', ws, req);
+              });
+            });
+        sources:
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+          - "https://github.com/websockets/ws#multiple-servers-sharing-a-single-https-server"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Evidence: websocket-server.js lines 163-173 — close() callback receives Error
+  # when server is already CLOSED state.
+  # Source: https://github.com/websockets/ws/blob/master/lib/websocket-server.js#L163
+  - name: WebSocketServer.close
+    import_path: "ws"
+    description: >
+      Stops the WebSocket server from accepting new connections. Does NOT forcibly
+      close existing connections — active WebSocket connections remain alive until
+      they close naturally. The HTTP server created internally by ws is also closed.
+      When passing an external HTTP server via the server option, that server must
+      be closed separately.
+    postconditions:
+      # Evidence: websocket-server.js lines 163-172 — when state is CLOSED,
+      # schedules callback with new Error('The server is not running')
+      - id: server-close-already-stopped
+        condition: >
+          WebSocketServer.close() is called on a server that is already closed
+          (either never started, or close() already called and completed).
+        throws: >
+          No synchronous throw. The callback (if provided) receives:
+          Error: The server is not running
+        required_handling: >
+          Always check server state before calling close(), or handle the error
+          in the callback:
+            wss.close((err) => {
+              if (err) {
+                // Server was already stopped — safe to ignore in cleanup code
+                if (err.message !== 'The server is not running') throw err;
+              }
+            });
+
+          This error is benign in shutdown/cleanup flows where close() may be
+          called defensively. Do NOT ignore all errors in the callback — only
+          the 'not running' case.
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket-server.js"
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: doc/ws.md server.close() section — "existing connections are not closed automatically"
+      - id: server-close-existing-connections-not-terminated
+        condition: >
+          WebSocketServer.close() is called while clients are still connected.
+          Existing WebSocket connections continue to work — only new connections
+          are rejected. The server's close event fires before all connections drain.
+        throws: "Does NOT throw. Existing connections continue unaffected."
+        required_handling: >
+          If graceful shutdown is required, terminate all active connections before
+          or after calling close():
+            wss.clients.forEach((client) => {
+              if (client.readyState === WebSocket.OPEN) {
+                client.close(1001, 'Server shutting down');
+              }
+            });
+            wss.close(() => { process.exit(0); });
+
+          Without explicit termination, long-lived connections keep the server
+          process alive indefinitely after close() returns.
+        sources:
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
