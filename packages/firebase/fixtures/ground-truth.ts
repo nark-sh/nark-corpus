@@ -19,10 +19,23 @@
  *   firestore-transaction-contention        (runTransaction)
  *   storage-upload-bytes-error              (uploadBytes)
  *   storage-get-download-url-error          (getDownloadURL)
+ *
+ * Added in depth pass 2026-04-17 (deepen-stream-2 pass 3):
+ *   email-link-expired-or-invalid                        (signInWithEmailLink)
+ *   anonymous-auth-not-enabled-or-quota-exceeded         (signInAnonymously)
+ *   update-profile-error                                 (updateProfile)
+ *   link-credential-conflict                             (linkWithCredential)
+ *   reauth-credential-error                              (reauthenticateWithCredential)
+ *   verify-before-update-email-error                     (verifyBeforeUpdateEmail)
+ *   batch-commit-permission-denied                       (writeBatch.commit)
+ *   count-from-server-error                              (getCountFromServer)
+ *   delete-object-error                                  (deleteObject)
+ *   functions-call-unauthenticated-or-permission-denied  (httpsCallable — no detector yet)
  */
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset } from 'firebase/auth';
-import { getDocs, addDoc, setDoc, updateDoc, deleteDoc, getDoc, runTransaction, collection, doc, getFirestore, query, where } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset, signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, EmailAuthProvider } from 'firebase/auth';
+import { getDocs, addDoc, setDoc, updateDoc, deleteDoc, getDoc, runTransaction, collection, doc, getFirestore, query, where, writeBatch, getCountFromServer } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 
 declare const GoogleAuthProvider: any;
 
@@ -116,15 +129,15 @@ async function gt_getDocs_proper(userId: string) {
 
 async function gt_addDoc_missing(data: Record<string, unknown>) {
   // SHOULD_FIRE: firestore-error — addDoc without try-catch
-  const ref = await addDoc(collection(db, 'items'), data);
-  return ref.id;
+  const docRef = await addDoc(collection(db, 'items'), data);
+  return docRef.id;
 }
 
 async function gt_addDoc_proper(data: Record<string, unknown>) {
   try {
     // SHOULD_NOT_FIRE: addDoc inside try-catch
-    const ref = await addDoc(collection(db, 'items'), data);
-    return ref.id;
+    const docRef = await addDoc(collection(db, 'items'), data);
+    return docRef.id;
   } catch (error) { throw error; }
 }
 
@@ -396,5 +409,201 @@ async function gt_getDownloadURL_proper(filePath: string) {
     // SHOULD_NOT_FIRE: getDownloadURL inside try-catch
     const url = await getDownloadURL(ref(storage, filePath));
     return url;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 21. signInWithEmailLink (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_signInWithEmailLink_missing(email: string, emailLink: string) {
+  // SHOULD_FIRE: email-link-expired-or-invalid — signInWithEmailLink without try-catch
+  const result = await signInWithEmailLink(auth, email, emailLink);
+  return result.user;
+}
+
+async function gt_signInWithEmailLink_proper(email: string, emailLink: string) {
+  try {
+    // SHOULD_NOT_FIRE: signInWithEmailLink inside try-catch
+    const result = await signInWithEmailLink(auth, email, emailLink);
+    return result.user;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 22. signInAnonymously (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_signInAnonymously_missing() {
+  // SHOULD_FIRE: anonymous-auth-not-enabled-or-quota-exceeded — signInAnonymously without try-catch
+  const result = await signInAnonymously(auth);
+  return result.user;
+}
+
+async function gt_signInAnonymously_proper() {
+  try {
+    // SHOULD_NOT_FIRE: signInAnonymously inside try-catch
+    const result = await signInAnonymously(auth);
+    return result.user;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 23. updateProfile (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_updateProfile_missing(displayName: string) {
+  const user = auth.currentUser!;
+  // SHOULD_FIRE: update-profile-error — updateProfile without try-catch
+  await updateProfile(user, { displayName });
+}
+
+async function gt_updateProfile_proper(displayName: string) {
+  const user = auth.currentUser!;
+  try {
+    // SHOULD_NOT_FIRE: updateProfile inside try-catch
+    await updateProfile(user, { displayName });
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 24. linkWithCredential (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_linkWithCredential_missing(email: string, password: string) {
+  const user = auth.currentUser!;
+  const credential = EmailAuthProvider.credential(email, password);
+  // SHOULD_FIRE: link-credential-conflict — linkWithCredential without try-catch
+  const result = await linkWithCredential(user, credential);
+  return result.user;
+}
+
+async function gt_linkWithCredential_proper(email: string, password: string) {
+  const user = auth.currentUser!;
+  const credential = EmailAuthProvider.credential(email, password);
+  try {
+    // SHOULD_NOT_FIRE: linkWithCredential inside try-catch
+    const result = await linkWithCredential(user, credential);
+    return result.user;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 25. reauthenticateWithCredential (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_reauthenticate_missing(email: string, password: string) {
+  const user = auth.currentUser!;
+  const credential = EmailAuthProvider.credential(email, password);
+  // SHOULD_FIRE: reauth-credential-error — reauthenticateWithCredential without try-catch
+  await reauthenticateWithCredential(user, credential);
+}
+
+async function gt_reauthenticate_proper(email: string, password: string) {
+  const user = auth.currentUser!;
+  const credential = EmailAuthProvider.credential(email, password);
+  try {
+    // SHOULD_NOT_FIRE: reauthenticateWithCredential inside try-catch
+    await reauthenticateWithCredential(user, credential);
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 26. verifyBeforeUpdateEmail (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_verifyBeforeUpdateEmail_missing(newEmail: string) {
+  const user = auth.currentUser!;
+  // SHOULD_FIRE: verify-before-update-email-error — verifyBeforeUpdateEmail without try-catch
+  await verifyBeforeUpdateEmail(user, newEmail);
+}
+
+async function gt_verifyBeforeUpdateEmail_proper(newEmail: string) {
+  const user = auth.currentUser!;
+  try {
+    // SHOULD_NOT_FIRE: verifyBeforeUpdateEmail inside try-catch
+    await verifyBeforeUpdateEmail(user, newEmail);
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 27. writeBatch.commit (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_batchCommit_missing(userId: string, data: Record<string, unknown>) {
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'users', userId), data);
+  batch.update(doc(db, 'counters', 'users'), { count: 1 });
+  // SHOULD_FIRE: batch-commit-permission-denied — batch.commit() without try-catch
+  await batch.commit();
+}
+
+async function gt_batchCommit_proper(userId: string, data: Record<string, unknown>) {
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'users', userId), data);
+  batch.update(doc(db, 'counters', 'users'), { count: 1 });
+  try {
+    // SHOULD_NOT_FIRE: batch.commit() inside try-catch
+    await batch.commit();
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 28. getCountFromServer (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_getCountFromServer_missing(userId: string) {
+  const q = query(collection(db, 'orders'), where('userId', '==', userId));
+  // SHOULD_FIRE: count-from-server-error — getCountFromServer without try-catch
+  const snapshot = await getCountFromServer(q);
+  return snapshot.data().count;
+}
+
+async function gt_getCountFromServer_proper(userId: string) {
+  const q = query(collection(db, 'orders'), where('userId', '==', userId));
+  try {
+    // SHOULD_NOT_FIRE: getCountFromServer inside try-catch
+    const snapshot = await getCountFromServer(q);
+    return snapshot.data().count;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 29. deleteObject (added 2026-04-17)
+// ──────────────────────────────────────────────
+
+async function gt_deleteObject_missing(filePath: string) {
+  // SHOULD_FIRE: delete-object-error — deleteObject without try-catch
+  await deleteObject(ref(storage, filePath));
+}
+
+async function gt_deleteObject_proper(filePath: string) {
+  try {
+    // SHOULD_NOT_FIRE: deleteObject inside try-catch
+    await deleteObject(ref(storage, filePath));
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 30. httpsCallable (added 2026-04-17)
+// Note: no scanner detector yet — httpsCallable returns a callable fn, not an awaitable.
+// Scanner concern queued: concern-20260417-firebase-deepen-1
+// ──────────────────────────────────────────────
+
+const functions = getFunctions();
+
+async function gt_httpsCallable_missing(email: string, orgId: string) {
+  const sendInvite = httpsCallable(functions, 'sendInvite');
+  // SHOULD_NOT_FIRE: httpsCallable result called without try-catch (no detector yet — concern queued)
+  const result = await sendInvite({ email, organizationId: orgId });
+  return result.data;
+}
+
+async function gt_httpsCallable_proper(email: string, orgId: string) {
+  const sendInvite = httpsCallable(functions, 'sendInvite');
+  try {
+    // SHOULD_NOT_FIRE: httpsCallable result called inside try-catch
+    const result = await sendInvite({ email, organizationId: orgId });
+    return result.data;
   } catch (error) { throw error; }
 }
