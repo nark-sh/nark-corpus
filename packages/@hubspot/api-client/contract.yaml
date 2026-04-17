@@ -1,10 +1,48 @@
+# @hubspot/api-client — Official HubSpot Node.js SDK
+# Generated SDK wrapping all HubSpot API endpoints.
+# Primary export: Client class (new Client({ accessToken: '...' }))
+# All API calls throw ApiException<ErrorBody> (from baseapi/exception.d.ts) on non-2xx status.
+# ApiException extends Error with: code (HTTP status), body (parsed JSON), headers.
+# RequiredError extends Error and is thrown synchronously when required params are null/undefined.
+#
+# CRITICAL BATCH PATTERN:
+# batchApi.create/update/upsert return HTTP 207 with BatchResponseSimplePublicObjectWithErrors
+# for partial failures. The SDK does NOT throw on 207 — callers must check response.errors[].
+# Source: lib/codegen/crm/contacts/apis/BatchApi.js (isCodeInRange("207") → no throw)
+#
+# Depth pass 2026-04-16 (deepen-stream-1 pass 6):
+# API surface: 14 distinct async-callable operations (batch upsert, merge, purge, getAll added)
+# Contracted before: 5 (create, update, archive, doSearch, getById)
+# Contracted after: 9 (+4 this pass: upsert, merge, purge, getAll)
+# Omitted: 5 (getPage — read-only list; batchApi.read — read-only; oauth.getAccessToken — read-only;
+#             oauth.refreshTokens — rare; imports.create/cancel — admin/niche)
+# Coverage: 9/14 = 0.64
+# Evidence confirmed from:
+#   lib/codegen/crm/contacts/apis/BatchApi.js — 207 partial-failure handling
+#   lib/codegen/crm/contacts/apis/BasicApi.js — merge (414), purge (gdpr-delete endpoint)
+#   lib/src/services/getAll.js — pagination loop, inherits getPage errors
+#   https://developers.hubspot.com/docs/api/error-handling — HTTP 207, 414, 423 documented
+#
+# Depth pass 2026-04-16 (deepen-stream-2 pass 6):
+# API surface: 14 total async-callable (confirmed)
+# Contracted before: 9 (create, update, archive, doSearch, getById, upsert, merge, purge, getAll)
+# Contracted after: 13 (+4 this pass: batchCreate, batchUpdate, timeline.eventsApi.create, oauth.tokensApi.create)
+# Omitted: 5 (getPage, batchApi.read, oauth.accessTokens, oauth.refreshTokens, imports.create/cancel)
+# Coverage: 13/14 = 0.93
+# Evidence confirmed from:
+#   lib/codegen/crm/contacts/apis/BatchApi.js — 207 partial-failure on batch create/update
+#   lib/codegen/crm/timeline/apis/EventsApi.js — 201 success, 207 partial batch, ApiException on 0xx
+#   lib/codegen/oauth/apis/TokensApi.js — ApiException on invalid_grant
+#   https://developers.hubspot.com/docs/api/timeline — OAuth required for timeline events
+#   https://developers.hubspot.com/docs/api/oauth/tokens — invalid_grant error documented
 package: "@hubspot/api-client"
 semver: ">=1.0.0 <12.0.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.93  # 13 contracted / 14 total async-callable (5 intentionally omitted)
 
 detection:
   class_names:
@@ -173,3 +211,472 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: upsert
+    import_path: "@hubspot/api-client"
+    description: >
+      Batch upsert operation: creates or updates CRM objects in bulk. Called as
+      client.crm.<object>.batchApi.upsert(input). Requires an idProperty (email or custom
+      unique identifier). Returns HTTP 200 when all records succeed, or HTTP 207
+      (BatchResponseSimplePublicObjectWithErrors) when some records fail. The SDK does NOT
+      throw on 207 — partial failures are silently embedded in response.errors[].
+    patterns:
+      - 'batchApi.upsert('
+
+    postconditions:
+      # Evidence: https://developers.hubspot.com/docs/api/error-handling — HTTP 207 multi-status documented
+      # Source confirmed: lib/codegen/crm/contacts/apis/BatchApi.js — isCodeInRange("207") returns
+      #   BatchResponseSimplePublicObjectWithErrors without throwing
+      # Docs: https://developers.hubspot.com/docs/api/crm/contacts (batch upsert section)
+      - id: upsert-partial-failure-unchecked
+        condition: >
+          batchApi.upsert() returns HTTP 207 when some records fail (e.g., validation errors,
+          duplicate email with email as idProperty). The SDK returns a
+          BatchResponseSimplePublicObjectWithErrors object — it does NOT throw. Callers who
+          do not inspect response.errors[] lose visibility into which records failed silently.
+        throws: >
+          Does NOT throw on partial failure. Returns BatchResponseSimplePublicObjectWithErrors
+          with HTTP 207. response.errors[] contains per-record failure details.
+          DOES throw ApiException<ErrorBody> on total failure (401, 403, 429, 5xx).
+        required_handling: >
+          Caller MUST check the return value status code or response.errors array:
+          - If response.errors exists and has items, handle each failed record individually
+          - Log or re-queue failed records — they were NOT upserted
+          - On total failure (thrown ApiException), wrap in try/catch
+          Note: partial upserts are NOT supported when using email as idProperty —
+          any email duplicate causes the ENTIRE batch to fail with 400.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+          - "https://developers.hubspot.com/docs/api/crm/contacts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: upsert-no-try-catch
+        condition: >
+          batchApi.upsert() called in async context without surrounding try/catch.
+          Authentication failures, rate limits, and server errors throw ApiException.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status), body, headers.
+          status 401: Invalid/missing access token.
+          status 403: Insufficient OAuth scope for batch write operations.
+          status 423: HubSpot account locked (high-volume upsert triggered lock, persists 2s).
+          status 429: Rate limit exceeded.
+          status 500/504: HubSpot server error or timeout.
+        required_handling: >
+          Caller MUST wrap batchApi.upsert() in try/catch.
+          Check error.code for HTTP status.
+          Implement exponential backoff for 429 (rate limit) and 423 (lock).
+          Do NOT retry 401/403 without fixing credentials.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: merge
+    import_path: "@hubspot/api-client"
+    description: >
+      Merges two CRM records (contacts or companies) into one. Called as
+      client.crm.contacts.basicApi.merge({ primaryObjectId, objectIdToMerge }).
+      The primary record retains its ID; the secondary is archived. All associations
+      from the secondary are moved to the primary. Makes an HTTP POST to /crm/v3/objects/contacts/merge.
+    patterns:
+      - 'basicApi.merge('
+      - '.merge({'
+
+    postconditions:
+      # Evidence: https://developers.hubspot.com/docs/api/error-handling — HTTP 414 documented
+      # Source confirmed: lib/codegen/crm/contacts/apis/BasicApi.js — merge endpoint /crm/v3/objects/contacts/merge
+      # HubSpot docs: "414 URI Too Long — merging records with 250+ combined merge history"
+      - id: merge-no-try-catch
+        condition: >
+          basicApi.merge() called in async context without surrounding try/catch.
+          Throws ApiException for auth failures, non-existent IDs, and merge limits.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 404: Either primaryObjectId or objectIdToMerge does not exist.
+          status 401/403: Authentication or insufficient scope.
+          status 414: Combined merge history of both records exceeds 250 entries (URI too long).
+                      This is a HubSpot-specific hard limit — cannot be worked around.
+          status 429: Rate limit exceeded.
+        required_handling: >
+          Caller MUST wrap merge() in try/catch.
+          Handle 404 gracefully — one or both records may have already been merged or deleted.
+          Handle 414 by checking merge history counts before calling merge — records with
+          250+ total prior merges cannot be merged further via API.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: purge
+    import_path: "@hubspot/api-client"
+    description: >
+      Permanently (hard) deletes a CRM contact for GDPR compliance. Called as
+      client.crm.contacts.basicApi.purge({ email } or { objectId }). Makes an HTTP POST
+      to /crm/v3/objects/contacts/gdpr-delete. Unlike archive(), this is irreversible —
+      the record cannot be restored. Requires the 'crm.objects.contacts.sensitive.read'
+      OAuth scope or private app scope.
+    patterns:
+      - 'basicApi.purge('
+      - '.purge({'
+      - 'gdpr-delete'
+
+    postconditions:
+      # Evidence: lib/codegen/crm/contacts/apis/BasicApi.js — endpoint /crm/v3/objects/contacts/gdpr-delete
+      # HubSpot OAuth scopes: crm.objects.contacts.sensitive.read required for gdpr-delete
+      # https://developers.hubspot.com/docs/api/crm/contacts (gdpr section)
+      - id: purge-no-try-catch
+        condition: >
+          basicApi.purge() called in async context without surrounding try/catch.
+          GDPR delete operations throw ApiException on auth errors and missing records.
+          Errors during GDPR compliance workflows have legal implications.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 401: Missing or invalid access token.
+          status 403: Access token lacks 'crm.objects.contacts.sensitive.read' scope
+                      required for GDPR delete operations.
+          status 404: Contact not found by email or objectId.
+          status 429: Rate limit exceeded.
+        required_handling: >
+          Caller MUST wrap purge() in try/catch.
+          Log all errors — failed GDPR delete attempts are a compliance risk.
+          Handle 403 by checking OAuth scopes — the GDPR delete scope is NOT included in
+          standard CRM write scopes and must be explicitly requested.
+          Handle 404 as "already deleted" — verify the contact is gone before reporting success.
+          DO NOT silently swallow errors — GDPR deletion failures require operator notification.
+        sources:
+          - "https://developers.hubspot.com/docs/api/crm/contacts"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: getAll
+    import_path: "@hubspot/api-client"
+    description: >
+      Convenience method that fetches ALL records of a CRM object type by auto-paginating
+      getPage() in a loop. Called as client.crm.<object>.getAll(). Accumulates ALL pages
+      into a single in-memory array. For large HubSpot portals (100k+ contacts), this can
+      exhaust Node.js heap memory. Delegates to basicApi.getPage() and inherits all its
+      error contracts.
+    patterns:
+      - '.getAll('
+
+    postconditions:
+      # Evidence: lib/src/services/getAll.js — pagination loop that calls api.getPage() repeatedly
+      #   and concatenates response.results into a single array with no size limit
+      # Source: result = result.concat(response.results) in a do-while until !paging.next.after
+      - id: getall-no-try-catch
+        condition: >
+          crm.<object>.getAll() called in async context without surrounding try/catch.
+          Inherits all getPage() error contracts. Network failures partway through pagination
+          throw ApiException after partially consuming results — caller gets no data.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 401/403: Authentication failure throws immediately on first page.
+          status 429: Rate limit exceeded — throws mid-pagination if rate limit hit.
+          status 500/504: HubSpot server error during any page fetch.
+        required_handling: >
+          Caller MUST wrap getAll() in try/catch.
+          Consider using getPage() with manual pagination instead of getAll() for
+          large datasets — getAll() loads ALL records into memory with no limit.
+          Do NOT call getAll() on contact/company/deal CRM objects without estimating
+          record count first — portals with 100k+ records will cause OOM crashes.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: batchCreate
+    import_path: "@hubspot/api-client"
+    description: >
+      Batch creates multiple CRM objects in a single request. Called as
+      client.crm.<object>.batchApi.create({ inputs: [...] }). Max 100 records per request.
+      Returns HTTP 201 when all records succeed, or HTTP 207 (BatchResponseSimplePublicObjectWithErrors)
+      when some records fail. The SDK does NOT throw on 207 — partial failures are embedded
+      silently in response.errors[]. Confirmed from BatchApi.js source.
+    patterns:
+      - 'batchApi.create('
+
+    postconditions:
+      # Evidence: lib/codegen/crm/contacts/apis/BatchApi.js — isCodeInRange("207") returns
+      #   BatchResponseSimplePublicObjectWithErrors without throwing (confirmed from source)
+      # Docs: https://developers.hubspot.com/docs/api/crm/contacts
+      #   "Multi-status errors tell you which records were successfully created and which were not"
+      - id: batch-create-partial-failure-unchecked
+        condition: >
+          batchApi.create() returns HTTP 207 when some records in the batch fail (e.g.,
+          duplicate email, invalid property values, missing required fields). The SDK
+          returns a BatchResponseSimplePublicObjectWithErrors object — it does NOT throw.
+          Callers who do not inspect response.errors[] silently lose failed records.
+        throws: >
+          Does NOT throw on partial failure (HTTP 207). Returns
+          BatchResponseSimplePublicObjectWithErrors with response.errors[] containing
+          per-record failures and response.results[] containing successful records.
+          DOES throw ApiException<ErrorBody> on total failure (401, 403, 409, 429, 5xx).
+        required_handling: >
+          Caller MUST check response.errors or response.numErrors after each batch create call.
+          If response.errors exists and has items, log each failed record with its error message.
+          Failed records must be retried individually or flagged for operator review.
+          HTTP 207 does NOT throw — callers relying on try/catch alone will silently lose data.
+          Wrap in try/catch for total failures (auth errors, rate limits, server errors).
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+          - "https://developers.hubspot.com/docs/api/crm/contacts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: batch-create-no-try-catch
+        condition: >
+          batchApi.create() called in async context without surrounding try/catch.
+          Total failures (auth, rate limits, server errors) throw ApiException.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 401: Invalid/missing access token.
+          status 403: Insufficient OAuth scope for CRM write operations.
+          status 409: All records in batch have duplicate values (total failure).
+          status 423: HubSpot account locked due to concurrent high-volume operations (retry after 2s).
+          status 429: Rate limit exceeded.
+          status 500/504: HubSpot server error or timeout.
+        required_handling: >
+          Caller MUST wrap batchApi.create() in try/catch for total failures.
+          Implement exponential backoff for 429 (rate limit) and 423 (account lock).
+          Do NOT retry 401/403 without rotating credentials/scopes.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: batchUpdate
+    import_path: "@hubspot/api-client"
+    description: >
+      Batch updates multiple existing CRM objects in a single request. Called as
+      client.crm.<object>.batchApi.update({ inputs: [...] }). Max 100 records per request.
+      Each input requires a record ID. Returns HTTP 200 when all succeed or HTTP 207
+      (BatchResponseSimplePublicObjectWithErrors) when some fail. Like batchApi.create(),
+      the SDK does NOT throw on 207 — partial failures are silently in response.errors[].
+    patterns:
+      - 'batchApi.update('
+
+    postconditions:
+      # Evidence: lib/codegen/crm/contacts/apis/BatchApi.js — identical 207 handling pattern
+      #   to batchCreate confirmed from source. Same BatchResponseSimplePublicObjectWithErrors.
+      # Docs: https://developers.hubspot.com/docs/api/crm/contacts (batch update section)
+      - id: batch-update-partial-failure-unchecked
+        condition: >
+          batchApi.update() returns HTTP 207 when some records fail (e.g., record IDs that
+          no longer exist, validation errors on specific properties). The SDK returns
+          BatchResponseSimplePublicObjectWithErrors — it does NOT throw. Callers who skip
+          checking response.errors[] lose visibility into which updates were applied.
+        throws: >
+          Does NOT throw on partial failure (HTTP 207). Returns
+          BatchResponseSimplePublicObjectWithErrors with response.errors[] per-record.
+          DOES throw ApiException<ErrorBody> on total failure (401, 403, 429, 5xx).
+        required_handling: >
+          Caller MUST check response.errors or response.numErrors after each batch update call.
+          Failed records are not retried by the SDK — caller is responsible for re-queuing.
+          Wrap in try/catch for total failures.
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+          - "https://developers.hubspot.com/docs/api/crm/contacts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: batch-update-no-try-catch
+        condition: >
+          batchApi.update() called in async context without surrounding try/catch.
+          Total failures throw ApiException.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 401/403: Authentication or scope failure.
+          status 429: Rate limit exceeded.
+          status 500/504: Server error.
+        required_handling: >
+          Caller MUST wrap batchApi.update() in try/catch.
+          Implement backoff for 429. Log all partial failures from response.errors[].
+        sources:
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: timeline.eventsApi.create
+    import_path: "@hubspot/api-client"
+    description: >
+      Creates a custom timeline event on a CRM record. Called as
+      client.crm.timeline.eventsApi.create(timelineEvent). Requires an eventTemplateId
+      and either email, objectId, or utk to identify the target record. Makes an HTTP POST
+      to /crm/v3/timeline/events. CRITICAL: This endpoint ONLY accepts OAuth 2.0 access
+      tokens — developer API keys and private app access tokens are explicitly rejected.
+    patterns:
+      - 'timeline.eventsApi.create('
+      - 'eventsApi.create('
+
+    postconditions:
+      # Evidence: lib/codegen/crm/timeline/apis/EventsApi.js — createWithHttpInfo confirmed
+      #   ApiException thrown on non-201 responses
+      # Docs: https://developers.hubspot.com/docs/api/timeline
+      #   "Developer API keys and private app access tokens cannot be used as authentication
+      #    when creating events."
+      - id: timeline-create-wrong-auth-type
+        condition: >
+          client.crm.timeline.eventsApi.create() called with a client configured using
+          a developer API key or private app access token instead of an OAuth 2.0 access
+          token. HubSpot explicitly rejects non-OAuth tokens for timeline event creation.
+        throws: >
+          ApiException<ErrorBody> with HTTP 403 when called with developer API key or
+          private app token. The error body contains a message indicating the authentication
+          method is not supported for this endpoint.
+        required_handling: >
+          Timeline events MUST use OAuth 2.0 access tokens only. Configure the HubSpot
+          Client with { accessToken: oauthToken } (not apiKey or developerApiKey).
+          Callers using a single-auth client for all HubSpot operations must create a
+          separate client instance for timeline operations.
+        sources:
+          - "https://developers.hubspot.com/docs/api/timeline"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: timeline-create-no-try-catch
+        condition: >
+          client.crm.timeline.eventsApi.create() called in async context without surrounding
+          try/catch. ApiException thrown on non-201 responses including invalid template IDs,
+          missing required tokens, and object-not-found for the target CRM record.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 400: Missing required event tokens, invalid eventTemplateId, or event body
+                      exceeds 1MB total / 510KB per token size limit.
+          status 401: Invalid or missing OAuth access token.
+          status 403: Access token lacks required OAuth scope, OR developer API key / private
+                      app token was used instead of OAuth (explicitly not supported).
+          status 404: eventTemplateId does not exist or target objectId (company/deal/ticket)
+                      not found.
+          status 429: Rate limit exceeded.
+        required_handling: >
+          Caller MUST wrap eventsApi.create() in try/catch.
+          Handle 400 by validating eventTemplateId and all required token values before calling.
+          Handle 404 by checking that the target CRM record exists.
+          Note: for contacts, if email is used and contact does not exist, a new contact is
+          automatically created — this is distinct from companies/deals/tickets where 404 is thrown.
+        sources:
+          - "https://developers.hubspot.com/docs/api/timeline"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: oauth.tokensApi.create
+    import_path: "@hubspot/api-client"
+    description: >
+      Exchanges an OAuth 2.0 authorization code for an access token and refresh token.
+      Called as client.oauth.tokensApi.create(grantType, code, redirectUri, clientId,
+      clientSecret). Makes an HTTP POST to /oauth/v1/token. Used in OAuth app installation
+      flows. Also used for refreshing tokens (grantType='refresh_token'). Throws ApiException
+      on invalid, expired, or already-used authorization codes.
+    patterns:
+      - 'oauth.tokensApi.create('
+      - 'tokensApi.create('
+
+    postconditions:
+      # Evidence: lib/codegen/oauth/apis/TokensApi.js — createWithHttpInfo confirmed
+      #   ApiException thrown on non-200 responses
+      # Docs: https://developers.hubspot.com/docs/api/oauth/tokens
+      #   "invalid_grant" error for expired/used codes documented in HubSpot OAuth error spec
+      #   HubSpot conforms to RFC 6749 OAuth 2.0 standard for error responses
+      - id: oauth-tokens-create-no-try-catch
+        condition: >
+          client.oauth.tokensApi.create() called in async context without surrounding
+          try/catch. OAuth authorization codes are single-use and expire within minutes.
+          Expired, already-used, or redirectUri-mismatched codes throw ApiException.
+        throws: >
+          ApiException<ErrorBody> (extends Error) with code (HTTP status).
+          status 400: invalid_grant — authorization code expired (codes expire quickly after
+                      user grants access), already exchanged, or redirectUri does not match
+                      the value used in the authorization URL.
+          status 400: invalid_client — clientId or clientSecret is invalid.
+          status 400: invalid_request — missing required parameters (code, redirectUri, etc.).
+          status 401: Unauthorized — credentials rejected by HubSpot.
+          Error body conforms to RFC 6749: { error: "invalid_grant", error_description: "...",
+            status: "BAD_REFRESH_TOKEN" } for refresh token failures.
+        required_handling: >
+          Caller MUST wrap tokensApi.create() in try/catch.
+          Authorization codes expire within minutes — implement the OAuth callback handler to
+          exchange the code immediately; do not queue it for later processing.
+          On invalid_grant, the user must restart the OAuth flow — do not retry with the same code.
+          Store returned access_token and refresh_token securely; handle the refresh flow
+          (grantType='refresh_token') with the same try/catch pattern when the access token expires.
+        sources:
+          - "https://developers.hubspot.com/docs/api/oauth/tokens"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
