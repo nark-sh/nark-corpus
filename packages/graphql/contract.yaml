@@ -1,10 +1,24 @@
 package: graphql
 semver: ">=16.0.0 <17.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-2 pass 2):
+# API surface: 8 async-callable exports (graphql, execute, subscribe, createSourceEventStream,
+#              parse, validate, buildSchema, + 3 sync-only: executeSync, graphqlSync, buildClientSchema)
+# Contracted before: 3 (execute, parse, validate)
+# Contracted after: 6 (added graphql, subscribe, buildSchema)
+# Omitted: 2 (createSourceEventStream — lower-level primitive covered by subscribe;
+#             parseValue/parseType — rarely called directly in app code)
+# Coverage: 6/8 = 0.75
+# Evidence sources (all confirmed from source inspection):
+#   graphql.js lines 19-97: graphqlImpl() behavior — errors returned not thrown
+#   execution/subscribe.js lines 153-161: GraphQLError → ExecutionResult, non-GraphQLError → re-thrown
+#   utilities/buildASTSchema.js lines 100-116: buildSchema calls parse + assertValidSDL
+#   validation/validate.js lines 137-149: assertValidSDL throws Error (not GraphQLError) on invalid SDL
+coverage_score: 0.75  # 6 contracted / 8 total callable (2 intentionally omitted)
 
 detection:
   type_names:
@@ -13,6 +27,69 @@ detection:
     - GraphQLError
 
 functions:
+  - name: graphql
+    import_path: "graphql"
+    description: >
+      All-in-one convenience function that parses, validates, and executes a GraphQL
+      operation in a single call. Returns Promise<ExecutionResult>. Unlike execute(),
+      errors from parsing and validation are NOT thrown — they are returned in the
+      result.errors array. The promise itself never rejects (resolver errors are captured
+      in result.errors). Only invalid schema types (not GraphQLSchema instance) cause rejection.
+    postconditions:
+      # Evidence: graphql.js lines 55-97 — graphqlImpl() catches parse SyntaxError and
+      # returns {errors: [syntaxError]} instead of throwing. Validation errors similarly
+      # returned as {errors: validationErrors}. Source: graphql.js:19-22 wraps in Promise.
+      - id: graphql-errors-not-thrown
+        condition: >
+          graphql() is called with a query string that has a syntax error, a schema
+          validation violation, or resolvers that throw errors. Caller checks for thrown
+          exception but does not check result.errors.
+        returns: >
+          ExecutionResult with errors array populated — parse errors, schema validation
+          errors, and resolver errors are all captured in result.errors[], never thrown.
+          result.data will be null or partial depending on which fields errored.
+        required_handling: >
+          Caller MUST check result.errors after awaiting graphql(). The promise NEVER
+          rejects for query/resolver errors — they are captured in result.errors[].
+          Pattern: const result = await graphql({...}); if (result.errors) { handle... }
+          Only invalid argument types (non-Schema object) will cause rejection.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/graphql.ts#L55"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: graphql.js line 60-67: validateSchema() returns errors array which is
+      # then returned as {errors: schemaValidationErrors} before any query execution.
+      # An invalid schema (e.g., circular type references) causes graphql() to return
+      # only errors without executing the query at all.
+      - id: graphql-invalid-schema-errors
+        condition: >
+          graphql() is called with a schema that has validation errors (invalid type
+          definitions, circular references, missing root types). The schema object exists
+          but fails internal validation.
+        returns: >
+          ExecutionResult with errors[] containing schema validation GraphQLErrors.
+          data will be undefined. No execution occurs.
+        required_handling: >
+          Validate schema with validateSchema() during application startup. If using
+          buildSchema() or buildASTSchema(), call assertValidSchema() immediately after.
+          The result of graphql() with an invalid schema looks identical to query errors —
+          only the error messages indicate it is a schema problem.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/graphql.ts#L60"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
   - name: execute
     import_path: "graphql"
     description: "Executes a GraphQL query"
@@ -30,6 +107,108 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: subscribe
+    import_path: "graphql"
+    description: >
+      Creates a GraphQL subscription and returns either an AsyncGenerator of ExecutionResults
+      (success) or an ExecutionResult with errors (failure). The return type is a discriminated
+      union — callers must check whether the result is an AsyncGenerator or an ExecutionResult
+      before iterating. Subscription resolver failures are captured in result.errors, not thrown,
+      but system-level errors (non-GraphQLErrors from the subscribe resolver) ARE re-thrown.
+    postconditions:
+      # Evidence: execution/subscribe.js lines 153-161:
+      #   if (error instanceof GraphQLError) { return { errors: [error] }; }
+      #   throw error;  // non-GraphQLErrors propagate
+      # Evidence: subscribe.d.ts return type: Promise<AsyncGenerator<ExecutionResult, void, void> | ExecutionResult>
+      - id: subscribe-result-not-checked
+        condition: >
+          subscribe() resolves but the caller does not check if the result is an
+          AsyncGenerator or an ExecutionResult (error). Caller assumes subscribe always
+          returns an async iterator and immediately starts iterating with for-await-of.
+        returns: >
+          ExecutionResult (not AsyncGenerator) when subscription field is missing,
+          subscription resolver fails, schema lacks subscription type, or field is
+          not defined. Iterating an ExecutionResult crashes with TypeError.
+        required_handling: >
+          Caller MUST check the return type before iterating:
+            const result = await subscribe({...});
+            if ('errors' in result) { handle subscription setup failure; return; }
+            for await (const event of result) { handle event; }
+          Checking Symbol.asyncIterator is also valid: if (Symbol.asyncIterator in result).
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/execution/subscribe.ts#L35"
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/execution/subscribe.ts#L97"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: execution/subscribe.js lines 159-162:
+      #   } catch (error) {
+      #     if (error instanceof GraphQLError) { return { errors: [error] }; }
+      #     throw error;  // ← non-GraphQLErrors from subscribe resolver propagate as rejections
+      - id: subscribe-system-error-thrown
+        condition: >
+          The subscription field's subscribe() resolver throws a non-GraphQLError (e.g.,
+          database connection error, EventEmitter setup failure, pubsub initialization error).
+          These are system-level errors distinct from business-logic GraphQLErrors.
+        throws: >
+          Any non-GraphQLError thrown by the subscription source resolver is re-thrown
+          as a Promise rejection. Database errors, pubsub errors, EventEmitter errors
+          propagate uncaught if subscribe() is not wrapped in try-catch.
+        required_handling: >
+          Wrap subscribe() call in try-catch for non-GraphQLError system failures:
+            try {
+              const result = await subscribe({...});
+              if ('errors' in result) { return; } // schema/field errors
+              for await (const event of result) { ... }
+            } catch (error) {
+              // system-level failure from subscribe resolver (DB, pubsub, etc.)
+              logger.error('Subscription setup failed:', error);
+            }
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/execution/subscribe.ts#L98"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: subscribe.js: iterates AsyncGenerator from createSourceEventStream and
+      # maps each payload through execute(). Each execute() call can return partial results
+      # with errors. Callers must check event.errors in each yielded ExecutionResult.
+      - id: subscribe-event-errors-unchecked
+        condition: >
+          In a for-await-of loop over the subscribe() result, each yielded ExecutionResult
+          event is used directly without checking event.errors. Database errors, auth
+          failures, or resolver errors in individual events silently produce empty data.
+        returns: >
+          Each yielded ExecutionResult may have errors[] populated for that specific event.
+          data may be null or partial. The stream continues yielding subsequent events.
+        required_handling: >
+          Check errors on EACH event, not just on subscription setup:
+            for await (const event of subscriptionResult) {
+              if (event.errors) {
+                logger.error('Event error:', event.errors);
+                // decide whether to continue or break
+              }
+              processData(event.data);
+            }
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/execution/subscribe.ts#L63"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
 
   - name: parse
     import_path: "graphql"
@@ -67,6 +246,73 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: buildSchema
+    import_path: "graphql"
+    description: >
+      Builds a GraphQLSchema from a SDL (Schema Definition Language) string. Called at
+      application startup. Internally calls parse() then assertValidSDL(). If the SDL
+      string is syntactically invalid, throws GraphQLError (from parse). If the SDL is
+      syntactically valid but semantically invalid (unknown types, duplicate definitions,
+      missing required fields), throws a generic Error (not GraphQLError) containing
+      concatenated validation messages.
+    postconditions:
+      # Evidence: utilities/buildASTSchema.js line 101: const document = parse(source, ...)
+      # parse() throws GraphQLError for syntax errors (unclosed braces, invalid tokens).
+      # Evidence: validation/validate.js lines 143-149: assertValidSDL() throws new Error(...)
+      # NOT a GraphQLError — it is a plain Error with all validation messages joined by \n\n.
+      - id: buildschema-syntax-error
+        condition: >
+          buildSchema() is called with a SDL string containing syntax errors (unclosed
+          braces, misspelled keywords like 'typo Query', invalid characters). The internal
+          parse() call throws before schema construction.
+        throws: "GraphQLError with syntax error message and location info"
+        required_handling: >
+          Wrap buildSchema() in try-catch at application startup. Syntax errors in SDL
+          indicate a programming mistake — fail fast and log the error with schema source.
+          Check err instanceof GraphQLError to identify parse errors.
+          These errors should NEVER occur in production if schema is committed to source control.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/utilities/buildASTSchema.ts#L100"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: validation/validate.js lines 143-149: assertValidSDL throws new Error(...)
+      # with concatenated validation messages. Not a GraphQLError — plain Error instance.
+      # Example: duplicate type names, referencing undefined types, invalid directive usage.
+      - id: buildschema-semantic-validation-error
+        condition: >
+          buildSchema() is called with syntactically valid SDL that fails semantic validation:
+          duplicate type definitions, fields referencing undefined types, invalid implements
+          usage, circular interface references, or using scalar names as object types.
+        throws: >
+          Error (NOT GraphQLError) with all validation errors joined by '\n\n'.
+          Cannot catch with: catch (e) { if (e instanceof GraphQLError) ... } — this check
+          will miss semantic validation errors.
+        required_handling: >
+          Wrap buildSchema() in try-catch without instanceof filtering:
+            try {
+              const schema = buildSchema(sdlString);
+            } catch (error) {
+              // catches BOTH GraphQLError (syntax) AND Error (semantic validation)
+              logger.error('Invalid schema SDL:', error.message);
+              process.exit(1); // or throw — schema is required for server startup
+            }
+          Do not assume thrown errors are always GraphQLError instances.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/v16.9.0/src/validation/validate.ts#L138"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 edge_cases:
   - id: resolver-error-masking
     description: "GraphQL resolvers should handle errors and return proper GraphQLError instances - uncaught errors expose internal stack traces to clients unless formatError is configured"
@@ -81,5 +327,5 @@ edge_cases:
       incident_cost_range: medium
 
 # Category: api
-# Latest version: 16.13.0
-# Generated: 2026-02-26
+# Latest version: 16.13.2
+# Depth-pass updated: 2026-04-16
