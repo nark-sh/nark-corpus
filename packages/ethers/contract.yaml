@@ -1,29 +1,69 @@
 package: ethers
 semver: ">=6.0.0 <7.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
+# Depth pass 2026-04-16 (deepen-stream-1 pass 2):
+# API surface: 20 distinct async-callable operations across Provider, Signer/Wallet, ContractFactory
+# Contracted before: 2 (getBalance, sendTransaction)
+# Contracted after: 9 (+7 this pass: TransactionResponse.wait, provider.estimateGas, provider.call,
+#                       provider.broadcastTransaction, Wallet.fromEncryptedJson,
+#                       provider.waitForTransaction, provider.getLogs)
+# Omitted: 11 (read-only GETs: getBlock, getTransaction, getTransactionReceipt,
+#               getTransactionCount, getCode, getStorage, getNetwork, getFeeData;
+#               utility ENS: resolveName, lookupAddress;
+#               sync-wrapped-as-async: wallet.signMessage)
+# Coverage: 9/20 = 0.45 (-> effective 9/9 = 1.0 of contracted callable surface)
+# Evidence sources confirmed from installed package source:
+#   lib.esm/providers/provider.js -- wait() TRANSACTION_REPLACED, CALL_EXCEPTION, TIMEOUT
+#   lib.esm/providers/abstract-provider.js -- NETWORK_ERROR, TIMEOUT, OFFCHAIN_FAULT
+#   lib.esm/providers/provider-jsonrpc.js -- INSUFFICIENT_FUNDS, NONCE_EXPIRED, REPLACEMENT_UNDERPRICED
+#   lib.esm/wallet/json-keystore.js -- UNSUPPORTED_OPERATION for invalid cipher
+#   https://docs.ethers.org/v6/api/utils/errors/
+coverage_score: 0.45  # 9 contracted / 20 total async-callable (11 intentionally omitted)
 
 detection:
   type_names:
     - Provider
     - Contract
     - Wallet
+    - JsonRpcProvider
+    - BrowserProvider
+    - InfuraProvider
+    - AlchemyProvider
+    - BaseWallet
+    - HDNodeWallet
+    - Signer
 
 functions:
   - name: getBalance
     import_path: "ethers"
-    description: "Gets account balance from blockchain"
+    description: >
+      Gets the ETH balance of an address at a given block from the blockchain.
+      Makes an RPC call to eth_getBalance. Used in wallet UIs, balance checks before
+      transactions, and treasury management systems.
     postconditions:
+      # Evidence: seen in 1 primary firing across 1 repo in scan-ethers-2026-04-02.json
+      # Top affected: cyl19970726/poly-sdk (stars 1264)
+      # Source: provider-jsonrpc.js -- makeError("SERVER_ERROR") for RPC failures
       - id: getbalance-rpc-error
-        condition: "RPC call fails (network down, rate limit, invalid address, node error)"
-        throws: "Error with RPC error details and error code"
-        required_handling: "Caller MUST wrap provider.getBalance() in try-catch to handle RPC errors. Network failures, rate limits, and invalid addresses crash application if unhandled."
+        condition: >
+          RPC call fails due to network failure, node unreachable, rate limit exceeded,
+          or invalid address format. Throws with error.code one of:
+          SERVER_ERROR (HTTP 4xx/5xx from RPC node), NETWORK_ERROR (no connectivity),
+          TIMEOUT (request timeout exceeded), or INVALID_ARGUMENT (invalid address).
+        throws: "EthersError with error.code = SERVER_ERROR | NETWORK_ERROR | TIMEOUT | INVALID_ARGUMENT"
+        required_handling: >
+          Caller MUST wrap provider.getBalance() in try-catch. Use isError(error, "SERVER_ERROR")
+          to detect RPC node failures, isError(error, "NETWORK_ERROR") for connectivity loss.
+          Uncaught errors crash balance-check routes and wallet UI components.
         sources:
           - "https://docs.ethers.org/v6/api/providers/#Provider-getBalance"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
         severity: error
+        evidence_quality: confirmed
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -33,17 +73,231 @@ functions:
 
   - name: sendTransaction
     import_path: "ethers"
-    description: "Sends transaction to blockchain"
+    description: >
+      Sends a signed transaction to the network. The transaction is broadcast immediately;
+      call tx.wait() on the returned TransactionResponse to wait for mining confirmation.
+      Throws on insufficient funds, nonce conflicts, or if user rejects via wallet.
     postconditions:
       # Evidence: seen in 1 primary firing across 1 repo in scan-ethers-2026-04-02.json
-      # Top affected: cyl19970726/poly-sdk (⭐ 1264)
-      - id: sendtransaction-error
-        condition: "transaction fails (insufficient gas, nonce error, network error, reverted)"
-        throws: "Error with transaction failure details (gas estimation, nonce, revert reason)"
-        required_handling: "Caller MUST wrap sendTransaction() in try-catch to handle transaction errors. Gas estimation failures, nonce conflicts, and reverted transactions crash application if unhandled. Check error.code for specific error types."
+      # Top affected: cyl19970726/poly-sdk (stars 1264)
+      # Source confirmed: provider-jsonrpc.js makeError("INSUFFICIENT_FUNDS"), makeError("NONCE_EXPIRED"),
+      #   makeError("REPLACEMENT_UNDERPRICED"), makeError("ACTION_REJECTED")
+      - id: sendtransaction-insufficient-funds
+        condition: >
+          Account has insufficient ETH to cover transaction cost (gas * gasPrice + value).
+          Throws InsufficientFundsError before the transaction is broadcast.
+        throws: "EthersError with error.code = INSUFFICIENT_FUNDS (InsufficientFundsError)"
+        required_handling: >
+          Caller MUST wrap sendTransaction() in try-catch. Check isError(error, "INSUFFICIENT_FUNDS")
+          to provide user-friendly message about insufficient balance. This is the most common
+          sendTransaction error in production -- check balance with getBalance() before sending.
         sources:
           - "https://docs.ethers.org/v6/api/providers/#Signer-sendTransaction"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
         severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: sendtransaction-nonce-expired
+        condition: >
+          Transaction nonce has already been used (transaction with same nonce already mined).
+          Common when retrying failed transactions or running concurrent transaction senders.
+        throws: "EthersError with error.code = NONCE_EXPIRED (NonceExpiredError)"
+        required_handling: >
+          Caller MUST catch and retry with a fresh nonce from provider.getTransactionCount().
+          Common in automated systems that send concurrent transactions or retry on failure.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: sendtransaction-action-rejected
+        condition: >
+          User rejected the transaction in their wallet (MetaMask, WalletConnect, etc.).
+          Only applies when using BrowserProvider or WalletConnect providers.
+        throws: "EthersError with error.code = ACTION_REJECTED (ActionRejectedError)"
+        required_handling: >
+          Caller MUST catch and handle gracefully -- user rejection is not a bug.
+          Use isError(error, "ACTION_REJECTED") to distinguish intentional cancellation
+          from infrastructure failures. Provide a "Transaction cancelled" message to users.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  - name: TransactionResponse.wait
+    import_path: "ethers"
+    description: >
+      Waits for a transaction to be mined and confirmed. CRITICAL: This is separate from
+      sendTransaction() -- sendTransaction() only broadcasts, wait() confirms mining.
+      Most code that sends financial transactions MUST call tx.wait() to know if the
+      transaction actually succeeded on-chain. Can throw on reverts, replacements, or timeouts.
+    postconditions:
+      # Evidence: source confirmed from lib.esm/providers/provider.js wait() method:
+      #   assert(false, "transaction was replaced", "TRANSACTION_REPLACED", {...})
+      #   assert(false, "transaction execution reverted", "CALL_EXCEPTION", {...})
+      #   makeError("wait for transaction timeout", "TIMEOUT")
+      - id: wait-transaction-replaced
+        condition: >
+          Transaction was replaced by another transaction with the same nonce but higher gas
+          (speed-up) or different parameters (cancel). Common during gas price fluctuations
+          when users re-submit with higher fees. Throws with the replacement transaction attached.
+        throws: "EthersError with error.code = TRANSACTION_REPLACED (TransactionReplacedError)"
+        required_handling: >
+          Caller MUST catch TRANSACTION_REPLACED from tx.wait(). This is NOT a fatal error --
+          the replacement transaction (error.replacement) may have succeeded. Check
+          error.receipt.status to verify outcome. Not handling this causes dApps to show
+          "transaction failed" for speed-up operations that actually succeeded.
+          Pattern: if (isError(e, 'TRANSACTION_REPLACED') && !e.cancelled) { return e.receipt; }
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: wait-call-exception
+        condition: >
+          Transaction was mined but execution reverted on-chain. The transaction consumed gas
+          but had no effect. Common with smart contract require() failures, access control
+          rejections, or DeFi slippage violations. This is different from sendTransaction()
+          throwing -- the TX was broadcast and mined, but the smart contract rejected it.
+        throws: "EthersError with error.code = CALL_EXCEPTION (CallExceptionError)"
+        required_handling: >
+          Caller MUST catch CALL_EXCEPTION from tx.wait() to detect on-chain reverts.
+          Use isError(error, "CALL_EXCEPTION"). Inspect error.revert for decoded revert
+          reason if the ABI is known. Critical for token transfers, DeFi operations, and
+          any contract interactions -- uncaught reverting transactions appear as silent
+          failures (gas consumed, nothing happened, no user notification).
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: wait-timeout
+        condition: >
+          Transaction was not mined within the timeout period. The transaction may still be
+          pending in the mempool and could be mined later. Throws TimeoutError.
+        throws: "EthersError with error.code = TIMEOUT (TimeoutError)"
+        required_handling: >
+          Caller MUST catch TIMEOUT from tx.wait() and handle pending state explicitly.
+          The transaction is NOT failed -- it may still be mined. Store the transaction hash
+          and allow users to check status later. Do NOT mark orders/payments as failed on timeout.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: provider.estimateGas
+    import_path: "ethers"
+    description: >
+      Estimates the gas required to execute a transaction. Performs a simulation at the
+      current block. Throws CALL_EXCEPTION if the transaction would revert, or
+      INSUFFICIENT_FUNDS if sender lacks ETH. Called before most sendTransaction calls.
+    postconditions:
+      # Evidence: source confirmed from abstract-provider.js -- estimateGas calls _perform which
+      # delegates to provider-jsonrpc.js where CALL_EXCEPTION and INSUFFICIENT_FUNDS are thrown.
+      - id: estimategas-call-exception
+        condition: >
+          The transaction would revert if executed at the current block state. Common when:
+          (1) contract require() conditions are not met, (2) caller lacks permissions,
+          (3) token approval is insufficient, (4) slippage exceeds tolerance in DeFi.
+        throws: "EthersError with error.code = CALL_EXCEPTION (CallExceptionError)"
+        required_handling: >
+          Caller MUST wrap estimateGas() in a separate try-catch from sendTransaction().
+          Both throw independently. Use isError(error, "CALL_EXCEPTION") and inspect
+          error.revert for the decoded revert reason to give users specific feedback.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#Provider-estimateGas"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: estimategas-insufficient-funds
+        condition: >
+          Sender account has insufficient ETH to cover minimum gas cost for the transaction.
+          estimateGas fails fast before broadcasting.
+        throws: "EthersError with error.code = INSUFFICIENT_FUNDS (InsufficientFundsError)"
+        required_handling: >
+          Caller MUST catch INSUFFICIENT_FUNDS from estimateGas() separately from
+          sendTransaction(). Both can throw it independently.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: provider.call
+    import_path: "ethers"
+    description: >
+      Executes a read-only smart contract call (eth_call). Used to query contract state,
+      decode return values, and simulate write operations without sending a transaction.
+      If the call reverts, throws CallExceptionError with the raw revert data.
+    postconditions:
+      # Evidence: source confirmed -- provider.d.ts: "If the call reverts, it will throw a
+      # CallExceptionError which includes the revert data."
+      # abstract-provider.js confirms CALL_EXCEPTION thrown on simulation reverts.
+      - id: call-revert-exception
+        condition: >
+          The smart contract execution reverts during eth_call simulation. Common causes:
+          (1) view/pure function has a require() that fails, (2) wrong ABI (calling
+          non-existent function), (3) calling with unauthorized address. Revert data is
+          attached to the error and can be decoded if the ABI is known.
+        throws: "EthersError with error.code = CALL_EXCEPTION (CallExceptionError) -- error.data contains raw revert bytes"
+        required_handling: >
+          Caller MUST wrap provider.call() in try-catch. Use isError(error, "CALL_EXCEPTION").
+          Decode revert reason: interface.parseError(error.data). Always wrap contract
+          read calls in try-catch -- contracts can revert on reads too. Uncaught revert
+          from call() crashes view-layer components displaying contract state.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#Provider-call"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -51,19 +305,219 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: provider.broadcastTransaction
+    import_path: "ethers"
+    description: >
+      Broadcasts a pre-signed raw transaction to the network. Unlike sendTransaction() which
+      handles signing, broadcastTransaction() accepts an already-signed hex string. Used when
+      signing is done separately (hardware wallets, offline signing, batching).
+    postconditions:
+      # Evidence: source confirmed from provider-jsonrpc.js -- same error mapping as sendTransaction:
+      # INSUFFICIENT_FUNDS, NONCE_EXPIRED, REPLACEMENT_UNDERPRICED are thrown here.
+      - id: broadcast-insufficient-funds
+        condition: >
+          The signed transaction would overdraft the sender's ETH balance. RPC node rejects
+          before adding to mempool. Common when broadcasting offline-signed transactions
+          where balance changed between signing and broadcasting.
+        throws: "EthersError with error.code = INSUFFICIENT_FUNDS (InsufficientFundsError)"
+        required_handling: >
+          Caller MUST wrap broadcastTransaction() in try-catch. Particularly important in
+          batch-signing workflows where balance may change between signing and broadcast.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#Provider-broadcastTransaction"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: broadcast-nonce-expired
+        condition: >
+          The nonce in the signed transaction has already been used. Common in batch-signing
+          workflows where some transactions were already sent, or offline-signed transactions
+          are broadcast out of order.
+        throws: "EthersError with error.code = NONCE_EXPIRED (NonceExpiredError)"
+        required_handling: >
+          Caller MUST catch NONCE_EXPIRED and re-sign with fresh nonce from getTransactionCount().
+          Critical for automated transaction systems that sign and broadcast asynchronously.
+        sources:
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: Wallet.fromEncryptedJson
+    import_path: "ethers"
+    description: >
+      Asynchronously decrypts a JSON Keystore Wallet (v3 format) using the provided password.
+      CPU-intensive (scrypt KDF). Used when loading wallets from file or database in
+      server-side Node.js applications or dApp backends.
+    postconditions:
+      # Evidence: source confirmed from lib.esm/wallet/json-keystore.js:
+      #   assert(false, "unsupported cipher", "UNSUPPORTED_OPERATION", {...}) for non-AES-128-CTR
+      #   Incorrect password fails MAC verification -- throws before returning
+      - id: from-encrypted-json-invalid-password
+        condition: >
+          Password is incorrect. The scrypt key derivation produces a key that fails MAC
+          verification in the keystore. Most common error when loading wallets -- wrong
+          passwords, encoding mismatches (UTF-8 vs bytes), or copy-paste errors.
+        throws: "Error with message about invalid password / MAC mismatch"
+        required_handling: >
+          Caller MUST wrap Wallet.fromEncryptedJson() in try-catch. Wrong password throws --
+          it does NOT return null. Provide a user-friendly "Incorrect password" message.
+          Never log the attempted password. Critical for server-side wallet management.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#Wallet-fromEncryptedJson"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: from-encrypted-json-corrupt-keystore
+        condition: >
+          The JSON string is malformed, missing required fields, or uses an unsupported
+          cipher (not aes-128-ctr). Throws UNSUPPORTED_OPERATION for unknown ciphers,
+          or JSON parse errors for malformed JSON.
+        throws: "EthersError with error.code = UNSUPPORTED_OPERATION | JSON.parse SyntaxError"
+        required_handling: >
+          Caller MUST validate the keystore JSON using isKeystoreJson() before calling
+          fromEncryptedJson(). Database corruption or filesystem errors can produce
+          truncated keystores that throw on decryption.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: provider.waitForTransaction
+    import_path: "ethers"
+    description: >
+      Waits for a transaction hash to be mined without requiring a TransactionResponse object.
+      Alternative to tx.wait() when only the hash is available (e.g., from external sources
+      or after process restart). Resolves to TransactionReceipt or null if confirms=0.
+    postconditions:
+      # Evidence: source confirmed from abstract-provider.js:
+      #   makeError("timeout", "TIMEOUT", { reason: "timeout" }) in waitForTransaction timer
+      - id: wait-for-transaction-timeout
+        condition: >
+          The transaction is not mined within the timeout period. If timeout is set and
+          expires, throws TIMEOUT. The transaction may still be pending -- it is NOT cancelled.
+        throws: "EthersError with error.code = TIMEOUT (TimeoutError)"
+        required_handling: >
+          Caller MUST catch TIMEOUT and NOT mark the transaction as failed. Store the
+          transaction hash and allow users to poll status later. Network congestion can
+          delay mining by minutes or hours for low-fee transactions.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#Provider-waitForTransaction"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: provider.getLogs
+    import_path: "ethers"
+    description: >
+      Queries the blockchain for event logs matching a filter. Used to read contract events
+      (Transfer, Deposit, etc.). RPC nodes commonly reject large block ranges or responses
+      with too many logs. Throws SERVER_ERROR for rejected queries.
+    postconditions:
+      # Evidence: source confirmed from provider-jsonrpc.js -- makeError("SERVER_ERROR") for
+      # oversized responses, rate limiting, and RPC rejections.
+      # Known production failure: getLogs with large fromBlock..toBlock range is rejected
+      # by Infura/Alchemy with "query returned more than 10000 results" SERVER_ERROR.
+      - id: getlogs-range-too-large
+        condition: >
+          The block range (fromBlock..toBlock) is too large for the RPC node. Infura and
+          Alchemy reject ranges returning more than 10,000 log entries. Also throws on
+          invalid filter parameters or general RPC node errors (SERVER_ERROR).
+        throws: "EthersError with error.code = SERVER_ERROR (ServerError)"
+        required_handling: >
+          Caller MUST wrap getLogs() in try-catch and implement chunked pagination for
+          large block ranges. Split queries into chunks (e.g., 2000 blocks at a time).
+          Not handling this crashes indexing jobs and event-sync workers that process
+          large block ranges at startup.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#Provider-getLogs"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
-  - id: transaction-wait-errors
-    description: "Use receipt = await tx.wait() to wait for confirmation - can throw if transaction reverts on-chain. Must wrap in try-catch to handle revert errors and get revert reason."
+  - id: isError-pattern-required
+    description: >
+      ethers v6 uses a typed error system with error.code (ErrorCode string). The recommended
+      pattern is isError(error, "CALL_EXCEPTION") rather than instanceof checks.
+      All 21 error codes are in the ErrorCode union: CALL_EXCEPTION, INSUFFICIENT_FUNDS,
+      NONCE_EXPIRED, TRANSACTION_REPLACED, TIMEOUT, SERVER_ERROR, NETWORK_ERROR, ACTION_REJECTED, etc.
+    sources:
+      - "https://docs.ethers.org/v6/api/utils/errors/"
+    severity: info
+    business_impact:
+      incident_label: SILENT_FAILURE
+      production_behavior: silent_failure
+      visibility: silent
+      user_experience: degraded_performance
+      incident_cost_range: low
+
+  - id: wait-is-required-after-send
+    description: >
+      sendTransaction() only BROADCASTS the transaction. It does NOT wait for mining confirmation.
+      Application logic that depends on the transaction succeeding (e.g., updating database,
+      releasing inventory, confirming payment) MUST call tx.wait() and handle its errors.
+      Not calling tx.wait() is a common silent failure pattern in Web3 applications.
     sources:
       - "https://docs.ethers.org/v6/api/providers/#TransactionResponse-wait"
     severity: error
     business_impact:
-      incident_label: DOWNTIME
-      production_behavior: immediate_exception
-      visibility: visible
-      user_experience: service_unavailable
-      incident_cost_range: medium
+      incident_label: SILENT_FAILURE
+      production_behavior: silent_failure
+      visibility: silent
+      user_experience: lost_transaction
+      incident_cost_range: high
+
+metadata:
+  last_verified: "2026-04-16"
+  evidence_quality: confirmed
+  coverage_score: 0.45
+  # 9 contracted functions / 20 total async-callable
+  # Added this pass (deepen-stream-1 pass 2): TransactionResponse.wait, provider.estimateGas,
+  #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
+  #   provider.waitForTransaction, provider.getLogs
+  # Intentionally omitted (11):
+  #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
+  #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR
+  #   provider.getNetwork, getFeeData -- infrastructure reads
+  #   provider.resolveName, lookupAddress -- ENS utilities, narrow adoption
+  #   wallet.signMessage -- async wrapper over sync crypto, no network calls
 
 # Category: blockchain
 # Latest version: 6.13.0
-# Generated: 2026-02-25
