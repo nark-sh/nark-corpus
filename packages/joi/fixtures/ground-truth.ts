@@ -11,11 +11,14 @@
  *   - schema.validate() (sync) → SHOULD_NOT_FIRE (scanner cannot detect sync result.error check patterns)
  *   - Joi.assert() (sync) → SHOULD_NOT_FIRE (scanner cannot detect sync throws)
  *   - Joi.attempt() (sync) → SHOULD_NOT_FIRE (scanner cannot detect sync throws)
+ *   - Joi.compile() (sync) → SHOULD_NOT_FIRE (scanner cannot detect sync throws)
  *
  * Contracted postconditions:
  *   validateasync-rejects: validateAsync() rejects with ValidationError on invalid data
+ *   compile-invalid-schema-throws: compile() throws AssertError on invalid/undefined schema
+ *   compile-version-mismatch-throws: compile() throws AssertError on joi version mismatch
  *
- * Note: validate(), assert(), attempt() are synchronous — the scanner detects
+ * Note: validate(), assert(), attempt(), compile() are synchronous — the scanner detects
  * unhandled ASYNC calls (await without try-catch). Sync patterns are out of scanner scope.
  *
  * Coverage:
@@ -23,6 +26,7 @@
  *   - Section 2: validateAsync() inside try-catch → SHOULD_NOT_FIRE
  *   - Section 3: validate() (sync, result-based) → SHOULD_NOT_FIRE (scanner cannot detect)
  *   - Section 4: Joi.assert() (sync) → SHOULD_NOT_FIRE (scanner cannot detect)
+ *   - Section 5: Joi.compile() (sync) → SHOULD_NOT_FIRE (scanner cannot detect sync throws)
  */
 
 import Joi from "joi";
@@ -106,4 +110,30 @@ export function assertUserDataWithCatch(data: unknown) {
   } catch (error) {
     console.error("Assertion failed:", error);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Joi.compile() — synchronous, throws AssertError on invalid schema
+// Note: compile() is synchronous — scanner cannot detect bare compile() calls.
+// Both cases below are SHOULD_NOT_FIRE for the async scanner.
+// However, compile() should be wrapped when receiving dynamic schema definitions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function compileDynamicSchemaSafe(rawSchema: Record<string, unknown>) {
+  try {
+    // SHOULD_NOT_FIRE: compile-invalid-schema-throws — compile() wrapped in try-catch
+    // Correct pattern when compiling schemas from dynamic sources (config, plugins)
+    const schema = Joi.compile(rawSchema);
+    return schema;
+  } catch (err) {
+    console.error("Invalid schema definition:", err);
+    return null;
+  }
+}
+
+export function compileStaticSchema() {
+  // SHOULD_NOT_FIRE: compile-invalid-schema-throws — static literal schema, safe at module load
+  // compile() on a known-correct literal schema never throws at runtime
+  const schema = Joi.compile({ name: Joi.string().required() });
+  return schema;
 }
