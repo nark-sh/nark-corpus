@@ -8,10 +8,14 @@ package: firebase
 semver: ">=9.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.54  # 20 contracted / ~37 total async-callable (after intentional omissions)
+coverage_score: 0.81  # 30 contracted / ~37 total async-callable (after intentional omissions)
+# effective_coverage: 0.81 — 30/37 non-omitted functions contracted (+10 this pass)
+# intentionally omitted (~7): signInWithPhoneNumber/linkWithPhoneNumber/updatePhoneNumber (SMS-only niche),
+#   getDocFromServer/getDocsFromServer (same errors as getDoc/getDocs, already contracted),
+#   fetchSignInMethodsForEmail (deprecated), validatePassword (optional policy enforcement)
 
 functions:
   - name: signInWithEmailAndPassword
@@ -921,6 +925,571 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  # ----- Additional auth functions (depth pass 2026-04-17, deepen-stream-2 pass 3) -----
+
+  - name: signInWithEmailLink
+    import_path: "firebase"
+    description: >
+      Signs in a user with a magic link sent to their email address (passwordless auth).
+      The link is single-use and expires. Called as signInWithEmailLink(auth, email, emailLink).
+      Very common pattern in modern SaaS for passwordless onboarding.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts AuthErrorCode enum (confirmed from installed package)
+      # Source: https://firebase.google.com/docs/reference/js/auth.md#signinwithemaillink
+      # Error codes: EXPIRED_OOB_CODE="expired-action-code", INVALID_OOB_CODE="invalid-action-code"
+      - id: email-link-expired-or-invalid
+        condition: >
+          signInWithEmailLink() called without try-catch. The email link has expired or
+          was already used, or the link doesn't match the email address provided.
+        throws: >
+          FirebaseError with code: auth/expired-action-code (link expired — 10 minute TTL),
+          auth/invalid-action-code (link already used or malformed), auth/invalid-email
+          (email doesn't match the one the link was sent to), auth/user-disabled (account
+          disabled after link was sent), auth/network-request-failed (network failure).
+        required_handling: >
+          Caller MUST wrap await signInWithEmailLink() in try-catch. Expired and already-used
+          links are the most common production failures — users often click links multiple times
+          or wait too long. Each link is single-use and has a 10-minute expiration.
+
+          try {
+            const result = await signInWithEmailLink(auth, email, window.location.href);
+            window.localStorage.removeItem('emailForSignIn');
+            return result.user;
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/expired-action-code') {
+                throw new Error('Sign-in link has expired. Please request a new one.');
+              }
+              if (error.code === 'auth/invalid-action-code') {
+                throw new Error('Sign-in link already used. Please request a new one.');
+              }
+              if (error.code === 'auth/invalid-email') {
+                throw new Error('Email does not match the sign-in link.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/auth/web/email-link-auth"
+          - "https://firebase.google.com/docs/reference/js/auth.md#signinwithemaillink"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: signInAnonymously
+    import_path: "firebase"
+    description: >
+      Signs in as an anonymous user without requiring credentials. Used for guest flows,
+      allowing users to use the app before creating an account. Called as signInAnonymously(auth).
+      If a current anonymous user is already signed in, returns that user (idempotent).
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts AuthErrorCode enum
+      # OPERATION_NOT_ALLOWED="operation-not-allowed", QUOTA_EXCEEDED="quota-exceeded"
+      # Source: https://firebase.google.com/docs/auth/web/anonymous-auth
+      - id: anonymous-auth-not-enabled-or-quota-exceeded
+        condition: >
+          signInAnonymously() called without try-catch. Anonymous auth not enabled in
+          Firebase Console, or quota for anonymous accounts exceeded.
+        throws: >
+          FirebaseError with code: auth/operation-not-allowed (anonymous authentication
+          not enabled in Firebase Console — frequent misconfiguration in new projects),
+          auth/quota-exceeded (new anonymous sign-ups rate-limited, common when deployed
+          to production without proper settings), auth/network-request-failed (network failure).
+        required_handling: >
+          Caller MUST wrap await signInAnonymously() in try-catch.
+          auth/operation-not-allowed means Anonymous sign-in is disabled in Firebase Console —
+          developers often forget to enable it for new environments (staging, production).
+          auth/quota-exceeded means Firebase is rate-limiting new anonymous sign-ups.
+
+          try {
+            const result = await signInAnonymously(auth);
+            return result.user;
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/operation-not-allowed') {
+                throw new Error('Anonymous sign-in is disabled. Enable it in Firebase Console.');
+              }
+              if (error.code === 'auth/quota-exceeded') {
+                throw new Error('Too many anonymous sign-in attempts. Please try again later.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/auth/web/anonymous-auth"
+          - "https://firebase.google.com/docs/reference/js/auth.md#signinanonymously"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: updateProfile
+    import_path: "firebase"
+    description: >
+      Updates the current user's displayName and/or photoURL. Called as
+      updateProfile(user, { displayName, photoURL }). Makes an HTTPS request to Firebase Auth
+      API. Very common in user onboarding flows (set display name after signup).
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts — updateProfile() → Promise<void>
+      # Error codes: NETWORK_REQUEST_FAILED, TOKEN_EXPIRED, USER_DELETED
+      # Source: https://firebase.google.com/docs/reference/js/auth.md#updateprofile
+      - id: update-profile-error
+        condition: >
+          updateProfile() called without try-catch. User's token expired, user was deleted,
+          or network failure.
+        throws: >
+          FirebaseError with code: auth/network-request-failed (network failure during profile
+          update — common in flaky connections), auth/user-token-expired (user's auth token
+          has expired, requires re-authentication), auth/user-not-found (user account was
+          deleted between sign-in and the profile update call).
+        required_handling: >
+          Caller MUST wrap await updateProfile() in try-catch.
+          auth/user-token-expired requires the user to sign in again.
+          This function is commonly called immediately after createUserWithEmailAndPassword()
+          in onboarding flows — both should be wrapped together.
+
+          try {
+            await updateProfile(auth.currentUser, {
+              displayName: name,
+              photoURL: avatarUrl
+            });
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/network-request-failed') {
+                throw new Error('Network error updating profile. Please try again.');
+              }
+              if (error.code === 'auth/user-token-expired') {
+                throw new Error('Session expired. Please sign in again.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#updateprofile"
+          - "https://firebase.google.com/docs/auth/web/manage-users#update_a_users_profile"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: linkWithCredential
+    import_path: "firebase"
+    description: >
+      Links an anonymous account or existing account to an auth credential (email/password,
+      OAuth provider, etc.). Called as linkWithCredential(user, credential). Critical for
+      anonymous-to-registered account promotion flows and social login linking.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts AuthErrorCode enum
+      # CREDENTIAL_ALREADY_IN_USE="credential-already-in-use", NEED_CONFIRMATION="account-exists-with-different-credential"
+      # Source: https://firebase.google.com/docs/reference/js/auth.md#linkwithcredential
+      - id: link-credential-conflict
+        condition: >
+          linkWithCredential() called without try-catch. The credential is already associated
+          with another Firebase account, or an account with that email already exists.
+        throws: >
+          FirebaseError with code: auth/credential-already-in-use (the credential is already
+          linked to a different Firebase user account — cannot link the same Google/GitHub account
+          to multiple Firebase users), auth/account-exists-with-different-credential (an account
+          with the same email already exists but uses a different sign-in method — e.g. user has
+          email/password account and tries to link Google with same email), auth/email-already-in-use
+          (for email/password credential linking when email is taken), auth/provider-already-linked
+          (user already has this provider linked), auth/requires-recent-login (security-sensitive
+          operation requires recent sign-in).
+        required_handling: >
+          Caller MUST wrap await linkWithCredential() in try-catch.
+          auth/credential-already-in-use is the most important case — the linked credential's
+          user needs to be merged or the conflict resolved.
+          auth/account-exists-with-different-credential is very common in social auth flows
+          where users try to link an OAuth account that matches an existing email/password account.
+
+          try {
+            const result = await linkWithCredential(user, credential);
+            return result.user;
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/credential-already-in-use') {
+                throw new Error('This account is already linked to another user.');
+              }
+              if (error.code === 'auth/account-exists-with-different-credential') {
+                throw new Error('An account with this email already exists with a different sign-in method.');
+              }
+              if (error.code === 'auth/requires-recent-login') {
+                throw new Error('Please sign in again before linking accounts.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#linkwithcredential"
+          - "https://firebase.google.com/docs/auth/web/account-linking"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: reauthenticateWithCredential
+    import_path: "firebase"
+    description: >
+      Re-authenticates a user with a fresh credential before a security-sensitive operation.
+      Called as reauthenticateWithCredential(user, credential). Required before deleteUser(),
+      updateEmail(), updatePassword() when the user's auth token is too old (requires-recent-login).
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts AuthErrorCode enum
+      # INVALID_PASSWORD="wrong-password", CREDENTIAL_TOO_OLD_LOGIN_AGAIN="requires-recent-login"
+      # USER_MISMATCH="user-mismatch"
+      # Source: https://firebase.google.com/docs/reference/js/auth.md#reauthenticatewithcredential
+      - id: reauth-credential-error
+        condition: >
+          reauthenticateWithCredential() called without try-catch. Wrong password, stale
+          credential, or user mismatch.
+        throws: >
+          FirebaseError with code: auth/wrong-password (incorrect password for email/password
+          credential — user mistyped current password), auth/user-mismatch (credential
+          does not correspond to the currently signed-in user — wrong account), auth/invalid-credential
+          (the auth credential is malformed or has expired — OAuth token expired),
+          auth/user-not-found (user account was deleted), auth/network-request-failed
+          (network failure during re-auth).
+        required_handling: >
+          Caller MUST wrap await reauthenticateWithCredential() in try-catch.
+          This is required before deleteUser() or updateEmail() — if it fails, the subsequent
+          sensitive operation must not proceed. auth/wrong-password is the most common failure.
+          auth/user-mismatch means the credentials don't belong to the current user.
+
+          const credential = EmailAuthProvider.credential(email, currentPassword);
+          try {
+            await reauthenticateWithCredential(auth.currentUser, credential);
+            // Now safe to call deleteUser() or updateEmail()
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/wrong-password') {
+                throw new Error('Current password is incorrect.');
+              }
+              if (error.code === 'auth/user-mismatch') {
+                throw new Error('Credential does not match the current user.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#reauthenticatewithcredential"
+          - "https://firebase.google.com/docs/auth/web/manage-users#re-authenticate_a_user"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: verifyBeforeUpdateEmail
+    import_path: "firebase"
+    description: >
+      Sends a verification email to the new address before updating the user's email.
+      The replacement for updateEmail() in projects with Email Enumeration Protection enabled.
+      Called as verifyBeforeUpdateEmail(user, newEmail). The email change only takes effect
+      after the user clicks the verification link.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth.d.ts — EMAIL_CHANGE_NEEDS_VERIFICATION, CREDENTIAL_TOO_OLD_LOGIN_AGAIN
+      # Source: https://firebase.google.com/docs/reference/js/auth.md#verifybeforeupdateemail
+      - id: verify-before-update-email-error
+        condition: >
+          verifyBeforeUpdateEmail() called without try-catch. Email already in use,
+          requires recent login, or network failure.
+        throws: >
+          FirebaseError with code: auth/email-already-in-use (new email already registered
+          to another account), auth/requires-recent-login (security-sensitive operation —
+          user must have signed in within the last few minutes), auth/invalid-email
+          (new email address is malformed), auth/network-request-failed (network failure
+          during verification email send), auth/operation-not-allowed (email/password
+          accounts not enabled — unlikely but possible in Identity Platform configs).
+        required_handling: >
+          Caller MUST wrap await verifyBeforeUpdateEmail() in try-catch.
+          auth/requires-recent-login is the most common failure — the user must reauthenticate
+          before changing their email. auth/email-already-in-use means the new email is taken.
+
+          try {
+            await verifyBeforeUpdateEmail(auth.currentUser, newEmail);
+            // Tell user to check their new email inbox
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/email-already-in-use') {
+                throw new Error('This email address is already registered.');
+              }
+              if (error.code === 'auth/requires-recent-login') {
+                throw new Error('Please sign in again before changing your email.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#verifybeforeupdateemail"
+          - "https://firebase.google.com/docs/auth/web/manage-users#set_a_users_email_address"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: low
+
+  # ----- Additional Firestore functions (depth pass 2026-04-17, deepen-stream-2 pass 3) -----
+
+  - name: writeBatch.commit
+    import_path: "firebase"
+    description: >
+      Commits a WriteBatch — executes multiple Firestore write operations atomically.
+      WriteBatch is created via writeBatch(firestore). Operations (set, update, delete) are
+      added via batch.set/update/delete, then committed via batch.commit(). Maximum 500
+      operations per batch. The batch will not resolve while offline.
+
+    postconditions:
+      # Evidence: @firebase/firestore/dist/index.d.ts — WriteBatch.commit(): Promise<void>
+      # FirestoreErrorCode = 'permission-denied' | 'not-found' | 'resource-exhausted' | etc.
+      # Source: https://firebase.google.com/docs/reference/js/firestore_.writebatch#writebatchcommit
+      - id: batch-commit-permission-denied
+        condition: >
+          batch.commit() called without try-catch. Firestore Security Rules deny one or more
+          writes in the batch, or the batch exceeds 500 operations.
+        throws: >
+          FirebaseError (FirestoreError) with code: permission-denied (Security Rules block
+          one or more write operations in the batch — the entire batch fails atomically),
+          not-found (a batch.update() or batch.delete() references a document that does not
+          exist), resource-exhausted (batch exceeds 500 operations or rate limits),
+          unavailable (Firestore temporarily unavailable — transient network/service issue),
+          unauthenticated (user not authenticated and rules require auth).
+          The WriteBatch.commit() Promise will never resolve while offline.
+        required_handling: >
+          Caller MUST wrap await batch.commit() in try-catch.
+          A single permission-denied write in the batch fails ALL writes atomically.
+          Check that all document paths in the batch pass Security Rules before committing.
+          Monitor for resource-exhausted if batches dynamically grow with user-generated content.
+
+          const batch = writeBatch(db);
+          batch.set(doc(db, 'users', userId), userData);
+          batch.update(doc(db, 'counters', 'users'), { count: increment(1) });
+
+          try {
+            await batch.commit();
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'permission-denied') {
+                throw new Error('Not authorized to perform this update.');
+              }
+              if (error.code === 'resource-exhausted') {
+                throw new Error('Batch too large or rate limit exceeded. Reduce batch size.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/firestore_.writebatch#writebatchcommit"
+          - "https://firebase.google.com/docs/firestore/manage-data/transactions#batched-writes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: getCountFromServer
+    import_path: "firebase"
+    description: >
+      Counts documents matching a Firestore query by executing the count on the server.
+      Called as getCountFromServer(query). Returns an AggregateQuerySnapshot where the
+      count is accessed via snapshot.data().count. Requires Spark plan or Blaze plan.
+      Common for pagination (total page count) and dashboard metrics.
+
+    postconditions:
+      # Evidence: @firebase/firestore/dist/index.d.ts — getCountFromServer returns Promise<AggregateQuerySnapshot>
+      # FirestoreErrorCode enum: 'permission-denied', 'resource-exhausted', 'unauthenticated'
+      # Source: https://firebase.google.com/docs/reference/js/firestore_.md#getcountfromserver
+      - id: count-from-server-error
+        condition: >
+          getCountFromServer() called without try-catch. Firestore Security Rules deny the
+          query, or the underlying index is not ready.
+        throws: >
+          FirebaseError (FirestoreError) with code: permission-denied (Security Rules deny
+          the underlying query the count is based on — common when the query has compound
+          filters that require field-level auth), unauthenticated (user not authenticated
+          and Security Rules require auth), failed-precondition (composite index not yet
+          built for the query — very common during development when adding new queries),
+          resource-exhausted (project quota exceeded or too many reads in short window),
+          unavailable (Firestore temporarily unavailable).
+        required_handling: >
+          Caller MUST wrap await getCountFromServer() in try-catch.
+          failed-precondition with a message about missing indexes is very common during
+          development — Firestore will include the index creation URL in the error message.
+          permission-denied occurs when Security Rules don't allow the underlying collection read.
+
+          try {
+            const snapshot = await getCountFromServer(query(collection(db, 'orders'),
+              where('userId', '==', userId)));
+            return snapshot.data().count;
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'permission-denied') {
+                throw new Error('Not authorized to count this collection.');
+              }
+              if (error.code === 'failed-precondition') {
+                throw new Error('Missing Firestore index. Check Firebase Console.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/firestore_.md#getcountfromserver"
+          - "https://firebase.google.com/docs/firestore/query-data/aggregation-queries"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ----- Additional Storage functions (depth pass 2026-04-17, deepen-stream-2 pass 3) -----
+
+  - name: deleteObject
+    import_path: "firebase"
+    description: >
+      Deletes a file from Firebase Storage. Called as deleteObject(ref).
+      Common in user profile flows (replace avatar), content management (remove files),
+      and cleanup operations. Does NOT delete Firestore documents that reference the file —
+      the caller must handle both deletions.
+
+    postconditions:
+      # Evidence: @firebase/storage/dist/storage-public.d.ts — deleteObject(ref): Promise<void>
+      # StorageErrorCode enum: 'storage/object-not-found', 'storage/unauthorized'
+      # Source: https://firebase.google.com/docs/reference/js/storage.md#deleteobject
+      - id: delete-object-error
+        condition: >
+          deleteObject() called without try-catch. File does not exist, or Security Rules
+          deny the delete operation.
+        throws: >
+          StorageError (extends FirebaseError) with code: storage/object-not-found (file
+          was already deleted or path is wrong — concurrent deletion is common in user-facing
+          apps where users can delete from multiple sessions), storage/unauthorized (Security
+          Rules deny the delete — user does not own the file or rules require ownership check),
+          storage/unauthenticated (user is not authenticated but rules require auth),
+          storage/retry-limit-exceeded (network failure with all retries exhausted).
+        required_handling: >
+          Caller MUST wrap await deleteObject() in try-catch.
+          storage/object-not-found should be treated as a success (idempotent delete is safe)
+          or at minimum should not crash the user-facing operation.
+          Always check Security Rules: rules must verify file ownership to prevent users
+          deleting others' files.
+
+          try {
+            await deleteObject(ref(storage, filePath));
+          } catch (error) {
+            if (error instanceof StorageError) {
+              if (error.code === 'storage/object-not-found') {
+                // File already deleted — treat as success for idempotent delete
+                return;
+              }
+              if (error.code === 'storage/unauthorized') {
+                throw new Error('Not authorized to delete this file.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/storage.md#deleteobject"
+          - "https://firebase.google.com/docs/storage/web/delete-files"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ----- Firebase Cloud Functions callable (depth pass 2026-04-17, deepen-stream-2 pass 3) -----
+
+  - name: httpsCallable
+    import_path: "firebase"
+    description: >
+      Returns a reference to a callable Firebase Cloud Function, then calls it.
+      Used as: const fn = httpsCallable(functions, 'myFunction'); const result = await fn(data).
+      The HttpsCallable reference itself does not throw — the error happens when the returned
+      function is called. Throws FunctionsError with gRPC-compatible codes. Common in SaaS
+      apps for server-side business logic, payment processing, and third-party API calls.
+
+    postconditions:
+      # Evidence: @firebase/functions/dist/functions-public.d.ts — FunctionsErrorCode type
+      # FunctionsErrorCodeCore: 'unauthenticated' | 'permission-denied' | 'not-found' | 'internal' | etc.
+      # FunctionsError extends FirebaseError with code: `functions/${FunctionsErrorCodeCore}`
+      # Source: https://firebase.google.com/docs/functions/callable?gen=2nd
+      - id: functions-call-unauthenticated-or-permission-denied
+        condition: >
+          httpsCallable(functions, name) result called without try-catch. User not authenticated,
+          permission denied, function not found, or internal server error.
+        throws: >
+          FunctionsError (extends FirebaseError) with code: functions/unauthenticated (function
+          requires Firebase Authentication and user is not signed in), functions/permission-denied
+          (user is signed in but does not have permission to call this function — typically
+          enforced via Firebase Auth claims check in the function), functions/not-found (function
+          does not exist or was not deployed — common during development), functions/internal
+          (unhandled exception in the Cloud Function — function threw an error not wrapped in
+          HttpsError), functions/unavailable (Cloud Functions temporarily unavailable — transient),
+          functions/deadline-exceeded (function execution timeout — 60s default),
+          functions/resource-exhausted (quota exceeded — max concurrent calls reached).
+        required_handling: >
+          Caller MUST wrap await fn(data) in try-catch, NOT await httpsCallable() itself.
+          functions/unauthenticated means the user must sign in before calling the function.
+          functions/internal means the Cloud Function itself crashed — check server logs.
+          functions/permission-denied is an application-level authorization failure.
+          Use error.code to distinguish user-facing errors from internal server errors.
+
+          const sendInvite = httpsCallable(functions, 'sendInvite');
+          try {
+            const result = await sendInvite({ email, organizationId });
+            return result.data;
+          } catch (error) {
+            if (error instanceof FunctionsError) {
+              if (error.code === 'functions/unauthenticated') {
+                throw new Error('Please sign in to perform this action.');
+              }
+              if (error.code === 'functions/permission-denied') {
+                throw new Error('You do not have permission to perform this action.');
+              }
+              if (error.code === 'functions/internal') {
+                throw new Error('Server error. Please try again later.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/functions/callable?gen=2nd"
+          - "https://firebase.google.com/docs/reference/js/functions.md#httpscallable"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 notes:
   - "All functions imported from firebase/auth and firebase/firestore sub-modules"
   - "Subpath imports (firebase/auth) are normalized to 'firebase' by the analyzer"
@@ -933,3 +1502,5 @@ notes:
   - "AuthErrorCode enum confirmed from @firebase/auth/dist/auth-public.d.ts (installed 4.2.0 via npm)"
   - "StorageErrorCode enum confirmed from @firebase/storage/dist/storage-public.d.ts"
   - "FirestoreErrorCode type confirmed from @firebase/firestore/dist/index.d.ts"
+  - "FunctionsErrorCode type confirmed from @firebase/functions/dist/functions-public.d.ts"
+  - "Depth pass 2026-04-17 (deepen-stream-2 pass 3): added 9 functions: signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, writeBatch.commit, getCountFromServer, deleteObject, httpsCallable. Coverage: 20→30 contracted (0.54→0.81 of ~37 total async-callable)."
