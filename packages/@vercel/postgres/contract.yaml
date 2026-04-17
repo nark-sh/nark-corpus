@@ -2,9 +2,10 @@ package: "@vercel/postgres"
 semver: ^0.10.0
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.63
 
 detection:
   type_names:
@@ -55,7 +56,7 @@ functions:
           - "https://vercel.com/docs/storage/vercel-postgres"
   - name: connect
     import_path: "@vercel/postgres"
-    description: "Obtains a client from the connection pool"
+    description: "Obtains a client from the connection pool (pool.connect()) or establishes a direct connection (VercelClient.connect())"
     postconditions:
       - id: connect-no-cleanup
         condition: "Client obtained from pool is not released"
@@ -72,6 +73,280 @@ functions:
         rationale: "Unreleased clients cause connection pool exhaustion"
         sources:
           - "https://vercel.com/kb/guide/connection-pooling-with-functions"
+          - "https://node-postgres.com/features/pooling"
+
+  - name: createPool
+    import_path: "@vercel/postgres"
+    description: >
+      Creates a VercelPool instance backed by @neondatabase/serverless. Reads the
+      POSTGRES_URL environment variable by default. Throws VercelPostgresError
+      synchronously if the connection string is missing or of the wrong type
+      (direct vs. pooled). Must be called with the pooled connection string
+      (contains '-pooler.' in hostname), not the direct connection string.
+    postconditions:
+      # Evidence: source confirmed from @vercel/postgres@0.10.0 dist/chunk-BZ4XJVIW.cjs
+      # VercelPostgresError codes: 'missing_connection_string', 'invalid_connection_string'
+      # Source: https://github.com/vercel/storage/tree/main/packages/postgres
+      - id: createpool-missing-connection-string
+        condition: >
+          POSTGRES_URL environment variable is not set (undefined or the literal
+          string "undefined") and no connectionString is passed in config.
+        throws: >
+          VercelPostgresError with code 'missing_connection_string':
+          "You did not supply a 'connectionString' and no 'POSTGRES_URL' env var was found."
+        required_handling: >
+          Caller MUST ensure POSTGRES_URL is set in the environment before calling
+          createPool(). In Vercel deployments this is injected automatically; in local
+          development it must be in .env.local. Missing connection string causes
+          VercelPostgresError at call time — it will not throw at query time.
+
+          Pattern: call createPool() inside a try-catch at module initialization, or
+          validate env vars at app startup before any database access.
+        sources:
+          - "https://github.com/vercel/storage/tree/main/packages/postgres"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: createpool-wrong-connection-string-type
+        condition: >
+          A direct (non-pooled) connection string is passed to createPool(). The
+          direct connection string uses the standard host format; pooled strings
+          contain '-pooler.' in the hostname. Using a direct connection string with
+          createPool() triggers an explicit validation error.
+        throws: >
+          VercelPostgresError with code 'invalid_connection_string':
+          "This connection string is meant to be used with a direct connection.
+          Make sure to use a pooled connection string or try createClient() instead."
+        required_handling: >
+          Use POSTGRES_URL (pooled) with createPool() and POSTGRES_URL_NON_POOLING
+          (direct) with createClient(). Mixing them causes VercelPostgresError at
+          call time. This is a common mistake when manually setting connection strings.
+        sources:
+          - "https://github.com/vercel/storage/tree/main/packages/postgres"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: createClient
+    import_path: "@vercel/postgres"
+    description: >
+      Creates a VercelClient for a direct (non-pooled) PostgreSQL connection.
+      Reads POSTGRES_URL_NON_POOLING by default. Throws VercelPostgresError
+      synchronously if the connection string is missing or of the wrong type.
+      Requires calling client.connect() before issuing queries and client.end()
+      after use to release the connection.
+    postconditions:
+      # Evidence: source confirmed from @vercel/postgres@0.10.0 dist/chunk-BZ4XJVIW.cjs
+      # VercelPostgresError codes: 'missing_connection_string', 'invalid_connection_string'
+      - id: createclient-missing-connection-string
+        condition: >
+          POSTGRES_URL_NON_POOLING environment variable is not set and no
+          connectionString is passed in config.
+        throws: >
+          VercelPostgresError with code 'missing_connection_string':
+          "You did not supply a 'connectionString' and no 'POSTGRES_URL_NON_POOLING' env var was found."
+        required_handling: >
+          Ensure POSTGRES_URL_NON_POOLING is set before calling createClient().
+          In Vercel deployments, both POSTGRES_URL and POSTGRES_URL_NON_POOLING are
+          injected automatically. In local development, both must be in .env.local.
+        sources:
+          - "https://github.com/vercel/storage/tree/main/packages/postgres"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: createclient-pooled-connection-string
+        condition: >
+          A pooled connection string (containing '-pooler.' in hostname) is passed
+          to createClient() instead of a direct connection string.
+        throws: >
+          VercelPostgresError with code 'invalid_connection_string':
+          "This connection string is meant to be used with a pooled connection.
+          Try createPool() instead."
+        required_handling: >
+          Use POSTGRES_URL_NON_POOLING (direct connection) with createClient().
+          Use POSTGRES_URL (pooled) with createPool() or the global sql/db template.
+          In serverless environments, prefer createPool() (or the global sql tag)
+          over createClient() to benefit from connection pooling.
+        sources:
+          - "https://github.com/vercel/storage/tree/main/packages/postgres"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: createclient-query-before-connect
+        condition: >
+          client.query() or client.sql`` is called on a VercelClient before
+          calling client.connect().
+        throws: >
+          Error: query is called on a client that is not connected. The underlying
+          pg Client rejects with a connection error.
+        required_handling: >
+          Always call await client.connect() before issuing any queries on a
+          VercelClient. Wrap the entire client lifecycle in try-catch-finally:
+
+          const client = createClient();
+          try {
+            await client.connect();
+            const result = await client.sql`SELECT * FROM users`;
+            return result.rows;
+          } catch (error) {
+            console.error('Database error:', error);
+            throw error;
+          } finally {
+            await client.end();  // always release the connection
+          }
+        sources:
+          - "https://node-postgres.com/apis/client"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pool.end
+    import_path: "@vercel/postgres"
+    description: >
+      Shuts down all clients in the pool and clears pool timers. Returns
+      Promise<void>. After pool.end() is called, any attempt to check out a
+      client from the pool will receive an error. Should be called during
+      graceful shutdown. The global sql/db object lazily creates a pool —
+      calling pool.end() on that pool prevents future queries from succeeding.
+    postconditions:
+      # Evidence: node-postgres Pool.end() documentation + pool behavior confirmed
+      # Source: https://node-postgres.com/apis/pool
+      - id: pool-end-no-error-handling
+        condition: >
+          pool.end() is called but not awaited, or the Promise is not handled.
+          Clients may not be fully released before the process exits.
+        throws: >
+          Pool.end() returns a Promise<void>. If not awaited, the shutdown is
+          fire-and-forget and connections may not close cleanly before process exit.
+        required_handling: >
+          Always await pool.end() in shutdown handlers:
+
+          process.on('SIGTERM', async () => {
+            try {
+              await pool.end();
+            } catch (error) {
+              console.error('Error closing pool:', error);
+            } finally {
+              process.exit(0);
+            }
+          });
+        sources:
+          - "https://node-postgres.com/apis/pool"
+          - "https://node-postgres.com/features/pooling"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: pool-end-queries-after-shutdown
+        condition: >
+          Any query (sql`...`, pool.query(), pool.connect()) is attempted after
+          pool.end() has been called.
+        throws: >
+          Error: pool has been shut down — the pool refuses new client checkouts
+          after end() is called.
+        required_handling: >
+          Do not issue queries after calling pool.end(). In serverless environments
+          (Vercel Edge/Lambda), pool lifecycle is managed per-invocation — do not
+          call pool.end() in the middle of request handling.
+        sources:
+          - "https://node-postgres.com/features/pooling"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: client.end
+    import_path: "@vercel/postgres"
+    description: >
+      Closes the direct PostgreSQL connection established by VercelClient.connect().
+      Returns Promise<void>. If not called after queries complete, the connection
+      is leaked — it remains open until the server forcibly closes it due to idle
+      timeout. In Lambda/Edge functions, leaked connections accumulate across
+      invocations until max_connections is reached.
+    postconditions:
+      # Evidence: node-postgres Client.end() documentation
+      # Source: https://node-postgres.com/apis/client
+      - id: client-end-not-called
+        condition: >
+          createClient() is used to run queries but client.end() is never called,
+          or is called in a code path that can be skipped when an error occurs
+          (not in a finally block).
+        throws: >
+          No immediate exception — connection leak is silent. The PostgreSQL server
+          will eventually close idle connections based on idle_in_transaction_session_timeout
+          and tcp_keepalives settings. In the meantime, each invocation creates a
+          new connection that is never returned.
+        required_handling: >
+          ALWAYS call client.end() in a finally block to guarantee connection cleanup
+          regardless of query success or failure:
+
+          const client = createClient();
+          try {
+            await client.connect();
+            const { rows } = await client.query('SELECT * FROM users');
+            return rows;
+          } catch (error) {
+            console.error('Query failed:', error);
+            throw error;
+          } finally {
+            await client.end();  // MUST be in finally — not try
+          }
+
+          Failure pattern (DO NOT DO THIS):
+          const client = createClient();
+          await client.connect();
+          const { rows } = await client.query('...');  // if this throws, end() is never called
+          await client.end();  // unreachable on error
+        sources:
+          - "https://node-postgres.com/apis/client"
+          - "https://node-postgres.com/features/transactions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+# DEPRECATION NOTE (2026-04-17):
+# @vercel/postgres@0.10.0 is deprecated. Vercel Postgres databases were migrated
+# to Neon in December 2024. New projects should use @neondatabase/serverless directly.
+# The @vercel/postgres SDK internally delegates to @neondatabase/serverless.
+# Migration guide: https://neon.com/docs/guides/vercel-postgres-transition-guide
+# VercelPostgresError codes: missing_connection_string, invalid_connection_string,
+#   incorrect_tagged_template_call, invalid_connection_type
+
 # Category: database
-# Latest version: 0.10.0
+# Latest version: 0.10.0 (DEPRECATED)
 # Generated: 2026-02-26
+# Deepened: 2026-04-17 — pass 1 (+5 functions: createPool, createClient, pool.end, client.end, createclient-query-before-connect)
