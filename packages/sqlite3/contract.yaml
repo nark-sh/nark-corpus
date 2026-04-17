@@ -1,10 +1,11 @@
 package: sqlite3
 semver: ">=5.0.3"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 intentionally omitted)
 
 # CRITICAL SECURITY NOTE:
 # sqlite3 has 1 CVE in versions < 5.0.3:
@@ -358,6 +359,242 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: each
+    import_path: "sqlite3"
+    description: >
+      Executes query and calls a callback for each row. Accepts an optional
+      completion callback as the last argument that receives (err, count) where
+      count is the total number of rows retrieved. Uses dual-callback pattern:
+      per-row callback (err, row) and optional completion callback (err, count).
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/each.test.js
+      #   — test shows complete callback receives (err, num) where num = row count
+      #   — row callback receives (err, row) per row; errors halt iteration
+      #   sqlite3 source: sqlite3.js normalizeMethod() wraps statement.each().finalize()
+      - id: each-completion-error-ignored
+        condition: >
+          SQL syntax error, SQLITE_BUSY, or SQLITE_CONSTRAINT occurs and the
+          completion callback (second callback argument) is omitted or doesn't
+          check its err parameter.
+        throws: >
+          Error passed to row callback and completion callback as first argument.
+          If row callback ignores err, the database error is silently swallowed
+          and the application proceeds with partial or zero results.
+        required_handling: >
+          Caller MUST check the err parameter in both the row callback AND the
+          completion callback. Pattern:
+          db.each(sql, params,
+            (err, row) => { if (err) throw err; /* use row */ },
+            (err, count) => { if (err) { /* handle */ } }
+          );
+          Omitting the completion callback or ignoring its err causes silent
+          failures where query errors are swallowed.
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/each.test.js"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: each-syntax-error
+        condition: "SQL syntax error in the query"
+        throws: "Error with 'SQLITE_ERROR' or syntax details passed to row callback"
+        required_handling: >
+          Caller MUST check err in row callback. DO NOT retry — indicates SQL
+          syntax error. Error message contains details about syntax issue.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+          - "https://www.sqlite.org/rescode.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: close
+    import_path: "sqlite3"
+    description: >
+      Closes the database connection. Callback receives (err) if closing fails.
+      Fails with SQLITE_BUSY if there are unfinalized prepared statements still
+      active, or with SQLITE_MISUSE if the database is already closed.
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js
+      #   — test asserts: err.errno === sqlite3.MISUSE on double-close
+      #   — test documents: "SQLITE_BUSY: unable to close due to unfinalised statements"
+      #   sqlite3 source: lib/sqlite3.js — close() is a native binding call with callback
+      - id: close-unfinalised-statements
+        condition: >
+          Database.close() called while prepared statements created with
+          Database.prepare() are still active (not finalized).
+        throws: >
+          Error with message "SQLITE_BUSY: unable to close due to unfinalised
+          statements" passed to callback. errno = sqlite3.BUSY.
+        required_handling: >
+          Caller MUST call stmt.finalize() on all prepared statements before
+          calling db.close(). Pattern:
+          stmt.finalize(() => db.close(callback));
+          Failing to finalize statements causes db.close() to fail silently
+          if no callback is provided, leaking the database connection.
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: close-already-closed
+        condition: >
+          Database.close() called a second time after the database is already
+          closed.
+        throws: >
+          Error with errno === sqlite3.MISUSE passed to callback.
+          SQLITE_MISUSE indicates the database connection was used in an
+          undefined/unsupported way.
+        required_handling: >
+          Caller MUST track database open/closed state and only close once.
+          Do not call db.close() multiple times. Wrap in a guard:
+          if (dbIsOpen) { db.close(() => { dbIsOpen = false; }); }
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: loadExtension
+    import_path: "sqlite3"
+    description: >
+      Loads a compiled SQLite extension (.so/.dll/.dylib) into the database
+      connection. The callback receives (err) if loading fails. Common failures
+      include file not found, incompatible architecture, and security restrictions.
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/extension.test.js
+      #   — test is disabled ("not a generically safe test to run on all systems")
+      #   — confirms loadExtension() passes error to callback on failure
+      #   https://www.sqlite.org/loadext.html — SQLite extension loading docs
+      #   sqlite3 source: native binding — errors propagated via callback pattern
+      - id: loadextension-file-not-found
+        condition: >
+          Extension file path does not exist, has wrong file extension, or
+          the .so/.dll/.dylib file cannot be opened by the OS.
+        throws: >
+          Error with message containing file path and OS error (e.g., "no such
+          file or directory") passed to callback. The database remains open
+          and usable, but without the extension.
+        required_handling: >
+          Caller MUST check err in the loadExtension callback. Pattern:
+          db.loadExtension('./myext', (err) => {
+            if (err) throw new Error(`Extension load failed: ${err.message}`);
+          });
+          Failing to check err causes the application to proceed without the
+          extension, leading to "no such function" SQL errors later.
+        sources:
+          - "https://www.sqlite.org/loadext.html"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: loadextension-security-disabled
+        condition: >
+          SQLite was compiled with SQLITE_OMIT_LOAD_EXTENSION or extension
+          loading was disabled via sqlite3_db_config() SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION.
+        throws: >
+          Error with message "not authorized" or "not implemented" passed to
+          callback. Common in restricted environments (embedded systems,
+          security-hardened builds).
+        required_handling: >
+          Caller MUST handle this error gracefully. Check at application startup
+          if extensions are available before depending on them.
+        sources:
+          - "https://www.sqlite.org/loadext.html#security_recommendations"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: backup
+    import_path: "sqlite3"
+    description: >
+      Creates a Backup object that copies the database to a file via incremental
+      step() calls. The Backup object emits 'error' and 'complete' events and
+      provides step(pageCount, callback) for incremental progress.
+      backup.retryErrors defaults to [BUSY, LOCKED] for automatic retry.
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/backup.test.js
+      #   — test shows step() callback receives (err) on MISUSE after finish()
+      #   — test confirms BUSY retry behavior via retryErrors array
+      #   sqlite3 source: lib/sqlite3.js backup() sets retryErrors = [BUSY, LOCKED]
+      - id: backup-cantopen-destination
+        condition: >
+          Destination file path is in a directory that doesn't exist, or the
+          process lacks write permission to the destination path.
+        throws: >
+          Error with SQLITE_CANTOPEN passed to the step() callback or the
+          initial backup callback. errno = sqlite3.CANTOPEN.
+        required_handling: >
+          Caller MUST check that the destination directory exists and is
+          writable before calling db.backup(). Check err in both the backup
+          callback and step() callbacks.
+          const backup = db.backup('path/to/backup.db', (err) => {
+            if (err) throw err; // destination not accessible
+          });
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/backup.test.js"
+          - "https://www.sqlite.org/rescode.html#cantopen"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: backup-misuse-after-finish
+        condition: >
+          backup.step() is called after backup.finish() has been called
+          (i.e., after the backup is already complete or abandoned).
+        throws: >
+          Error with message "Backup is already finished" and errno ===
+          sqlite3.MISUSE passed to the step() callback.
+        required_handling: >
+          Caller MUST check backup.completed or backup.failed before calling
+          step() again. Do not call step() after the backup is finished.
+          Track completion state via backup.completed property.
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/backup.test.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 edge_cases:
   - id: callback-vs-promise
