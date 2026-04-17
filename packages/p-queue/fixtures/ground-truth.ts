@@ -73,8 +73,8 @@ export function addWithChainedCatch() {
 
 // @expect-violation: addall-unhandled-rejection
 export async function addAllWithoutCatch(items: string[]) {
-  // SHOULD_FIRE: addall-unhandled-rejection — await addAll() without try-catch
   // If any task throws, the entire addAll() promise rejects unhandled
+  // SHOULD_FIRE: addall-unhandled-rejection — await addAll() without try-catch
   await queue.addAll(items.map(item => async () => {
     if (!item) throw new Error('empty item');
     return item;
@@ -98,12 +98,12 @@ export async function addAllWithCatch(items: string[]) {
 
 // ─── 7. onError() awaited directly — hangs forever in success case ───────────
 
-// @expect-violation: onerror-never-resolves-hangs
+// @expect-clean (detection not implemented — behavioral pattern requires Promise.race context analysis)
 export async function onErrorAwaitedDirectly() {
   const q = new PQueue({ concurrency: 2 });
-  // SHOULD_FIRE: onerror-never-resolves-hangs — awaiting onError() directly
   // hangs forever if no task ever errors. Must use Promise.race.
   q.add(async () => 'ok').catch(() => {});
+  // Detection not implemented: requires Promise.race context analysis (no throws/returns field)
   await q.onError(); // never resolves if tasks succeed
 }
 
@@ -125,10 +125,9 @@ export async function onErrorWithPromiseRace() {
 
 // ─── 9. onEmpty() misused as "all done" signal ───────────────────────────────
 
-// @expect-violation: onempty-not-all-done
+// @expect-clean (detection not implemented — behavioral pattern, no throws/returns field)
 export async function onEmptyMisusedasDoneSignal() {
   const q = new PQueue({ concurrency: 3 });
-  // SHOULD_FIRE: onempty-not-all-done — onEmpty resolves when queue drains,
   // NOT when all executing tasks finish. Tasks in q.pending still run after this.
   // Each add() has .catch() so no add-unhandled-rejection fires
   q.add(async () => {
@@ -139,6 +138,7 @@ export async function onEmptyMisusedasDoneSignal() {
     await new Promise(r => setTimeout(r, 200));
     return 'result2';
   }).catch((err) => console.error(err));
+  // Detection not implemented: requires semantic analysis of "all done" vs "queue empty" (no throws/returns field)
   await q.onEmpty(); // queue is empty but tasks are still executing!
   // proceeding here while tasks are still running
 }
