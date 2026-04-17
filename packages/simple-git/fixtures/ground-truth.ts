@@ -7,13 +7,17 @@
  * Key contract rules:
  *   - git.push(), git.pull(), git.clone(), git.merge() throw GitError / GitResponseError
  *   - git.fetch(), git.commit(), git.checkout(), git.rebase(), git.raw(), git.clean() too
+ *   - git.stash(), git.reset(), git.revert(), git.pushTags(), git.deleteLocalBranch() too
+ *   - git.submoduleAdd(), git.submoduleUpdate() too (network calls)
  *   - All async git calls MUST be wrapped in try-catch
  *   - merge() is special: throws GitResponseError<MergeSummary> even when git exits 0
  *   - rebase() throws GitError (not GitResponseError) on conflict — always abort in catch
  *   - clean() requires FORCE or DRY_RUN mode or throws TaskConfigurationError before git runs
+ *   - deleteLocalBranch() throws GitResponseError<BranchSingleDeleteResult> on unmerged branches
+ *   - reset(ResetMode.HARD) is destructive — permanently discards uncommitted changes
  */
 
-import simpleGit, { SimpleGit } from 'simple-git';
+import simpleGit, { SimpleGit, ResetMode } from 'simple-git';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. push() — bare calls without try-catch
@@ -300,6 +304,192 @@ export async function cleanWithCatch(cwd: string) {
     // SHOULD_NOT_FIRE: wrapped in try-catch, using proper CleanOptions
     // Note: In production, use CleanOptions.DRY_RUN first to preview
     await git.clean('f');
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Depth pass 2026-04-17: stash(), reset(), revert(), pushTags(),
+//   deleteLocalBranch(), submoduleAdd(), submoduleUpdate()
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 18. stash() — no try-catch (save variant)
+// @expect-violation: simple-git-stash-missing-try-catch
+export async function stashNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-stash-missing-try-catch — throws "No local changes to save" on clean tree
+  await git.stash();
+}
+
+// 18b. stash(['pop']) — no try-catch (most dangerous: can produce conflicts)
+// @expect-violation: simple-git-stash-missing-try-catch
+export async function stashPopNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-stash-missing-try-catch — stash pop can produce conflicts
+  await git.stash(['pop']);
+}
+
+// @expect-clean
+export async function stashWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.stash();
+  } catch (err: any) {
+    if (err.message?.includes('No local changes to save')) {
+      return; // clean tree, not a fatal error
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+export async function stashPopWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with conflict handling
+    await git.stash(['pop']);
+  } catch (err: any) {
+    if (err.message?.includes('CONFLICT')) {
+      console.error('Stash pop produced conflicts:', err.message);
+    }
+    throw err;
+  }
+}
+
+// 19. reset() — no try-catch
+// @expect-violation: simple-git-reset-missing-try-catch
+export async function resetNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-reset-missing-try-catch — throws on bad ref or merge in progress
+  await git.reset(ResetMode.HARD);
+}
+
+// 19b. reset(ResetMode.SOFT) — no try-catch
+// @expect-violation: simple-git-reset-missing-try-catch
+export async function resetSoftNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-reset-missing-try-catch — soft reset can also fail (bad ref, empty repo)
+  await git.reset(ResetMode.SOFT, ['HEAD~1']);
+}
+
+// @expect-clean
+export async function resetWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.reset(ResetMode.HARD);
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 20. revert() — no try-catch
+// @expect-violation: simple-git-revert-missing-try-catch
+export async function revertNoCatch(cwd: string, commitHash: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-revert-missing-try-catch — can produce conflicts, leaves reverting state
+  await git.revert(commitHash as any);
+}
+
+// @expect-clean
+export async function revertWithAbortOnFail(cwd: string, commitHash: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with abort on conflict
+    await git.revert(commitHash as any);
+  } catch (err: any) {
+    if (err.message?.includes('CONFLICT')) {
+      try {
+        await git.revert(['--abort'] as any);
+      } catch (abortErr) {
+        console.error('Revert abort failed:', abortErr);
+      }
+    }
+    throw err;
+  }
+}
+
+// 21. pushTags() — no try-catch
+// @expect-violation: simple-git-push-tags-missing-try-catch
+export async function pushTagsNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-push-tags-missing-try-catch — network/auth failures like push()
+  await git.pushTags('origin');
+}
+
+// @expect-clean
+export async function pushTagsWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.pushTags('origin');
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 22. deleteLocalBranch() — no try-catch
+// @expect-violation: simple-git-delete-local-branch-missing-try-catch
+export async function deleteLocalBranchNoCatch(cwd: string, branchName: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-delete-local-branch-missing-try-catch
+  //   throws GitResponseError<BranchSingleDeleteResult> when branch has unmerged commits
+  await git.deleteLocalBranch(branchName);
+}
+
+// @expect-clean
+export async function deleteLocalBranchWithCatch(cwd: string, branchName: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    const result = await git.deleteLocalBranch(branchName);
+    console.log('Deleted branch:', result.branch);
+  } catch (err: any) {
+    if (err.git) {
+      // GitResponseError — unmerged branch
+      console.warn('Branch not fully merged:', err.git.branch);
+    }
+    throw err;
+  }
+}
+
+// 23. submoduleAdd() — no try-catch
+// @expect-violation: simple-git-submodule-add-missing-try-catch
+export async function submoduleAddNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-submodule-add-missing-try-catch — network call, auth/URL failures
+  await git.submoduleAdd('https://github.com/user/repo.git', 'vendor/repo');
+}
+
+// @expect-clean
+export async function submoduleAddWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.submoduleAdd('https://github.com/user/repo.git', 'vendor/repo');
+    await git.add('.gitmodules');
+    await git.commit('Add vendor/repo submodule');
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 24. submoduleUpdate() — no try-catch
+// @expect-violation: simple-git-submodule-update-missing-try-catch
+export async function submoduleUpdateNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-submodule-update-missing-try-catch — fetches submodule remotes
+  await git.submoduleUpdate(['--init', '--recursive']);
+}
+
+// @expect-clean
+export async function submoduleUpdateWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.submoduleUpdate(['--init', '--recursive']);
   } catch (err) {
     throw err;
   }

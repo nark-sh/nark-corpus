@@ -7,18 +7,26 @@ package: "simple-git"
 semver: ">=3.32.3"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.48  # 10 contracted / 21 total async-callable (11 intentionally omitted)
-# Depth pass 2026-04-16 (deepen-stream-2 pass 10):
-# API surface: ~50 distinct methods on SimpleGit interface; 21 meaningfully async-callable
-#   (read-only list/query methods like log, branch, status, diff, tags, getRemotes counted but omitted)
-# Contracted before: 4 (push, pull, clone, merge)
-# Contracted after: 10 (+6 this pass: fetch, commit, checkout, rebase, raw, clean)
-# Omitted: 11 (see functions_intentionally_omitted in deepen-index.json)
+coverage_score: 0.81  # 17 contracted / (50 total - 29 intentionally omitted) = 17/21
+# Depth pass 2026-04-17 (deepen-stream-2 pass 11):
+# API surface: ~50 distinct methods on SimpleGit interface; 21 meaningfully worth contracting
+#   (read-only list/query methods like log, branch, status, diff, tags, getRemotes, etc omitted)
+# Contracted before: 10 (push, pull, clone, merge, fetch, commit, checkout, rebase, raw, clean)
+# Contracted after: 17 (+7 this pass: stash, reset, revert, pushTags, deleteLocalBranch, submoduleAdd, submoduleUpdate)
+# Omitted: 29 (add, addConfig, addAnnotatedTag, addTag, addRemote, removeRemote, catFile, binaryCatFile,
+#   hashObject, checkIgnore, countObjects, firstCommit, getConfig, grep, cwd, env, exec, listRemote,
+#   mirror, mv, remote, revparse, rm, rmKeepLocal, show, showBuffer, stashList, subModule, submoduleInit,
+#   updateServerInfo, branch, branchLocal, status, diff, diffSummary, log, tags, tag, getRemotes, listConfig,
+#   version, checkIsRepo)
 # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
 #   node_modules source: /dist/cjs/index.js — GitResponseError, TaskConfigurationError confirmed
+#   deleteBranchTask: throws GitResponseError<BranchSingleDeleteResult> on unmerged branch (line 3880)
+#   stash: uses straightThroughStringTask (line 3577) — GitError on pop/apply conflicts
+#   reset: resetTask uses straightThroughStringTask (line 1084) — GitError on bad ref/mode conflict
+#   revert: uses straightThroughStringTask2 (line 4473) — GitError on conflicts (NOT GitResponseError)
 
 detection:
   factory_methods:
@@ -521,6 +529,432 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: stash
+    import_path: "simple-git"
+    description: >
+      Stashes working directory changes for later retrieval. Used as:
+      git.stash() to save, git.stash(['pop']) to restore, git.stash(['apply']) to restore
+      without removing from stash stack, git.stash(['drop']) to discard a stash.
+      IMPORTANT: git.stash(['pop']) and git.stash(['apply']) can produce conflicts
+      when the stashed changes conflict with the current working tree — these throw GitError
+      even when the stash was valid. git.stash() on a clean working tree exits non-zero
+      and throws GitError ("No local changes to save").
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js — stash() uses straightThroughStringTask (line 3577-3582)
+      #   straightThroughStringTask propagates GitError on any non-zero exit code
+      #   git stash pop/apply can produce conflict state — git exits 1, simple-git throws GitError
+      - id: simple-git-stash-missing-try-catch
+        condition: >
+          async function calls git.stash(), git.stash(['pop']), git.stash(['apply']),
+          or git.stash(['drop']) without wrapping in try-catch. The most dangerous case:
+          git.stash(['pop']) and git.stash(['apply']) can throw GitError when conflicts
+          occur between stashed changes and the current branch — leaving partial conflict
+          markers in the working tree. git.stash() on a clean tree also throws.
+        throws: >
+          GitError — on any failure:
+          "No local changes to save" (stash on clean tree, exit 1),
+          "CONFLICT (content): Merge conflict in <file>" (stash pop/apply conflict, exit 1),
+          "error: Your local changes to the following files would be overwritten by merge" (dirty tree during pop),
+          "fatal: Ref refs/stash is not a stash reference" (drop/apply on empty stash),
+          "ENOENT: no such file or directory, git" (git not installed).
+        required_handling: >
+          Caller MUST wrap git.stash() in try-catch for all stash subcommands.
+
+          For stash save:
+            try {
+              await git.stash();
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('No local changes to save')) {
+                // Nothing to stash — not a fatal error
+                return;
+              }
+              throw err;
+            }
+
+          For stash pop (most important — conflict handling):
+            try {
+              await git.stash(['pop']);
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('CONFLICT')) {
+                // Stash pop produced conflicts — working tree is dirty
+                // Must resolve conflicts manually or run: git checkout -- .
+                console.error('Stash pop produced conflicts:', err.message);
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-stash"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: reset
+    import_path: "simple-git"
+    description: >
+      Resets the current HEAD to a specified state. Used as:
+      git.reset(ResetMode.HARD) — discards ALL uncommitted changes (DESTRUCTIVE),
+      git.reset(ResetMode.SOFT) — moves HEAD but keeps staging + working tree,
+      git.reset(ResetMode.MIXED) — moves HEAD and clears staging, keeps working tree,
+      git.reset(ResetMode.MERGE) — aborts a failed merge,
+      git.reset(ResetMode.KEEP) — resets HEAD but keeps working tree changes.
+      CRITICAL: ResetMode.HARD permanently and irrecoverably discards all uncommitted
+      changes including staged and unstaged files. This is the most destructive git
+      operation and has no undo. Without try-catch, failures leave the repo in an
+      inconsistent mid-reset state.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js resetTask() lines 1084-1090:
+      #   resetTask uses straightThroughStringTask — throws GitError on non-zero exit
+      #   ResetMode enum: mixed | soft | hard | merge | keep (lines 1112-1119)
+      - id: simple-git-reset-missing-try-catch
+        condition: >
+          async function calls git.reset() or git.reset(ResetMode.HARD) without wrapping
+          in try-catch. Critical failure modes:
+          (1) ResetMode.HARD called programmatically — if anything throws before completion,
+          partially-reset files may be deleted with no undo path.
+          (2) reset() to a specific commit hash fails when the hash does not exist.
+          (3) reset() on a bare repository fails ("fatal: Failed to resolve HEAD").
+          (4) ResetMode.MERGE fails if there are unmerged paths.
+        throws: >
+          GitError — on any non-zero git exit:
+          "fatal: Failed to resolve 'HEAD'" (empty/bare repo),
+          "fatal: ambiguous argument '<hash>': unknown revision or path" (bad commit reference),
+          "fatal: Cannot do a hard reset in the middle of a merge" (merge in progress),
+          "error: Entry '<file>' not uptodate. Cannot merge" (ResetMode.MERGE with local changes).
+        required_handling: >
+          Caller MUST wrap git.reset() in try-catch. For hard reset, always verify
+          the reset target is valid before calling:
+
+            import { simpleGit, ResetMode } from 'simple-git';
+
+            try {
+              // Soft reset: HEAD~1 to uncommit last commit (keeps changes staged)
+              await git.reset(ResetMode.SOFT, ['HEAD~1']);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Reset failed:', err.message);
+              }
+              throw err;
+            }
+
+          For HARD reset (DESTRUCTIVE — use with extreme caution):
+            try {
+              await git.reset(ResetMode.HARD);
+              // All uncommitted changes are now permanently gone
+            } catch (err) {
+              // Even HARD reset can fail (e.g., merge in progress)
+              throw err;
+            }
+
+          NEVER call git.reset(ResetMode.HARD) in automated workflows without:
+          (1) explicit user confirmation or (2) backup of important changes.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-reset"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: revert
+    import_path: "simple-git"
+    description: >
+      Creates new commits that undo previous commits. Used as:
+      git.revert(commitHash, options?).
+      Unlike git.reset(), revert is non-destructive — it creates a new commit that
+      undoes the changes of the target commit, preserving history. However, revert can
+      fail with conflicts when the changes being reverted overlap with later changes
+      (similar to merge conflicts). When conflicts occur, the repo is left in a
+      "reverting" state that blocks subsequent git operations.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js Git2.prototype.revert (lines 4467-4476):
+      #   Uses straightThroughStringTask2 — throws GitError on non-zero exit
+      #   git revert with conflicts exits 1; simple-git throws GitError (NOT GitResponseError)
+      #   Source validation: git revert --no-commit vs --no-edit affect conflict behavior
+      - id: simple-git-revert-missing-try-catch
+        condition: >
+          async function calls git.revert(commitHash) without wrapping in try-catch.
+          Revert conflicts — where the changes being undone have since been modified —
+          leave the repo in "reverting" state (.git/REVERT_HEAD exists). All subsequent
+          git operations on that working directory fail with "error: you need to resolve
+          your current index first" until the revert is aborted or completed.
+          Also throws when the commit hash is invalid or not found.
+        throws: >
+          GitError — on conflict or invalid ref:
+          "CONFLICT (content): Merge conflict in <file>" (conflict during revert, exit 1),
+          "error: could not revert <hash>" (conflict in fast path),
+          "error: commit <hash> is a merge but no -m option was given" (reverting a merge commit),
+          "fatal: bad object <hash>" (invalid commit hash),
+          "error: you need to resolve your current index first" (revert in progress).
+        required_handling: >
+          Caller MUST wrap git.revert() in try-catch AND abort on conflict to restore
+          the working directory to a usable state:
+
+            try {
+              await git.revert(commitHash);
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('CONFLICT')) {
+                console.error('Revert produced conflicts, aborting:', err.message);
+                // CRITICAL: abort to clear the reverting state
+                try {
+                  await git.revert(['--abort']);
+                } catch (abortErr) {
+                  console.error('Revert abort failed:', abortErr.message);
+                }
+              }
+              throw err;
+            }
+
+          To revert a merge commit, supply the parent option:
+            await git.revert(commitHash, ['-m', '1']);
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-revert"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: pushTags
+    import_path: "simple-git"
+    description: >
+      Pushes local tags to a remote. Used as: git.pushTags(remote?, options?).
+      Equivalent to git.push([remote, '--tags']). Makes a network connection to the
+      remote — all push failure modes apply. Commonly used in release automation
+      workflows after creating a version tag.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js pushTagsTask() (lines 3072-3076):
+      #   pushTagsTask appends '--tags' and delegates to pushTask()
+      #   Uses same parsePushResult parser as push() — same error profile
+      #   Network call confirmed — pushes to remote via git push --tags --verbose --porcelain
+      - id: simple-git-push-tags-missing-try-catch
+        condition: >
+          async function calls git.pushTags() without wrapping in try-catch.
+          pushTags() is equivalent to push(['--tags']) — all push failure modes apply:
+          network failures, authentication failures, remote rejection (tag already exists
+          with different content), and permission denied.
+        throws: >
+          GitError — on any non-zero exit:
+          "Permission denied (publickey)" (SSH auth failure),
+          "could not read Username for 'https://...'" (HTTPS auth prompt unavailable),
+          "remote: Repository not found" (invalid remote URL),
+          "! [rejected]  v1.0.0 -> v1.0.0 (already exists)" (tag already exists),
+          "ECONNREFUSED / ETIMEDOUT" (network failure).
+        required_handling: >
+          Caller MUST wrap git.pushTags() in try-catch.
+
+          Minimum handling:
+            try {
+              await git.pushTags('origin');
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Tag push failed:', err.message);
+              }
+              throw err;
+            }
+
+          For release automation, always push tags separately from commits so that
+          failure to push tags does not block the commit push.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-push"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: deleteLocalBranch
+    import_path: "simple-git"
+    description: >
+      Deletes a local branch. Used as: git.deleteLocalBranch(branchName, forceDelete?).
+      SPECIAL: When deleting an unmerged branch without force (forceDelete=false),
+      git exits with error code 1 and simple-git throws GitResponseError<BranchSingleDeleteResult>
+      — the parsed result is attached as .git. With forceDelete=true, the deletion
+      succeeds even if the branch has unmerged commits.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      #   Documentation: "treats a failed attempt as an error"
+      # Source: dist/cjs/index.js deleteBranchTask() (lines 3869-3885):
+      #   onError: throws new GitResponseError(parsedResult, String(error))
+      #   hasBranchDeletionError checks: exitCode === 1 && deleteErrorRegex matches stderr
+      #   deleteErrorRegex = /^error[^']+'([^']+)'/m — matches "error: The branch '...' is not fully merged"
+      - id: simple-git-delete-local-branch-missing-try-catch
+        condition: >
+          async function calls git.deleteLocalBranch(branchName) without wrapping in
+          try-catch. The most common failure: deleting a branch with unmerged commits
+          without the forceDelete flag throws GitResponseError<BranchSingleDeleteResult>
+          with the parsed failure details. Also throws when the branch does not exist
+          or when trying to delete the currently checked-out branch.
+        throws: >
+          GitResponseError<BranchSingleDeleteResult> — when the branch has unmerged
+          commits and forceDelete is false (default). The .git property contains the
+          parsed BranchSingleDeleteResult with { branch, hash, success: false }.
+          Error message from git: "error: The branch '<name>' is not fully merged.
+          If you are sure you want to delete it, run 'git branch -D <name>'."
+
+          GitError — for other failures:
+          "error: branch '<name>' not found" (branch does not exist),
+          "error: Cannot delete branch '<name>' checked out at '<path>'" (current branch).
+        required_handling: >
+          Caller MUST wrap git.deleteLocalBranch() in try-catch.
+
+          Pattern for safe branch deletion:
+            try {
+              const result = await git.deleteLocalBranch(branchName);
+              // result.success is always true here (GitResponseError thrown otherwise)
+              console.log('Deleted branch:', result.branch);
+            } catch (err) {
+              if (err instanceof GitResponseError) {
+                // Unmerged branch — either force-delete or handle gracefully
+                const parsed = err.git; // BranchSingleDeleteResult
+                console.warn('Branch not fully merged:', parsed?.branch);
+                // Option: force delete
+                // await git.deleteLocalBranch(branchName, true);
+              } else if (err instanceof GitError) {
+                console.error('Branch delete failed:', err.message);
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-branch"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: submoduleAdd
+    import_path: "simple-git"
+    description: >
+      Adds a git submodule. Used as: git.submoduleAdd(repo, path).
+      Makes a network connection to clone the submodule repository — all clone
+      failure modes apply (network errors, authentication failures, invalid URLs).
+      Also writes to .gitmodules which must be staged and committed separately.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js addSubModuleTask() (line 4208):
+      #   addSubModuleTask runs: git submodule add <repo> <path>
+      #   Uses straightThroughStringTask — throws GitError on non-zero exit
+      #   git submodule add makes network connection to clone the submodule repo
+      - id: simple-git-submodule-add-missing-try-catch
+        condition: >
+          async function calls git.submoduleAdd(repo, path) without wrapping in try-catch.
+          submoduleAdd clones the submodule repository over the network — all clone
+          error modes apply. Also fails when the path already exists, when git cannot
+          write .gitmodules, or when the local path conflicts with existing files.
+        throws: >
+          GitError — on any non-zero exit:
+          "fatal: repository '<url>' not found" (invalid remote URL or private repo without auth),
+          "Permission denied (publickey)" (SSH auth failure),
+          "fatal: '<path>' already exists in the index" (path conflict),
+          "fatal: A git repository cannot be used as a subdirectory of itself" (nested git repo),
+          "ECONNREFUSED / ETIMEDOUT" (network failure during submodule clone).
+        required_handling: >
+          Caller MUST wrap git.submoduleAdd() in try-catch.
+
+          Minimum handling:
+            try {
+              await git.submoduleAdd('https://github.com/user/repo.git', 'vendor/repo');
+              // Remember to stage and commit .gitmodules after adding
+              await git.add('.gitmodules');
+              await git.commit('Add vendor/repo submodule');
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Submodule add failed:', err.message);
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-submodule"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: submoduleUpdate
+    import_path: "simple-git"
+    description: >
+      Updates registered submodules to match the committed state. Used as:
+      git.submoduleUpdate(options?). With --init flag, also initializes uninitialized
+      submodules. Makes network connections to fetch submodule commits — all fetch
+      failure modes apply. Commonly run in CI/CD pipelines after git.clone() or git.pull()
+      to populate nested submodule directories.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js updateSubModuleTask() (line 4221):
+      #   updateSubModuleTask runs: git submodule update <customArgs>
+      #   Uses straightThroughStringTask — throws GitError on non-zero exit
+      #   git submodule update makes network connections to fetch submodule commits
+      - id: simple-git-submodule-update-missing-try-catch
+        condition: >
+          async function calls git.submoduleUpdate() or git.submoduleUpdate(['--init'])
+          without wrapping in try-catch. submoduleUpdate fetches each registered submodule
+          from its remote — all fetch/clone failure modes apply. A single failing submodule
+          causes the entire update to fail, leaving other submodules un-updated.
+          Common in post-clone CI scripts that do: await git.submoduleUpdate(['--init', '--recursive']).
+        throws: >
+          GitError — on any non-zero exit:
+          "fatal: repository '<url>' not found" (submodule remote no longer exists),
+          "Permission denied (publickey)" (SSH auth failure for any submodule remote),
+          "fatal: No url found for submodule path '<path>'" (.gitmodules not initialized),
+          "ECONNREFUSED / ETIMEDOUT" (network failure during submodule fetch),
+          "fatal: Needed a single revision" (corrupt submodule reference in parent repo).
+        required_handling: >
+          Caller MUST wrap git.submoduleUpdate() in try-catch.
+
+          Minimum handling (common CI pattern):
+            try {
+              // Initialize + update all submodules recursively
+              await git.submoduleUpdate(['--init', '--recursive']);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Submodule update failed:', err.message);
+                // Check: are .gitmodules configured? Is the remote accessible?
+              }
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-submodule"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "All SimpleGit async methods can throw GitError (base) or GitResponseError<T> (with parsed git output)"
   - "GitResponseError extends GitError and adds .git property with parsed content"
@@ -528,6 +962,10 @@ notes:
   - "merge() is special: throws GitResponseError<MergeSummary> even when git exits 0 if conflicts detected"
   - "rebase() is NOT special like merge() — uses straightThroughStringTask, always throws GitError on conflict"
   - "raw() always throws GitError (never GitResponseError) — no structured parser output"
+  - "deleteLocalBranch() throws GitResponseError<BranchSingleDeleteResult> when branch has unmerged commits"
+  - "revert() uses straightThroughStringTask — throws GitError on conflict (NOT GitResponseError like merge)"
+  - "stash(['pop']) can produce conflicts — throws GitError, leaves conflict markers in working tree"
+  - "reset(ResetMode.HARD) is irreversibly destructive — always wrap in try-catch, never call without intent"
   - "CVE-2026-28292 (CVSS 9.8): RCE via case-sensitivity bypass in protocol.allow — affected 3.15.0-3.32.2, fixed in 3.32.3"
   - "simpleGit() factory function is synchronous — errors occur on first async call, not at construction"
   - "Real-world evidence: activepieces/git-sync-handler.ts calls git.push() without try-catch"
