@@ -12,6 +12,8 @@
  *   - onerror-never-resolves-hangs
  *   - onempty-not-all-done
  *   - onsizelessthan-excludes-pending
+ *   - onpendingzero-ignores-queued-tasks
+ *   - onpendingzero-resolves-immediately-when-no-running-tasks
  *
  * Key rules:
  *   - await queue.add() without try-catch → SHOULD_FIRE
@@ -21,6 +23,7 @@
  *   - await queue.onIdle() in paused queue without timeout → SHOULD_FIRE
  *   - await queue.onError() without Promise.race → SHOULD_FIRE
  *   - await queue.onEmpty() as "all done" signal → SHOULD_FIRE
+ *   - await queue.onPendingZero() used as "all work done" signal → SHOULD_FIRE (behavioral)
  */
 
 import PQueue from 'p-queue';
@@ -171,4 +174,64 @@ export async function onSizeLessThanMisusedForTotalWork() {
       await new Promise(r => setTimeout(r, 50));
     }).catch((err) => console.error(err)); // suppress add rejection — violation is about onSizeLessThan semantics
   }
+}
+
+// ─── 12. onPendingZero() misused as "all work done" signal ────────────────────
+
+// @expect-violation: onpendingzero-ignores-queued-tasks
+export async function onPendingZeroMisusedAsAllDoneSignal() {
+  const q = new PQueue({ concurrency: 2 });
+  // Add many tasks to the queue — they will start running up to concurrency limit
+  for (let i = 0; i < 10; i++) {
+    q.add(async () => {
+      await new Promise(r => setTimeout(r, 50));
+      return i;
+    }).catch((err) => console.error(err));
+  }
+  // SHOULD_FIRE: onpendingzero-ignores-queued-tasks
+  // Caller expects all 10 tasks to be done, but onPendingZero() resolves when
+  // queue.pending === 0 — the 8 remaining queued tasks (not yet started) are ignored.
+  // This is the same mistake as using onEmpty() instead of onIdle().
+  await q.onPendingZero(); // resolves after first 2 tasks complete — 8 tasks still queued!
+  // proceed assuming all work is done — but it's not
+}
+
+// ─── 13. onPendingZero() used correctly with pause() ─────────────────────────
+
+// @expect-clean
+export async function onPendingZeroCorrectUsageWithPause() {
+  const q = new PQueue({ concurrency: 2 });
+  // Start some tasks
+  q.add(async () => {
+    await new Promise(r => setTimeout(r, 50));
+    return 'task1';
+  }).catch((err) => console.error(err));
+  q.add(async () => {
+    await new Promise(r => setTimeout(r, 50));
+    return 'task2';
+  }).catch((err) => console.error(err));
+
+  // Pause the queue before draining in-flight tasks
+  q.pause();
+  // SHOULD_NOT_FIRE: correct use — pause first, then drain in-flight tasks only
+  // We explicitly want to drain pending tasks while keeping queued tasks paused
+  await q.onPendingZero();
+  // All running tasks finished — safe to mutate shared state
+  // Queued tasks are still waiting (intentionally held by pause)
+}
+
+// ─── 14. onPendingZero() resolves immediately when no tasks running ───────────
+
+// @expect-violation: onpendingzero-resolves-immediately-when-no-running-tasks
+export async function onPendingZeroCalledWhenQueuePausedNotStarted() {
+  const q = new PQueue({ concurrency: 2, autoStart: false });
+  // Add tasks to a paused queue — they are queued but never run (autoStart: false)
+  q.add(async () => 'task1').catch((err) => console.error(err));
+  q.add(async () => 'task2').catch((err) => console.error(err));
+  q.add(async () => 'task3').catch((err) => console.error(err));
+  // SHOULD_FIRE: onpendingzero-resolves-immediately-when-no-running-tasks
+  // q.pending === 0 (no tasks have started), so this resolves immediately
+  // even though q.size === 3 (3 tasks are waiting to run)
+  await q.onPendingZero(); // resolves immediately — nothing is running
+  // caller mistakenly thinks all 3 tasks finished, but they never ran
 }

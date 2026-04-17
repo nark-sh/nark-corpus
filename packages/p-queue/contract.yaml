@@ -5,7 +5,9 @@ maintainer: "corpus-team"
 last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.67  # 6 contracted / 9 total async-callable (2 intentionally omitted)
+coverage_score: 0.78  # 7 contracted / 9 total async-callable (2 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 7/7 = 1.0
+# Pass 2 (deepen-stream-2) added onPendingZero with 2 postconditions
 
 # Detection rules for analyzer integration
 detection:
@@ -301,6 +303,101 @@ functions:
           onSizeLessThan(N) is correct and sufficient.
         sources:
           - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: onPendingZero
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when queue.pending === 0 (all currently
+      RUNNING tasks have finished). Unlike onIdle(), queued tasks (queue.size > 0)
+      are completely ignored — the promise resolves even if there are many tasks
+      waiting to start. Resolves immediately if pending is already 0.
+      Use case: drain in-flight tasks before mutating shared state while keeping
+      the queue paused (queue.pause() then await queue.onPendingZero()).
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts
+      # Source: onPendingZero resolves on 'pendingZero' event emitted from #next() when this.#pending === 0
+      # Behavior confirmed: resolves when queue.pending === 0, ignoring queue.size entirely
+      - id: onpendingzero-ignores-queued-tasks
+        condition: >
+          await queue.onPendingZero() is used as a "wait for all work to finish" signal —
+          the same way queue.onIdle() is used. Since onPendingZero() only waits for currently
+          RUNNING tasks (queue.pending === 0) and ignores QUEUED tasks (queue.size > 0),
+          the promise resolves while items are still sitting in the queue waiting to start.
+          The documentation states: "The difference with onIdle is that onPendingZero only waits
+          for currently running tasks to finish, ignoring queued tasks."
+          Common mistake: using onPendingZero() in shutdown/completion checks expecting
+          all work to be done, when in fact a full queue of pending tasks remains unexecuted.
+        throws: >
+          No exception — the method always resolves (no rejection path). The problem is
+          silent early resolution: code continues as if all work is done, while queued
+          tasks have not yet been started or executed. This is a behavioral contract
+          violation, not a thrown error.
+        required_handling: >
+          Use await queue.onIdle() when you need ALL work (queued + running) to complete:
+            await queue.onIdle();   // size === 0 AND pending === 0
+
+          Use await queue.onPendingZero() ONLY when you specifically want to drain in-flight
+          tasks while keeping queued tasks held (e.g., after queue.pause()):
+            queue.pause();
+            await queue.onPendingZero();
+            // All running tasks finished; queued tasks are still waiting
+            // Safe to mutate shared state now
+
+          NEVER use onPendingZero() as a replacement for onIdle() in shutdown sequences:
+            // WRONG — resolves even if 1000 tasks are still queued:
+            await queue.onPendingZero();
+            process.exit(0);  // queued tasks never ran!
+
+            // CORRECT — waits for queue AND pending to drain:
+            await queue.onIdle();
+            process.exit(0);
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: onpendingzero-resolves-immediately-when-no-running-tasks
+        condition: >
+          queue.onPendingZero() is called when no tasks are currently running
+          (queue.pending === 0) — even if the queue has many items waiting to start
+          (queue.size > 0). The method returns immediately via its fast-path check
+          without waiting for any work to be done. This is an easy mistake when
+          the queue is paused with autoStart:false and tasks have been added but
+          not yet started — pending is 0, so onPendingZero() resolves instantly
+          even though no work has been done.
+          Implementation confirmed from source: "if (this.#pending === 0) { return; }"
+        throws: >
+          No exception — resolves immediately (synchronous early return). The problem is
+          that code after await onPendingZero() runs instantly even if the queue
+          has work that has never started.
+        required_handling: >
+          Only use onPendingZero() when you know tasks are currently running and you want
+          to wait for them to drain. Use queue.pending to check before calling:
+            // If you want to drain only currently-running tasks:
+            if (queue.pending > 0) {
+              await queue.onPendingZero();
+            }
+            // Note: this does NOT process queued tasks
+
+            // If you want ALL work done (queued + running), always use onIdle():
+            await queue.onIdle();  // handles the already-idle case internally too
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
         severity: warning
         business_impact:
           incident_label: SILENT_FAILURE
