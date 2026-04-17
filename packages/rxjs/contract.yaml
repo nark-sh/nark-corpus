@@ -2,10 +2,13 @@ package: rxjs
 semver: ">=7.0.0 <8.0.0"
 contract_version: "1.1.0"
 maintainer: "agent-onboard"
-last_verified: "2026-04-11"
+last_verified: "2026-04-16"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80
+coverage_score: 1.0
+# Depth pass 2026-04-16 (deepen-stream-2 pass 5): +1 function (fromFetch, 2 postconditions)
+# API surface: 5 total (firstValueFrom, lastValueFrom, forEach, toPromise, fromFetch)
+# All 5 contracted. Coverage: 5/5 = 1.0
 # Audit 2026-04-06: 1 repo scanned (nestjs/nest, 75011★), 1 affected (100%), 23 violations.
 # All violations in lastValueFrom — no try-catch wrapping in nestjs/nest core guards/helpers.
 # FP check: 0/20 FPs (0.0%). Contract confirmed accurate. No changes needed.
@@ -188,3 +191,98 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         evidence_quality: confirmed
+
+  - name: fromFetch
+    import_path: "rxjs/fetch"
+    description: >
+      Wraps the native fetch() API in an Observable. Automatically creates an internal
+      AbortController to cancel the in-flight request when the subscription is torn down.
+      CRITICAL BEHAVIORAL CONTRACT: Non-2xx HTTP responses (404, 500, etc.) are NOT emitted
+      as Observable errors — they are emitted as Observable.next() values with response.ok === false.
+      Callers MUST check response.ok explicitly, exactly like the native fetch() API.
+      Used in Angular and NestJS apps for HTTP requests via Observable patterns.
+    postconditions:
+      # Evidence: rxjs/src/internal/observable/dom/fetch.ts (package source, confirmed)
+      # fetch().then(response => subscriber.next(response) + subscriber.complete()) for all HTTP statuses
+      # .catch(handleError) -> subscriber.error(err) ONLY for network/CORS/abort errors
+      # Official JSDoc example: "if (response.ok) { return response.json(); } else { return of({error: true}) }"
+      # Confirmed: non-2xx status is NOT an Observable error — it's a next() value
+      - id: fromfetch-no-ok-check
+        condition: >
+          The fromFetch() Observable emits a Response with response.ok === false
+          (HTTP 4xx/5xx status codes) but the caller does not check response.ok and
+          proceeds to use the response body as if the request succeeded.
+          Common pattern: await firstValueFrom(fromFetch('/api/data').pipe(switchMap(r => r.json())))
+          without checking r.ok first — a 500 response silently returns error body as data.
+        throws: >
+          Does NOT throw. The Observable emits the Response as a next() value regardless
+          of HTTP status. The error is silent — response.ok is false, response.status is 4xx/5xx,
+          but no Observable error notification is raised unless the caller explicitly throws one.
+        required_handling: >
+          Caller MUST check response.ok before consuming the response body:
+            fromFetch('/api/users').pipe(
+              switchMap(response => {
+                if (response.ok) { return response.json(); }
+                throw new Error(`HTTP Error: ${response.status}`);
+              })
+            )
+          Not checking response.ok causes 4xx/5xx errors to silently appear as
+          successful data responses, corrupting application state. This is the
+          most common fromFetch misuse pattern.
+        sources:
+          - "https://github.com/ReactiveX/rxjs/blob/master/packages/rxjs/src/internal/observable/dom/fetch.ts"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/ok"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: fromfetch-network-error-unhandled
+        condition: >
+          The underlying native fetch() rejects with a TypeError (network unreachable,
+          CORS policy violation, invalid URL, DNS resolution failure). The fromFetch()
+          Observable propagates this as an Observable error notification. When subscribed
+          via firstValueFrom(fromFetch(...)) without try-catch, it becomes an unhandled
+          Promise rejection. Common in Node.js backends using fromFetch for service-to-service calls.
+        throws: >
+          TypeError: Failed to fetch (browser) or TypeError: fetch failed (Node.js).
+          Propagated via subscriber.error(err) from the .catch(handleError) in fromFetch source.
+        required_handling: >
+          Caller MUST handle network errors via catchError() operator or try-catch:
+            try {
+              const response = await firstValueFrom(fromFetch('/api/data'));
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              return await response.json();
+            } catch (err) {
+              // TypeError for network failures, custom Error for non-2xx
+            }
+          Network errors cause unhandled promise rejections in async functions
+          using await firstValueFrom(fromFetch(...)) without try-catch.
+        sources:
+          - "https://github.com/ReactiveX/rxjs/blob/master/packages/rxjs/src/internal/observable/dom/fetch.ts"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/fetch#exceptions"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+metadata:
+  last_verified: "2026-04-16"
+  evidence_quality: confirmed
+  coverage_score: 1.0
+  # 5 contracted functions / 5 total async-callable
+  # All functions confirmed from package source or official docs
+  # Depth pass 2026-04-16 (deepen-stream-2 pass 5):
+  #   Added: fromFetch() -- 2 postconditions (fromfetch-no-ok-check, fromfetch-network-error-unhandled)
+  #   Key insight: fromFetch emits non-2xx responses as Observable.next() values NOT errors
+  #   Evidence source: rxjs/src/internal/observable/dom/fetch.ts
+  # Functions: firstValueFrom, lastValueFrom, forEach, toPromise, fromFetch
+  # No intentionally omitted functions (all 5 are relevant to SaaS async patterns)
