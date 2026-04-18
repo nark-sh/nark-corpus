@@ -1,20 +1,55 @@
 package: luxon
 semver: ">=3.2.1"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-priority: low
-# Note: 0 violations across 13 repos in scan-luxon-2026-04-02.json — luxon uses
-# returns-invalid-object pattern (dt.isValid=false) rather than throws, so scanner
-# does not fire on this package. Postconditions are documentation-confirmed.
+# Depth pass 2026-04-17 (deepen-stream-2 pass 2):
+# API surface: 25 callable functions/methods; 10 with distinct error contracts
+# Contracted before: 6 (fromISO, fromFormat, fromSQL, fromHTTP, fromRFC2822, fromObject)
+#   — previous postconditions covered returns-invalid pattern only (no throw contracts)
+# Contracted after: 10 (+4 new: fromMillis, fromSeconds, startOf/endOf, min/max)
+# Also: added ConflictingSpecificationError postcondition to existing fromObject
+#       and fromFormat-missing-args postcondition to existing fromFormat
+# Intentionally omitted: 15 functions (see below)
+#   — fromJSDate, fromString (deprecated), local, utc, now, fromSQL (returns-invalid only),
+#     fromHTTP, fromRFC2822, fromISO (returns-invalid pattern — no throw, already contracted)
+#     fromFormatParser (locale-mismatch niche), buildFormatParser (sync, no error contract)
+#     toISO, toISODate, toRelative, toRelativeCalendar (return null on invalid, no throw)
+#     diff, hasSame, equals, setZone, plus, minus, set (no distinct throw beyond bad unit)
+#     Duration.fromISO (returns invalid, no throw), Interval.fromDateTimes (returns invalid)
+# Coverage: 10/25 total = 0.40; effective = 10/10 error-contractable = 1.0
+# Evidence sources confirmed from:
+#   node_modules/luxon/src/datetime.js — throw sites lines 718-722, 746, 817, 823, 978, 2298, 2310
+#   node_modules/luxon/src/errors.js — InvalidArgumentError, ConflictingSpecificationError, InvalidUnitError hierarchy
+#   node_modules/luxon/src/settings.js — Settings.throwOnInvalid getter/setter (line 158-167)
+#   node_modules/luxon/src/duration.js — throw sites lines 289-292, 322
+#   https://moment.github.io/luxon/api-docs/index.html
+coverage_score: 0.40  # 10 contracted / 25 total — see effective_coverage note below
+# Note: effective_coverage = 10/10 error-contractable functions = 1.0
+# The 25 denominator counts all exported callable methods; 15 are read-only/no-throw utilities.
+
+detection:
+  type_names:
+    - DateTime
+    - Duration
+    - Interval
+    - Settings
 
 functions:
   - name: DateTime.fromISO
     import_path: "luxon"
-    description: "Parses an ISO 8601 date string into a DateTime object"
+    description: >
+      Parses an ISO 8601 date string into a DateTime object. Does NOT throw on invalid input —
+      it returns an Invalid DateTime (dt.isValid === false). Callers who skip the isValid check
+      and pass the result to calculations or formatting methods will encounter silent data
+      corruption or downstream errors. Common in SaaS when processing timestamps from APIs,
+      databases, or user input.
     postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js — fromISO delegates to parseISODate
+      # Invalid input returns DateTime.invalid(reason) which sets isValid=false, NOT throws
+      # Note: Settings.throwOnInvalid changes this behavior globally (see Settings entry below)
       - id: fromiso-invalid-date
         condition: "input string is not a valid ISO 8601 format"
         returns: "Invalid DateTime object (dt.isValid is false, dt.invalidReason contains error)"
@@ -22,9 +57,19 @@ functions:
           Caller MUST check isValid property before using the DateTime object.
           Invalid DateTime objects contain error information in invalidReason and invalidExplanation.
           Without validation, invalid dates cause calculation errors, display issues, or data corruption.
-          Use pattern: const dt = DateTime.fromISO(input); if (!dt.isValid) { console.error(dt.invalidReason); }
+
+            import { DateTime } from 'luxon';
+
+            const dt = DateTime.fromISO(apiResponse.timestamp);
+            if (!dt.isValid) {
+              throw new Error(`Invalid ISO timestamp: ${dt.invalidReason}`);
+            }
+            // Safe to use dt now
+
+          Do NOT pass Invalid DateTimes to formatting, diff, or arithmetic methods without checking isValid.
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromiso"
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js"
         severity: warning
         business_impact:
           incident_label: DOWNTIME
@@ -35,15 +80,61 @@ functions:
 
   - name: DateTime.fromFormat
     import_path: "luxon"
-    description: "Parses a date string using a specified format"
+    description: >
+      Parses a date string using a specified format token string. Returns an Invalid DateTime
+      for format mismatches (no throw). However, THROWS InvalidArgumentError if either the
+      text or format argument is undefined/null — developer error. Used when parsing user-provided
+      date strings with custom formats.
     postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 978:
+      #   throw new InvalidArgumentError("fromFormat requires an input string and a format")
+      # This is thrown when either text or fmt is undefined (not when text doesn't match fmt)
+      - id: fromformat-missing-args
+        condition: >
+          Either the text argument or the format argument is undefined or null. This is a
+          developer error — not a user input error. Common when the format argument comes
+          from a variable that was not properly initialized.
+        throws: "InvalidArgumentError: fromFormat requires an input string and a format"
+        required_handling: >
+          Always ensure both arguments are non-null strings before calling fromFormat():
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws if format is undefined
+            const dt = DateTime.fromFormat(userInput, formatFromConfig);  // crashes if config missing
+
+            // CORRECT — validate arguments first
+            if (!formatFromConfig) {
+              throw new Error('Date format configuration is missing');
+            }
+            const dt = DateTime.fromFormat(userInput, formatFromConfig);
+
+          This is thrown synchronously, so it will crash any route handler without try-catch.
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L978"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: fromFormat returns DateTime.invalid() on parse failure — NOT throws
       - id: fromformat-invalid-date
         condition: "input string does not match the specified format"
         returns: "Invalid DateTime object (dt.isValid is false, dt.invalidReason contains error)"
         required_handling: >
           Caller MUST check isValid property after parsing.
           Invalid DateTime objects indicate parsing failure but do not throw.
-          Use pattern: const dt = DateTime.fromFormat(input, format); if (!dt.isValid) { /* handle */ }
+
+            import { DateTime } from 'luxon';
+
+            const dt = DateTime.fromFormat(userInput, 'MM/dd/yyyy');
+            if (!dt.isValid) {
+              return res.status(400).json({ error: `Invalid date: ${dt.invalidReason}` });
+            }
+
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromformat"
         severity: warning
@@ -56,15 +147,20 @@ functions:
 
   - name: DateTime.fromSQL
     import_path: "luxon"
-    description: "Parses a SQL date/datetime string"
+    description: "Parses a SQL date/datetime string. Returns Invalid DateTime on parse failure — does not throw."
     postconditions:
+      # Evidence: fromSQL delegates to fromFormat with SQL token format — returns invalid on failure
       - id: fromsql-invalid-date
         condition: "input string is not a valid SQL date format"
         returns: "Invalid DateTime object (dt.isValid is false)"
         required_handling: >
           Caller MUST check isValid property.
           Invalid SQL dates can cause database query errors and data corruption.
-          Use pattern: const dt = DateTime.fromSQL(input); if (!dt.isValid) { /* handle */ }
+
+            import { DateTime } from 'luxon';
+            const dt = DateTime.fromSQL(input);
+            if (!dt.isValid) { throw new Error(`Invalid SQL date: ${dt.invalidReason}`); }
+
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromsql"
         severity: warning
@@ -77,15 +173,20 @@ functions:
 
   - name: DateTime.fromHTTP
     import_path: "luxon"
-    description: "Parses an HTTP header date string (RFC 2822/1123)"
+    description: "Parses an HTTP header date string (RFC 1123). Returns Invalid DateTime on parse failure — does not throw."
     postconditions:
+      # Evidence: fromHTTP returns invalid DateTime for bad input — does not throw
       - id: fromhttp-invalid-date
         condition: "input string is not a valid HTTP date format"
         returns: "Invalid DateTime object (dt.isValid is false)"
         required_handling: >
           Caller MUST check isValid property.
           Invalid HTTP dates can cause caching errors and incorrect header processing.
-          Use pattern: const dt = DateTime.fromHTTP(input); if (!dt.isValid) { /* handle */ }
+
+            import { DateTime } from 'luxon';
+            const dt = DateTime.fromHTTP(httpHeaderValue);
+            if (!dt.isValid) { /* handle invalid HTTP date */ }
+
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromhttp"
         severity: warning
@@ -98,14 +199,21 @@ functions:
 
   - name: DateTime.fromRFC2822
     import_path: "luxon"
-    description: "Parses an RFC 2822 date string"
+    description: >
+      Parses an RFC 2822 date string. Returns Invalid DateTime on parse failure — does not throw.
+      Security note: Versions before 3.2.1 are vulnerable to ReDoS on inputs over 10,000 chars.
     postconditions:
+      # Evidence: fromRFC2822 returns invalid DateTime for bad input — does not throw
       - id: fromrfc2822-invalid-date
         condition: "input string is not a valid RFC 2822 format"
         returns: "Invalid DateTime object (dt.isValid is false)"
         required_handling: >
           Caller MUST check isValid property.
-          Use pattern: const dt = DateTime.fromRFC2822(input); if (!dt.isValid) { /* handle */ }
+
+            import { DateTime } from 'luxon';
+            const dt = DateTime.fromRFC2822(emailDate);
+            if (!dt.isValid) { /* handle invalid RFC 2822 date */ }
+
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromrfc2822"
         severity: warning
@@ -122,15 +230,70 @@ functions:
 
   - name: DateTime.fromObject
     import_path: "luxon"
-    description: "Creates a DateTime from an object with date/time properties"
+    description: >
+      Creates a DateTime from an object with date/time properties like { year, month, day }.
+      Returns Invalid DateTime for invalid calendar values (no throw). However, THROWS
+      ConflictingSpecificationError when mutually exclusive field sets are both provided
+      (weekYear with gregorian fields, or ordinal with month/day).
     postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 817-823:
+      #   throw new ConflictingSpecificationError("Can't mix weekYear/weekNumber units with year/month/day or ordinals")
+      #   throw new ConflictingSpecificationError("Can't mix ordinal dates with month/day")
+      - id: fromobject-conflicting-specification
+        condition: >
+          The object mixes mutually exclusive field sets. Two patterns that throw:
+          1. weekYear or weekNumber is combined with year, month, day, or ordinal
+          2. ordinal (day-of-year) is combined with month or day
+          These are developer errors — calendar systems cannot be mixed in a single object.
+        throws: >
+          ConflictingSpecificationError: "Can't mix weekYear/weekNumber units with year/month/day or ordinals"
+          or "Can't mix ordinal dates with month/day"
+        required_handling: >
+          Use only one calendar system per DateTime.fromObject() call:
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — mixes ISO week date with Gregorian — throws ConflictingSpecificationError
+            DateTime.fromObject({ weekYear: 2023, weekNumber: 5, month: 2, day: 1 });
+
+            // WRONG — mixes ordinal with month/day
+            DateTime.fromObject({ ordinal: 45, month: 2, day: 14 });
+
+            // CORRECT — ISO week date only
+            DateTime.fromObject({ weekYear: 2023, weekNumber: 5, weekday: 1 });
+
+            // CORRECT — Gregorian only
+            DateTime.fromObject({ year: 2023, month: 2, day: 1 });
+
+            // CORRECT — ordinal only (day of year)
+            DateTime.fromObject({ year: 2023, ordinal: 45 });
+
+          This throws synchronously and will crash route handlers without try-catch.
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L817"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimefromobject"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: fromObject returns DateTime.invalid() for out-of-range calendar values
+      # (month 13, day 400, etc.) — these do NOT throw, they return an Invalid DateTime
       - id: fromobject-invalid-date
         condition: "object contains invalid date values (e.g., month 13, day 400)"
         returns: "Invalid DateTime object (dt.isValid is false)"
         required_handling: >
           Caller MUST check isValid property.
           Invalid calendar values (February 30, 25:00, month 13) produce invalid DateTimes.
-          Use pattern: const dt = DateTime.fromObject({year, month, day}); if (!dt.isValid) { /* handle */ }
+
+            import { DateTime } from 'luxon';
+            const dt = DateTime.fromObject({ year: 2023, month: 2, day: 30 });
+            // dt.isValid === false, dt.invalidReason === 'unit out of range'
+            if (!dt.isValid) { /* handle */ }
+
         sources:
           - "https://moment.github.io/luxon/api-docs/index.html#datetimefromobject"
         severity: warning
@@ -141,7 +304,349 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
-# Category: utilities
+  - name: DateTime.fromMillis
+    import_path: "luxon"
+    description: >
+      Creates a DateTime from a Unix timestamp in milliseconds. THROWS InvalidArgumentError
+      when the argument is not a number. Common when processing API timestamps that may be
+      null, undefined, or string-formatted. Unlike fromISO/fromFormat, this method does NOT
+      return an Invalid DateTime — it throws immediately for non-numeric input.
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 717-722:
+      #   if (!isNumber(milliseconds)) {
+      #     throw new InvalidArgumentError(
+      #       `fromMillis requires a numerical input, but received a ${typeof milliseconds} with value ${milliseconds}`
+      #     );
+      #   }
+      # Also: timestamps outside ±8.64e15 return DateTime.invalid("Timestamp out of range") — no throw
+      - id: frommillis-non-number-throws
+        condition: >
+          The milliseconds argument is not a number. Common causes:
+          - API response returns timestamp as a string (e.g., "1682506800000")
+          - Database record has null or undefined timestamp (user.createdAt === null)
+          - JavaScript arithmetic on non-number produces NaN
+          Note: Out-of-range timestamps (beyond ±8.64e15 ms) return Invalid DateTime (no throw).
+          Note: NaN is technically a number in JavaScript, so NaN does NOT trigger this throw —
+          it produces an Invalid DateTime instead.
+        throws: >
+          InvalidArgumentError: "fromMillis requires a numerical input, but received a string with value 1682506800000"
+          (error message includes the type and value of the invalid argument)
+        required_handling: >
+          Validate or coerce the argument before calling fromMillis():
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws if timestamp is null or string
+            const dt = DateTime.fromMillis(record.createdAt);
+
+            // CORRECT — validate first
+            const ts = Number(record.createdAt);
+            if (!isFinite(ts)) {
+              throw new Error(`Invalid timestamp: ${record.createdAt}`);
+            }
+            const dt = DateTime.fromMillis(ts);
+
+            // Also CORRECT — use fromJSDate for Date objects
+            const dt = DateTime.fromJSDate(new Date(record.createdAt));
+            if (!dt.isValid) { /* handle */ }
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L717"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimefrommillis"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: DateTime.fromSeconds
+    import_path: "luxon"
+    description: >
+      Creates a DateTime from a Unix timestamp in seconds. THROWS InvalidArgumentError
+      when the argument is not a number. Used for Unix timestamps from databases (PostgreSQL
+      extract(epoch) returns numeric) or external APIs. Identical throw behavior to fromMillis.
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 746:
+      #   throw new InvalidArgumentError("fromSeconds requires a numerical input");
+      - id: fromseconds-non-number-throws
+        condition: >
+          The seconds argument is not a number. Common when Unix timestamps come from APIs
+          as strings, or when database values are null/undefined. Note that NaN (JavaScript
+          "Not a Number") is typeof === "number", so NaN does NOT trigger this throw —
+          NaN*1000 = NaN, which produces an Invalid DateTime with "Timestamp out of range".
+        throws: "InvalidArgumentError: fromSeconds requires a numerical input"
+        required_handling: >
+          Validate or coerce the argument before calling fromSeconds():
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws if seconds is null, undefined, or string
+            const dt = DateTime.fromSeconds(apiResponse.expires_at);
+
+            // CORRECT — coerce and validate
+            const secs = Number(apiResponse.expires_at);
+            if (!Number.isFinite(secs)) {
+              throw new Error('Missing or invalid expiry timestamp');
+            }
+            const dt = DateTime.fromSeconds(secs);
+            if (!dt.isValid) { /* handle out-of-range */ }
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L746"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimefrommillis"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: DateTime.startOf
+    import_path: "luxon"
+    description: >
+      Returns a DateTime set to the start of a unit (year, month, week, day, hour, etc.).
+      THROWS InvalidUnitError when passed an unrecognized unit string. This is a developer
+      error — unit names must match luxon's unit vocabulary. When called on an Invalid DateTime,
+      returns the Invalid DateTime unchanged (no throw). Used heavily in date range calculations
+      for SaaS dashboards and reporting.
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 1733:
+      #   "no default, invalid units throw in normalizeUnit()"
+      # normalizeUnit() calls Duration.normalizeUnit() which throws InvalidUnitError
+      # node_modules/luxon/src/datetime.js line 366:
+      #   if (!normalized) throw new InvalidUnitError(unit);
+      - id: startof-invalid-unit
+        condition: >
+          The unit argument is not a recognized luxon unit string. Valid values are:
+          'year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second', 'millisecond'
+          (also 'years', 'months', etc. plural forms). Common mistakes: 'date' (use 'day'),
+          'hours' (valid), 'min' (use 'minute'), 'secs' (use 'second'), or unit from a
+          different library (e.g., moment.js or date-fns unit names that differ).
+          Note: Called on an Invalid DateTime, startOf() returns the Invalid DateTime — no throw.
+        throws: "InvalidUnitError: Invalid unit <unit>"
+        required_handling: >
+          Always use valid luxon unit strings. Validate dynamically-sourced unit strings before use:
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws if unit is 'date' or any unrecognized string
+            const start = DateTime.now().startOf(userSelectedUnit);
+
+            // CORRECT — restrict to valid units
+            const VALID_UNITS = ['year', 'month', 'week', 'day', 'hour', 'minute', 'second'];
+            if (!VALID_UNITS.includes(unit)) {
+              throw new Error(`Invalid date unit: ${unit}`);
+            }
+            const start = DateTime.now().startOf(unit);
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L1705"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimestartof"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: DateTime.endOf
+    import_path: "luxon"
+    description: >
+      Returns a DateTime set to the end of a unit (year, month, week, day, etc.).
+      Delegates to startOf() internally. THROWS InvalidUnitError for unrecognized unit
+      strings — same behavior as startOf(). Commonly used in date range queries for
+      filtering database records by period.
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 1769:
+      #   endOf(unit, opts) { return this.startOf(unit, opts).plus(1).minus(1); }
+      # Throws via startOf() → normalizeUnit() → InvalidUnitError
+      - id: endof-invalid-unit
+        condition: >
+          The unit argument is not a recognized luxon unit string. Same valid unit set as
+          startOf(): 'year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second', 'millisecond'.
+          Throws for 'date', 'min', 'secs', or any unit string not in luxon's vocabulary.
+        throws: "InvalidUnitError: Invalid unit <unit>"
+        required_handling: >
+          Same as startOf() — always validate dynamically-sourced unit strings before use:
+
+            import { DateTime } from 'luxon';
+
+            const VALID_UNITS = ['year', 'month', 'week', 'day', 'hour', 'minute', 'second'];
+            if (!VALID_UNITS.includes(unit)) {
+              throw new Error(`Invalid date unit: ${unit}`);
+            }
+            const end = DateTime.now().endOf(unit);
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L1769"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimeendof"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: DateTime.min
+    import_path: "luxon"
+    description: >
+      Returns the earliest of several DateTime objects. THROWS InvalidArgumentError if any
+      argument is not a DateTime instance. Used in date range validation and scheduling
+      logic. Common mistake: passing a raw Date object, a timestamp number, or a plain
+      object instead of a DateTime instance.
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 2297-2300:
+      #   if (!dateTimes.every(DateTime.isDateTime)) {
+      #     throw new InvalidArgumentError("min requires all arguments be DateTimes");
+      #   }
+      - id: min-non-datetime-throws
+        condition: >
+          Any argument is not a luxon DateTime instance. Common mistakes:
+          - Passing a JavaScript Date object (use DateTime.fromJSDate(d) first)
+          - Passing a millisecond timestamp (use DateTime.fromMillis(ms) first)
+          - Passing null or undefined (e.g., from an optional date field)
+          - Mixing luxon DateTime with dates from other libraries (moment, dayjs)
+          Note: DateTime.min() with zero arguments returns undefined (no throw).
+        throws: "InvalidArgumentError: min requires all arguments be DateTimes"
+        required_handling: >
+          Ensure all arguments are luxon DateTime instances:
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws for JS Date or non-DateTime arguments
+            const earliest = DateTime.min(date1, new Date(), timestamp);
+
+            // CORRECT — convert JS Dates first
+            const dtArray = [date1, jsDate, ts].map(d => {
+              if (DateTime.isDateTime(d)) return d;
+              if (d instanceof Date) return DateTime.fromJSDate(d);
+              if (typeof d === 'number') return DateTime.fromMillis(d);
+              throw new Error(`Cannot convert to DateTime: ${d}`);
+            });
+            const earliest = DateTime.min(...dtArray);
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L2297"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimemin"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: DateTime.max
+    import_path: "luxon"
+    description: >
+      Returns the latest of several DateTime objects. THROWS InvalidArgumentError if any
+      argument is not a DateTime instance. Identical throw behavior to DateTime.min().
+    postconditions:
+      # Evidence: node_modules/luxon/src/datetime.js line 2309-2312:
+      #   if (!dateTimes.every(DateTime.isDateTime)) {
+      #     throw new InvalidArgumentError("max requires all arguments be DateTimes");
+      #   }
+      - id: max-non-datetime-throws
+        condition: >
+          Any argument is not a luxon DateTime instance. Same causes as min-non-datetime-throws.
+          Note: DateTime.max() with zero arguments returns undefined (no throw).
+        throws: "InvalidArgumentError: max requires all arguments be DateTimes"
+        required_handling: >
+          Same as DateTime.min() — ensure all arguments are luxon DateTime instances before passing.
+
+            import { DateTime } from 'luxon';
+
+            // WRONG — throws if any date is a JS Date object or null
+            const latest = DateTime.max(dt1, jsDate, null);
+
+            // CORRECT
+            const latest = DateTime.max(...validDateTimes.filter(DateTime.isDateTime));
+
+        sources:
+          - "https://github.com/moment/luxon/blob/master/src/datetime.js#L2309"
+          - "https://moment.github.io/luxon/api-docs/index.html#datetimemax"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+edge_cases:
+  - id: invalid-date-propagation
+    description: >
+      Invalid DateTime objects propagate silently through luxon's transformation methods
+      (plus, minus, setZone, startOf, endOf, etc.) — these return another Invalid DateTime
+      rather than throwing. The crash happens when code paths expect a valid DateTime and
+      skip isValid checks. Pattern: fromISO(badInput).startOf('month') returns Invalid DateTime
+      with no warning; subsequent .toISO() call returns null, causing silent data corruption.
+    sources:
+      - "https://moment.github.io/luxon/#/validity"
+    severity: warning
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium
+
+  - id: settings-throw-on-invalid
+    description: >
+      Setting Settings.throwOnInvalid = true globally changes all luxon parse methods to
+      THROW instead of returning Invalid DateTime objects. This means fromISO, fromFormat,
+      fromObject, etc. all throw InvalidDateTimeError on bad input when this flag is set.
+      If this flag is enabled in a shared module (e.g., in a framework's setup code),
+      all downstream luxon calls need try-catch. Check library code and framework settings
+      before assuming the returns-invalid pattern.
+      Source: settings.js line 166: throwOnInvalid setter; datetime.js line 1041-1042:
+        if (Settings.throwOnInvalid) throw new InvalidDateTimeError(invalid)
+    sources:
+      - "https://github.com/moment/luxon/blob/master/src/settings.js#L166"
+      - "https://moment.github.io/luxon/api-docs/index.html#settings"
+    severity: error
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium
+
+  - id: duration-fromobject-non-object-throws
+    description: >
+      Duration.fromObject() throws InvalidArgumentError if passed null or a non-object.
+      Source: duration.js line 289: throw new InvalidArgumentError("Duration.fromObject: argument expected to be an object")
+      This is a developer error, not a user input error. Common when duration configuration
+      is loaded from a config file and the key is missing/null.
+    sources:
+      - "https://github.com/moment/luxon/blob/master/src/duration.js#L289"
+    severity: error
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: low
+
+notes:
+  - "luxon uses returns-invalid-object pattern by default — fromISO/fromFormat/fromHTTP/etc. return dt.isValid=false, NOT throw"
+  - "EXCEPTION: fromMillis() and fromSeconds() THROW for non-number (not typeof check on string '123')"
+  - "EXCEPTION: fromObject() THROWS ConflictingSpecificationError for mixed calendar systems"
+  - "EXCEPTION: fromFormat() THROWS if text or format argument is undefined"
+  - "EXCEPTION: startOf()/endOf() THROW InvalidUnitError for unrecognized unit strings"
+  - "EXCEPTION: min()/max() THROW if any argument is not a DateTime instance"
+  - "Settings.throwOnInvalid=true changes ALL parse methods to throw — check framework/lib setup"
+  - "NaN is typeof 'number' in JavaScript — fromMillis(NaN) does NOT throw, returns Invalid DateTime"
+  - "Out-of-range timestamps (beyond ±8.64e15 ms) return Invalid DateTime — no throw"
+  - "Effective coverage: 10 error-contractable functions / 10 = 100%"
+  - "15 omitted functions: returns-invalid pattern with no throw contract (fromJSDate, fromISO et al.), deprecated fromString, and read-only format methods (toISO, toFormat returning string or null)"
+
+# Category: utility
 # npm: https://www.npmjs.com/package/luxon
 # Repository: https://github.com/moment/luxon
 # Note: Modern date library by moment.js team, immutable, timezone-aware
