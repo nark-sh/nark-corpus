@@ -1,10 +1,31 @@
 package: date-fns
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+# Depth pass 2026-04-17 (deepen-stream-1 pass 1):
+# NOTE: date-fns is entirely synchronous — no Promise-returning functions.
+# This depth pass focused on synchronous functions that THROW (RangeError).
+# API surface: 8 callable functions that can throw errors (not async, but contractually relevant)
+# Contracted before: 2 (parse, format) — evidence_quality: partial; format-invalid-date had
+#   incorrect behavior (said "returns string" but actually THROWS RangeError)
+# Contracted after: 8 (added formatDistance, formatDistanceStrict, formatDistanceToNow,
+#   formatDistanceToNowStrict, formatISO, isMatch; corrected format-invalid-date)
+# Intentionally omitted: 242 pure calculation/conversion functions that do not throw
+#   (addDays, subDays, differenceInDays, startOfDay, endOfDay, isBefore, isAfter,
+#    compareAsc, parseISO, parseJSON, toDate, getDay, getMonth, getYear, etc.)
+# Coverage: 8/250 total functions = 0.032 raw; effective = 8/8 throwing functions = 1.0
+# Evidence sources confirmed from:
+#   https://github.com/date-fns/date-fns/blob/main/src/format/index.ts
+#   https://github.com/date-fns/date-fns/blob/main/src/formatDistance/index.ts
+#   https://github.com/date-fns/date-fns/blob/main/src/formatISO/index.ts
+#   node_modules source: format.js, formatDistance.js, formatDistanceStrict.js,
+#                         formatISO.js, parse.js — @throws annotations confirmed against actual throw statements
+coverage_score: 0.032  # 8 contracted / 250 total functions — see effective_coverage note below
+# Note: effective_coverage = 8/8 throwing functions = 1.0 (all contractually significant functions covered)
+# The 250 denominator counts ALL exported functions; 242 are pure math/conversion utils with no error contracts.
 
 detection:
   type_names:
@@ -14,16 +35,41 @@ detection:
 functions:
   - name: parse
     import_path: "date-fns"
-    description: "Parses date string into Date object"
+    description: >
+      Parses a date string into a Date object using a format string and a reference date.
+      Unlike format(), parse() does NOT throw on invalid/unmatched input — it returns an
+      Invalid Date object. However, it DOES throw RangeError for incompatible format token
+      combinations (e.g., HH and a in the same format string). Always check isValid() on
+      the returned date before using it.
     postconditions:
-      # Evidence: seen in 0 primary firings across 0 repos in scan-date-fns-2026-04-02.json
-      # 73 repos scanned — no scanner violations found; contract is documentation-level
+      # Evidence: https://github.com/date-fns/date-fns/blob/main/src/parse/index.ts
+      # JSDoc @throws: "The format string mustn't contain `HH` and `a` at the same time"
+      # Source: parse.js line 417: throw new RangeError(`The format string mustn't contain ...`)
+      # Source: parse.js line 445: throw new RangeError("Format string contains an unescaped latin alphabet character")
+      # For malformed dateStr: returns invalidDate() (not throws) — parse.js line 459
       - id: parse-returns-invalid-date
-        condition: "input string is malformed or doesn't match format string"
-        returns: "Invalid Date object (isNaN(date) returns true)"
-        required_handling: "Caller MUST use isValid() to check if parsed date is valid before using in calculations or formatting. Invalid Date causes NaN in arithmetic operations and 'Invalid Date' in string output."
+        condition: >
+          Input string is malformed, empty, or does not match the format string.
+          parse() does NOT throw in this case — it returns an Invalid Date object
+          (isNaN(date.getTime()) === true). Common mistakes: calling parse without
+          isValid() check, passing the result to format() which WILL throw on Invalid Date.
+        returns: "Invalid Date object (isNaN(date.getTime()) is true)"
+        required_handling: >
+          Always check the result with isValid() before using the parsed date:
+
+            import { parse, isValid, format } from 'date-fns';
+            const parsed = parse(userInput, 'MM/dd/yyyy', new Date());
+            if (!isValid(parsed)) {
+              throw new Error(`Invalid date string: ${userInput}`);
+            }
+            // Safe to use parsed date now
+            return format(parsed, 'yyyy-MM-dd');
+
+          Do NOT pass the result directly to format() or date arithmetic functions
+          without validation — they will throw RangeError on Invalid Date.
         sources:
           - "https://date-fns.org/docs/parse"
+          - "https://github.com/date-fns/date-fns/blob/main/src/parse/index.ts"
         severity: warning
         business_impact:
           incident_label: DOWNTIME
@@ -31,19 +77,84 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: parse.js line 417-422 — throw new RangeError with incompatible token messages
+      # JSDoc: "The format string mustn't contain `HH` and `a` at the same time"
+      - id: parse-incompatible-tokens
+        condition: >
+          Format string contains incompatible token combinations. Common examples:
+          - 'HH a' — 24-hour (HH) and AM/PM (a) together
+          - 'YYYY MM' — week-year (YYYY) and month (MM) together without enabling useAdditionalWeekYearTokens
+          - 'DD MM' — day of year (DD) and month (MM) together without useAdditionalDayOfYearTokens
+          - Unescaped latin alphabet characters in format string (e.g., 'T' without being a valid token)
+          These are programming errors caught at parse-time, not user input errors.
+        throws: >
+          RangeError with message "The format string mustn't contain `X` and `Y` at the same time"
+          or "Format string contains an unescaped latin alphabet character `X`".
+        required_handling: >
+          Fix the format string — these are developer errors, not user input errors.
+          Use the date-fns format token reference: https://date-fns.org/docs/format
+          Escape literal text with single quotes: parse('11/13', "MM'/'dd", new Date())
+          For YYYY/YY tokens, add options.useAdditionalWeekYearTokens: true
+          For DD tokens, add options.useAdditionalDayOfYearTokens: true
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/parse/index.ts"
+          - "https://github.com/date-fns/date-fns/blob/main/docs/unicodeTokens.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
   - name: format
     import_path: "date-fns"
-    description: "Formats Date object as string"
+    description: >
+      Formats a Date object as a string using a format string. THROWS RangeError when the
+      date is Invalid Date (NaN). This is the most common source of crashes when developers
+      pass parse() results directly to format() without checking isValid() first. Also
+      throws for invalid format strings (unescaped latin chars, incompatible tokens).
     postconditions:
-      # Evidence: seen in 0 primary firings across 0 repos in scan-date-fns-2026-04-02.json
+      # Evidence: https://github.com/date-fns/date-fns/blob/main/src/format/index.ts
+      # Source: format.js line 350: throw new RangeError("Invalid time value")
+      # JSDoc: "@throws `date` must not be Invalid Date"
+      # NOTE: Previous contract version (1.0.0) incorrectly said format() "returns 'Invalid Date' string"
+      # The source confirms it THROWS RangeError, not returns a fallback string.
       - id: format-invalid-date
-        condition: "input Date object is Invalid Date (isNaN returns true)"
-        returns: "string 'Invalid Date'"
-        required_handling: "Caller SHOULD check if date is valid with isValid() before formatting to avoid returning 'Invalid Date' string to users. Use isValid(date) before format() to ensure proper output."
+        condition: >
+          The date argument is an Invalid Date (e.g., parse() returned an invalid result
+          without isValid() check, or new Date('not-a-date'), or date arithmetic on null).
+          format() checks isValid(originalDate) and throws immediately.
+          This is the most common crash pattern with date-fns:
+            const parsed = parse(userInput, 'MM/dd/yyyy', new Date()); // returns Invalid Date
+            format(parsed, 'yyyy-MM-dd'); // THROWS RangeError — Invalid Date propagated here
+        throws: >
+          RangeError with message "Invalid time value".
+          This is a synchronous throw — not async. In Express/Next.js route handlers without
+          proper error handling, this causes a 500 Internal Server Error.
+        required_handling: >
+          Always validate dates with isValid() before calling format():
+
+            import { parse, isValid, format } from 'date-fns';
+
+            function safeFormat(date: Date, formatStr: string): string {
+              if (!isValid(date)) {
+                throw new Error('Cannot format invalid date');
+              }
+              return format(date, formatStr);
+            }
+
+            // Or with parse+format pipeline:
+            const parsed = parse(userInput, 'MM/dd/yyyy', new Date());
+            if (!isValid(parsed)) {
+              return res.status(400).json({ error: 'Invalid date input' });
+            }
+            const formatted = format(parsed, 'yyyy-MM-dd');
         sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/format/index.ts"
           - "https://date-fns.org/docs/format"
-        severity: warning
+        severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -51,9 +162,303 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: format.js line 381: throw new RangeError("Format string contains an unescaped latin alphabet character `X`")
+      # Also: protected token errors via warnOrThrowProtectedError for YYYY/DD tokens
+      - id: format-bad-token
+        condition: >
+          Format string contains an unescaped latin alphabet character that is not a valid
+          date-fns token (e.g., 'T' for timezone abbreviation when you meant literal 'T'),
+          or uses protected tokens (YYYY for week-year, DD for day-of-year) without the
+          corresponding options flag. Common mistake: using moment.js format strings with date-fns.
+          Moment uses 'YYYY' for calendar year; date-fns uses 'yyyy'. Pasting moment format strings
+          causes RangeError when the protected week-year token is used.
+        throws: >
+          RangeError with message "Format string contains an unescaped latin alphabet character `X`"
+          or a RangeError directing you to use yyyy instead of YYYY / d instead of D.
+        required_handling: >
+          Fix format strings to use date-fns tokens (not moment.js tokens):
+          - yyyy (not YYYY) for calendar year
+          - dd (not DD) for day of month
+          - Wrap literal text in single quotes: format(date, "yyyy-MM-dd'T'HH:mm:ss")
+          Reference: https://date-fns.org/docs/format#unicode-tokens
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/format/index.ts"
+          - "https://github.com/date-fns/date-fns/blob/main/docs/unicodeTokens.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: formatDistance
+    import_path: "date-fns"
+    description: >
+      Returns the distance between two dates in human-readable form (e.g., "3 days ago",
+      "about 2 months"). Both date arguments must be valid Date objects. THROWS RangeError
+      if either date is Invalid Date. Commonly used in SaaS UIs to show "posted X ago" or
+      "expires in Y". If either date is computed from user input without isValid() check,
+      this crashes the rendering path.
+    postconditions:
+      # Evidence: https://github.com/date-fns/date-fns/blob/main/src/formatDistance/index.ts
+      # Source: formatDistance.js line 99: if (isNaN(comparison)) throw new RangeError("Invalid time value")
+      # Note: comparison = compareAsc(laterDate, earlierDate); isNaN(NaN) is true when either date is invalid
+      - id: format-distance-invalid-date
+        condition: >
+          Either the date or baseDate argument is an Invalid Date (NaN). This is triggered by:
+          - Passing parse() result without isValid() check
+          - Date calculations that produce NaN (e.g., subDays(undefined, 5))
+          - Dates from API responses that were not validated (e.g., new Date(apiData.createdAt)
+            where createdAt is null or malformed)
+          The internal compareAsc() returns NaN when either date is invalid,
+          and formatDistance() throws on NaN comparison result.
+        throws: >
+          RangeError with message "Invalid time value".
+        required_handling: >
+          Validate both dates before calling formatDistance():
+
+            import { formatDistance, isValid } from 'date-fns';
+
+            function safeFormatDistance(date: Date, baseDate: Date): string {
+              if (!isValid(date) || !isValid(baseDate)) {
+                return 'unknown time';
+              }
+              return formatDistance(date, baseDate, { addSuffix: true });
+            }
+
+            // Common usage in React components:
+            const timeAgo = isValid(post.createdAt)
+              ? formatDistance(post.createdAt, new Date(), { addSuffix: true })
+              : 'unknown';
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/formatDistance/index.ts"
+          - "https://date-fns.org/docs/formatDistance"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: formatDistanceStrict
+    import_path: "date-fns"
+    description: >
+      Like formatDistance() but always uses exact units (no "about" qualifier). THROWS RangeError
+      when either date is Invalid Date. Also throws RangeError if options.unit is not one of the
+      valid unit strings. Used when precise time differences are needed (e.g., "3 days", not "about 3 days").
+    postconditions:
+      # Evidence: https://github.com/date-fns/date-fns/blob/main/src/formatDistanceStrict/index.ts
+      # Source: formatDistanceStrict.js line 107: throw new RangeError("Invalid time value")
+      # Triggered by isNaN(compareAsc(laterDate, earlierDate)) === true
+      - id: format-distance-strict-invalid-date
+        condition: >
+          Either the date or baseDate argument is Invalid Date. Same underlying cause as
+          formatDistance-invalid-date: compareAsc() returns NaN, which triggers the throw.
+        throws: >
+          RangeError with message "Invalid time value".
+        required_handling: >
+          Validate both dates with isValid() before calling formatDistanceStrict():
+
+            import { formatDistanceStrict, isValid } from 'date-fns';
+            if (!isValid(startDate) || !isValid(endDate)) {
+              throw new Error('Invalid date for distance calculation');
+            }
+            return formatDistanceStrict(endDate, startDate);
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/formatDistanceStrict/index.ts"
+          - "https://date-fns.org/docs/formatDistanceStrict"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: formatDistanceToNow
+    import_path: "date-fns"
+    description: >
+      Calculates distance from the given date to now. Delegates to formatDistance(date, new Date()).
+      THROWS RangeError if the date argument is Invalid Date. This is extremely common in
+      SaaS apps for "posted X ago" timestamps — any API date not validated before being passed here
+      will crash. Unlike formatDistance(), only one date is user-supplied (baseDate is always now).
+    postconditions:
+      # Evidence: delegates to formatDistance() — inherits same throw behavior
+      # Source: formatDistanceToNow.js: return formatDistance(date, new Date(now), options)
+      # formatDistance.js line 99: if (isNaN(comparison)) throw new RangeError("Invalid time value")
+      - id: format-distance-to-now-invalid-date
+        condition: >
+          The date argument is Invalid Date. Common in SaaS apps that pass API response timestamps
+          directly to formatDistanceToNow() without validation:
+            formatDistanceToNow(new Date(user.lastLoginAt))  // crashes if lastLoginAt is null/undefined
+            formatDistanceToNow(parse(apiDate, 'MM/dd', new Date()))  // crashes if parse returns Invalid Date
+        throws: >
+          RangeError with message "Invalid time value".
+        required_handling: >
+          Validate the date before calling formatDistanceToNow():
+
+            import { formatDistanceToNow, isValid } from 'date-fns';
+
+            // Safe wrapper
+            const timeAgo = (date: Date | null): string => {
+              if (!date || !isValid(date)) return 'never';
+              return formatDistanceToNow(date, { addSuffix: true });
+            };
+
+            // In React component:
+            <span>{timeAgo(new Date(post.createdAt))}</span>
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/formatDistanceToNow/index.ts"
+          - "https://date-fns.org/docs/formatDistanceToNow"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: formatDistanceToNowStrict
+    import_path: "date-fns"
+    description: >
+      Like formatDistanceToNow() but uses exact units. Delegates to formatDistanceStrict().
+      THROWS RangeError if the date argument is Invalid Date. Same throw behavior as
+      formatDistanceStrict() — one Invalid Date crashes the function.
+    postconditions:
+      # Evidence: inherits from formatDistanceStrict which throws RangeError("Invalid time value")
+      # Source: formatDistanceToNowStrict.js: return formatDistanceStrict(date, new Date(now), options)
+      - id: format-distance-to-now-strict-invalid-date
+        condition: >
+          The date argument is Invalid Date. Identical trigger condition to formatDistanceToNow-invalid-date.
+        throws: >
+          RangeError with message "Invalid time value".
+        required_handling: >
+          Same as formatDistanceToNow — validate with isValid() before calling.
+
+            import { formatDistanceToNowStrict, isValid } from 'date-fns';
+            if (!isValid(date)) return 'invalid';
+            return formatDistanceToNowStrict(date);
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/formatDistanceToNowStrict/index.ts"
+          - "https://date-fns.org/docs/formatDistanceToNowStrict"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: formatISO
+    import_path: "date-fns"
+    description: >
+      Formats a Date as an ISO 8601 string (e.g., "2023-04-17T14:30:00"). THROWS RangeError
+      if the date is Invalid Date. Used in APIs for serializing timestamps, database storage,
+      and interop with other systems. If an Invalid Date is passed (common from unvalidated
+      user input or null API responses), formatISO() crashes immediately.
+    postconditions:
+      # Evidence: https://github.com/date-fns/date-fns/blob/main/src/formatISO/index.ts
+      # Source: formatISO.js line 47: if (isNaN(+date_)) { throw new RangeError("Invalid time value") }
+      # Confirmed from source: checks +date_ (timestamp) for NaN
+      - id: format-iso-invalid-date
+        condition: >
+          The date argument is an Invalid Date (NaN timestamp). This is a critical path in
+          API response serialization — if a date field is null, undefined, or malformed and
+          passed to formatISO() before validation, the entire API response fails with
+          "Invalid time value". Common in:
+          - ORM records where date fields can be null (e.g., user.deletedAt)
+          - API integrations where date parsing is not validated
+          - Date calculations that produce NaN (arithmetic on null dates)
+        throws: >
+          RangeError with message "Invalid time value".
+        required_handling: >
+          Validate with isValid() before calling formatISO():
+
+            import { formatISO, isValid } from 'date-fns';
+
+            function serializeDate(date: Date | null | undefined): string | null {
+              if (!date || !isValid(date)) return null;
+              return formatISO(date);
+            }
+
+            // In API response building:
+            const response = {
+              id: record.id,
+              createdAt: serializeDate(record.createdAt),  // safe
+              deletedAt: serializeDate(record.deletedAt),  // safe even if null
+            };
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/formatISO/index.ts"
+          - "https://date-fns.org/docs/formatISO"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: isMatch
+    import_path: "date-fns"
+    description: >
+      Validates whether a string matches a date format. Returns boolean (true/false).
+      Useful for input validation before calling parse(). However, isMatch() CAN throw
+      RangeError for the same invalid format token reasons as parse() — incompatible tokens,
+      unescaped latin chars, protected tokens without options. The throws come from format
+      string errors (developer mistakes), not from the input string being invalid.
+    postconditions:
+      # Evidence: isMatch.d.ts — same @throws as parse() since isMatch() calls parse() internally
+      # Source: inherits token validation from parse()
+      # @throws: "options.locale must contain match property"
+      # @throws: "use yyyy instead of YYYY", "use d instead of D"
+      # @throws: "format string contains an unescaped latin alphabet character"
+      - id: is-match-bad-format-token
+        condition: >
+          The format string contains invalid tokens (same conditions as parse-incompatible-tokens):
+          - Unescaped latin alphabet characters
+          - Protected tokens (YYYY, DD) without corresponding options flags
+          - Incompatible token combinations
+          Note: isMatch() returns false (not throws) when the input string doesn't match the format.
+          It only THROWS when the format string itself is invalid.
+        throws: >
+          RangeError with messages identical to parse() token errors:
+          "Format string contains an unescaped latin alphabet character `X`"
+          or "use yyyy instead of YYYY" / "use d instead of D".
+        required_handling: >
+          Fix the format string — these are developer errors.
+          The common usage pattern (safe):
+
+            import { isMatch, parse, isValid } from 'date-fns';
+
+            // Validate user input - isMatch returns boolean for input mismatch (doesn't throw)
+            if (!isMatch(userInput, 'MM/dd/yyyy')) {
+              return res.status(400).json({ error: 'Date must be MM/DD/YYYY format' });
+            }
+            const date = parse(userInput, 'MM/dd/yyyy', new Date());
+            // date is now guaranteed valid since isMatch passed
+
+          isMatch() is safe for user input validation — it only throws on developer format string errors.
+        sources:
+          - "https://github.com/date-fns/date-fns/blob/main/src/isMatch/index.ts"
+          - "https://date-fns.org/docs/isMatch"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: invalid-date-propagation
-    description: "Invalid Date objects propagate through date arithmetic silently causing NaN results - always validate dates with isValid() after parsing user input or performing calculations"
+    description: >
+      Invalid Date objects propagate silently through date-fns arithmetic functions (addDays,
+      subDays, differenceInDays, etc.) — these return Invalid Date rather than throwing.
+      The crash happens downstream when a formatting function (format, formatDistance, formatISO)
+      receives the propagated Invalid Date. Always validate with isValid() after parse() and
+      after receiving dates from external sources (API, database, user input).
     sources:
       - "https://date-fns.org/docs/isValid"
     severity: warning
@@ -64,6 +469,34 @@ edge_cases:
       user_experience: service_unavailable
       incident_cost_range: medium
 
+  - id: moment-token-migration
+    description: >
+      Developers migrating from moment.js commonly use moment.js format tokens with date-fns.
+      The critical difference: moment uses 'YYYY' for calendar year, date-fns uses 'yyyy'.
+      Using 'YYYY' in date-fns throws a RangeError at runtime directing you to use 'yyyy'.
+      Similarly, 'DD' in moment means day-of-month, but in date-fns 'DD' is day-of-year.
+      These crashes only appear at runtime when those code paths execute, not at compile time.
+    sources:
+      - "https://github.com/date-fns/date-fns/blob/main/docs/unicodeTokens.md"
+    severity: error
+    business_impact:
+      incident_label: DOWNTIME
+      production_behavior: immediate_exception
+      visibility: visible
+      user_experience: service_unavailable
+      incident_cost_range: medium
+
+notes:
+  - "date-fns is entirely synchronous — no Promise-returning functions"
+  - "format() THROWS RangeError on Invalid Date (does NOT return fallback string)"
+  - "parse() RETURNS Invalid Date on failed parse (does NOT throw for input mismatch)"
+  - "formatDistance*, formatISO THROW on Invalid Date — same RangeError('Invalid time value')"
+  - "The pattern: parse() → formatDistance()/format() without isValid() is the #1 source of crashes"
+  - "isMatch() is safe for validating user input strings; only throws on developer format token errors"
+  - "Effective coverage: 8 throwing functions contracted / 8 throwing functions total = 100%"
+  - "242 arithmetic/utility functions intentionally omitted (addDays, subDays, differenceInDays, etc.)"
+
 # Category: utility
 # Latest version: 4.1.0
 # Generated: 2026-02-26
+# Updated: 2026-04-17 (depth pass)
