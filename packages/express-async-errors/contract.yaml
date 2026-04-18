@@ -1,17 +1,32 @@
 package: express-async-errors
 semver: '>=3.0.0 <4.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-13'
+last_verified: '2026-04-17'
 status: production
 evidence_quality: confirmed
+coverage_score: 0.82
+# Depth pass 2026-04-17 (deepen-stream-2 pass 3):
+# API surface: 11 behavioral contracts (side-effect-only package — no exported functions)
+# Contracted before: 5 (2 preconditions + 3 postconditions)
+# Contracted after: 9 (+4 new postconditions: express-v5-incompatible, esm-not-supported,
+#   param-middleware-patched, bundler-code-splitting-breaks-patch)
+# Intentionally omitted: 2 (function.length preservation — impl detail, already correct;
+#   async error handler patching — covered by async-error-forwarded)
+# Evidence confirmed from:
+#   https://github.com/davidbanham/express-async-errors/blob/master/index.js (source)
+#   https://github.com/davidbanham/express-async-errors/issues/28 (Express 5 incompatibility)
+#   https://github.com/davidbanham/express-async-errors/issues/50 (ESM ReferenceError)
+#   https://github.com/davidbanham/express-async-errors/issues/47 (bundler code-splitting)
+#   node_modules/express-async-errors/index.js — patchRouterParam() confirmed
+
 functions:
   - name: require
     import_path: express-async-errors
     description: >
       Monkey-patches Express's Layer#handle to automatically catch errors thrown or rejected in async route handlers and
       pass them to the next() error handler. Must be required once at app startup before routes are defined. Has no
-      return value.
+      return value. Also patches Router.prototype.constructor.param to wrap async param middleware callbacks.
     preconditions:
       - id: require-before-routes
         description: >
@@ -85,6 +100,182 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         required_handling: No action required — use the returned value as needed.
+
+      # Evidence: https://github.com/davidbanham/express-async-errors/issues/28
+      # Root cause: Express v5 moved Layer and Router into pillarjs/router package.
+      # require('express/lib/router') no longer resolves in Express v5 — throws a module-not-found error.
+      # Express v5 also natively supports async route handlers (returns Promise), making this package redundant.
+      - id: express-v5-incompatible
+        condition: >
+          Project uses Express v5 (express@^5.0.0) with express-async-errors installed. Express v5 relocated
+          its internal Router and Layer modules to a separate pillarjs/router package, breaking the deep-require
+          mechanism (require('express/lib/router')) that express-async-errors relies on. Requiring the package
+          throws a fatal module-not-found error at application startup.
+        throws: >
+          Error: Cannot find module 'express/lib/router' (or equivalent module-not-found error)
+          thrown synchronously when require('express-async-errors') is called. This crashes the entire
+          Node.js process before any routes are served.
+        required_handling: >
+          Do NOT use express-async-errors with Express v5. Express v5 natively supports async route handlers
+          returning Promises — async errors are automatically forwarded to the next() error handler without
+          any additional library.
+
+          Migration: Simply remove express-async-errors from your project when upgrading to Express v5.
+
+            // Express v5 — this works natively without express-async-errors:
+            app.get('/users', async (req, res) => {
+              const users = await User.findAll();  // rejection auto-forwarded to error handler
+              res.json(users);
+            });
+
+            // Error handler still required:
+            app.use((err, req, res, next) => {
+              res.status(500).json({ error: err.message });
+            });
+        sources:
+          - https://github.com/davidbanham/express-async-errors/issues/28
+          - https://github.com/pillarjs/router
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: https://github.com/davidbanham/express-async-errors/issues/50
+      # Root cause: index.js uses require() (CommonJS) which is not available in ES module scope.
+      # Projects using 'type: module' in package.json or using ESM loaders (ts-node esm, swc esm)
+      # will encounter this error when trying to import the package.
+      - id: esm-not-supported
+        condition: >
+          Project uses ES module syntax or ESM-strict loaders (e.g., Node.js 'type: module', ts-node with
+          ESM loader @swc-node/register/esm, or Vitest with ESM configuration). express-async-errors is
+          a CommonJS-only package that uses require() internally. Attempting to import it in an ES module
+          context throws ReferenceError at startup.
+        throws: >
+          ReferenceError: require is not defined in ES module scope
+          thrown when the import is processed. This is a fatal startup error.
+        required_handling: >
+          Option 1 — Use CommonJS throughout your Express app (avoid 'type: module' in package.json).
+          CommonJS is still the standard for Express applications:
+
+            // package.json — do NOT set "type": "module" in Express apps using this library
+            const createError = require('express-async-errors');  // CJS require — works
+
+          Option 2 — Use a different approach: write explicit try/catch or next(err) wrappers
+          instead of relying on this library, which works in both CJS and ESM:
+
+            // Works in both CJS and ESM — no library needed
+            app.get('/users', async (req, res, next) => {
+              try {
+                const users = await User.findAll();
+                res.json(users);
+              } catch (err) {
+                next(err);
+              }
+            });
+
+          Option 3 — Upgrade to Express v5 which natively supports async handlers in both ESM and CJS.
+        sources:
+          - https://github.com/davidbanham/express-async-errors/issues/50
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/express-async-errors/index.js — patchRouterParam() function:
+      #   Router.prototype.constructor.param = function param(name, fn) { fn = wrap(fn); ... }
+      # The wrap() function catches async rejections and calls next(err) automatically.
+      # This behavior is NOT documented in the README — it is an undocumented side effect.
+      # Evidence: test.js line 52-68 — "propagates param middleware errors too"
+      - id: param-middleware-patched
+        condition: >
+          Async param middleware callbacks registered via app.param() throw or reject. The library
+          patches Router.prototype.constructor.param to wrap all param callbacks with the same
+          async error catching mechanism applied to route handlers. This means async errors in
+          param middleware are ALSO automatically forwarded to next(err) — no explicit try-catch needed.
+          This is an undocumented feature not mentioned in the README.
+        returns: >
+          Param middleware async errors are automatically forwarded to the Express error handler via
+          next(err). Same behavior as route handler async errors — no explicit error handling in the
+          param callback is required.
+        required_handling: >
+          Param middleware errors are caught automatically, same as route errors. However, an error
+          handler (4-arg middleware) must still be registered:
+
+            require('express-async-errors');  // patches both routes AND param middleware
+
+            app.param('userId', async (req, res, next, id) => {
+              const user = await User.findById(id);  // rejection auto-forwarded to error handler
+              if (!user) throw new Error(`User ${id} not found`);  // also forwarded
+              req.user = user;
+            });
+
+            app.use((err, req, res, next) => {
+              res.status(404).json({ error: err.message });
+            });
+
+          Note: The error handler must still be registered — same requirement as for route handlers.
+        sources:
+          - https://github.com/davidbanham/express-async-errors/blob/master/index.js
+          - https://github.com/davidbanham/express-async-errors/blob/master/test.js
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://github.com/davidbanham/express-async-errors/issues/47
+      # Root cause: Bundlers (webpack, esbuild, etc.) that perform code-splitting may place
+      # express-async-errors in a separate chunk from the route handlers. When the patch runs
+      # in a different chunk context than the routes, the Layer.prototype mutation affects a
+      # different Layer instance than the one used by the routes — making the patch ineffective.
+      - id: bundler-code-splitting-breaks-patch
+        condition: >
+          Application is bundled with a code-splitting bundler (webpack with splitChunks, esbuild
+          with splitting:true, Rollup with manualChunks). express-async-errors patches Express
+          internals by mutating Layer.prototype at require-time. When code-splitting places the
+          library and the route definitions in separate chunks, the prototype mutation may affect
+          a different Layer instance than the one loaded by the route chunks. Result: the patch
+          appears to work in development (no bundler) but silently fails in production builds —
+          async errors in routes are NOT forwarded to error handlers and cause unhandled promise
+          rejections.
+        returns: >
+          Async errors in route handlers are silently swallowed — NOT forwarded to the Express
+          error handler. No crash, no 500 — the request hangs until timeout or the connection
+          is dropped. This is worse than a crash because it is invisible in monitoring.
+        required_handling: >
+          Disable code-splitting in your bundler configuration when using express-async-errors:
+
+            // webpack.config.js — disable splitChunks to prevent cross-chunk prototype mutation
+            module.exports = {
+              optimization: {
+                splitChunks: false,  // disable code splitting
+              }
+            };
+
+            // esbuild — do not use splitting:true with express-async-errors
+            esbuild.build({ splitting: false });
+
+          Alternative: ensure express-async-errors and all Express-using code are in the same chunk.
+          Best alternative: avoid bundling server-side Node.js code (Node.js does not need bundling
+          the way browsers do). Run Node.js directly or use ts-node/tsx for TypeScript.
+        sources:
+          - https://github.com/davidbanham/express-async-errors/issues/47
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
     edge_cases:
       - id: require-once
         description: >-
