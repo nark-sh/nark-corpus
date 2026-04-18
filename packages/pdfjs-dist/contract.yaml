@@ -4,29 +4,28 @@
 # Error classes: InvalidPDFException, PasswordException, ResponseException, AbortException,
 # FormatError, UnknownErrorException (all extend BaseException), RenderingCancelledException.
 #
-# Depth pass 2026-04-17 (deepen-stream-2 pass 5):
-# API surface: 13 async-callable operations (7 intentionally omitted read-only operations)
-# Contracted before: 1 (getDocument)
-# Contracted after: 6 (+5 this pass: doc.getPage, page.getTextContent, page.render,
-#                      doc.saveDocument, doc.destroy)
-# Omitted: 7 (read-only GETs with no domain-specific error contracts)
-# Coverage: 6/13 = 0.46 (effective contracted/non-omitted = 6/6 = 1.0)
+# Depth pass 2026-04-17 (deepen-stream-1 pass 9):
+# API surface: 16 async-callable operations (7 intentionally omitted read-only operations)
+# Contracted before: 6 (getDocument, getPage, getTextContent, render, saveDocument, destroy)
+# Contracted after: 9 (+3 this pass: doc.cleanup, doc.getData, TextLayer.render)
+# Omitted: 7 (read-only GETs with no domain-specific error contracts — unchanged)
+# Coverage: 9/16 = 0.56 (effective contracted/non-omitted = 9/9 = 1.0)
 # Evidence sources confirmed from:
-#   node_modules/pdfjs-dist/build/pdf.mjs (transport.getPage lines 16084-16110)
-#   node_modules/pdfjs-dist/build/pdf.mjs (getTextContent lines 15284-15300)
-#   node_modules/pdfjs-dist/build/pdf.mjs (InternalRenderTask.cancel lines 16370-16385)
-#   node_modules/pdfjs-dist/build/pdf.mjs (PDFDocumentLoadingTask.destroy lines 14828-14845)
-#   node_modules/pdfjs-dist/types/src/shared/util.d.ts (error class declarations)
-#   https://mozilla.github.io/pdf.js/api/draft/
+#   node_modules/pdfjs-dist/build/pdf.mjs (transport.startCleanup lines 16212-16235)
+#   node_modules/pdfjs-dist/build/pdf.mjs (transport.getData line 16048)
+#   node_modules/pdfjs-dist/build/pdf.mjs (TextLayer.render lines 14353-14376)
+#   node_modules/pdfjs-dist/build/pdf.mjs (TextLayer.cancel lines 14405-14410)
+#   https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
+#   https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/text_layer.js
 package: "pdfjs-dist"
 semver: ">=2.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
 last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.46  # 6 contracted / 13 total async-callable (7 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 6/6 = 1.0
+coverage_score: 0.56  # 9 contracted / 16 total async-callable (7 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
 
 detection:
   # getDocument is the entry-point factory. Returns a PDFDocumentLoadingTask —
@@ -472,14 +471,235 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: high
 
+  - name: cleanup
+    import_path: "pdfjs-dist"
+    description: >
+      Cleans up resources allocated by the PDF document on both the main thread and the
+      worker thread. Releases loaded fonts, clears cached page objects, and frees memory
+      used for rendering pipeline. Used in memory-sensitive SaaS apps that process many
+      PDFs in sequence. Delegates to transport.startCleanup() which iterates all cached
+      pages and checks if any are currently rendering.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 16212-16235 (transport.startCleanup):
+      # for (const page of this.#pageCache.values()) {
+      #   const cleanupSuccessful = page.cleanup();
+      #   if (!cleanupSuccessful) {
+      #     throw new Error(`startCleanup: Page ${page.pageNumber} is currently rendering.`);
+      #   }
+      # }
+      # Confirmed: page.cleanup() returns false when rendering is in progress (page._rendering flag).
+      # Also confirmed from official docs: "Do not, under any circumstances, call this method
+      # when rendering is currently ongoing since that may lead to rendering errors."
+      # Source: https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
+      - id: cleanup-during-rendering
+        condition: >
+          doc.cleanup() is called without try-catch, and one or more pages are currently
+          being rendered (i.e., page.render() has been called and the renderTask.promise
+          has not yet resolved or been cancelled). This is common in SaaS apps that
+          implement PDF thumbnail generation or page viewers where cleanup is triggered
+          by navigation or timeout while a render is in progress.
+          The cleanup call will throw synchronously from the `startCleanup` method after
+          the worker-side cleanup completes but before all pages are cleaned on the main thread.
+        throws: >
+          Error with message "startCleanup: Page N is currently rendering." where N is
+          the 1-based page number that is still rendering. This is a plain JavaScript
+          Error object (not a pdfjs-dist custom exception type).
+          Confirmed from build/pdf.mjs line 16225:
+          `throw new Error(\`startCleanup: Page \${page.pageNumber} is currently rendering.\`)`.
+          The check `!cleanupSuccessful` is triggered because PDFPageProxy.cleanup()
+          returns `false` when `page._rendering` is truthy.
+        required_handling: >
+          Caller MUST either: (a) wrap doc.cleanup() in try-catch, or (b) ensure all
+          rendering has completed or been cancelled before calling cleanup.
+
+          Safe pattern — cancel all renders before cleanup:
+            // Cancel any in-progress renders first
+            if (renderTask) {
+              renderTask.cancel();
+              try {
+                await renderTask.promise;
+              } catch (e) {
+                if (e.name !== 'RenderingCancelledException') throw e;
+              }
+            }
+            // Now cleanup is safe
+            try {
+              await doc.cleanup();
+            } catch (error) {
+              console.warn('Cleanup failed (rendering may still be active):', error.message);
+            }
+
+          Alternative: skip cleanup when rendering is uncertain.
+          Note: cleanup() is optional memory optimization — failing silently is acceptable
+          if it's called at an inopportune time. Only cleanup when you KNOW no renders
+          are in progress.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: getData
+    import_path: "pdfjs-dist"
+    description: >
+      Returns the raw binary data of the original loaded PDF document as a Uint8Array.
+      Called on PDFDocumentProxy. This is the method to use when you want to download
+      or re-save an unmodified PDF — saveDocument() should only be used when annotations
+      have been added. Uses sendWithPromise("GetData") to fetch the raw data from the worker.
+      May also be called on PDFDocumentLoadingTask if you need the data before the
+      document finishes loading (e.g., during a loading error).
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs line 16048 (transport.getData):
+      # getData() { return this.messageHandler.sendWithPromise("GetData", null); }
+      # Uses sendWithPromise which rejects if the worker is destroyed before responding.
+      # Also: PDFDocumentLoadingTask.getData() (line 14845) delegates to same transport.
+      # The worker can be destroyed before getData() resolves if destroy() is called
+      # while getData() is in-flight.
+      - id: getdata-no-try-catch
+        condition: >
+          doc.getData() is called without try-catch, and the worker thread is destroyed
+          before the data transfer completes. This can happen in SaaS apps when:
+          (a) doc.destroy() is called on one path while getData() is awaited on another
+          (e.g., a request timeout fires while the data is being transferred), or
+          (b) the PDF was loaded from a streaming source and getData() is called before
+          the full document was buffered (returns only the buffered data, or rejects
+          if the transport is not available).
+          The messageHandler.sendWithPromise chain propagates worker errors as rejections.
+        throws: >
+          Error with message "Worker was destroyed" (or similar) — propagated from
+          messageHandler.sendWithPromise when the worker is terminated before
+          the GetData message response arrives.
+          Also potentially: any Error thrown from the worker thread during data
+          serialization if the PDF is in an unusual state.
+          These are plain JavaScript Error objects, not pdfjs-dist custom exceptions.
+        required_handling: >
+          Caller MUST wrap doc.getData() in try-catch. For PDF download workflows:
+
+            try {
+              const bytes = await doc.getData();
+              const blob = new Blob([bytes], { type: 'application/pdf' });
+              const url = URL.createObjectURL(blob);
+              // Trigger download
+              a.href = url;
+              a.download = 'document.pdf';
+              a.click();
+              URL.revokeObjectURL(url);
+            } catch (error) {
+              console.error('Failed to get PDF data:', error.message);
+              // Notify user that download failed
+              showError('PDF download failed. Please try again.');
+            } finally {
+              await doc.destroy();
+            }
+
+          Note: For unmodified PDFs, prefer getData() over saveDocument(). For PDFs
+          where annotations were added, use saveDocument() instead. saveDocument()
+          logs a warning when annotationStorage is empty and suggests getData().
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: TextLayer.render
+    import_path: "pdfjs-dist"
+    description: >
+      Renders a text layer for a PDF page by reading text content from a stream and
+      creating DOM elements for text selection and accessibility. Called on a TextLayer
+      instance (constructed with textContentSource, container, and viewport). Returns
+      a Promise that resolves when all text items have been processed and rendered to
+      the DOM. Used in PDF viewer applications to enable text selection, search, and
+      copy-paste over PDF pages. The TextLayer is a separate layer rendered on top of
+      the canvas render. Cancel via textLayer.cancel() (not renderTask.cancel()).
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs lines 14353-14376 (TextLayer.render):
+      # The pump() function reads from this.#textContentSource via getReader().
+      # On read failure: this.#capability.reject(error) — promise rejects.
+      # In cancel(): new AbortException("TextLayer task cancelled.") → this.#capability.reject(abortEx)
+      # Confirmed from source line 14406: `const abortEx = new AbortException("TextLayer task cancelled.")`
+      # Also: if #reader.read() throws or the stream errors, #capability.reject is called.
+      # Source: https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/text_layer.js
+      - id: textlayer-render-no-try-catch
+        condition: >
+          await textLayer.render() is called without try-catch, and either:
+          (a) textLayer.cancel() is called while rendering is in progress (e.g., user
+          navigates to a different page before the text layer finishes), or
+          (b) doc.cleanup() or doc.destroy() is called while the text layer is reading
+          from the text content stream, causing the stream to error.
+          Both cases reject the render() promise with AbortException. This is common
+          in React-based PDF viewers where a component unmounts or the user pages
+          through the document quickly.
+        throws: >
+          AbortException (pdfjs-dist custom class extending BaseException) — thrown when
+          textLayer.cancel() is called or the underlying text content stream is aborted.
+          Message: "TextLayer task cancelled."
+          Name property: 'AbortException'.
+          Confirmed from build/pdf.mjs line 14406:
+          `const abortEx = new AbortException("TextLayer task cancelled.")`.
+          Also: any Error from the text content stream reader errors propagates through
+          #capability.reject — these would be worker errors (UnknownErrorException or
+          plain Error from transport destruction).
+        required_handling: >
+          Caller MUST await textLayer.render() in a try-catch. AbortException should
+          NOT be re-thrown — it is an expected cancellation signal, not a failure.
+
+            const textLayer = new pdfjs.TextLayer({
+              textContentSource: page.streamTextContent(),
+              container: textLayerDiv,
+              viewport,
+            });
+            try {
+              await textLayer.render();
+            } catch (error) {
+              if (error.name === 'AbortException') {
+                // Expected — text layer was cancelled (e.g., user navigated away)
+                // Do NOT re-throw — this is an intentional cancellation
+                return;
+              }
+              // Actual error — log and propagate
+              console.error('Text layer rendering failed:', error);
+              throw error;
+            }
+
+          To cancel a text layer render (e.g., on component unmount):
+            textLayer.cancel();  // This rejects the render() promise with AbortException
+
+          Note: AbortException for TextLayer.render() follows the same pattern as
+          RenderingCancelledException for page.render() — both are intentional
+          cancellation signals that should be caught but not re-thrown.
+        sources:
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/text_layer.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "getDocument() returns a PDFDocumentLoadingTask — must await .promise to get PDFDocumentProxy"
   - "Pages are 1-indexed: first page = 1, last page = doc.numPages. 0-indexing is a very common bug."
   - "getTextContent() returns empty items array for scanned image-only PDFs — not an error. Check items.length."
   - "stopAtErrors: true in getDocument() causes parsing failures to reject promises (default: false = silent skip)"
   - "render() returns RenderTask — must await .promise. RenderingCancelledException is an intentional cancel signal."
+  - "TextLayer.render() returns a Promise directly (not a RenderTask). Cancel via textLayer.cancel()."
   - "In Node.js, pdfjs-dist requires node-canvas for render() — not needed for getTextContent()"
   - "Error classes: InvalidPDFException, PasswordException, ResponseException, AbortException, FormatError, UnknownErrorException, RenderingCancelledException — all extend BaseException (name property set)"
   - "PasswordException.code indicates type: PasswordResponses.NEED_PASSWORD (1) or INCORRECT_PASSWORD (2)"
   - "Leaked workers (no destroy()) cause Node.js process to hang on exit and memory to grow unboundedly"
   - "saveDocument() warns (not errors) when annotationStorage is empty — use getData() for unmodified PDFs"
+  - "cleanup() throws if called while a page is rendering — always cancel renders before calling cleanup()"

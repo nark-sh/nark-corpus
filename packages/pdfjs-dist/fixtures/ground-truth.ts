@@ -13,6 +13,9 @@
  *   - await renderTask.promise without try-catch → SHOULD_FIRE: render-no-try-catch
  *   - await doc.saveDocument() without try-catch → SHOULD_FIRE: savedocument-no-try-catch
  *   - doc.destroy() not in finally block → SHOULD_FIRE: destroy-not-called-finally
+ *   - await doc.cleanup() without try-catch → NO_DETECTOR (cleanup-during-rendering, no scanner rule yet)
+ *   - await doc.getData() without try-catch → SHOULD_FIRE: getdata-no-try-catch
+ *   - await textLayer.render() without try-catch → NO_DETECTOR (textlayer-render-no-try-catch, no scanner rule yet)
  *
  * Coverage:
  *   - Section 1: bare getDocument().promise → SHOULD_FIRE
@@ -28,8 +31,14 @@
  *   - Section 11: doc.saveDocument() without try-catch → SHOULD_FIRE
  *   - Section 12: doc.saveDocument() with try-catch → SHOULD_NOT_FIRE
  *   - Section 13: non-contracted patterns → SHOULD_NOT_FIRE
+ *   - Section 14: doc.cleanup() without try-catch → SHOULD_FIRE
+ *   - Section 15: doc.cleanup() with try-catch → SHOULD_NOT_FIRE
+ *   - Section 16: doc.getData() without try-catch → SHOULD_FIRE
+ *   - Section 17: doc.getData() with try-catch → SHOULD_NOT_FIRE
+ *   - Section 18: TextLayer.render() without try-catch → SHOULD_FIRE
+ *   - Section 19: TextLayer.render() with try-catch → SHOULD_NOT_FIRE
  *
- * Updated: 2026-04-17 (deepen-stream-2 pass 5) — added sections 5-13 for new functions
+ * Updated: 2026-04-17 (deepen-stream-1 pass 9) — added sections 14-19 for cleanup, getData, TextLayer.render
  */
 
 import * as pdfjs from "pdfjs-dist";
@@ -256,5 +265,150 @@ export async function processPdfWithDestroy(buffer: ArrayBuffer) {
     throw error;
   } finally {
     await doc?.destroy();  // Always destroy
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. doc.cleanup() — without try-catch → NO_DETECTOR (contract exists, no scanner rule yet)
+// Scanner concern queued: concern-20260417-pdfjs-dist-deepen-6
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function cleanupDocumentNoCatch(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  // NO_DETECTOR: cleanup-during-rendering — no scanner rule yet for doc.cleanup().
+  // Contract postcondition exists (cleanup-during-rendering). Scanner concern queued.
+  // Will throw Error("startCleanup: Page N is currently rendering.") if a page is rendering.
+  await doc.cleanup();
+}
+
+export async function cleanupAfterRenderNoCatch(buffer: ArrayBuffer, canvas: any) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+  const renderTask = page.render({ canvas, viewport });
+  // Start render but don't await it — then immediately cleanup while rendering is in progress
+  // NO_DETECTOR: cleanup-during-rendering — no scanner rule yet for doc.cleanup().
+  await doc.cleanup();
+  await renderTask.promise;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. doc.cleanup() — with try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function cleanupDocumentWithCatch(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  try {
+    // SHOULD_NOT_FIRE: cleanup() inside try-catch satisfies error handling requirement
+    await doc.cleanup();
+  } catch (error: any) {
+    if (error.message?.includes('currently rendering')) {
+      console.warn('Cleanup skipped — rendering in progress');
+    } else {
+      throw error;
+    }
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. doc.getData() — without try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getPdfDataNoCatch(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  // SHOULD_FIRE: getdata-no-try-catch — worker error during data transfer unhandled
+  const bytes = await doc.getData();
+  return bytes;
+}
+
+export async function downloadPdfNoCatch(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  // SHOULD_FIRE: getdata-no-try-catch — Error("Worker was destroyed") propagates if destroy() races
+  const pdfData = await doc.getData();
+  return new Blob([pdfData], { type: 'application/pdf' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. doc.getData() — with try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getPdfDataWithCatch(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  try {
+    // SHOULD_NOT_FIRE: getData() inside try-catch satisfies error handling requirement
+    const bytes = await doc.getData();
+    return new Uint8Array(bytes);
+  } catch (error) {
+    console.error('Failed to get PDF data:', error);
+    return null;
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. TextLayer.render() — without try-catch → NO_DETECTOR (no scanner rule yet)
+// TextLayer is constructed directly (new pdfjs.TextLayer({...})), not through the
+// instance chain (getDocument → getPage → render). Scanner does not track TextLayer
+// instances, so render() on TextLayer is not detected.
+// Scanner concern queued: concern-20260417-pdfjs-dist-deepen-8
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderTextLayerNoCatch(buffer: ArrayBuffer, container: HTMLElement) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+  const textLayer = new pdfjs.TextLayer({
+    textContentSource: page.streamTextContent(),
+    container,
+    viewport,
+  });
+  // NO_DETECTOR: textlayer-render-no-try-catch — no scanner rule yet for TextLayer.render().
+  // Contract postcondition exists. Scanner does not track TextLayer instances.
+  await textLayer.render();
+}
+
+export async function renderTextLayerWithCancelNoCatch(buffer: ArrayBuffer, container: HTMLElement) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+  const textLayer = new pdfjs.TextLayer({
+    textContentSource: page.streamTextContent(),
+    container,
+    viewport,
+  });
+  // Cancel immediately after starting — AbortException will be thrown if not caught
+  textLayer.cancel();
+  // NO_DETECTOR: textlayer-render-no-try-catch — no scanner rule yet for TextLayer.render().
+  await textLayer.render();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. TextLayer.render() — with try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderTextLayerWithCatch(buffer: ArrayBuffer, container: HTMLElement) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+  const textLayer = new pdfjs.TextLayer({
+    textContentSource: page.streamTextContent(),
+    container,
+    viewport,
+  });
+  try {
+    // SHOULD_NOT_FIRE: textLayer.render() inside try-catch satisfies error handling requirement
+    await textLayer.render();
+  } catch (error: any) {
+    if (error.name === 'AbortException') {
+      // Expected — text layer was cancelled (e.g., user navigated away)
+      return;
+    }
+    console.error('Text layer rendering failed:', error);
+    throw error;
+  } finally {
+    await doc.destroy();
   }
 }
