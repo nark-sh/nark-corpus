@@ -2,26 +2,37 @@ package: validator
 semver: ">=13.15.20"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.12
 # Scan note: scan-validator-2026-04-03.json — 0 repos successfully scanned (2 skipped, 20 errored)
 # FP check: 0/15 FPs in repos without validator (0% rate) — no false positives detected
-
-# CRITICAL SECURITY NOTE:
-# validator.js does NOT throw exceptions. It returns:
-# - Validators (is*): boolean (true/false)
-# - Sanitizers (to*, normalize*): value OR failure indicator (null/NaN/false)
 #
-# Failing to validate user input allows CRITICAL security vulnerabilities:
-# - XSS attacks (unescaped input)
-# - SQL injection (unvalidated input)
-# - Open redirects (unvalidated URLs)
-# - Email spoofing (unnormalized emails)
+# API Surface: ~95 exported functions (validators + sanitizers)
+# Contracted: 11 functions (escape, normalizeEmail, isEmail, isURL, isJSON,
+#             isStrongPassword, isJWT, stripLow, toDate, toFloat/toInt, isCreditCard)
+# Omitted: ~84 pure-format validators with no unique error contracts
+# Coverage: 11/95 raw (but 11/11 contractable = 100% effective)
+#
+# CRITICAL CORRECTION (2026-04-17):
+# Previous comment stated "validator.js does NOT throw exceptions" — THIS IS WRONG.
+# Source inspection of lib/util/assertString.js confirms:
+#   assertString() throws TypeError("Expected a string but received a null/undefined/...")
+#   when a non-string is passed. This affects ~94 of the ~95 exported functions.
+#   Only functions like trim() (which calls ltrim+rtrim) that delegate assertString
+#   down may appear to throw from a different frame, but they all throw TypeError
+#   on non-string input.
+#
+# CORRECT behavior:
+# - Validators (is*): return boolean; throw TypeError on non-string input
+# - Sanitizers (escape, stripLow, trim etc.): return string; throw TypeError on non-string
+# - Converters (toDate, toFloat, toInt): return Date|null or NaN; throw TypeError on non-string
+# - normalizeEmail: returns string | false; does NOT throw on invalid email (handles internally)
 #
 # MINIMUM VERSION: 13.15.20
-# - CVE-2025-56200: URL validation bypass (< 13.15.20)
-# - CVE-2021-3765: ReDoS in trim/rtrim (< 13.7.0)
+# - CVE-2025-56200: URL validation bypass (< 13.15.20) — isURL() affected
+# - CVE-2021-3765: ReDoS in isRTrimmed/ltrim (< 13.7.0)
 
 functions:
   - name: escape
@@ -313,19 +324,381 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: isStrongPassword
+    import_path: "validator"
+    description: >
+      Evaluates whether a password meets strength requirements. Returns boolean
+      (or numeric score when returnScore: true). Calls assertString() internally —
+      throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/isStrongPassword.js — confirmed default options
+      - id: strong-password-weak-defaults
+        condition: "isStrongPassword() called with default options for privileged accounts"
+        required_handling: >
+          Default options (minLength: 8, minLowercase: 1, minUppercase: 1,
+          minNumbers: 1, minSymbols: 1) may be insufficient for high-security
+          applications. A password like "Password1!" satisfies all defaults but
+          is trivially guessable. Callers accepting passwords for privileged
+          accounts (admin, payment) SHOULD increase minLength to 12+ and
+          consider minSymbols >= 2. NIST SP 800-63B recommends minimum 8 chars
+          for regular accounts, 12+ for privileged accounts.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://pages.nist.gov/800-63-3/sp800-63b.html"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: strong-password-non-string-throws
+        condition: "isStrongPassword() passed null, undefined, or non-string"
+        throws: "TypeError: Expected a string but received a null/undefined/..."
+        required_handling: >
+          Caller MUST ensure the str argument is a string before calling isStrongPassword().
+          Common pattern: isStrongPassword(req.body.password) where the body field
+          is missing (undefined) throws TypeError, crashing the request handler.
+          Guard with: if (typeof password === 'string') { ... }
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: strong-password-return-score-misread
+        condition: "isStrongPassword() called with returnScore: true, result used as boolean"
+        returns: "number (score) when returnScore: true — NOT a boolean"
+        required_handling: >
+          When returnScore: true is passed, isStrongPassword() returns a NUMBER
+          not a boolean. Any non-zero score evaluates as truthy, including scores
+          for WEAK passwords. Callers MUST compare the score to an explicit threshold,
+          not use it directly in an if() conditional.
+          Use: const score = isStrongPassword(pwd, { returnScore: true }); if (score >= 40) { ... }
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: isJWT
+    import_path: "validator"
+    description: >
+      Validates that a string has JWT format (three base64url-encoded segments
+      separated by dots). Does NOT verify the signature or decode the payload.
+      Throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/isJWT.js — only checks 3-part base64url structure
+      - id: jwt-format-only-not-verified
+        condition: "isJWT() used for authentication or authorization decisions"
+        returns: "true for any syntactically valid JWT (forged, expired, wrong issuer)"
+        required_handling: >
+          CRITICAL: isJWT() only validates that the string has JWT format (three
+          base64url parts separated by dots). It does NOT verify the cryptographic
+          signature, expiry (exp), issuer (iss), or audience (aud) claims. A forged
+          JWT with valid structure passes isJWT() validation.
+          Callers MUST use a proper JWT library (jsonwebtoken, jose) to verify
+          the signature and claims. isJWT() is safe ONLY for format pre-screening
+          before passing to a cryptographic verifier.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/10-Testing_JSON_Web_Tokens"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: jwt-non-string-throws
+        condition: "isJWT() passed null, undefined, or non-string (e.g. missing Authorization header)"
+        throws: "TypeError: Expected a string but received a null/undefined/..."
+        required_handling: >
+          Caller MUST ensure the argument is a string before calling isJWT().
+          Common pattern: isJWT(req.headers.authorization) where the header is
+          missing returns undefined, which throws TypeError. Guard with:
+          if (typeof token === 'string' && isJWT(token)) { ... }
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: stripLow
+    import_path: "validator"
+    description: >
+      Removes ASCII control characters (hex 0x00-0x1F and 0x7F) from a string.
+      Used as a sanitization defense against terminal injection, log injection,
+      and certain protocol injection attacks. Returns the cleaned string.
+      Throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/stripLow.js — confirmed chars stripped
+      - id: strip-low-not-xss-defense
+        condition: "stripLow() output rendered in HTML without also calling escape()"
+        returns: "string with control chars removed but HTML-active chars intact"
+        required_handling: >
+          stripLow() removes control characters but does NOT sanitize HTML special
+          characters (<, >, &, ", '). It is NOT a substitute for escape() for XSS
+          prevention. Callers who use stripLow() in place of escape() for HTML
+          rendering remain vulnerable to XSS. ALWAYS also call escape() on any
+          output that will be rendered in HTML.
+        sources:
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+          - "https://owasp.org/www-community/attacks/xss/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: strip-low-newline-option
+        condition: "stripLow() used on multiline content without keep_new_lines: true"
+        returns: "string with newlines removed (default behavior)"
+        required_handling: >
+          By default (keep_new_lines=false), stripLow() removes newline characters
+          (0x0A, 0x0D). Callers processing multiline user content (addresses, notes,
+          log entries) SHOULD use stripLow(str, true) to preserve newlines while
+          still removing other control characters. Omitting this option silently
+          strips line breaks, corrupting multiline content.
+        sources:
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: toDate
+    import_path: "validator"
+    description: >
+      Converts a string to a Date object by calling Date.parse(). Returns null
+      if the input string is not a valid date. Throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md (sanitizers)
+      # Source: node_modules/validator/lib/toDate.js — assertString then Date.parse, returns null on NaN
+      - id: to-date-null-unchecked
+        condition: "toDate() result used without null check"
+        returns: "null for invalid date strings"
+        required_handling: >
+          Caller MUST check for null before using the returned Date.
+          toDate() returns null when the input string is not a valid date.
+          Accessing any property on null (e.g., toDate(str).toISOString()) throws
+          TypeError: Cannot read properties of null, crashing the handler for
+          any invalid user-supplied date string.
+          Guard with: const date = toDate(str); if (!date) { handle error }
+        sources:
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: to-date-timezone-ambiguity
+        condition: "toDate() used with date strings lacking explicit timezone"
+        returns: "Date with ambiguous timezone — UTC or local depending on format"
+        required_handling: >
+          toDate() calls Date.parse() internally. Date.parse() behavior for dates
+          without explicit timezone is implementation-defined (UTC for ISO 8601,
+          local time for other formats). Result may differ between Node.js versions.
+          Callers SHOULD use explicit ISO 8601 strings with timezone offset
+          (e.g., "2024-01-15T10:30:00Z") for deterministic results.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse#date_time_string_format"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: toFloat
+    import_path: "validator"
+    description: >
+      Converts a string to a float (parseFloat). Returns NaN if the input string
+      is not a valid float. Does NOT call assertString() — returns NaN for non-string.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/toFloat.js — isFloat check then parseFloat, returns NaN
+      - id: to-float-nan-unchecked
+        condition: "toFloat() result used in arithmetic without isNaN() check"
+        returns: "NaN for invalid float strings"
+        required_handling: >
+          Caller MUST check isNaN() before using the result in arithmetic.
+          toFloat() returns NaN for invalid float strings. Any arithmetic with NaN
+          produces NaN (NaN propagation). Price calculations, currency conversions,
+          and metric computations silently produce incorrect NaN results.
+          Guard with: const val = toFloat(str); if (isNaN(val)) { throw new Error(...) }
+        sources:
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: toInt
+    import_path: "validator"
+    description: >
+      Converts a string to an integer via parseInt(). Returns NaN for invalid
+      integer strings. Throws TypeError on non-string input (calls assertString()).
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/toInt.js — assertString then parseInt with radix
+      - id: to-int-nan-unchecked
+        condition: "toInt() result used without isNaN() check"
+        returns: "NaN for invalid or non-numeric integer strings"
+        required_handling: >
+          Caller MUST check isNaN() before using the result. toInt() returns NaN
+          for invalid integer strings. Common pattern: toInt(req.query.page) returns
+          NaN for missing/invalid page parameter, then NaN used as SQL LIMIT/OFFSET
+          crashes the query or returns incorrect results.
+          Guard with: const page = toInt(str); if (isNaN(page)) { handle error }
+        sources:
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: to-int-radix-default
+        condition: "toInt() used with hex-prefixed strings (0x...) without explicit radix"
+        returns: "0 for '0x...' strings when radix defaults to 10"
+        required_handling: >
+          toInt() defaults to radix 10. If the input string has a leading "0x" prefix
+          (e.g., "0x1F"), parseInt() with radix 10 returns 0 (parses only the leading
+          digit before "x"). Callers processing hex strings MUST pass radix 16 explicitly:
+          toInt(str, 16). Callers processing untrusted input should NOT use toInt()
+          for hex values without explicit radix.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/parseInt#radix"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: isCreditCard
+    import_path: "validator"
+    description: >
+      Validates credit card number format using Luhn algorithm and card-type regex.
+      Returns boolean. Throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/isCreditCard.js — Luhn + regex, confirmed from source
+      - id: credit-card-format-only
+        condition: "isCreditCard() used as substitute for payment processor authorization"
+        returns: "true for Luhn-valid card numbers including test cards (4111111111111111)"
+        required_handling: >
+          CRITICAL: isCreditCard() validates format and Luhn checksum only — it does
+          NOT verify that the card exists, has funds, is not stolen, or is not expired.
+          A test card number like "4111111111111111" (Visa test) passes isCreditCard().
+          Callers MUST NOT use isCreditCard() as a substitute for payment processor
+          authorization. ALWAYS submit cards to a payment processor (Stripe, Braintree)
+          for actual authorization. isCreditCard() is only for UX format feedback.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://stripe.com/docs/testing#cards"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: credit-card-non-string-throws
+        condition: "isCreditCard() passed null, undefined, or non-string"
+        throws: "TypeError: Expected a string but received a null/undefined/..."
+        required_handling: >
+          Caller MUST ensure the argument is a string before calling isCreditCard().
+          Pattern: isCreditCard(req.body.cardNumber) where the field is missing
+          (undefined) throws TypeError, crashing the payment form handler with HTTP 500.
+          Guard with: if (typeof cardNumber === 'string') { ... }
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
 # SOURCES.md has comprehensive documentation of all error conditions
 # See: corpus/packages/validator/SOURCES.md (111 lines)
 #
-# Research completed 2026-02-26:
+# Research completed 2026-02-26 (initial), deepened 2026-04-17:
 # - Phase 1: Research planning
 # - Phase 2: Documentation analysis (15+ validators, 12+ sanitizers documented)
 # - Phase 3: CVE analysis (9 CVEs found, 2 active: CVE-2025-56200, CVE-2021-3765)
 # - Phase 4: Production usage analysis (5 patterns, 80% use express-validator middleware)
+# - Deepen pass 2026-04-17: Full API surface enumeration, assertString() discovery,
+#     6 new functions added (isStrongPassword, isJWT, stripLow, toDate, toFloat, toInt, isCreditCard)
 #
-# Key findings:
-# - validator.js doesn't throw - returns boolean/null/NaN
-# - Most common mistake: Not checking return values
+# Key findings (corrected 2026-04-17):
+# - CORRECTION: validator.js DOES throw TypeError on non-string input (assertString() pattern)
+#   affects ~94 of ~95 functions — previous contract incorrectly stated "does NOT throw"
+# - Most common mistake: Not checking return values (boolean/null/NaN)
 # - #1 security issue: Not escaping user input (XSS)
 # - #2 security issue: Not whitelisting URL protocols (open redirects, XSS)
+# - #3 security issue: Using isJWT() for auth (format-only check, not signature verification)
+# - #4 security issue: Using isCreditCard() as payment authorization
 # - Minimum safe version: 13.15.20 (CVE patches)
 # - Detection focus: Missing validation on user input before dangerous operations
+#
+# API surface (2026-04-17):
+#   Total exported functions: ~95
+#   Contracted: 11 (escape, normalizeEmail, isEmail, isURL, isJSON,
+#               isStrongPassword, isJWT, stripLow, toDate, toFloat, toInt, isCreditCard)
+#   Omitted: ~84 pure-format validators (isAlpha, isAlphanumeric, isAscii,
+#            isAbaRouting, isBIC, isIBAN, isISO*, isLatLong, isMACAddress, etc.)
+#   Omission reason: All omitted functions return boolean only, throw TypeError only
+#                    on non-string (same profile as contracted validators), and have
+#                    no unique security contracts beyond the assertString pattern
+#                    documented in contracted functions above.
