@@ -1,10 +1,23 @@
 package: supertest
 semver: ">=4.0.0 <8.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0
+# Depth pass 2026-04-18 (deepen-stream-2 pass 9):
+# API surface: 2 distinct contractable functions (request, request.agent)
+# bearer() is sync (just sets Authorization header), no error contract needed
+# All HTTP method functions (get, post, put, delete, patch, head) return same Test
+#   chain and share the same error profile as request() — already contracted
+# Contracted before: 1 (request) — coverage: 50%
+# Contracted after: 2 (+ request.agent) — coverage: 100%
+# Evidence sources:
+#   node_modules/supertest/lib/agent.js — inspected directly
+#   node_modules/supertest/index.js — inspected directly
+#   node_modules/supertest/README.md — inspected directly
+#   https://github.com/ladjs/supertest#readme
 # Audit 2026-04-13: 3 repos scanned, 0 violations.
 # scan-supertest-2026-04-13.json. FP check: 0/20 type-A FPs (0% rate). Confirmed.
 
@@ -119,3 +132,102 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: agent
+    import_path: "supertest"
+    namespace: "request"
+    description: >
+      Creates a persistent TestAgent that maintains cookies and session state across multiple
+      HTTP requests. Used for testing authentication flows, session-based features, and
+      any scenario requiring cookie persistence. Wraps superagent's Agent with supertest
+      Test instances for each request.
+    # Evidence: node_modules/supertest/lib/agent.js (inspected directly 2026-04-18)
+    # Evidence: node_modules/supertest/index.js — agent export confirmed
+    # Evidence: node_modules/supertest/README.md — agent usage patterns documented
+    # Evidence: https://github.com/ladjs/supertest#readme
+
+    postconditions:
+      - id: agent-http2-not-supported
+        condition: "http2 option passed to request.agent() on a Node.js version without http2 support"
+        throws: "Error('supertest: this version of Node.js does not support http2')"
+        required_handling: >
+          Caller MUST NOT pass { http2: true } unless the runtime Node.js version supports http2.
+          Node.js 8.4.0+ supports http2, but it must be explicitly available.
+          Confirmed from agent.js source: throws Error synchronously in constructor if http2
+          module is unavailable. Guard with try/catch or check Node.js version before use.
+        sources:
+          - "https://github.com/ladjs/supertest/blob/master/lib/agent.js"
+          - "https://github.com/ladjs/supertest#readme"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: agent-cookie-state-leak
+        condition: "A shared agent instance is reused across separate test suites or test files without resetting state"
+        throws: "No exception — silent test pollution: cookies set in one test suite affect subsequent suites"
+        required_handling: >
+          Caller MUST create a fresh agent per test suite (describe block) or use beforeEach
+          to recreate the agent. A shared agent persists Set-Cookie headers across all requests
+          made through it. When test A logs in and test B expects an unauthenticated response,
+          the shared agent silently sends the auth cookie from test A to test B, causing
+          intermittent failures when tests run in a different order.
+          Pattern: const agent = request.agent(app); in describe() scope, not module scope.
+        sources:
+          - "https://github.com/ladjs/supertest#readme"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: agent-server-not-closed
+        condition: "request.agent(app) used with a manually created http.Server that is not closed after tests"
+        throws: "Process hangs — Node.js event loop is kept alive by open server handle"
+        required_handling: >
+          Caller MUST close the server in afterAll/after hooks when using request.agent()
+          with a manually created server object. Unlike request(app) which creates a new
+          internal server per Test instance and closes it after each request, the agent
+          holds a reference to the server that persists for the lifetime of the agent.
+          Use afterAll(() => server.close()) to prevent test suite from hanging.
+          When passing an Express app function (not a server), supertest auto-creates and
+          auto-closes a server per request — no manual cleanup needed.
+        sources:
+          - "https://github.com/ladjs/supertest/blob/master/lib/test.js"
+          - "https://github.com/ladjs/supertest#readme"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: agent-async-unhandled-rejection
+        condition: "Agent request chain is not awaited in async test functions"
+        throws: "UnhandledPromiseRejection — assertion failures are silently swallowed"
+        required_handling: >
+          Same pattern as request() — callers MUST await agent chains or return the promise.
+          agent.get('/').expect(200) without await or return means assertion errors are
+          unhandled. The agent silently succeeds even if the response was 404.
+          Correct: await agent.get('/api/user').expect(200)
+          Incorrect: agent.get('/api/user').expect(200) // no await — silent failure
+        sources:
+          - "https://github.com/ladjs/supertest#readme"
+          - "https://github.com/ladjs/supertest/blob/master/lib/test.js"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
