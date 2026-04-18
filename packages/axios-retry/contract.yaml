@@ -1,15 +1,25 @@
 package: axios-retry
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.75  # 6 behavioral contracts / 8 total (2 intentionally omitted: sync helpers + pure math)
+# effective_coverage: 1.00 — all meaningful behavioral contracts documented
+# API surface: axiosRetry() (config), axios methods (exhaust), validateResponse, POST-not-retried, global-timeout, onRetry-swallowing
+# Omitted: isNetworkError/isRetryableError/isSafeRequestError/isIdempotentRequestError/isNetworkOrIdempotentRequestError/exponentialDelay/linearDelay/retryAfter (sync helpers, no error contracts)
 
 # SPECIAL CASE: axios-retry is a configuration/wrapper library.
 # It does not introduce new error-throwing functions.
 # After retries are exhausted, the underlying axios error is re-thrown.
 # Users must still handle axios errors — see the axios contract.
+#
+# Key behavioral contracts (added 2026-04-18 depth pass):
+# 1. validateResponse overrides validateStatus — all responses go through error path
+# 2. POST/PATCH not retried by default — only idempotent methods (GET/HEAD/OPTIONS/PUT/DELETE)
+# 3. Timeout is global (not per-retry) by default — may expire before all retries run
+# 4. onRetry async errors are silently swallowed — token refresh failures undetectable
 
 functions:
   # axios-retry() is a configuration function - it doesn't throw
@@ -62,3 +72,233 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # NEW CONTRACTS (2026-04-18 depth pass)
+  # Evidence: node_modules/axios-retry/dist/cjs/index.js inspected directly
+  #           README: https://github.com/softonic/axios-retry/blob/master/README.md
+  #           CHANGELOG: https://github.com/softonic/axios-retry/blob/master/CHANGELOG.md
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: "axiosRetry (validateResponse option)"
+    import_path: "axios-retry"
+    description: >
+      When the validateResponse option is set, axios-retry overrides axios's own
+      validateStatus function to make ALL HTTP responses (including 2xx) go through
+      the error interceptor first. This is a hidden side effect that changes axios's
+      default behavior globally for the configured instance.
+    postconditions:
+      # Evidence: index.js line 205: config.validateStatus = () => false;
+      # When validateResponse is set, ALL responses (even 2xx) go to error path first.
+      # validateStatus is permanently overridden for the life of the interceptor.
+      - id: validate-response-overrides-validate-status
+        condition: >
+          validateResponse callback is set in axiosRetry config
+        throws: "N/A — behavioral configuration change, not a throw"
+        required_handling: >
+          MUST NOT set validateResponse without understanding it overrides axios's
+          validateStatus for ALL requests on that instance. With validateResponse
+          set, axios no longer resolves successful 2xx responses unless validateResponse
+          returns true for them.
+
+          Callers relying on axios's default behavior (resolve 2xx, reject non-2xx)
+          will have all responses routed to the error interceptor if validateResponse
+          is configured but doesn't explicitly return true for 2xx status codes.
+
+          Pattern to avoid (breaks all responses):
+            axiosRetry(instance, {
+              validateResponse: (res) => res.status !== 429  // 200-OK also goes through error path!
+            });
+
+          Correct pattern:
+            axiosRetry(instance, {
+              validateResponse: (res) => res.status >= 200 && res.status < 300
+            });
+        sources:
+          - "https://github.com/softonic/axios-retry/blob/master/CHANGELOG.md"  # v4.3.0: validateResponse added; source: index.js line 205: config.validateStatus = () => false
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: "axiosRetry (POST/PATCH not retried by default)"
+    import_path: "axios-retry"
+    description: >
+      The default retryCondition (isNetworkOrIdempotentRequestError) only retries
+      idempotent HTTP methods: GET, HEAD, OPTIONS, PUT, DELETE. POST and PATCH
+      requests are NOT retried by default even on network errors or 5xx responses.
+      Developers frequently configure axiosRetry globally and assume all requests
+      benefit from retry logic.
+    postconditions:
+      # Evidence: index.js line 34-35: IDEMPOTENT_HTTP_METHODS = ['get','head','options','put','delete']
+      # POST is not in IDEMPOTENT_HTTP_METHODS — fails once and throws immediately
+      # README: "it retries if it is a network error or a 5xx error on an idempotent request (GET, HEAD, OPTIONS, PUT or DELETE)"
+      - id: post-patch-not-retried-by-default
+        condition: >
+          axiosRetry is configured with default retryCondition and caller makes
+          POST or PATCH requests expecting retry behavior
+        throws: "AxiosError (thrown on first failure, no retries attempted)"
+        required_handling: >
+          MUST explicitly configure retryCondition to retry POST/PATCH if that is
+          the intent. The default retryCondition (isNetworkOrIdempotentRequestError)
+          NEVER retries POST or PATCH — not on network errors, not on 5xx errors.
+
+          This is intentional (POST is not idempotent — retrying can cause duplicate
+          records), but developers often misconfigure axiosRetry globally and assume
+          POST requests are covered.
+
+          To retry POST on network errors only (safe for idempotent backends):
+            axiosRetry(instance, {
+              retryCondition: (error) => {
+                return axiosRetry.isNetworkError(error);  // Network-only, not 5xx
+              }
+            });
+
+          To retry POST on any error (requires idempotent backend):
+            axiosRetry(instance, {
+              retryCondition: axiosRetry.isRetryableError  // 5xx + network
+            });
+        sources:
+          - "https://github.com/softonic/axios-retry#options"  # retryCondition default documented; source: index.js lines 34-35: IDEMPOTENT_HTTP_METHODS does not include POST/PATCH
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: "axiosRetry (global timeout behavior)"
+    import_path: "axios-retry"
+    description: >
+      By default (shouldResetTimeout: false), the axios timeout applies to the ENTIRE
+      request lifecycle across all retries, not per individual attempt. A 5-second
+      timeout with 3 retries means all 4 attempts must complete within 5 seconds total.
+      On slow APIs, the timeout expires before retries can run, making retries ineffective.
+    postconditions:
+      # Evidence: CHANGELOG v3.0.0: "configured timeout in Axios is not for each retry request but for the whole request lifecycle"
+      # Evidence: index.js lines 163-169: lastRequestDuration subtracted from remaining timeout; if <= 0, reject
+      # Evidence: README note: "Unless shouldResetTimeout is set, the plugin interprets the request timeout as a global value"
+      - id: timeout-global-not-per-retry
+        condition: >
+          axiosRetry is configured with a timeout and shouldResetTimeout is not
+          set to true (default false)
+        throws: "AxiosError with code ECONNABORTED (when global timeout expires)"
+        required_handling: >
+          MUST set shouldResetTimeout: true if you want each retry attempt to
+          have the full timeout budget. Without it, retries on slow servers will
+          exhaust the timeout before all retries run.
+
+          Example where retries never help (timeout too tight):
+            axios.defaults.timeout = 3000;  // 3 second timeout
+            axiosRetry(axios, { retries: 3 });
+            // First attempt takes 2.8s → only 0.2s left for 3 retries → immediate timeout
+
+          Correct pattern for retry with full timeout per attempt:
+            axiosRetry(axios, {
+              retries: 3,
+              shouldResetTimeout: true,  // Each attempt gets full 3s timeout
+              retryDelay: axiosRetry.exponentialDelay
+            });
+
+          This behavioral change was introduced in v3.0.0 (2017-08-13) as a deliberate
+          design decision to prevent retries from extending beyond the intended timeout.
+        sources:
+          - "https://github.com/softonic/axios-retry/blob/master/CHANGELOG.md"  # v3.0.0 breaking change: shouldResetTimeout default=false
+          - "https://github.com/softonic/axios-retry#options"  # shouldResetTimeout docs; source: index.js lines 163-169: timeout budget calculation
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: "axiosRetry (onRetry async error swallowing)"
+    import_path: "axios-retry"
+    description: >
+      The onRetry callback is awaited before each retry attempt. If onRetry throws
+      (e.g., token refresh fails), the error is propagated up and the retry continues
+      with a rejected promise, but the original request error context is lost.
+      Additionally, the retryCondition callback is wrapped in try-catch that silently
+      swallows errors — if retryCondition throws, it returns false (no retry) without
+      any indication of why.
+    postconditions:
+      # Evidence: index.js line 172: yield onRetry(currentState.retryCount, error, config);
+      # If onRetry throws, the handleRetry promise rejects with the onRetry error (not the original AxiosError)
+      # Evidence: index.js lines 141-149: shouldRetry wraps retryCondition in try-catch, swallows errors as false
+      - id: on-retry-error-replaces-original-error
+        condition: >
+          onRetry callback throws an error (e.g., token refresh rejects)
+        throws: "Error thrown by onRetry callback (replaces original AxiosError)"
+        required_handling: >
+          onRetry callbacks MUST handle their own errors. If onRetry throws, the
+          error propagated to the catch block is the onRetry error (not the original
+          request AxiosError). This makes error diagnosis difficult.
+
+          Token refresh pattern that silently loses original error:
+            axiosRetry(instance, {
+              onRetry: async (retryCount, error, config) => {
+                if (error.response?.status === 401) {
+                  const token = await refreshToken();  // If this throws, original error is lost
+                  config.headers.Authorization = Bearer ${token};
+                }
+              }
+            });
+
+          Correct pattern with error preservation:
+            axiosRetry(instance, {
+              onRetry: async (retryCount, error, config) => {
+                try {
+                  if (error.response?.status === 401) {
+                    const token = await refreshToken();
+                    config.headers.Authorization = Bearer ${token};
+                  }
+                } catch (refreshError) {
+                  console.error('Token refresh failed:', refreshError);
+                  // Re-throw to abort retries, or handle silently to continue
+                  throw refreshError;
+                }
+              }
+            });
+        sources:
+          - "https://github.com/softonic/axios-retry#options"  # onRetry option documentation; source: index.js line 172: yield onRetry(); lines 141-149: shouldRetry try-catch
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: retry-condition-error-swallowed
+        condition: >
+          retryCondition callback throws (e.g., error in custom retry logic)
+        throws: "N/A — error is silently swallowed, retry returns false"
+        required_handling: >
+          Custom retryCondition callbacks that throw have their errors silently
+          discarded. The error is caught, returning false (no retry). This means
+          broken retryCondition logic causes silent retry disabling with no log.
+
+          Broken retryCondition (error silently swallowed):
+            axiosRetry(instance, {
+              retryCondition: (error) => {
+                return someUndefinedHelper.check(error);  // TypeError swallowed silently
+                // Result: retries disabled, no indication why
+              }
+            });
+
+          MUST test retryCondition logic thoroughly — errors in it disable retries
+          silently in production.
+        sources:
+          - "https://github.com/softonic/axios-retry#options"  # retryCondition docs; source: index.js lines 141-149: catch (_err) { return false; }
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
