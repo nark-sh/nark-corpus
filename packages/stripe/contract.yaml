@@ -1,11 +1,24 @@
 package: stripe
-semver: ">=8.0.0 <16.0.0"
-contract_version: "1.0.0"
+semver: ">=8.0.0 <17.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.56
+# Depth pass 2026-04-18 (deepen-stream-2 pass 8):
+# API surface: 23 async-callable functions (expanded from 13 in prior pass)
+# 10 new functions discovered in stripe v22: constructEventAsync, finalizeInvoice, pay,
+#   sendInvoice, voidInvoice, markUncollectible, resume, incrementAuthorization,
+#   verifyMicrodeposits, reverse (payout)
+# Contracted before: 9 (create, confirm, constructEvent, retrieve, capture, cancel, refund, attach, detach)
+# Contracted after: 18 (+9 this pass: constructEventAsync, finalizeInvoice, pay, sendInvoice,
+#   voidInvoice, markUncollectible, resume, incrementAuthorization, verifyMicrodeposits)
+# Intentionally omitted (5): update, list, search, expire, reverse(payout)
+# Evidence: stripe v22.0.2 TypeScript declarations, https://docs.stripe.com/error-codes,
+#   https://docs.stripe.com/billing/invoices/workflow, https://docs.stripe.com/api/invoices/
+# Error codes confirmed from stripe/cjs/resources/*.d.ts Code union types
+# coverage_score: 18/23 = 0.78 raw; effective = 18/18 non-omitted = 1.0
+coverage_score: 0.78
 
 functions:
   - name: create
@@ -596,3 +609,555 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+
+  - name: constructEventAsync
+    import_path: "stripe"
+    description: >
+      Async version of constructEvent for webhook signature verification. Added in stripe v14
+      for Edge Runtime (Cloudflare Workers, Vercel Edge Functions, Deno) where SubtleCrypto
+      is required instead of Node's crypto module. Functionally identical to constructEvent
+      but returns a Promise and uses the Web Crypto API. Must be awaited before processing
+      the webhook payload.
+
+    postconditions:
+      # Evidence: stripe/cjs/Webhooks.d.ts — constructEventAsync returns Promise<Event>
+      # stripe/cjs/crypto/SubtleCryptoProvider.d.ts — uses WebCrypto API
+      # https://docs.stripe.com/webhooks/signatures — same tolerance/signature verification as constructEvent
+      - id: construct-event-async-signature-failed
+        condition: >
+          Webhook signature does not match — payload tampered, wrong secret used, or
+          raw body was parsed/re-serialized before verification (common bug: Express
+          JSON body-parser consumed the raw buffer before passing to constructEventAsync).
+        throws: "StripeSignatureVerificationError — no signatures found matching the expected signature for payload"
+        required_handling: >
+          Return 400 immediately. DO NOT process the webhook payload. Log for security
+          monitoring. In Edge Runtimes, use request.text() (not request.json()) to get
+          the raw body — calling request.json() first and then re-serializing causes
+          signature mismatch even with a valid signature.
+        sources:
+          - "https://docs.stripe.com/webhooks/signatures"
+          - "https://github.com/stripe/stripe-node/blob/master/src/Webhooks.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: construct-event-async-timestamp-tolerance
+        condition: >
+          Webhook timestamp is outside the tolerance window (default 300 seconds).
+          Used to prevent replay attacks where an attacker captures and re-sends
+          a valid webhook payload later.
+        throws: "StripeSignatureVerificationError — Timestamp outside the tolerance zone"
+        required_handling: >
+          Return 400. Do NOT process — this is a replay attack prevention mechanism.
+          If webhooks are consistently failing timestamp validation, check server clock
+          sync (NTP). Do not increase tolerance beyond 600 seconds.
+        sources:
+          - "https://docs.stripe.com/webhooks/signatures"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: security_breach
+          incident_cost_range: high
+
+  - name: finalizeInvoice
+    import_path: "stripe"
+    description: >
+      Finalizes a draft invoice, moving it from 'draft' to 'open' status. Once finalized,
+      the invoice is immutable — line items, amounts, and taxes cannot be changed.
+      Stripe auto-sends the invoice to the customer if collection_method is 'send_invoice'.
+      Commonly called in billing automation to explicitly advance invoices.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/invoices/finalize
+      # Error codes confirmed from stripe/cjs/resources/Invoices.d.ts Code union type:
+      # invoice_no_payment_method_types, invoice_not_editable, status_transition_invalid
+      - id: finalize-no-payment-method-types
+        condition: >
+          Invoice cannot be finalized because the customer has no valid payment method
+          or the account has no enabled payment method types. Occurs when the customer's
+          card was deleted or expires before finalization, or when no payment method
+          types are configured for the subscription's currency.
+        throws: "StripeInvalidRequestError with code 'invoice_no_payment_method_types'"
+        required_handling: >
+          Caller MUST catch and notify the customer to add a valid payment method before
+          the invoice can be finalized. Do not silently swallow — the subscription billing
+          cycle will not advance until the invoice is finalized.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/api/invoices/finalize"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: finalize-invoice-not-editable
+        condition: >
+          Invoice is not in 'draft' status — it has already been finalized (open, paid,
+          void, or uncollectible). Attempting to finalize a non-draft invoice throws this
+          error. Common bug: calling finalizeInvoice from a webhook handler that fires
+          multiple times due to retry logic.
+        throws: "StripeInvalidRequestError with code 'invoice_not_editable'"
+        required_handling: >
+          Caller SHOULD check invoice.status before calling finalizeInvoice. Treat
+          invoice_not_editable as a no-op (already finalized) and continue normally.
+          Use idempotency keys on the finalize call to prevent double-finalization.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/billing/invoices/workflow"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: pay
+    import_path: "stripe"
+    description: >
+      Manually pays an open invoice immediately, bypassing Stripe's automatic collection.
+      Charges the invoice's default payment method. Useful for retrying failed invoices,
+      implementing "Pay Now" buttons in customer portals, or charging outside the normal
+      billing cycle. Returns the paid invoice object on success.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/invoices/pay
+      # Error codes from stripe/cjs/resources/Invoices.d.ts Code union:
+      # invoice_payment_intent_requires_action, card_declined, invoice_not_editable
+      - id: pay-requires-action
+        condition: >
+          The payment requires additional customer authentication (3D Secure / SCA).
+          Stripe's auto-collection normally handles this for subscription invoices, but
+          when calling pay() manually, the payment may require the customer to complete
+          3DS authentication before the invoice can be paid.
+        throws: "StripeInvalidRequestError with code 'invoice_payment_intent_requires_action'"
+        required_handling: >
+          Caller MUST handle this by directing the customer to complete authentication.
+          Retrieve the invoice's payment_intent and use its next_action.redirect_to_url
+          or client_secret for 3DS confirmation on the frontend. Do NOT retry pay()
+          without customer authentication.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/billing/migration/strong-customer-authentication"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: pay-card-declined
+        condition: >
+          The customer's payment method was declined during invoice payment. The invoice
+          remains 'open' and the associated PaymentIntent transitions to requires_payment_method.
+        throws: "StripeCardError with code 'card_declined'"
+        required_handling: >
+          Caller MUST catch and notify customer to update their payment method. The
+          invoice is NOT paid — it remains open. Query invoice.payment_intent.last_payment_error
+          for the specific decline reason to show the customer.
+        sources:
+          - "https://docs.stripe.com/api/invoices/pay"
+          - "https://docs.stripe.com/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: pay-invoice-not-payable
+        condition: >
+          Invoice is not in 'open' status — already paid, voided, or uncollectible.
+          Attempting to pay a non-open invoice throws this error. Common in retry
+          logic that doesn't check invoice status first.
+        throws: "StripeInvalidRequestError with code 'invoice_not_editable' or status_transition_invalid"
+        required_handling: >
+          Check invoice.status before calling pay(). If status is 'paid', treat as
+          success. If status is 'void' or 'uncollectible', log and skip. Do not retry.
+        sources:
+          - "https://docs.stripe.com/api/invoices/pay"
+          - "https://docs.stripe.com/billing/invoices/workflow"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: sendInvoice
+    import_path: "stripe"
+    description: >
+      Sends a finalized invoice to the customer via email. Only applies to invoices
+      with collection_method='send_invoice'. Stripe sends the invoice PDF and a payment
+      link to the customer's email address on file. Cannot be called on draft invoices
+      or invoices with collection_method='charge_automatically'.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/invoices/send_invoice (404 — docs moved)
+      # Error codes from stripe/cjs/resources/Invoices.d.ts Code union:
+      # invoice_not_editable, email_invalid, status_transition_invalid
+      - id: send-invoice-not-open
+        condition: >
+          Invoice is not in 'open' status. Draft invoices must be finalized before
+          sending. Paid/voided/uncollectible invoices cannot be re-sent.
+        throws: "StripeInvalidRequestError with code 'status_transition_invalid' or 'invoice_not_editable'"
+        required_handling: >
+          Caller MUST ensure invoice is finalized (status='open') before calling
+          sendInvoice. For draft invoices, call finalizeInvoice first. For already-sent
+          invoices, Stripe's invoice portal allows customers to access past invoices
+          without re-sending.
+        sources:
+          - "https://docs.stripe.com/api/invoices"
+          - "https://docs.stripe.com/invoicing/send-email"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: send-invoice-invalid-email
+        condition: >
+          Customer email address is invalid or missing. The invoice cannot be emailed
+          if the customer object has no email address or has an improperly formatted
+          email (e.g., email stored as a display name rather than an email address).
+        throws: "StripeInvalidRequestError with code 'email_invalid'"
+        required_handling: >
+          Caller MUST validate that customer.email is set and properly formatted before
+          calling sendInvoice. Update the customer's email via stripe.customers.update()
+          if missing. Fallback: use Stripe dashboard to manually send or download the
+          invoice PDF.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/invoicing/send-email"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: voidInvoice
+    import_path: "stripe"
+    description: >
+      Voids a finalized invoice, permanently canceling it without charging the customer.
+      The invoice transitions from 'open' or 'uncollectible' to 'void'. This is irreversible.
+      Use when an invoice was created in error or must be canceled after finalization.
+      Note: voiding does NOT refund any partial payments already applied to the invoice.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/invoices/void
+      # https://docs.stripe.com/billing/invoices/workflow — state machine: open/uncollectible → void
+      # Error code: status_transition_invalid from stripe/cjs/resources/Invoices.d.ts Code union
+      - id: void-invoice-invalid-state
+        condition: >
+          Invoice is not in 'open' or 'uncollectible' status. Cannot void a draft, paid,
+          or already-voided invoice. Draft invoices should be deleted instead of voided.
+          Paid invoices must be refunded, not voided.
+        throws: "StripeInvalidRequestError with code 'status_transition_invalid'"
+        required_handling: >
+          Caller MUST check invoice.status before calling voidInvoice. Only call on
+          invoices in 'open' or 'uncollectible' status. For draft invoices: use
+          stripe.invoices.del(). For paid invoices: use stripe.refunds.create() instead.
+          Treat 'already_voided' cases as no-op.
+        sources:
+          - "https://docs.stripe.com/api/invoices/void"
+          - "https://docs.stripe.com/billing/invoices/workflow"
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: void-invoice-rate-limit
+        condition: "Rate limit exceeded during void operation"
+        throws: "StripeRateLimitError"
+        required_handling: >
+          Implement exponential backoff. Use idempotency keys to safely retry voids.
+          Since voiding is irreversible, confirm the invoice state before retrying.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeRateLimitError"
+        sources:
+          - "https://docs.stripe.com/rate-limits"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: markUncollectible
+    import_path: "stripe"
+    description: >
+      Marks a finalized invoice as uncollectible — a bad debt accounting designation
+      indicating the invoice is unlikely to be collected. The invoice transitions from
+      'open' to 'uncollectible'. This is a bookkeeping operation that affects revenue
+      recognition reporting. The invoice can later be voided or marked as paid out-of-band.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/invoices/mark_uncollectible
+      # https://docs.stripe.com/billing/invoices/workflow — state machine: only open → uncollectible
+      # Error code: status_transition_invalid from stripe/cjs/resources/Invoices.d.ts Code union
+      - id: mark-uncollectible-invalid-state
+        condition: >
+          Invoice is not in 'open' status. Only open invoices can be marked uncollectible.
+          Draft, paid, voided, or already-uncollectible invoices throw this error.
+          Common mistake: calling markUncollectible on an invoice that was auto-paid
+          by Stripe before the mark operation ran.
+        throws: "StripeInvalidRequestError with code 'status_transition_invalid'"
+        required_handling: >
+          Caller MUST check invoice.status === 'open' before calling markUncollectible.
+          If status is 'paid', no further action needed. If status is 'void', skip.
+          If status is 'uncollectible', treat as no-op. Re-fetch the invoice if the
+          status may have changed since the last read (race condition in webhook handlers).
+        sources:
+          - "https://docs.stripe.com/api/invoices/mark_uncollectible"
+          - "https://docs.stripe.com/billing/invoices/workflow"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: resume
+    import_path: "stripe"
+    description: >
+      Resumes a paused subscription. The subscription must be in 'paused' status
+      (set via pause_collection on the subscription). When resumed, Stripe generates
+      a prorated invoice for the period since pausing if billing_cycle_anchor='now'.
+      If resumption generates an invoice, the subscription stays 'paused' until that
+      invoice is paid — it does not immediately become 'active'.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/subscriptions/resume
+      # https://docs.stripe.com/billing/subscriptions/pause-payment
+      # Error codes from stripe/cjs/resources/Subscriptions.d.ts Code union:
+      # status_transition_invalid, customer_max_subscriptions
+      - id: resume-invalid-state
+        condition: >
+          Subscription is not in 'paused' status. Active, canceled, trialing, or
+          past_due subscriptions cannot be resumed. Common mistake: calling resume()
+          on a subscription that was never paused via pause_collection, or on a
+          subscription that was already resumed by a concurrent request.
+        throws: "StripeInvalidRequestError with code 'status_transition_invalid'"
+        required_handling: >
+          Caller MUST check subscription.status === 'paused' before calling resume().
+          If subscription is already 'active', treat as success. If 'canceled', inform
+          the customer they must re-subscribe. Use idempotency keys to prevent
+          double-resume in concurrent webhook handlers.
+        sources:
+          - "https://docs.stripe.com/api/subscriptions/resume"
+          - "https://docs.stripe.com/billing/subscriptions/pause-payment"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: resume-payment-required
+        condition: >
+          Resuming the subscription generates an invoice (due to billing_cycle_anchor='now'
+          or outstanding balance) that fails payment. The subscription does NOT become
+          'active' — it stays 'paused' until the generated invoice is paid. Callers
+          that don't check subscription.status after resume() assume the subscription
+          is active when it's not.
+        returns: >
+          Subscription with status='paused' (not 'active') when the generated invoice
+          has not yet been paid. The subscription only becomes 'active' once the invoice
+          is collected.
+        required_handling: >
+          After calling resume(), re-fetch the subscription and check subscription.status.
+          If still 'paused', redirect the customer to pay the outstanding invoice via
+          invoice.hosted_invoice_url. Do NOT assume resume() immediately makes the
+          subscription active.
+        sources:
+          - "https://docs.stripe.com/billing/subscriptions/pause-payment"
+          - "https://docs.stripe.com/api/subscriptions/resume"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  - name: incrementAuthorization
+    import_path: "stripe"
+    description: >
+      Increases the authorized amount on a PaymentIntent that has not yet been captured.
+      Used in hotel holds, marketplace flows, or any scenario where the final charge
+      amount is higher than the original authorization. The PaymentIntent must be in
+      'requires_capture' status and the card must support incremental authorizations
+      (incremental_authorization_supported must be true). Maximum 10 increment attempts
+      including declines.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/api/payment_intents/increment_authorization
+      # Error code: card_declined (on issuer rejection), intent_invalid_state (wrong status)
+      # Confirmed from stripe/cjs/resources/PaymentIntents.d.ts Code union
+      - id: increment-authorization-card-declined
+        condition: >
+          The card issuer declined the incremental authorization request. This does NOT
+          invalidate the original authorization — the PaymentIntent remains capturable
+          for the previously authorized amount. The amount is not increased. Common
+          reasons: issuer policy, insufficient available credit for the delta amount.
+        throws: "StripeCardError with code 'card_declined'"
+        required_handling: >
+          Caller MUST catch card_declined and NOT cancel the PaymentIntent. The original
+          authorization remains valid and the PaymentIntent can still be captured for
+          the pre-increment amount. Inform the customer that the additional amount could
+          not be authorized and adjust the final charge accordingly.
+        sources:
+          - "https://docs.stripe.com/api/payment_intents/increment_authorization"
+          - "https://docs.stripe.com/payments/incremental-authorization"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: increment-authorization-invalid-state
+        condition: >
+          PaymentIntent is not in 'requires_capture' status, or card does not support
+          incremental authorizations (incremental_authorization_supported=false), or the
+          10-attempt limit has been reached.
+        throws: "StripeInvalidRequestError with code 'intent_invalid_state'"
+        required_handling: >
+          Check payment_intent.status === 'requires_capture' before calling. Check
+          payment_intent.incremental_authorization.status === 'available' to verify
+          the card supports incremental auth. If not available, capture for the
+          original amount and handle the overage separately.
+        sources:
+          - "https://docs.stripe.com/payments/incremental-authorization"
+          - "https://docs.stripe.com/api/payment_intents/increment_authorization"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: verifyMicrodeposits
+    import_path: "stripe"
+    description: >
+      Verifies a bank account PaymentMethod or SetupIntent via microdeposit confirmation.
+      After Stripe sends two small deposits to a bank account (ACH/BACS), the customer
+      enters the amounts to verify ownership. Available on PaymentIntents and SetupIntents.
+      Time-sensitive: microdeposit amounts expire after a set period and the customer
+      has a limited number of verification attempts.
+
+    postconditions:
+      # Evidence: stripe/cjs/resources/PaymentIntents.d.ts Code union — microdeposit codes:
+      # payment_method_microdeposit_failed, payment_method_microdeposit_verification_amounts_invalid,
+      # payment_method_microdeposit_verification_amounts_mismatch,
+      # payment_method_microdeposit_verification_attempts_exceeded,
+      # payment_method_microdeposit_verification_descriptor_code_mismatch,
+      # payment_method_microdeposit_verification_timeout
+      - id: verify-microdeposits-amounts-mismatch
+        condition: >
+          The customer entered microdeposit amounts that do not match what Stripe deposited.
+          Commonly caused by the customer reading the wrong deposits, entering amounts in
+          the wrong currency denomination (cents vs. dollars), or transposing the two amounts.
+        throws: "StripeInvalidRequestError with code 'payment_method_microdeposit_verification_amounts_mismatch'"
+        required_handling: >
+          Caller MUST display the error to the customer and allow them to retry. The
+          customer has a limited number of attempts — track attempt count and warn
+          the customer before the final attempt. Do NOT retry programmatically; this
+          requires human input. Allow the customer to re-enter the deposit amounts.
+        sources:
+          - "https://docs.stripe.com/payments/ach-debit/accept-a-payment#web-confirm-payment-intent"
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: verify-microdeposits-attempts-exceeded
+        condition: >
+          The customer has exhausted all verification attempts. Stripe allows a limited
+          number of incorrect amount submissions. After this limit, the payment method
+          is permanently unverifiable and cannot be used.
+        throws: "StripeInvalidRequestError with code 'payment_method_microdeposit_verification_attempts_exceeded'"
+        required_handling: >
+          Caller MUST NOT allow further retry — the bank account is permanently locked
+          for this payment flow. Instruct the customer to add a new bank account and
+          start the verification process fresh. Remove the failed payment method from
+          the customer's account to prevent future confusion.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: verify-microdeposits-timeout
+        condition: >
+          The microdeposit verification window has expired. Microdeposits expire after
+          a set number of days if not verified. The PaymentIntent or SetupIntent's
+          associated bank account becomes unverifiable.
+        throws: "StripeInvalidRequestError with code 'payment_method_microdeposit_verification_timeout'"
+        required_handling: >
+          Caller MUST detect timeout errors and prompt the customer to restart the
+          bank account verification flow with a fresh payment method. The expired
+          microdeposits cannot be re-sent — a new payment method must be created.
+          Send proactive reminders to customers before the verification window closes.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/payments/ach-debit"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high

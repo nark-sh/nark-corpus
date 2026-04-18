@@ -384,3 +384,272 @@ export async function detachPaymentMethodWithCatch(pmId: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. constructEventAsync — postconditions: construct-event-async-signature-failed,
+//     construct-event-async-timestamp-tolerance
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: construct-event-async-signature-failed
+// @expect-violation: construct-event-async-timestamp-tolerance
+export async function constructEventAsyncNoCatch(payload: string, sig: string, secret: string) {
+  // FUTURE_SHOULD_FIRE: construct-event-async-signature-failed — async webhook verification
+  // throws StripeSignatureVerificationError, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-1)
+  const event = await stripe.webhooks.constructEventAsync(payload, sig, secret);
+  return event;
+}
+
+// @expect-clean
+export async function constructEventAsyncWithCatch(payload: string, sig: string, secret: string) {
+  try {
+    // SHOULD_NOT_FIRE: constructEventAsync inside try-catch handles signature verification failure
+    const event = await stripe.webhooks.constructEventAsync(payload, sig, secret);
+    return event;
+  } catch (err: any) {
+    console.error('Async webhook signature verification failed:', err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. finalizeInvoice — postconditions: finalize-no-payment-method-types,
+//     finalize-invoice-not-editable
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: finalize-no-payment-method-types
+// @expect-violation: finalize-invoice-not-editable
+export async function finalizeInvoiceNoCatch(invoiceId: string) {
+  // FUTURE_SHOULD_FIRE: finalize-no-payment-method-types — stripe.invoices.finalizeInvoice throws
+  // when customer has no payment method, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-2)
+  const invoice = await stripe.invoices.finalizeInvoice(invoiceId);
+  return invoice;
+}
+
+// @expect-clean
+export async function finalizeInvoiceWithCatch(invoiceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: finalizeInvoice inside try-catch handles no-payment-method-types
+    const invoice = await stripe.invoices.finalizeInvoice(invoiceId);
+    return invoice;
+  } catch (err: any) {
+    if (err.code === 'invoice_not_editable') {
+      return null; // already finalized — treat as no-op
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. invoices.pay — postconditions: pay-requires-action, pay-card-declined,
+//     pay-invoice-not-payable
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: pay-requires-action
+// @expect-violation: pay-card-declined
+// @expect-violation: pay-invoice-not-payable
+export async function payInvoiceNoCatch(invoiceId: string) {
+  // FUTURE_SHOULD_FIRE: pay-requires-action — stripe.invoices.pay throws when 3DS required,
+  // no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-3)
+  const invoice = await stripe.invoices.pay(invoiceId);
+  return invoice;
+}
+
+// @expect-clean
+export async function payInvoiceWithCatch(invoiceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: invoices.pay inside try-catch handles requires-action and card-declined
+    const invoice = await stripe.invoices.pay(invoiceId);
+    return invoice;
+  } catch (err: any) {
+    if (err.code === 'invoice_payment_intent_requires_action') {
+      throw new Error('3DS authentication required — redirect customer to complete payment');
+    }
+    if (err.type === 'StripeCardError') {
+      throw new Error(`Card declined: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. sendInvoice — postconditions: send-invoice-not-open, send-invoice-invalid-email
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: send-invoice-not-open
+// @expect-violation: send-invoice-invalid-email
+export async function sendInvoiceNoCatch(invoiceId: string) {
+  // FUTURE_SHOULD_FIRE: send-invoice-not-open — stripe.invoices.sendInvoice throws on non-open invoice
+  // (detection rule queued as concern-20260418-stripe-deepen-4)
+  const invoice = await stripe.invoices.sendInvoice(invoiceId);
+  return invoice;
+}
+
+// @expect-clean
+export async function sendInvoiceWithCatch(invoiceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: sendInvoice inside try-catch handles not-open and invalid-email
+    const invoice = await stripe.invoices.sendInvoice(invoiceId);
+    return invoice;
+  } catch (err: any) {
+    if (err.code === 'email_invalid') {
+      throw new Error('Customer email address is invalid — update before sending invoice');
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. voidInvoice — postconditions: void-invoice-invalid-state, void-invoice-rate-limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: void-invoice-invalid-state
+// @expect-violation: void-invoice-rate-limit
+export async function voidInvoiceNoCatch(invoiceId: string) {
+  // FUTURE_SHOULD_FIRE: void-invoice-invalid-state — stripe.invoices.voidInvoice throws on
+  // non-open/non-uncollectible invoice, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-5)
+  const invoice = await stripe.invoices.voidInvoice(invoiceId);
+  return invoice;
+}
+
+// @expect-clean
+export async function voidInvoiceWithCatch(invoiceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: voidInvoice inside try-catch handles invalid-state errors
+    const invoice = await stripe.invoices.voidInvoice(invoiceId);
+    return invoice;
+  } catch (err: any) {
+    if (err.code === 'status_transition_invalid') {
+      throw new Error(`Cannot void invoice in current state: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. markUncollectible — postconditions: mark-uncollectible-invalid-state
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: mark-uncollectible-invalid-state
+export async function markUncollectibleNoCatch(invoiceId: string) {
+  // FUTURE_SHOULD_FIRE: mark-uncollectible-invalid-state — stripe.invoices.markUncollectible
+  // throws on non-open invoice, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-6)
+  const invoice = await stripe.invoices.markUncollectible(invoiceId);
+  return invoice;
+}
+
+// @expect-clean
+export async function markUncollectibleWithCatch(invoiceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: markUncollectible inside try-catch handles invalid-state
+    const invoice = await stripe.invoices.markUncollectible(invoiceId);
+    return invoice;
+  } catch (err: any) {
+    if (err.code === 'status_transition_invalid') {
+      return null; // already paid or voided — treat as no-op
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. subscriptions.resume — postconditions: resume-invalid-state, resume-payment-required
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: resume-invalid-state
+// @expect-violation: resume-payment-required
+export async function resumeSubscriptionNoCatch(subId: string) {
+  // FUTURE_SHOULD_FIRE: resume-invalid-state — stripe.subscriptions.resume throws when
+  // subscription is not paused, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-7)
+  const sub = await stripe.subscriptions.resume(subId);
+  return sub;
+}
+
+// @expect-clean
+export async function resumeSubscriptionWithCatch(subId: string) {
+  try {
+    // SHOULD_NOT_FIRE: subscriptions.resume inside try-catch handles invalid-state
+    const sub = await stripe.subscriptions.resume(subId);
+    // Must check status after resume — may still be paused if invoice payment failed
+    if (sub.status !== 'active') {
+      throw new Error('Subscription resumed but payment required before activation');
+    }
+    return sub;
+  } catch (err: any) {
+    if (err.code === 'status_transition_invalid') {
+      throw new Error('Subscription is not in paused state — cannot resume');
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. paymentIntents.incrementAuthorization — postconditions: increment-authorization-card-declined,
+//     increment-authorization-invalid-state
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: increment-authorization-card-declined
+// @expect-violation: increment-authorization-invalid-state
+export async function incrementAuthorizationNoCatch(piId: string, amount: number) {
+  // FUTURE_SHOULD_FIRE: increment-authorization-card-declined — stripe.paymentIntents.incrementAuthorization
+  // throws StripeCardError on issuer decline, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-8)
+  const pi = await stripe.paymentIntents.incrementAuthorization(piId, { amount });
+  return pi;
+}
+
+// @expect-clean
+export async function incrementAuthorizationWithCatch(piId: string, amount: number) {
+  try {
+    // SHOULD_NOT_FIRE: incrementAuthorization inside try-catch handles card-declined
+    const pi = await stripe.paymentIntents.incrementAuthorization(piId, { amount });
+    return pi;
+  } catch (err: any) {
+    if (err.type === 'StripeCardError') {
+      // Issuer declined increment — can still capture for original amount
+      return null; // signal: increment failed, use original amount
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. paymentIntents.verifyMicrodeposits — postconditions: verify-microdeposits-amounts-mismatch,
+//     verify-microdeposits-attempts-exceeded, verify-microdeposits-timeout
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: verify-microdeposits-amounts-mismatch
+// @expect-violation: verify-microdeposits-attempts-exceeded
+// @expect-violation: verify-microdeposits-timeout
+export async function verifyMicrodepositsNoCatch(piId: string, amounts: number[]) {
+  // FUTURE_SHOULD_FIRE: verify-microdeposits-amounts-mismatch — stripe.paymentIntents.verifyMicrodeposits
+  // throws when amounts don't match, no try-catch
+  // (detection rule queued as concern-20260418-stripe-deepen-9)
+  const pi = await stripe.paymentIntents.verifyMicrodeposits(piId, { amounts });
+  return pi;
+}
+
+// @expect-clean
+export async function verifyMicrodepositsWithCatch(piId: string, amounts: number[]) {
+  try {
+    // SHOULD_NOT_FIRE: verifyMicrodeposits inside try-catch handles mismatch and timeout
+    const pi = await stripe.paymentIntents.verifyMicrodeposits(piId, { amounts });
+    return pi;
+  } catch (err: any) {
+    if (err.code === 'payment_method_microdeposit_verification_amounts_mismatch') {
+      throw new Error('Deposit amounts incorrect — please re-enter the amounts from your bank statement');
+    }
+    if (err.code === 'payment_method_microdeposit_verification_attempts_exceeded') {
+      throw new Error('Too many failed attempts — please add a new bank account');
+    }
+    if (err.code === 'payment_method_microdeposit_verification_timeout') {
+      throw new Error('Verification window expired — please start bank account verification again');
+    }
+    throw err;
+  }
+}
