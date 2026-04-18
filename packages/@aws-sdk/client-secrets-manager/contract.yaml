@@ -1,6 +1,6 @@
 package: "@aws-sdk/client-secrets-manager"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.1.1"
 maintainer: "corpus-team"
 last_verified: "2026-04-18"
 status: production
@@ -23,6 +23,7 @@ evidence_quality: confirmed
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/models/models_0.d.ts (exception class hierarchy)
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/commands/*.d.ts (@throws annotations)
+# v1.1.1: fixed schema — renamed description->condition, converted business_impact to objects, added sources
 coverage_score: 0.33
 
 detection:
@@ -94,6 +95,12 @@ functions:
           - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/troubleshoot.html"
           - "https://aws.amazon.com/blogs/developer/service-error-handling-modular-aws-sdk-js/"
         severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
   - name: GetSecretValueCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -108,43 +115,54 @@ functions:
       # Error types confirmed from dist-types/commands/GetSecretValueCommand.d.ts @throws annotations
       - id: get-secret-value-not-found
         severity: error
-        description: >
-          Throws ResourceNotFoundException (error.name === "ResourceNotFoundException")
-          when the secret does not exist, the ARN references a deleted secret, or the
-          secret was created in a different region. Common mistake: hardcoded secret
-          names that differ between environments (dev/staging/prod).
-        business_impact: >
-          Application startup fails completely. Database connections cannot be
-          established. All requests fail until the secret name is corrected.
-          Errors during startup often bypass error handlers if called outside
-          a try-catch block.
-        evidence_quality: confirmed
+        condition: >
+          secret does not exist, the ARN references a deleted secret, or the
+          secret was created in a different region; throws ResourceNotFoundException
+          (error.name === "ResourceNotFoundException")
+        throws: ResourceNotFoundException
+        required_handling: >
+          Catch ResourceNotFoundException and handle missing secret explicitly.
+          Check that the secret name matches the environment (dev/staging/prod).
+          Either throw with a descriptive message or return a default value if
+          the missing secret represents an optional feature.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
       - id: get-secret-value-decryption-failure
         severity: error
-        description: >
-          Throws DecryptionFailure (error.name === "DecryptionFailure") when the KMS
-          key used to encrypt the secret is unavailable, disabled, deleted, or the
-          caller lacks kms:Decrypt permission on that key. Affects secrets encrypted
-          with customer-managed KMS keys.
-        business_impact: >
-          Secrets using customer-managed KMS keys become inaccessible when the key
-          is rotated, disabled, or IAM permissions change. Application cannot read
-          credentials needed to connect to downstream services.
-        evidence_quality: confirmed
+        condition: >
+          KMS key used to encrypt the secret is unavailable, disabled, deleted, or the
+          caller lacks kms:Decrypt permission; throws DecryptionFailure
+          (error.name === "DecryptionFailure")
+        throws: DecryptionFailure
+        required_handling: >
+          Catch DecryptionFailure and log the KMS key ARN and error details.
+          Alert the on-call team — this indicates a KMS permission or key lifecycle
+          issue that requires manual remediation. Do not retry without fixing the
+          underlying KMS configuration.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
       - id: get-secret-value-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new GetSecretValueCommand(...)) without
-          a wrapping try-catch. Any of ResourceNotFoundException, DecryptionFailure,
-          AccessDeniedException, or network errors propagate as unhandled rejections,
-          crashing Node.js processes or triggering default error middleware.
-        business_impact: >
-          Application crash at startup. All in-flight requests fail. Health checks
-          fail causing container orchestrators to restart the pod repeatedly.
-          Common in initialization code that runs before global error handlers are
-          registered.
+        condition: >
+          caller invokes await smClient.send(new GetSecretValueCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceNotFoundException, DecryptionFailure, AccessDeniedException, or
+          network errors propagate as unhandled rejections
         required_handling: >
           Always wrap in try-catch:
             try {
@@ -153,7 +171,7 @@ functions:
                 VersionStage: 'AWSCURRENT'
               }));
               const secret = result.SecretString
-                ?? Buffer.from(result.SecretBinary!).toString('utf8');
+                ?? Buffer.from(result.SecretBinary).toString('utf8');
               return JSON.parse(secret);
             } catch (error) {
               if (error instanceof ResourceNotFoundException) {
@@ -162,7 +180,15 @@ functions:
               throw error;
             }
           Note: always check both SecretString and SecretBinary — only one is populated.
-        evidence_quality: confirmed
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/secrets-manager/"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: high
 
   - name: BatchGetSecretValueCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -180,21 +206,10 @@ functions:
       # secrets, you can see the errors in Errors in the response."
       - id: batch-get-secret-partial-failure-unchecked
         severity: error
-        description: >
+        condition: >
           BatchGetSecretValueCommand returns HTTP 200 (Promise resolves) even when
-          individual secrets fail. Per-secret errors appear in response.Errors[] with
-          each entry containing {SecretId, ErrorCode, Message}. A caller that only
-          checks response.SecretValues without examining response.Errors silently
-          processes incomplete data — some secrets are missing without any indication.
-          Affected error codes per secret: ResourceNotFoundException,
-          AccessDeniedException, DecryptionFailure, InvalidRequestException,
-          InvalidParameterException.
-        business_impact: >
-          Application silently operates with missing secrets. Database credentials
-          may be absent while the application continues with null/undefined values.
-          Feature flags loaded in batch may be missing, causing silent feature
-          degradation. Particularly dangerous in bulk startup flows that load many
-          configuration values at once.
+          individual secrets fail; per-secret errors appear in response.Errors[] but
+          caller does not check response.Errors after the call
         required_handling: >
           Always check response.Errors after the call:
             const response = await smClient.send(new BatchGetSecretValueCommand({
@@ -209,21 +224,36 @@ functions:
             }
 
             return response.SecretValues;
-        evidence_quality: confirmed
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_BatchGetSecretValue.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
       - id: batch-get-secret-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new BatchGetSecretValueCommand(...)) without
-          a wrapping try-catch. While per-secret errors land in response.Errors[],
-          request-level errors (DecryptionFailure for KMS, InvalidNextTokenException
-          for pagination, InternalServiceError, network failures) still throw and bypass
-          any response.Errors check.
-        business_impact: >
-          Request-level errors crash the application even though the caller may have
-          prepared for per-secret error handling via response.Errors. Must handle both
-          thrown exceptions (request-level) AND response.Errors[] (per-secret failures).
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new BatchGetSecretValueCommand(...)) without
+          a wrapping try-catch; request-level errors (DecryptionFailure for KMS,
+          InvalidNextTokenException, InternalServiceError, network failures) still throw
+        throws: >
+          Request-level errors including DecryptionFailure, InvalidNextTokenException,
+          InternalServiceError, and network failures
+        required_handling: >
+          Wrap the entire call in try-catch to handle request-level failures.
+          Also check response.Errors[] for per-secret failures after the call succeeds.
+          Both error channels must be handled independently.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_BatchGetSecretValue.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: high
 
   - name: CreateSecretCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -237,16 +267,10 @@ functions:
       # Error types confirmed from dist-types/commands/CreateSecretCommand.d.ts @throws annotations
       - id: create-secret-already-exists
         severity: error
-        description: >
-          Throws ResourceExistsException (error.name === "ResourceExistsException")
-          when a secret with the requested Name already exists in the account and
-          region. Common in deployment scripts or IaC that call CreateSecret without
-          first checking whether the secret exists.
-        business_impact: >
-          Deployment scripts fail on second run. Infrastructure-as-code apply
-          operations throw on re-runs. Common pattern: caller should check for
-          ResourceExistsException and call UpdateSecretCommand instead, or use
-          conditional creation logic.
+        condition: >
+          a secret with the requested Name already exists in the account and region;
+          throws ResourceExistsException (error.name === "ResourceExistsException")
+        throws: ResourceExistsException
         required_handling: >
           Handle ResourceExistsException explicitly:
             try {
@@ -259,45 +283,72 @@ functions:
                 throw error;
               }
             }
-        evidence_quality: confirmed
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: create-secret-kms-encryption-failure
         severity: error
-        description: >
-          Throws EncryptionFailure (error.name === "EncryptionFailure") when the
-          specified KMS key cannot be used to encrypt the secret value. Causes:
-          KMS key is disabled, deleted, pending deletion, or the caller lacks
-          kms:GenerateDataKey and kms:Decrypt permissions on the specified key.
-        business_impact: >
-          Secret creation fails silently when callers don't handle this error.
-          Provisioning scripts report success without creating the secret value,
-          leaving dependent services without credentials.
-        evidence_quality: confirmed
+        condition: >
+          specified KMS key cannot be used to encrypt the secret value — key is disabled,
+          deleted, pending deletion, or caller lacks kms:GenerateDataKey and kms:Decrypt
+          permissions; throws EncryptionFailure (error.name === "EncryptionFailure")
+        throws: EncryptionFailure
+        required_handling: >
+          Catch EncryptionFailure and verify KMS key status and IAM permissions.
+          Log the KMS key ARN and the error. Do not assume the secret was created.
+          Alert the on-call team — this requires KMS configuration remediation.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: create-secret-limit-exceeded
         severity: warning
-        description: >
-          Throws LimitExceededException (error.name === "LimitExceededException")
-          when the request would exceed an account-level Secrets Manager quota.
-          Default quota: 500,000 secrets per account per region (soft limit).
-          Also triggered when Tags quota is exceeded (max 50 tags per secret).
-        business_impact: >
-          Multi-tenant applications that create per-customer secrets hit account
-          quotas. Provisioning new tenants fails. Quota increase requests must be
-          submitted via AWS Support before limits are reached.
-        evidence_quality: confirmed
+        condition: >
+          request would exceed account-level Secrets Manager quota (default 500,000 secrets
+          per account per region) or Tags quota (max 50 tags per secret);
+          throws LimitExceededException (error.name === "LimitExceededException")
+        throws: LimitExceededException
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
       - id: create-secret-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new CreateSecretCommand(...)) without
-          a wrapping try-catch. ResourceExistsException, EncryptionFailure,
-          LimitExceededException, and network errors propagate as unhandled rejections.
-        business_impact: >
-          Provisioning scripts crash on duplicate secret creation instead of
-          gracefully handling the idempotent case. Infrastructure setup fails
-          mid-run leaving resources in a partially provisioned state.
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new CreateSecretCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceExistsException, EncryptionFailure, LimitExceededException,
+          and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. At minimum handle ResourceExistsException to enable
+          idempotent provisioning (catch and update instead of failing). Log all
+          other errors and re-throw to prevent silent provisioning failures.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
   - name: PutSecretValueCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -312,56 +363,82 @@ functions:
       # Error types confirmed from dist-types/commands/PutSecretValueCommand.d.ts @throws annotations
       - id: put-secret-value-secret-not-found
         severity: error
-        description: >
-          Throws ResourceNotFoundException (error.name === "ResourceNotFoundException")
-          when the specified SecretId does not exist. Unlike CreateSecretCommand,
-          PutSecretValueCommand requires the secret to already exist.
-        business_impact: >
-          Rotation pipelines fail when the target secret was deleted or when SecretId
-          references the wrong name/ARN. Credentials are not updated, leaving
-          services running with stale or expired credentials.
-        evidence_quality: confirmed
+        condition: >
+          specified SecretId does not exist; PutSecretValueCommand requires the secret
+          to already exist unlike CreateSecretCommand; throws ResourceNotFoundException
+          (error.name === "ResourceNotFoundException")
+        throws: ResourceNotFoundException
+        required_handling: >
+          Catch ResourceNotFoundException and verify the SecretId. Either create
+          the secret first with CreateSecretCommand, or check whether the secret name
+          differs between environments (dev/staging/prod).
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutSecretValue.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: put-secret-value-version-conflict
         severity: error
-        description: >
-          Throws ResourceExistsException (error.name === "ResourceExistsException")
-          when ClientRequestToken matches an existing version ID but the SecretString
-          or SecretBinary values are different from the existing version. A new version
-          cannot modify an existing version's value — only create a new one.
-        business_impact: >
-          Rotation scripts using deterministic ClientRequestTokens fail on retry if
-          the secret value changed between calls. The version ID conflict prevents
-          the update from taking effect.
-        evidence_quality: confirmed
+        condition: >
+          ClientRequestToken matches an existing version ID but SecretString or SecretBinary
+          values differ from the existing version; throws ResourceExistsException
+          (error.name === "ResourceExistsException")
+        throws: ResourceExistsException
+        required_handling: >
+          Catch ResourceExistsException and use a unique ClientRequestToken (e.g., UUID)
+          on each rotation attempt, or omit ClientRequestToken to let the SDK generate one.
+          Do not reuse deterministic token IDs across calls with different secret values.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutSecretValue.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: put-secret-value-throttling
         severity: warning
-        description: >
-          Throws LimitExceededException (error.name === "LimitExceededException")
-          when PutSecretValue is called more than approximately once per 10 minutes
-          for the same secret, which would create more versions than Secrets Manager
-          removes (> 100 versions exceed the per-secret version quota for versions
-          older than 24h).
-        business_impact: >
-          High-frequency rotation pipelines or polling-style configuration refresh
-          loops exhaust the 100-version quota, causing all subsequent PutSecretValue
-          calls to fail for that secret. The secret cannot be updated until older
-          versions are deleted.
-        evidence_quality: confirmed
+        condition: >
+          PutSecretValue is called more than approximately once per 10 minutes for the
+          same secret, exceeding the version quota; throws LimitExceededException
+          (error.name === "LimitExceededException")
+        throws: LimitExceededException
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutSecretValue.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: put-secret-value-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new PutSecretValueCommand(...)) without
-          a wrapping try-catch. ResourceNotFoundException, ResourceExistsException,
-          EncryptionFailure, LimitExceededException, and network errors propagate as
-          unhandled rejections.
-        business_impact: >
-          Credential rotation scripts crash silently. The old secret value remains
-          in use while dependent services continue operating with stale credentials,
-          creating a security window where revoked credentials are still being used.
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new PutSecretValueCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceNotFoundException, ResourceExistsException, EncryptionFailure,
+          LimitExceededException, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Handle ResourceNotFoundException (secret missing) and
+          LimitExceededException (version quota). Log all errors and do not assume
+          the rotation succeeded on failure — keep using the old credential until
+          rotation is confirmed.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutSecretValue.html"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: UpdateSecretCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -376,43 +453,63 @@ functions:
       # UpdateSecret: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecret.html
       - id: update-secret-not-found
         severity: error
-        description: >
-          Throws ResourceNotFoundException (error.name === "ResourceNotFoundException")
-          when the specified SecretId does not exist. UpdateSecret cannot create a
-          new secret — use CreateSecretCommand for initial creation.
-        business_impact: >
-          Idempotent provisioning scripts that call UpdateSecret without checking
-          existence first fail when the secret has not been created yet, or was
-          deleted. Dependency on secret existing before update is called.
-        evidence_quality: confirmed
+        condition: >
+          specified SecretId does not exist; UpdateSecret cannot create a new secret;
+          throws ResourceNotFoundException (error.name === "ResourceNotFoundException")
+        throws: ResourceNotFoundException
+        required_handling: >
+          Catch ResourceNotFoundException and verify the secret exists before updating.
+          Either create the secret first with CreateSecretCommand or validate the
+          SecretId is correct for the target environment.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: update-secret-kms-errors
         severity: error
-        description: >
-          Throws DecryptionFailure (error.name === "DecryptionFailure") when the
-          existing secret cannot be decrypted with the current KMS key, or
-          EncryptionFailure (error.name === "EncryptionFailure") when the new
-          value cannot be encrypted with the specified KMS key. Common when
-          rotating KMS keys or migrating secrets to customer-managed keys.
-        business_impact: >
-          KMS key rotation or cross-account secret migration fails silently.
-          The secret value remains unchanged while the application may assume
-          the update succeeded. Applications using the old KMS key continue
-          to work until the key is deactivated, masking the failure.
-        evidence_quality: confirmed
+        condition: >
+          existing secret cannot be decrypted with the current KMS key (DecryptionFailure),
+          or new value cannot be encrypted with specified KMS key (EncryptionFailure);
+          common when rotating KMS keys or migrating to customer-managed keys
+        throws: DecryptionFailure or EncryptionFailure
+        required_handling: >
+          Catch DecryptionFailure and EncryptionFailure separately. Log the KMS key ARN
+          and alert the on-call team — KMS errors require manual key configuration
+          remediation and cannot be resolved by retrying.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: update-secret-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new UpdateSecretCommand(...)) without
-          a wrapping try-catch. ResourceNotFoundException, DecryptionFailure,
-          EncryptionFailure, LimitExceededException, and network errors propagate
-          as unhandled rejections.
-        business_impact: >
-          Secret update failures are invisible to the application. Stale configuration
-          values remain in use. In credential rotation flows, the old credential
-          stays active while the application thinks it has been updated.
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new UpdateSecretCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceNotFoundException, DecryptionFailure, EncryptionFailure,
+          LimitExceededException, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Handle ResourceNotFoundException for missing secrets
+          and KMS errors for encryption failures. Log failures and do not assume
+          the update succeeded — stale secret values may remain in use silently.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecret.html"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: DeleteSecretCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -430,38 +527,47 @@ functions:
       # or nonexistent secret, the operation does not return ResourceNotFoundException."
       - id: delete-secret-recovery-window-not-immediate
         severity: warning
-        description: >
+        condition: >
           DeleteSecretCommand with RecoveryWindowInDays (default 30 days) does NOT
-          immediately destroy the secret. The secret receives a DeletionDate but
-          remains in the account and its name cannot be reused until the window
-          expires. GetSecretValueCommand on a scheduled-deletion secret throws
-          InvalidRequestException, not ResourceNotFoundException.
-        business_impact: >
-          Applications that delete and immediately recreate a secret with the same
-          name fail with ResourceExistsException during the recovery window. Cleanup
-          scripts that assume deletion is immediate may leave stale IAM policies
-          and references pointing to a recovering (inaccessible) secret.
+          immediately destroy the secret; the secret name cannot be reused until the
+          window expires; GetSecretValueCommand on a scheduled-deletion secret throws
+          InvalidRequestException, not ResourceNotFoundException
         required_handling: >
           Use RecoveryWindowInDays: 7 for the minimum window, or
           ForceDeleteWithoutRecovery: true for immediate permanent deletion.
           If creating a replacement secret immediately after deletion, use a
           different name or wait for the recovery window to expire.
-        evidence_quality: confirmed
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DeleteSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: delete-secret-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new DeleteSecretCommand(...)) without
-          a wrapping try-catch. ResourceNotFoundException (for normal delete of
-          non-existent secret), InvalidRequestException (e.g., secret managed by
-          another service), and network errors propagate as unhandled rejections.
-          Note: ForceDeleteWithoutRecovery on a non-existent secret does NOT throw.
-        business_impact: >
-          Cleanup scripts crash when secrets are already deleted (normal delete
-          path). Script retries fail repeatedly rather than proceeding with
-          the rest of the cleanup. Infrastructure teardown leaves resources
-          in an inconsistent state.
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new DeleteSecretCommand(...)) without
+          a wrapping try-catch; ResourceNotFoundException (for normal delete of
+          non-existent secret), InvalidRequestException, and network errors propagate;
+          note: ForceDeleteWithoutRecovery on a non-existent secret does NOT throw
+        throws: >
+          ResourceNotFoundException, InvalidRequestException, and network errors
+          propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Handle ResourceNotFoundException to make delete idempotent
+          (catch and continue if secret doesn't exist). Handle InvalidRequestException
+          for secrets managed by other services. Log all other errors.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DeleteSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
   - name: RotateSecretCommand
     import_path: "@aws-sdk/client-secrets-manager"
@@ -480,19 +586,11 @@ functions:
       # is still in progress and returns an error" — confirmed from docs
       - id: rotate-secret-async-completion-assumed
         severity: warning
-        description: >
+        condition: >
           RotateSecretCommand resolves immediately with the new VersionId, but the
-          rotation Lambda function runs asynchronously in the background. The new
-          secret value is NOT available until the Lambda function completes all four
-          rotation steps (createSecret, setSecret, testSecret, finishSecret). Code
-          that reads the secret immediately after RotateSecretCommand returns may
-          read the old value (AWSCURRENT stage) or an intermediate AWSPENDING value.
-        business_impact: >
-          Applications that rotate credentials and immediately reconnect using the
-          new value may fail if the Lambda function has not yet completed. Zero-downtime
-          rotation workflows that don't poll for AWSCURRENT availability break.
-          Cache invalidation after rotation may evict the old value before the new
-          one is available.
+          rotation Lambda function runs asynchronously; code reads the secret immediately
+          after RotateSecretCommand returns and may read the old AWSCURRENT value or an
+          intermediate AWSPENDING value
         required_handling: >
           After calling RotateSecretCommand, poll DescribeSecretCommand until
           response.RotationEnabled === true and response.LastRotatedDate is updated,
@@ -503,49 +601,74 @@ functions:
             }));
             // Do NOT immediately read the secret — wait for Lambda to complete
             // Poll DescribeSecret until LastRotatedDate changes, or use SQS notification
-        evidence_quality: confirmed
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: rotate-secret-lambda-not-configured
         severity: error
-        description: >
-          Throws InvalidRequestException (error.name === "InvalidRequestException")
-          when RotateImmediately is true but no RotationLambdaARN is provided and
-          no rotation Lambda has been previously configured for the secret.
-          Also throws when the Lambda function ARN is invalid or the Lambda
-          function has been deleted.
-        business_impact: >
-          Rotation calls fail when secrets are first created without configuring a
-          Lambda rotation function. Applications that automate rotation at secret
-          creation time fail silently if the Lambda ARN is not set up in advance.
-        evidence_quality: confirmed
+        condition: >
+          RotateImmediately is true but no RotationLambdaARN is provided and no rotation
+          Lambda has been previously configured, or the Lambda function ARN is invalid
+          or deleted; throws InvalidRequestException
+          (error.name === "InvalidRequestException")
+        throws: InvalidRequestException
+        required_handling: >
+          Catch InvalidRequestException and check that a rotation Lambda function is
+          configured for the secret before calling RotateSecretCommand. Set up the
+          Lambda ARN via RotationLambdaARN parameter or via the AWS console first.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
       - id: rotate-secret-in-progress
         severity: warning
-        description: >
-          Throws InvalidRequestException (error.name === "InvalidRequestException")
-          when a previous rotation is still in progress (AWSPENDING label is present
-          but not attached to AWSCURRENT). Calling RotateSecret again while rotation
-          is in progress always returns an error.
-        business_impact: >
-          Rotation retry logic that calls RotateSecretCommand again when the first
-          attempt appears to hang will fail. The AWSPENDING label remains attached
-          to an intermediate version, blocking new rotation attempts until the
-          in-progress rotation is resolved (either completes or AWSPENDING is
-          manually removed).
-        evidence_quality: confirmed
+        condition: >
+          a previous rotation is still in progress (AWSPENDING label is present but not
+          yet attached to AWSCURRENT); calling RotateSecret again while rotation is in
+          progress always throws InvalidRequestException
+          (error.name === "InvalidRequestException")
+        throws: InvalidRequestException
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
       - id: rotate-secret-no-try-catch
         severity: error
-        description: >
-          Caller invokes await smClient.send(new RotateSecretCommand(...)) without
-          a wrapping try-catch. InvalidRequestException (Lambda not configured,
-          rotation in progress), ResourceNotFoundException, and network errors
-          propagate as unhandled rejections.
-        business_impact: >
-          Rotation orchestration scripts crash without logging the root cause.
-          A rotation that was "triggered" may have silently failed, leaving
-          credentials unrotated past their scheduled rotation date.
-        evidence_quality: confirmed
+        condition: >
+          caller invokes await smClient.send(new RotateSecretCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          InvalidRequestException (Lambda not configured, rotation in progress),
+          ResourceNotFoundException, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Handle InvalidRequestException to detect rotation-in-progress
+          vs Lambda-not-configured cases (check error.message). Log all errors — a failed
+          rotation call means credentials were NOT rotated despite the caller expecting
+          the rotation to have started.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
