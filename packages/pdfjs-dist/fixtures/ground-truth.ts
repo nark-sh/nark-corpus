@@ -269,15 +269,12 @@ export async function processPdfWithDestroy(buffer: ArrayBuffer) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 14. doc.cleanup() — without try-catch → NO_DETECTOR (contract exists, no scanner rule yet)
-// Scanner concern queued: concern-20260417-pdfjs-dist-deepen-6
+// 14. doc.cleanup() — without try-catch → SHOULD_FIRE
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function cleanupDocumentNoCatch(buffer: ArrayBuffer) {
   const doc = await getDocument({ data: buffer as Uint8Array }).promise;
-  // NO_DETECTOR: cleanup-during-rendering — no scanner rule yet for doc.cleanup().
-  // Contract postcondition exists (cleanup-during-rendering). Scanner concern queued.
-  // Will throw Error("startCleanup: Page N is currently rendering.") if a page is rendering.
+  // SHOULD_FIRE: cleanup-during-rendering — doc.cleanup() without try-catch throws if a page is rendering
   await doc.cleanup();
 }
 
@@ -287,7 +284,7 @@ export async function cleanupAfterRenderNoCatch(buffer: ArrayBuffer, canvas: any
   const viewport = page.getViewport({ scale: 1.0 });
   const renderTask = page.render({ canvas, viewport });
   // Start render but don't await it — then immediately cleanup while rendering is in progress
-  // NO_DETECTOR: cleanup-during-rendering — no scanner rule yet for doc.cleanup().
+  // SHOULD_FIRE: cleanup-during-rendering — doc.cleanup() without try-catch while rendering throws
   await doc.cleanup();
   await renderTask.promise;
 }
@@ -349,11 +346,10 @@ export async function getPdfDataWithCatch(buffer: ArrayBuffer) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 18. TextLayer.render() — without try-catch → NO_DETECTOR (no scanner rule yet)
-// TextLayer is constructed directly (new pdfjs.TextLayer({...})), not through the
-// instance chain (getDocument → getPage → render). Scanner does not track TextLayer
-// instances, so render() on TextLayer is not detected.
-// Scanner concern queued: concern-20260417-pdfjs-dist-deepen-8
+// 18. TextLayer.render() — without try-catch → SHOULD_FIRE
+// TextLayer is tracked via class_names: [TextLayer] in pdfjs-dist contract.
+// new pdfjs.TextLayer({...}) → textLayer tracked as pdfjs-dist. render() matches
+// the 'render' function contract → fires render-no-try-catch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function renderTextLayerNoCatch(buffer: ArrayBuffer, container: HTMLElement) {
@@ -365,8 +361,7 @@ export async function renderTextLayerNoCatch(buffer: ArrayBuffer, container: HTM
     container,
     viewport,
   });
-  // NO_DETECTOR: textlayer-render-no-try-catch — no scanner rule yet for TextLayer.render().
-  // Contract postcondition exists. Scanner does not track TextLayer instances.
+  // SHOULD_FIRE: render-no-try-catch — textLayer.render() without try-catch throws AbortException on cancel
   await textLayer.render();
 }
 
@@ -381,7 +376,7 @@ export async function renderTextLayerWithCancelNoCatch(buffer: ArrayBuffer, cont
   });
   // Cancel immediately after starting — AbortException will be thrown if not caught
   textLayer.cancel();
-  // NO_DETECTOR: textlayer-render-no-try-catch — no scanner rule yet for TextLayer.render().
+  // SHOULD_FIRE: render-no-try-catch — textLayer.render() after cancel() throws AbortException
   await textLayer.render();
 }
 

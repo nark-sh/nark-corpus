@@ -115,8 +115,7 @@ export async function extractRawTextBufferWithCatch(buffer: Buffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function convertToMarkdownPathNoCatch(docxPath: string) {
-  // SHOULD_FIRE: converttomarkdown-file-read-error — mammoth.convertToMarkdown({path}) without
-  // try-catch throws ENOENT if file not found. Same error profile as convertToHtml.
+  // SHOULD_FIRE: converttomarkdown-file-read-error — mammoth.convertToMarkdown({path}) without try-catch throws ENOENT if file not found
   const result = await mammoth.convertToMarkdown({ path: docxPath });
   return result.value;
 }
@@ -135,8 +134,7 @@ export async function convertToMarkdownPathWithCatch(docxPath: string) {
 
 // @expect-violation: converttomarkdown-file-read-error
 export async function convertToMarkdownBufferNoCatch(buffer: Buffer) {
-  // SHOULD_FIRE: converttomarkdown-corrupt-docx-error — mammoth.convertToMarkdown({buffer})
-  // without try-catch throws on corrupt zip data.
+  // SHOULD_FIRE: converttomarkdown-file-read-error — mammoth.convertToMarkdown({buffer}) without try-catch throws on corrupt zip data
   const result = await mammoth.convertToMarkdown({ buffer });
   return result.value;
 }
@@ -148,8 +146,7 @@ export async function convertToMarkdownBufferNoCatch(buffer: Buffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function embedStyleMapNoCatch(docxPath: string, styleMap: string) {
-  // SHOULD_FIRE: embedstylemap-file-read-error — mammoth.embedStyleMap({path}) without
-  // try-catch throws ENOENT if file not found. The function opens the docx via unzip.openZip().
+  // SHOULD_FIRE: embedstylemap-file-read-error — mammoth.embedStyleMap({path}) without try-catch throws ENOENT if file not found
   const result = await mammoth.embedStyleMap({ path: docxPath }, styleMap);
   return result.toBuffer();
 }
@@ -168,8 +165,7 @@ export async function embedStyleMapWithCatch(docxPath: string, styleMap: string)
 
 // @expect-violation: embedstylemap-file-read-error
 export async function embedStyleMapBufferNoCatch(buffer: Buffer, styleMap: string) {
-  // SHOULD_FIRE: embedstylemap-corrupt-docx-error — mammoth.embedStyleMap({buffer}) without
-  // try-catch throws on corrupt zip data during ZIP structure read.
+  // SHOULD_FIRE: embedstylemap-file-read-error — mammoth.embedStyleMap({buffer}) without try-catch throws on corrupt zip data
   const result = await mammoth.embedStyleMap({ buffer }, styleMap);
   return result.toArrayBuffer();
 }
