@@ -132,4 +132,17 @@ app.use(cors({
   }
 }));
 
+// ❌ VIOLATION: CorsOptionsDelegate that can fail without error forwarding
+// @expect-violation: delegate-error-propagation
+// The delegate calls an async function but does not catch errors before invoking callback.
+// If the async lookup fails, the error is unhandled — Express's next() is never called
+// with the error, and the request hangs.
+app.use(cors((req, callback) => {
+  // No try-catch — if this promise rejects, the callback is never called
+  // and the request hangs indefinitely.
+  Promise.resolve({ origin: ['https://example.com'] })
+    .then(options => callback(null, options));
+  // Missing: .catch(err => callback(err))
+}));
+
 export default app;
