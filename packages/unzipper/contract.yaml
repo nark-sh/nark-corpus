@@ -1,10 +1,32 @@
+# unzipper — Node.js streaming unzip library.
+# Primary APIs: Parse()/Extract() for streaming, Open.* for random-access.
+# Error strings (confirmed from source): MISSING_PASSWORD, BAD_PASSWORD, PATH_MISSING,
+# PATTERN_NOT_FOUND, FILE_ENDED, 'invalid signature: 0x...', 'Missing content length header'
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 8):
+# API surface: 12 async-callable operations (3 intentionally omitted)
+# Contracted before: 3 (Parse, Extract, Open.file)
+# Contracted after: 9 (+6 this pass: ParseOne, Open.buffer, Open.url, Open.s3_v3,
+#                      CentralDirectory.extract, Entry.buffer)
+# Omitted: 3 (Open.s3 deprecated v2 SDK, Open.custom same-profile as file/buffer, PullStream internal)
+# Coverage: 9/12 = 0.75 (effective contracted/non-omitted = 9/9 = 1.0)
+# Evidence sources confirmed from:
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/parseOne.js
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/directory.js
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/index.js
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/unzip.js
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/extract.js
+#   /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/BufferStream.js
+#   https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md
 package: unzipper
 semver: ">=0.9.0 <0.13.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.75  # 9 contracted / 12 total async-callable (3 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
 
 functions:
   - name: Parse
@@ -193,3 +215,588 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: ParseOne
+    import_path: "unzipper"
+    description: >
+      Extracts a single matching entry from a ZIP archive stream. Accepts an optional
+      regex or string pattern to match against entry paths. Returns a Duplex stream
+      whose output is the first matching entry's content, piped downstream. The
+      .buffer() method on the returned stream provides a Promise<Buffer> interface.
+      If no entry matches the pattern, emits error 'PATTERN_NOT_FOUND' on the output
+      stream after the archive is fully consumed. Commonly used to extract a single
+      known file from an archive (e.g., a config file or specific document).
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/parseOne.js
+      # Lines: outStream.emit('error', new Error('PATTERN_NOT_FOUND')) in 'finish' handler
+      # when `found` is false after all entries are processed.
+      # Also: outStream.emit('error', err) when Parse stream emits an error.
+      - id: parseone-pattern-not-found
+        condition: >
+          fs.createReadStream(zipFile).pipe(unzipper.ParseOne(/pattern/)) is piped
+          and the source archive contains no entries matching the provided regex or
+          string pattern. The Duplex stream fully processes all entries and emits
+          'PATTERN_NOT_FOUND' error on the output stream after the archive completes.
+          Also triggered when the archive is empty. This is the most common silent
+          failure in code using ParseOne — callers that don't attach an error handler
+          receive an unhandled stream error that crashes the process.
+        throws: >
+          Error with message 'PATTERN_NOT_FOUND' — emitted as a stream error event
+          on the output (Duplex) stream returned by ParseOne(). This is NOT a thrown
+          synchronous exception — it propagates via stream.emit('error', ...) or via
+          the promise rejection when using .buffer().
+          Confirmed from parseOne.js: `outStream.emit('error', new Error('PATTERN_NOT_FOUND'))`
+          when the 'finish' event fires without setting `found = true`.
+        required_handling: >
+          Use the .buffer() promise form with try-catch for reliable error handling:
+
+            try {
+              const content = await fs.createReadStream(zipFile)
+                .pipe(unzipper.ParseOne(/config\.json$/))
+                .buffer();
+              return JSON.parse(content.toString());
+            } catch (error) {
+              if (error.message === 'PATTERN_NOT_FOUND') {
+                console.warn('Expected file not found in archive');
+                return null;  // Or throw a more descriptive error
+              }
+              throw error;
+            }
+
+          When using the stream form (without .buffer()), attach an error handler:
+            const extracted = stream.pipe(unzipper.ParseOne('target.txt'));
+            extracted.on('error', (err) => {
+              if (err.message === 'PATTERN_NOT_FOUND') { ... }
+            });
+
+          Note: ParseOne() without a pattern extracts the FIRST entry — no PATTERN_NOT_FOUND
+          is possible unless the archive itself is empty or corrupt.
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/parseOne.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: parseOne.js line: entry.on('error', function(e) { outStream.emit('error', e); })
+      # Corrupt zip entries propagate entry errors to the output stream.
+      # Also from parse.js: self.emit('error', new Error('invalid signature: 0x' + ...))
+      - id: parseone-corrupt-archive-error
+        condition: >
+          The source ZIP stream contains a corrupt or invalid archive (invalid signature,
+          truncated data, malformed local file headers). The Parse stream underlying
+          ParseOne emits an error that propagates to the ParseOne output stream.
+          This is the same corruption error as the Parse contract, but specific to the
+          single-entry extraction workflow.
+        throws: >
+          Error with message 'invalid signature: 0x<hex>' — from parse.js when local
+          file header signature bytes do not match 0x04034b50.
+          Error with message 'FILE_ENDED' — from PullStream.js when the input stream
+          ends before expected bytes are read (truncated archive).
+          Both propagate via stream.emit('error', ...) or reject .buffer() promise.
+        required_handling: >
+          Always handle errors when piping into ParseOne:
+
+            try {
+              const buffer = await readStream
+                .pipe(unzipper.ParseOne('README.md'))
+                .buffer();
+              return buffer.toString();
+            } catch (error) {
+              if (error.message && error.message.startsWith('invalid signature')) {
+                throw new Error('Not a valid ZIP file');
+              }
+              if (error.message === 'FILE_ENDED') {
+                throw new Error('ZIP file is truncated or incomplete');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/parseOne.js"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/parse.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Open.buffer
+    import_path: "unzipper"
+    description: >
+      Opens a ZIP archive from an in-memory Buffer. Returns a Promise<CentralDirectory>
+      with the same interface as Open.file(). Used when a ZIP file has already been
+      loaded into memory (e.g., received via HTTP response body, stored in a database,
+      or constructed programmatically). Unlike Open.file(), there is no ENOENT error
+      since no file system access is involved — the buffer is read directly.
+      The returned CentralDirectory object has .files (Promise<File[]>) and .extract().
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/index.js
+      # Open.buffer() calls directory() with an in-memory buffer source.
+      # directory.js: throws Error on invalid zip64 signatures, FILE_ENDED on truncated data.
+      # No ENOENT possible (buffer, not file system).
+      - id: open-buffer-invalid-zip
+        condition: >
+          The Buffer passed to Open.buffer() does not contain a valid ZIP archive
+          (wrong magic bytes, no central directory, corrupt structure). The directory
+          parser reads from the buffer's tail looking for the end-of-central-directory
+          record, and if the buffer is not a ZIP (e.g., a PDF, an image, or empty
+          bytes), the directory parser will emit FILE_ENDED or invalid signature errors.
+        throws: >
+          Error with message 'FILE_ENDED' — when PullStream exhausts the buffer before
+          finding the end-of-central-directory record. Common when the buffer is not
+          a ZIP file at all, or is empty/truncated.
+          Error with message 'invalid zip64 end of central dir locator signature ...' —
+          when the buffer contains what looks like a ZIP64 header but has corrupt signature bytes.
+          These propagate as Promise rejections from Open.buffer().
+        required_handling: >
+          Wrap Open.buffer() in try-catch:
+
+            try {
+              const directory = await unzipper.Open.buffer(fileBuffer);
+              const files = await directory.files;
+              for (const file of files) {
+                if (file.type === 'File') {
+                  const content = await file.buffer();
+                  // process content
+                }
+              }
+            } catch (error) {
+              if (error.message === 'FILE_ENDED') {
+                throw new Error('Buffer is not a valid ZIP archive (possibly empty or wrong format)');
+              }
+              throw error;
+            }
+
+          For user-uploaded files, validate the content-type header and the magic bytes
+          (ZIP files start with 0x504B0304 — 'PK\x03\x04') before calling Open.buffer().
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/directory.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Open.url
+    import_path: "unzipper"
+    description: >
+      Opens a remote ZIP archive via HTTP/HTTPS using range requests for efficient
+      access without downloading the entire file. Requires an external HTTP request
+      library (e.g., the `request` npm package — note: deprecated) as the first
+      argument. Returns a Promise<CentralDirectory>. Uses HTTP Range headers to
+      read only the central directory from the ZIP tail. The remote server MUST
+      support Content-Length and range requests; servers that do not return
+      Content-Length cause Open.url() to reject immediately.
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/index.js
+      # Lines: reject(new Error('Missing content length header')) when response has no Content-Length.
+      # Also: req.on('error', reject) for network errors.
+      - id: open-url-missing-content-length
+        condition: >
+          The remote server does not return a Content-Length header in its response.
+          Open.url() makes a HEAD-like request to determine the file size before
+          making range requests. If the server omits Content-Length (many CDNs with
+          chunked transfer encoding, servers with gzip compression enabled, or
+          servers that don't support it), the size() call rejects immediately with
+          'Missing content length header'. This is a common failure when using
+          Open.url() against APIs or cloud storage endpoints that do not expose
+          file size in headers.
+        throws: >
+          Error with message 'Missing content length header' — confirmed from
+          Open/index.js: `reject(new Error('Missing content length header'))` when
+          the response to the initial size-detection request has no Content-Length.
+          This is a Promise rejection (not a stream error) since the failure occurs
+          during the initial setup of the CentralDirectory, before any streaming begins.
+        required_handling: >
+          Wrap Open.url() in try-catch and handle the 'Missing content length header'
+          error specifically:
+
+            const request = require('request');  // Or an alternative HTTP library
+            try {
+              const directory = await unzipper.Open.url(request, {
+                url: 'https://example.com/archive.zip',
+                headers: { 'User-Agent': 'MyApp/1.0' }
+              });
+              const files = await directory.files;
+              // process files
+            } catch (error) {
+              if (error.message === 'Missing content length header') {
+                // Fall back to downloading the full file
+                console.warn('Remote server does not support range requests, falling back to full download');
+                const response = await fetch(zipUrl);
+                const buffer = Buffer.from(await response.arrayBuffer());
+                const directory = await unzipper.Open.buffer(buffer);
+                // ...
+              }
+              throw error;
+            }
+
+          Note: Open.url() is typically used with the deprecated `request` library.
+          For modern code, prefer downloading the full ZIP with fetch() and using
+          Open.buffer() instead.
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/index.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: Open/index.js — req.on('error', reject) for network-level errors.
+      - id: open-url-network-error
+        condition: >
+          Open.url() fails because the URL is unreachable (DNS failure, connection
+          refused, SSL error, HTTP error response). The underlying request library
+          emits an 'error' event that is forwarded to the Promise rejection.
+        throws: >
+          Error from the request library — the specific type depends on which library
+          is passed as the first argument. With the `request` library, network errors
+          are Error objects with message like 'ENOTFOUND', 'ECONNREFUSED', or
+          'ETIMEDOUT'. HTTP 4xx/5xx responses do NOT automatically reject — the
+          request library's behavior determines this.
+        required_handling: >
+          Wrap Open.url() in try-catch and handle network errors:
+
+            try {
+              const directory = await unzipper.Open.url(request, zipUrl);
+            } catch (error) {
+              console.error('Failed to open remote ZIP:', error.message);
+              throw error;
+            }
+        sources:
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Open.s3_v3
+    import_path: "unzipper"
+    description: >
+      Opens a ZIP archive stored in AWS S3 using the AWS SDK v3 (@aws-sdk/client-s3).
+      Uses S3 range requests for efficient access without downloading the full file.
+      Requires an instantiated S3Client and params with Bucket and Key. Returns a
+      Promise<CentralDirectory>. This is the modern replacement for Open.s3() which
+      used the deprecated AWS SDK v2. Uses HeadObjectCommand to get file size, then
+      GetObjectCommand with Range headers to read the central directory.
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/index.js
+      # s3_v3 uses client.send(new HeadObjectCommand(...)) for size detection.
+      # S3 errors from HeadObject: NoSuchKey, NoSuchBucket, AccessDenied (403), etc.
+      # GetObject with Range: same S3 error classes.
+      # The s3_v3 stream() method emits S3 errors onto the PassThrough stream.
+      - id: open-s3v3-not-found-or-access-denied
+        condition: >
+          Open.s3_v3() is called and either:
+          (a) The S3 object does not exist (NoSuchKey from HeadObjectCommand)
+          (b) The bucket does not exist (NoSuchBucket)
+          (c) The caller does not have GetObject/HeadObject permissions (AccessDenied / 403)
+          The HeadObjectCommand is sent during the initial size() call inside directory(),
+          and its rejection propagates as a Promise rejection from Open.s3_v3().
+        throws: >
+          AWS SDK v3 S3ServiceException subclasses:
+          - NoSuchKey (404) — S3 object doesn't exist at the specified key
+          - NoSuchBucket (404) — S3 bucket doesn't exist
+          - S3ServiceException with $metadata.httpStatusCode === 403 — access denied
+          These are thrown by client.send() and propagate through the async HeadObjectCommand.
+          Check: error.$metadata?.httpStatusCode or error.name for specific error types.
+        required_handling: >
+          Wrap Open.s3_v3() in try-catch and handle common S3 errors:
+
+            const { S3Client, NoSuchKey } = require('@aws-sdk/client-s3');
+            const s3 = new S3Client({ region: 'us-east-1' });
+            try {
+              const directory = await unzipper.Open.s3_v3(s3, {
+                Bucket: 'my-bucket',
+                Key: 'archives/data.zip',
+              });
+              const files = await directory.files;
+              for (const file of files) {
+                if (file.type === 'File') {
+                  const content = await file.buffer();
+                  // process content
+                }
+              }
+            } catch (error) {
+              if (error.name === 'NoSuchKey') {
+                throw new Error(`Archive not found: ${params.Key}`);
+              }
+              if (error.$metadata?.httpStatusCode === 403) {
+                throw new Error('Access denied to S3 archive — check IAM permissions');
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/index.js"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/s3/command/HeadObjectCommand/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: CentralDirectory.extract
+    import_path: "unzipper"
+    description: >
+      Extracts all files from a CentralDirectory (returned by Open.*) to a specified
+      path on disk. Returns a Promise<void> that resolves when all files are extracted.
+      Supports optional concurrency (default: 1). This is the standard method for
+      extracting the full contents of a ZIP opened via Open.file(), Open.buffer(), or
+      Open.s3_v3(). Internally uses Bluebird.map with concurrency control. Includes
+      zip slip protection (skips entries whose resolved path escapes the destination).
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/directory.js
+      # vars.extract = function(opts) { if (!opts || !opts.path) throw new Error('PATH_MISSING'); }
+      # Confirmed: synchronous throw (not async) when opts.path is missing.
+      - id: extract-path-missing
+        condition: >
+          CentralDirectory.extract() is called without an opts.path parameter, or with
+          opts.path set to undefined/null/empty string. The path is required for extracting
+          files to disk. The function throws synchronously (not as a Promise rejection)
+          when this check fails, which means the error may propagate differently depending
+          on whether the caller is in an async context.
+        throws: >
+          Error with message 'PATH_MISSING' — thrown synchronously in the extract function:
+          `if (!opts || !opts.path) throw new Error('PATH_MISSING')`.
+          Confirmed from directory.js. In an async function awaiting extract(), this
+          synchronous throw IS caught as a Promise rejection by the async function wrapper.
+          In .then() chains, it also propagates as a rejection. Always use try-catch.
+        required_handling: >
+          Always provide opts.path and wrap in try-catch:
+
+            const directory = await unzipper.Open.file('archive.zip');
+            try {
+              await directory.extract({ path: '/tmp/extracted', concurrency: 4 });
+            } catch (error) {
+              if (error.message === 'PATH_MISSING') {
+                throw new Error('Extraction path is required');
+              }
+              throw error;
+            }
+
+          Use path.resolve() to get an absolute path — the function normalizes the path
+          internally with path.resolve(path.normalize(opts.path)).
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/directory.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: directory.js extract function uses fs.createWriteStream and fs.ensureDir (fs-extra)
+      # entry.stream(opts.password).on('error', reject).pipe(writer).on('close', resolve).on('error', reject)
+      # fs.ensureDir() can fail with EACCES (permission denied) or other filesystem errors.
+      - id: extract-filesystem-error
+        condition: >
+          CentralDirectory.extract() fails because of filesystem errors during extraction:
+          - Destination path does not exist and cannot be created (EACCES, EROFS)
+          - Disk is full (ENOSPC)
+          - Destination path is read-only (EACCES)
+          - An individual entry file stream encounters a compression error
+          The extract() method uses fs-extra's ensureDir() and fs.createWriteStream()
+          for each entry. Failures in any entry propagate as Promise rejections via
+          Bluebird.map's error handling.
+        throws: >
+          Error with EACCES — permission denied writing to destination directory.
+          Error with ENOSPC — no space left on device.
+          Error with ENOENT — parent directory of a nested path cannot be created
+          (rare, since ensureDir is used, but can happen with race conditions).
+          Entry stream errors (zlib errors like 'Z_BUF_ERROR') for corrupt compressed entries.
+        required_handling: >
+          Wrap extract() in try-catch and handle common filesystem errors:
+
+            const { mkdir } = require('fs/promises');
+            const destPath = path.resolve('/tmp', 'extracted-' + Date.now());
+            await mkdir(destPath, { recursive: true });
+
+            const directory = await unzipper.Open.file('archive.zip');
+            try {
+              await directory.extract({ path: destPath });
+            } catch (error) {
+              if (error.code === 'EACCES') {
+                throw new Error(`Cannot write to ${destPath}: permission denied`);
+              }
+              if (error.code === 'ENOSPC') {
+                throw new Error('Disk full — extraction aborted');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/directory.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: Entry.buffer
+    import_path: "unzipper"
+    description: >
+      Reads the content of a parsed ZIP entry into a Buffer. Called on Entry objects
+      emitted by Parse() or ParseOne() streams. Returns a Promise<Buffer> that resolves
+      with the full decompressed file content. This is the primary method for reading
+      individual file content from a streaming ZIP. For entries from Open.* (CentralDirectory
+      File objects), use File.buffer() with optional password parameter. Internally,
+      Entry.buffer() wraps the entry stream with BufferStream which concatenates all
+      chunks. Also handles encrypted entries (those requiring a password) when accessed
+      through File.buffer() after Open.file/buffer/s3_v3.
+
+    postconditions:
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/Open/unzip.js
+      # throw new Error('MISSING_PASSWORD') when encrypted entry is accessed without password
+      # throw new Error('BAD_PASSWORD') when password check byte doesn't match
+      # These propagate through entry.vars promise chain into BufferStream's rejection.
+      - id: entry-buffer-missing-password
+        condition: >
+          file.buffer() (or entry.buffer()) is called on an encrypted ZIP entry without
+          providing the password, or with a wrong password. Encrypted ZIP entries have
+          the encryption flag set (vars.flags & 0x01). The password check occurs during
+          stream setup — before any decompressed data is read — so failure is immediate.
+          This is common when processing user-uploaded ZIP files that may be encrypted,
+          or when building ZIP processors that need to handle both encrypted and
+          unencrypted archives.
+        throws: >
+          Error with message 'MISSING_PASSWORD' — thrown when the entry has encryption
+          flag set but no password was provided. Confirmed from Open/unzip.js:
+          `if (!_password) throw new Error('MISSING_PASSWORD')`.
+          Error with message 'BAD_PASSWORD' — thrown when the provided password fails
+          the verification byte check. Confirmed from Open/unzip.js:
+          `if (header[11] !== check) throw new Error('BAD_PASSWORD')`.
+          Both errors are thrown synchronously in the .vars Promise chain and propagate
+          as rejections when awaiting file.buffer() or entry.buffer().
+        required_handling: >
+          Check for encrypted entries and handle appropriately:
+
+            // When using Open.*:
+            const directory = await unzipper.Open.file('archive.zip');
+            const files = await directory.files;
+            for (const file of files) {
+              if (file.type !== 'File') continue;
+              try {
+                const content = await file.buffer(password);  // pass password or undefined
+                processContent(content);
+              } catch (error) {
+                if (error.message === 'MISSING_PASSWORD') {
+                  console.error(`${file.path} is encrypted — password required`);
+                  continue;  // Skip or prompt user
+                }
+                if (error.message === 'BAD_PASSWORD') {
+                  console.error(`Wrong password for ${file.path}`);
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            // When using Parse() streams:
+            stream.pipe(unzipper.Parse()).on('entry', async (entry) => {
+              try {
+                const content = await entry.buffer();
+              } catch (error) {
+                if (error.message === 'MISSING_PASSWORD') {
+                  entry.autodrain();  // Drain the entry to keep the stream moving
+                }
+              }
+            });
+
+          Note: The encryption flag can be checked via entry.vars (a Promise) —
+          but this is internal API. Prefer try-catch with specific error messages.
+        sources:
+          - "https://raw.githubusercontent.com/ZJONSSON/node-unzipper/master/README.md"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/unzip.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: /private/tmp/claude/bc-deepen/unzipper/node_modules/unzipper/lib/BufferStream.js
+      # entry.on('error', reject) — any entry stream error (corrupt compressed data, zlib failure)
+      # propagates as BufferStream rejection.
+      - id: entry-buffer-decompression-error
+        condition: >
+          entry.buffer() or file.buffer() is called and the compressed entry data is
+          corrupt or uses an unsupported compression method. The zlib.createInflateRaw()
+          stream decompresses the data; if the compressed bytes are corrupt, zlib emits
+          an error that propagates through the entry stream into BufferStream's rejection.
+          Common with partially-downloaded ZIP files, network-interrupted transfers, or
+          archives where individual entries are corrupt even though the central directory
+          is intact.
+        throws: >
+          Error from zlib — typically 'invalid block type', 'unknown compression method',
+          or 'Z_BUF_ERROR'. Propagates via entry.on('error', reject) in BufferStream.
+          Error with message 'FILE_ENDED' — if the source stream ends before the
+          expected compressed bytes are read (truncated entry).
+        required_handling: >
+          Wrap entry.buffer() / file.buffer() in try-catch for each entry independently:
+
+            const directory = await unzipper.Open.buffer(zipBuffer);
+            const files = await directory.files;
+            const results = await Promise.allSettled(
+              files
+                .filter(f => f.type === 'File')
+                .map(async (file) => {
+                  try {
+                    return { path: file.path, content: await file.buffer() };
+                  } catch (error) {
+                    console.warn(`Failed to read ${file.path}: ${error.message}`);
+                    return { path: file.path, content: null, error: error.message };
+                  }
+                })
+            );
+
+          Use Promise.allSettled() rather than Promise.all() when processing multiple
+          entries so one corrupt entry doesn't abort the entire batch.
+        sources:
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/BufferStream.js"
+          - "https://github.com/ZJONSSON/node-unzipper/blob/master/lib/Open/unzip.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "Parse() and Extract() use stream events — attach .on('error') or use .promise() for awaitable error handling"
+  - "Open.* functions return Promise<CentralDirectory> — always wrap in try-catch"
+  - "ParseOne() without a match pattern extracts the first entry; with a pattern, emits PATTERN_NOT_FOUND if no match"
+  - "Encrypted entries throw MISSING_PASSWORD or BAD_PASSWORD — check these when processing user-uploaded ZIPs"
+  - "CentralDirectory.extract() throws PATH_MISSING synchronously when opts.path is missing"
+  - "Zip slip protection: extract() and CentralDirectory.extract() both skip entries that would write outside destination path"
+  - "Open.url() requires an external request library (e.g., 'request' package) as first argument"
+  - "Open.s3_v3() uses @aws-sdk/client-s3 v3 — prefer over deprecated Open.s3() which uses v2"
+  - "FILE_ENDED error means the archive is truncated (stream ended before all expected bytes were read)"
+  - "Entry.autodrain() must be called on entries not consumed in Parse() streams — failure causes stream backpressure and hangs"

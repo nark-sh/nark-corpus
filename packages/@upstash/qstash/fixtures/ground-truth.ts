@@ -18,6 +18,11 @@
  *   - queue.upsert() without try-catch → SHOULD_FIRE: queue-upsert-api-error
  *   - queue.pause() without try-catch → SHOULD_FIRE: queue-pause-api-error
  *   - queue.resume() without try-catch → SHOULD_FIRE: queue-resume-api-error
+ *   - queue.delete() without try-catch → SHOULD_FIRE: queue-delete-api-error
+ *   - client.messages.cancel() without try-catch → SHOULD_FIRE: messages-cancel-api-error
+ *   - client.dlq.delete() without try-catch → SHOULD_FIRE: dlq-delete-api-error
+ *   - client.dlq.retry() without try-catch → SHOULD_FIRE: dlq-retry-api-error
+ *   - client.logs() without try-catch → SHOULD_FIRE: logs-api-error
  *   - Above methods inside try-catch → SHOULD_NOT_FIRE
  *
  * Contracted postconditions (original):
@@ -38,6 +43,18 @@
  *   queue-upsert-api-error: queue.upsert() throws QstashError on HTTP failure
  *   queue-pause-api-error: queue.pause() throws QstashError on HTTP failure
  *   queue-resume-api-error: queue.resume() throws QstashError on HTTP failure
+ *
+ * New postconditions (depth pass 2026-04-17):
+ *   queue-delete-api-error: queue.delete() throws QstashError on HTTP failure
+ *   queue-delete-data-loss: queue.delete() with pending messages silently drops them
+ *   messages-cancel-api-error: messages.cancel() throws QstashError on HTTP failure
+ *   messages-cancel-result-unchecked: cancel() returns {cancelled:0} for unmatched, no throw
+ *   dlq-delete-api-error: dlq.delete() throws QstashError on HTTP failure
+ *   dlq-delete-cursor-not-checked: dlq.delete() returns cursor when more remain
+ *   dlq-retry-api-error: dlq.retry() throws QstashError on HTTP failure
+ *   dlq-retry-cursor-not-checked: dlq.retry() returns cursor when more remain
+ *   logs-api-error: logs() throws QstashError on HTTP failure
+ *   logs-cursor-not-checked: logs() returns cursor when more remain
  *
  * Coverage:
  *   - Section 1: bare publishJSON() → SHOULD_FIRE
@@ -61,6 +78,16 @@
  *   - Section 19: bare queue.pause() → SHOULD_FIRE
  *   - Section 20: bare queue.resume() → SHOULD_FIRE
  *   - Section 21: queue.pause()/resume() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 22: bare queue.delete() → SHOULD_FIRE
+ *   - Section 23: queue.delete() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 24: bare messages.cancel() → SHOULD_FIRE
+ *   - Section 25: messages.cancel() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 26: bare dlq.delete() → SHOULD_FIRE
+ *   - Section 27: dlq.delete() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 28: bare dlq.retry() → SHOULD_FIRE
+ *   - Section 29: dlq.retry() inside try-catch → SHOULD_NOT_FIRE
+ *   - Section 30: bare logs() → SHOULD_FIRE
+ *   - Section 31: logs() inside try-catch → SHOULD_NOT_FIRE
  */
 
 import { Client, Receiver } from "@upstash/qstash";
@@ -399,4 +426,155 @@ export async function pauseAndResumeQueueWithCatch() {
     console.error("Failed to resume queue:", error);
     throw error;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. Bare queue.delete() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteQueueNoCatch() {
+  const queue = qstash.queue({ queueName: "old-email-queue" });
+  // NO_DETECTOR_YET: queue-delete-api-error — queue.delete() without try-catch
+  // Scanner concern: concern-20260417-upstash-qstash-deepen-1
+  // NOTE: also risks queue-delete-data-loss if pending messages exist
+  await queue.delete();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. queue.delete() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteQueueWithCatch() {
+  const queue = qstash.queue({ queueName: "old-email-queue" });
+  try {
+    // SHOULD_NOT_FIRE: queue.delete() inside try-catch satisfies queue-delete-api-error
+    await queue.delete();
+  } catch (error) {
+    console.error("Failed to delete queue:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. Bare messages.cancel() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function cancelMessagesNoCatch(messageIds: string[]) {
+  // SHOULD_FIRE: messages-cancel-api-error — messages.cancel() without try-catch
+  await qstash.messages.cancel(messageIds);
+}
+
+export async function cancelAllMessagesNoCatch() {
+  // SHOULD_FIRE: messages-cancel-api-error — cancel({all: true}) without try-catch
+  await qstash.messages.cancel({ all: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. messages.cancel() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function cancelMessagesWithCatch(messageIds: string[]) {
+  try {
+    // SHOULD_NOT_FIRE: messages.cancel() inside try-catch
+    const result = await qstash.messages.cancel(messageIds);
+    return result.cancelled;
+  } catch (error) {
+    console.error("Failed to cancel messages:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. Bare dlq.delete() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteDlqMessagesNoCatch(dlqIds: string[]) {
+  // SHOULD_FIRE: dlq-delete-api-error — dlq.delete() without try-catch
+  await qstash.dlq.delete(dlqIds);
+}
+
+export async function deleteAllDlqMessagesNoCatch() {
+  // SHOULD_FIRE: dlq-delete-api-error — dlq.delete({all:true}) without try-catch
+  await qstash.dlq.delete({ all: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. dlq.delete() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteDlqMessagesWithCatch() {
+  let cursor: string | undefined;
+  do {
+    try {
+      // SHOULD_NOT_FIRE: dlq.delete() inside try-catch with cursor loop
+      const result = await qstash.dlq.delete({ all: true, count: 100, cursor });
+      cursor = result.cursor;
+    } catch (error) {
+      console.error("Failed to delete DLQ messages:", error);
+      throw error;
+    }
+  } while (cursor);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. Bare dlq.retry() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function retryDlqMessagesNoCatch(dlqIds: string[]) {
+  // SHOULD_FIRE: dlq-retry-api-error — dlq.retry() without try-catch
+  await qstash.dlq.retry(dlqIds);
+}
+
+export async function retryAllDlqMessagesNoCatch() {
+  // SHOULD_FIRE: dlq-retry-api-error — dlq.retry({all:true}) without try-catch
+  await qstash.dlq.retry({ all: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. dlq.retry() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function retryDlqMessagesWithCatch() {
+  let cursor: string | undefined;
+  do {
+    try {
+      // SHOULD_NOT_FIRE: dlq.retry() inside try-catch with cursor loop
+      const result = await qstash.dlq.retry({ all: true, count: 100, cursor });
+      cursor = result.cursor;
+    } catch (error) {
+      console.error("Failed to retry DLQ messages:", error);
+      throw error;
+    }
+  } while (cursor);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. Bare logs() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function fetchLogsNoCatch() {
+  // SHOULD_FIRE: logs-api-error — logs() without try-catch
+  const result = await qstash.logs();
+  return result.logs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. logs() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function fetchAllLogsWithCatch() {
+  let cursor: string | undefined;
+  const allLogs = [];
+  do {
+    try {
+      // SHOULD_NOT_FIRE: logs() inside try-catch with cursor pagination
+      const res = await qstash.logs({ cursor });
+      allLogs.push(...res.logs);
+      cursor = res.cursor;
+    } catch (error) {
+      console.error("Failed to fetch logs:", error);
+      throw error;
+    }
+  } while (cursor);
+  return allLogs;
 }

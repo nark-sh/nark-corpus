@@ -8,10 +8,10 @@ package: "@upstash/qstash"
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.67
+coverage_score: 0.90
 
 detection:
   class_names:
@@ -580,6 +580,320 @@ functions:
           incident_cost_range: medium
         evidence_quality: confirmed
 
+  - name: queue.delete
+    import_path: "@upstash/qstash"
+    description: >
+      Permanently deletes a named QStash queue and all of its pending messages.
+      Called on a Queue instance obtained via client.queue({ queueName }). This is
+      an IRREVERSIBLE operation — all messages in the queue are permanently lost.
+      Used during cleanup, decommissioning, or when recreating a queue with different
+      settings. Makes an HTTPS DELETE request to the QStash API.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/queue.ts
+      # Source confirmed: delete() throws Error("Please provide a queue name...") synchronously
+      # HTTP errors from http.ts error hierarchy
+      - id: queue-delete-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), queue not found (404), rate limit (429),
+          or server error (5xx). Also throws synchronously if queueName was not provided
+          to the Queue constructor.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          Error("Please provide a queue name to the Queue constructor") if queueName missing.
+        required_handling: >
+          Caller MUST wrap queue.delete() in try/catch. An uncaught error during queue deletion
+          can leave a queue in an inconsistent state, especially in cleanup flows. More
+          critically: if a 404 is thrown, the caller must decide whether to treat it as
+          success (idempotent) or failure.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/queue.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/queues"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: queue-delete-data-loss
+        condition: >
+          queue.delete() is called on a queue that still has pending messages (queue.lag > 0).
+          The SDK does NOT warn about pending messages — the delete succeeds silently and
+          all pending messages are permanently discarded without delivery.
+        throws: >
+          Does not throw. The delete succeeds and returns void. Pending messages are lost.
+        required_handling: >
+          Callers SHOULD check queue.get() to inspect the lag field before deleting a queue
+          with pending messages. If message delivery matters, pause + drain the queue first
+          before deleting it. This is a data-loss pattern, not an exception pattern.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/queue.ts"
+          - "https://upstash.com/docs/qstash/features/queues"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: messages.cancel
+    import_path: "@upstash/qstash"
+    description: >
+      Cancels (prevents delivery of) one or more QStash messages by messageId, filter,
+      or all messages. Called on the client.messages accessor. Returns the count of
+      cancelled messages. Used in cleanup flows, error recovery, and when cancelling
+      in-flight jobs that should no longer run. Critically: calling cancel() on an empty
+      string array returns {cancelled: 0} without throwing — it is a no-op, not an error.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/messages.ts
+      # Confirmed: cancel(string[]) returns {cancelled: 0} for empty arrays, no throw
+      # HTTP errors from http.ts error hierarchy
+      - id: messages-cancel-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), rate limit (429), server error (5xx),
+          or network failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.messages.cancel() in try/catch. An uncaught error in a
+          cleanup flow means messages continue to be delivered to an endpoint that should
+          no longer receive them. Background jobs run after cancellation was intended.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/messages.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/messages"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: messages-cancel-result-unchecked
+        condition: >
+          cancel() returns {cancelled: N} where N may be less than the number of messages
+          expected to be cancelled. This happens when messages were already delivered,
+          are IN_PROGRESS, messageIds don't exist, or a filter matches fewer messages
+          than expected. An empty array input silently returns {cancelled: 0}.
+        throws: >
+          Does not throw. Returns {cancelled: 0} even when no messages are cancelled,
+          including for empty string[] input.
+        required_handling: >
+          Callers SHOULD check the returned cancelled count against the expected count.
+          Discarding the return value and assuming all messages were cancelled is incorrect.
+          In multi-step flows where cancellation is a precondition to safe re-queuing,
+          uncancelled messages will cause duplicate delivery.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/messages.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: dlq.delete
+    import_path: "@upstash/qstash"
+    description: >
+      Removes messages from the Dead Letter Queue (DLQ) by dlqId, filter, or all.
+      Called on client.dlq. Used in error recovery flows to clear processed DLQ messages.
+      Supports bulk deletion with cursor-based pagination for large DLQ backlogs.
+      Critically: passing an empty string[] returns {deleted: 0} without throwing.
+      IRREVERSIBLE — once deleted from DLQ, failed messages cannot be retried.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts
+      # Confirmed: delete([]) returns {deleted: 0} without throw
+      # HTTP errors from http.ts error hierarchy
+      - id: dlq-delete-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), rate limit (429), server error (5xx),
+          or network failure. Filter validation errors (400) if filter parameters are invalid.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.dlq.delete() in try/catch. An uncaught error in a DLQ
+          cleanup flow leaves processed messages in the DLQ indefinitely. Re-runs of the
+          cleanup code may attempt to process already-handled messages again.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+          - "https://upstash.com/docs/qstash/features/dlq"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: dlq-delete-cursor-not-checked
+        condition: >
+          dlq.delete() returns {deleted: N, cursor?: string}. If cursor is present,
+          there are more DLQ messages to delete. Callers that don't loop until cursor
+          is undefined will silently leave DLQ messages undeleted.
+        throws: >
+          Does not throw. Returns with cursor set when more messages remain.
+        required_handling: >
+          Callers performing bulk DLQ cleanup MUST loop until cursor is undefined:
+            let cursor: string | undefined;
+            do {
+              const result = await client.dlq.delete({ all: true, count: 100, cursor });
+              cursor = result.cursor;
+            } while (cursor);
+          Stopping after a single call leaves the remainder of the DLQ unprocessed.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+          - "https://upstash.com/docs/qstash/features/dlq"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: dlq.retry
+    import_path: "@upstash/qstash"
+    description: >
+      Re-queues messages from the Dead Letter Queue (DLQ) for re-delivery. Called on
+      client.dlq. Used in error recovery flows to retry failed messages after the
+      underlying issue has been resolved. Supports single dlqId, array, filter, or all.
+      Returns {cursor?, responses: [{messageId}][]} — one response per message attempted.
+      Critically: empty array input returns {responses: []} without throwing.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts
+      # Confirmed: retry([]) returns {responses: []} without throw
+      # HTTP errors from http.ts error hierarchy
+      - id: dlq-retry-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), rate limit (429), server error (5xx),
+          or network failure. Filter validation errors (400) if filter parameters are invalid.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.dlq.retry() in try/catch. An uncaught error in a DLQ
+          retry flow means failed messages remain in the DLQ without being re-queued.
+          Recovery from incidents becomes manual — operators must re-trigger the flow
+          after fixing the underlying issue.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+          - "https://upstash.com/docs/qstash/features/dlq"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: dlq-retry-cursor-not-checked
+        condition: >
+          dlq.retry() returns {cursor?: string, responses: [{messageId}][]}. If cursor
+          is present, there are more DLQ messages remaining. Callers that don't loop
+          until cursor is undefined will silently leave some DLQ messages unretried.
+        throws: >
+          Does not throw. Returns with cursor set when more messages remain.
+        required_handling: >
+          Callers performing bulk DLQ retry MUST loop until cursor is undefined:
+            let cursor: string | undefined;
+            do {
+              const result = await client.dlq.retry({ all: true, count: 100, cursor });
+              cursor = result.cursor;
+            } while (cursor);
+          Stopping after a single call leaves remaining failed messages in the DLQ.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: logs
+    import_path: "@upstash/qstash"
+    description: >
+      Retrieves paginated QStash delivery logs. Called on the Client instance.
+      Used in observability dashboards, debugging failed deliveries, and auditing
+      message flow. Returns {cursor?, logs: Log[], events: Log[]}. Pagination
+      is cursor-based — callers must loop until cursor is undefined to retrieve
+      all logs. The events field is deprecated; use logs instead.
+
+    postconditions:
+      # Evidence: https://github.com/upstash/qstash-js/blob/main/src/client/client.ts
+      # HTTP errors from http.ts error hierarchy
+      - id: logs-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), rate limit (429), server error (5xx),
+          or network failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.logs() in try/catch. Uncaught errors in log fetching
+          loops will abort the pagination loop mid-way, producing incomplete log data.
+          Observability pipelines that rely on complete log retrieval will silently
+          output partial results.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/events"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: logs-cursor-not-checked
+        condition: >
+          client.logs() returns {cursor?: string, logs: Log[]}. The response is
+          paginated — maximum 1000 logs per request. Callers that don't loop until
+          cursor is undefined will silently retrieve only the first page, missing
+          older log entries.
+        throws: >
+          Does not throw. Returns with cursor set when more logs remain.
+        required_handling: >
+          Callers retrieving historical logs MUST paginate:
+            let cursor: string | undefined;
+            const allLogs: Log[] = [];
+            do {
+              const res = await client.logs({ cursor });
+              allLogs.push(...res.logs);
+              cursor = res.cursor;
+            } while (cursor);
+          Single-call implementations silently miss all but the most recent page.
+        sources:
+          - "https://github.com/upstash/qstash-js/blob/main/src/client/client.ts"
+          - "https://upstash.com/docs/qstash/sdks/ts/examples/events"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
 notes:
   - "publishJSON/publish make HTTPS calls to QStash API at publish time — always need try-catch"
   - "QStash's retry config (retries: N) applies to MESSAGE DELIVERY, not the publish call itself"
@@ -592,3 +906,7 @@ notes:
   - "All Queue methods (upsert/pause/resume/delete) throw synchronous Error if queueName is missing from constructor"
   - "schedules.create() schedules may take up to 60 seconds to activate after creation"
   - "verify() result (true/false) should be checked — returning false without throwing is not a SignatureError"
+  - "queue.delete() is IRREVERSIBLE — all pending messages are permanently lost without warning"
+  - "dlq.delete() and dlq.retry() return cursor when more messages remain — must loop until cursor is undefined"
+  - "messages.cancel() returns {cancelled: 0} for empty arrays, not an exception"
+  - "logs() is paginated — max 1000 per page; must loop on cursor for complete log retrieval"
