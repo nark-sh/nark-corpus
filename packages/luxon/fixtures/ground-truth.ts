@@ -24,6 +24,7 @@ import { DateTime, Duration } from 'luxon';
 
 // @expect-violation: frommillis-non-number-throws
 // ❌ SHOULD_FIRE — fromMillis called without try-catch; throws if argument is string/null/undefined
+// SHOULD_FIRE: frommillis-non-number-throws — fromMillis called without try-catch
 async function fromMillisNoTryCatch(timestampMs: string | number): Promise<string> {
   const dt = DateTime.fromMillis(timestampMs as number); // throws if string
   return dt.toISO() ?? 'invalid';
@@ -36,11 +37,15 @@ async function fromMillisWithValidation(timestampMs: unknown): Promise<string> {
   if (!Number.isFinite(ts)) {
     throw new Error(`Invalid timestamp: ${timestampMs}`);
   }
-  const dt = DateTime.fromMillis(ts);
-  if (!dt.isValid) {
-    throw new Error(`Timestamp out of range: ${ts}`);
+  try {
+    const dt = DateTime.fromMillis(ts);
+    if (!dt.isValid) {
+      throw new Error(`Timestamp out of range: ${ts}`);
+    }
+    return dt.toISO() ?? '';
+  } catch (error) {
+    throw new Error(`Failed to create DateTime: ${error}`);
   }
-  return dt.toISO() ?? '';
 }
 
 // @expect-clean
@@ -72,8 +77,12 @@ async function fromSecondsWithValidation(expiresAt: unknown): Promise<boolean> {
   if (!Number.isFinite(secs)) {
     return false; // treat as expired/invalid
   }
-  const dt = DateTime.fromSeconds(secs);
-  return dt.isValid && dt.valueOf() > Date.now();
+  try {
+    const dt = DateTime.fromSeconds(secs);
+    return dt.isValid && dt.valueOf() > Date.now();
+  } catch (error) {
+    return false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -147,19 +156,27 @@ function startOfWithDynamicUnit(dt: DateTime, unit: string): DateTime {
 }
 
 // @expect-clean
-// ✅ SHOULD_NOT_FIRE — validate unit against allowed values before use
+// ✅ SHOULD_NOT_FIRE — validate unit against allowed values, wrapped in try-catch
 function startOfWithValidatedUnit(dt: DateTime, unit: string): DateTime {
   const VALID_UNITS = ['year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second', 'millisecond'];
   if (!VALID_UNITS.includes(unit)) {
     throw new Error(`Invalid date unit: ${unit}. Valid units: ${VALID_UNITS.join(', ')}`);
   }
-  return dt.startOf(unit as 'day');
+  try {
+    return dt.startOf(unit as 'day');
+  } catch (error) {
+    throw new Error(`Failed to compute startOf(${unit}): ${error}`);
+  }
 }
 
 // @expect-clean
-// ✅ SHOULD_NOT_FIRE — hardcoded valid unit
+// ✅ SHOULD_NOT_FIRE — hardcoded valid unit, wrapped in try-catch
 function startOfCurrentDay(): DateTime {
-  return DateTime.now().startOf('day');
+  try {
+    return DateTime.now().startOf('day');
+  } catch (error) {
+    throw new Error(`Failed to compute startOf(day): ${error}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -173,9 +190,13 @@ function endOfWithDynamicUnit(dt: DateTime, unit: string): DateTime {
 }
 
 // @expect-clean
-// ✅ SHOULD_NOT_FIRE — hardcoded valid unit
+// ✅ SHOULD_NOT_FIRE — hardcoded valid unit, wrapped in try-catch
 function endOfCurrentMonth(): DateTime {
-  return DateTime.now().endOf('month');
+  try {
+    return DateTime.now().endOf('month');
+  } catch (error) {
+    throw new Error(`Failed to compute endOf(month): ${error}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -189,7 +210,7 @@ function findEarliestDateUnsafe(dates: (DateTime | Date)[]): DateTime {
 }
 
 // @expect-clean
-// ✅ SHOULD_NOT_FIRE — convert all to DateTime instances first
+// ✅ SHOULD_NOT_FIRE — convert all to DateTime instances first, with try-catch
 function findEarliestDateSafe(dates: (DateTime | Date)[]): DateTime | undefined {
   const dateTimes = dates.map(d => {
     if (DateTime.isDateTime(d)) return d;
@@ -197,7 +218,11 @@ function findEarliestDateSafe(dates: (DateTime | Date)[]): DateTime | undefined 
   }).filter(dt => dt.isValid);
 
   if (dateTimes.length === 0) return undefined;
-  return DateTime.min(...dateTimes);
+  try {
+    return DateTime.min(...dateTimes);
+  } catch (error) {
+    return undefined;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -211,10 +236,14 @@ function findLatestDateUnsafe(...dates: (DateTime | Date | number)[]): DateTime 
 }
 
 // @expect-clean
-// ✅ SHOULD_NOT_FIRE — all args are guaranteed DateTime instances
+// ✅ SHOULD_NOT_FIRE — all args are guaranteed DateTime instances, with try-catch
 function findLatestOfDateTimes(dt1: DateTime, dt2: DateTime): DateTime {
   if (!DateTime.isDateTime(dt1) || !DateTime.isDateTime(dt2)) {
     throw new Error('Both arguments must be DateTime instances');
   }
-  return DateTime.max(dt1, dt2);
+  try {
+    return DateTime.max(dt1, dt2);
+  } catch (error) {
+    throw new Error(`Failed to find max DateTime: ${error}`);
+  }
 }

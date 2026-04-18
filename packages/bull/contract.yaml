@@ -2,12 +2,14 @@ package: bull
 semver: ">=3.0.0 <5.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"  # deepen-stream-2 pass 5: expanded from 17→21 contracted functions
+last_verified: "2026-04-17"  # deepen-stream-1 pass 3: expanded from 21→23 contracted functions (Job.extendLock, Queue.getMetrics)
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.70  # 21 contracted / 30 total async-callable (13 omitted read-only/monitoring, +4 this pass)
-# effective_coverage: 1.0 — 21/21 non-omitted functions contracted
-# functions_added_this_pass: Queue.whenCurrentJobsFinished, Queue.removeJobs, Job.releaseLock, Job.moveToFailed
+coverage_score: 0.74  # 23 contracted / 31 total async-callable (13 omitted read-only/monitoring, +2 this pass: Job.extendLock + Queue.getMetrics)
+# effective_coverage: 1.0 — 23/23 non-omitted functions contracted
+# functions_added_this_pass (deepen-stream-1 pass 3): Job.extendLock, Queue.getMetrics
+# functions_added_previous_pass: Queue.whenCurrentJobsFinished, Queue.removeJobs, Job.releaseLock, Job.moveToFailed
+# Queue.getCountsPerPriority intentionally omitted — read-only diagnostic (see omission note below)
 
 # Event handler detection NOW SUPPORTED (as of 2026-02-27):
 # The EventListenerAnalyzer can now detect missing event handlers:
@@ -1313,3 +1315,170 @@ functions:
           user_experience: lost_data
           incident_cost_range: low
         evidence_quality: confirmed
+
+  - name: Job.extendLock
+    import_path: "bull"
+    description: >
+      Extends the lock on an active job to prevent it from being marked as stalled.
+      Must be called periodically in long-running job processors (those that take longer
+      than `lockDuration` milliseconds, default 30 seconds). Returns a Promise<number>:
+      1 if the lock was successfully extended, 0 if the lock was not extended (lock
+      expired or taken by another worker). Bull's internal processor automatically calls
+      this via a timer, but external long-running processors (e.g., spawned child processes,
+      streaming operations) may need to call it manually.
+    postconditions:
+      # Evidence: bull/lib/commands/extendLock-2.lua — confirmed return values 0 and 1
+      # Evidence: bull/lib/queue.js lines 1155-1179 — internal lock renewer checks `if (lock && \!timerStopped)`
+      # Evidence: bull/lib/job.js lines 238-239 — Job.prototype.extendLock delegates to scripts.extendLock
+      # Source: https://github.com/OptimalBits/bull/blob/master/lib/commands/extendLock-2.lua
+      # Source: https://github.com/OptimalBits/bull/blob/master/lib/queue.js
+      - id: extend-lock-zero-return-unchecked
+        condition: >
+          await job.extendLock(duration) is called without checking the return value,
+          and the function returns 0 (lock not extended because lock expired or was
+          taken by another worker).
+        throws: "Does not throw — returns 0 silently when lock extension fails"
+        severity: error
+        description: >
+          extendLock() resolves with 0 when the Redis Lua script cannot extend the lock
+          because (a) the job's lock has already expired, or (b) another worker has taken
+          ownership of the job via a different token. A return of 0 means the current
+          worker no longer has exclusive ownership. Continuing to process the job after
+          receiving 0 causes duplicate processing: two workers run the same job
+          simultaneously. This is the same stall/duplicate-processing bug that missing
+          'stalled' event listeners cause, but triggered explicitly in long-running processors.
+          bull's internal lock renewer (queue.js line 1173) correctly checks `if (lock && \!timerStopped)`.
+          User code must do the same.
+        required_handling: >
+          Caller MUST check the return value of extendLock():
+          const extended = await job.extendLock(30000);
+          if (\!extended) {
+            // Another worker took the job — stop processing immediately
+            throw new Error('Lock lost: job taken by another worker');
+          }
+          Without this check, duplicate processing causes duplicate emails, duplicate
+          payments, or data corruption in distributed queue deployments.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/commands/extendLock-2.lua"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: extend-lock-no-try-catch
+        condition: >
+          await job.extendLock(duration) called without try-catch and Redis connection
+          is unavailable or the Redis command fails.
+        throws: "Error (ioredis connection error or NOSCRIPT error if Lua script not loaded)"
+        severity: warning
+        description: >
+          extendLock() delegates to a Redis custom command (scripts.extendLock). If Redis
+          is unavailable or the connection is dropped mid-processing, the promise rejects
+          with a connection error. Without try-catch, this propagates as an unhandled
+          rejection. In long-running processors that manually call extendLock on a timer,
+          a Redis blip during lock renewal causes the job to be considered stalled by
+          other workers, triggering duplicate processing while the original processor
+          continues unaware.
+        required_handling: >
+          Wrap extendLock() calls in try-catch. On Redis error, abort the current
+          job processing and let Bull's stall detection handle requeuing:
+          try {
+            const extended = await job.extendLock(this.settings.lockDuration);
+            if (\!extended) throw new Error('Lock lost');
+          } catch (err) {
+            logger.error('Lock renewal failed, aborting job', err);
+            return;
+          }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: Queue.getMetrics
+    import_path: "bull"
+    description: >
+      Returns metrics for completed or failed jobs as a time-series data structure.
+      Accepts type ('completed' | 'failed'), and optional start/end range (default 0/-1
+      for all data). Returns { meta: { count, prevTS, prevCount }, data: number[], count: number }.
+      Uses Redis pipeline (multi/exec) internally. Data points represent job counts per
+      minute bucket. Metrics must be enabled via MetricsOpts in QueueOptions to collect data.
+      Returns zeroed meta if no metrics data exists yet.
+    postconditions:
+      # Evidence: bull/lib/getters.js lines 233-260 — throws err if Redis pipeline reports error
+      # Evidence: bull/lib/getters.js line 247 — `if (err || err2) { throw err || err2 || err3; }`
+      # Source: https://github.com/OptimalBits/bull/blob/master/lib/getters.js
+      - id: get-metrics-metrics-not-enabled
+        condition: >
+          queue.getMetrics() called but metrics were not enabled in QueueOptions
+          (no `metrics` key in queue constructor options).
+        throws: "Does not throw — returns zeroed data structure silently"
+        severity: warning
+        description: >
+          If metrics collection was not enabled via the `metrics` option in QueueOptions,
+          getMetrics() returns { meta: { count: 0, prevTS: 0, prevCount: 0 }, data: [], count: 0 }
+          with no indication that metrics are disabled. Callers that check `result.count === 0`
+          cannot distinguish between "metrics not enabled" and "no jobs completed yet."
+          Dashboards built on getMetrics() will silently show empty charts if metrics
+          were never configured.
+        required_handling: >
+          Ensure metrics are enabled in the queue constructor:
+          const queue = new Queue('jobs', { metrics: { maxDataPoints: 1440 } });
+          Document to callers that zero results may mean metrics are disabled,
+          not that no jobs have run.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/getters.js"
+          - "https://github.com/OptimalBits/bull/blob/master/README.md"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: get-metrics-no-try-catch
+        condition: >
+          await queue.getMetrics('completed') called without try-catch and Redis
+          pipeline exec returns an error in the first or second result.
+        throws: "Error (Redis pipeline error from multi.exec)"
+        severity: warning
+        description: >
+          getMetrics() uses a Redis multi/exec pipeline. If any pipeline command fails
+          (connection error, OOM, cluster redirect), the pipeline exec result includes
+          an error in position [0] or [1]. The implementation throws
+          `err || err2 || err3` — confirmed from getters.js source line 247.
+          Without try-catch around getMetrics(), Redis errors in monitoring/dashboard
+          code crash the caller (often a periodic metrics endpoint or cron job).
+        required_handling: >
+          Wrap getMetrics() in try-catch in dashboard/monitoring code:
+          try {
+            const metrics = await queue.getMetrics('completed');
+            return metrics.data;
+          } catch (err) {
+            logger.error('Failed to fetch queue metrics:', err);
+            return [];
+          }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/getters.js"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+# Intentionally omitted from deepen-stream-1 pass 3:
+# Queue.getCountsPerPriority() — read-only diagnostic returning counts per priority level.
+#   Pure Redis ZCOUNT/LLEN queries. No distinct error behavior beyond generic Redis connection
+#   errors (identical to count() which is already omitted). Added in bull 4.x. Low adoption.
+#   Omission reason: same category as count(), getCompletedCount(), etc. already omitted.

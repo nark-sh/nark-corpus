@@ -2,9 +2,10 @@ package: "passport-local"
 semver: ">=1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.83  # 5/6 callable API surfaces contracted (passReqToCallback, body-parser, usernameField, Strategy, serializeUser; animate is internal-only)
 
 functions:
   - name: "Strategy"
@@ -119,6 +120,128 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: "Strategy (passReqToCallback)"
+    import_path: "passport-local"
+    description: >
+      When passReqToCallback: true is set in LocalStrategy options, the verify
+      callback signature changes from (username, password, done) to
+      (req, username, password, done). If the callback is not updated to match
+      this new signature, arguments are silently misaligned: req lands in the
+      username parameter, the actual username lands in password, the actual password
+      lands in done, and the real done callback is never called — causing the
+      request to hang indefinitely.
+    postconditions:
+      # Evidence: https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js#L86-L91
+      # Confirmed from source: strategy.js invokes this._verify(req, username, password, verified)
+      # when passReqToCallback is true, vs this._verify(username, password, verified) otherwise.
+      # Issue documented: https://github.com/jaredhanson/passport-local/issues/128
+      - id: pass-req-callback-signature-mismatch
+        condition: "passReqToCallback: true is set but verify callback uses (username, password, done) signature"
+        throws: "Request hangs (done() never called); timeout after server request timeout"
+        required_handling: >
+          When passReqToCallback: true is set, the verify callback MUST use the signature
+          (req, username, password, done) — NOT (username, password, done).
+          With the wrong signature, the req object is silently bound to the username parameter,
+          the actual username to password, and the actual password to done.
+          The real done callback is never called, leaving the HTTP request hanging until
+          the server connection times out. The bug is completely silent — no error is thrown,
+          no warning is logged.
+        sources:
+          - "https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js"
+          - "https://github.com/jaredhanson/passport-local/issues/128"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: "Strategy (body-parser dependency)"
+    import_path: "passport-local"
+    description: >
+      LocalStrategy reads credentials from req.body and req.query. If express.json()
+      or express.urlencoded() (formerly body-parser) middleware is not configured
+      before passport.authenticate(), req.body is undefined. The lookup utility
+      returns null for both username and password, and the strategy fails with
+      HTTP 400 'Missing credentials' — even though the client sent valid credentials
+      in the POST body. This is one of the most common configuration mistakes with
+      passport-local.
+    postconditions:
+      # Evidence: https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js#L71-L76
+      # Source confirms: lookup(req.body, usernameField) called first, then req.query fallback.
+      # When req.body is undefined (no body-parser), both return null, triggering 400 fail.
+      # Confirmed by GitHub issues: #196, #180, #176 all relate to missing body parsing.
+      - id: missing-body-parser-silent-400
+        condition: "body-parser (express.urlencoded/express.json) middleware not mounted before passport.authenticate()"
+        throws: "HTTP 400 'Missing credentials' — not an exception, but an authentication failure"
+        required_handling: >
+          Express applications using passport-local MUST configure body-parser middleware
+          before calling passport.authenticate(). Without it, req.body is undefined
+          and LocalStrategy returns HTTP 400 'Missing credentials' even when the client
+          sends correct credentials in the POST body.
+
+          Required middleware order:
+            1. app.use(express.urlencoded({ extended: false }))  // for HTML form submissions
+            2. app.use(express.json())                           // for JSON API clients
+            3. app.use(passport.initialize())
+            4. app.use(passport.session())
+            5. app.post('/login', passport.authenticate('local', ...))
+
+          This failure produces no server-side error — only the client sees a 400 response.
+          It is a silent misconfiguration that is extremely hard to debug.
+        sources:
+          - "https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js"
+          - "https://www.passportjs.org/concepts/authentication/strategies/"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: "Strategy (usernameField / passwordField)"
+    import_path: "passport-local"
+    description: >
+      LocalStrategy defaults to reading credentials from req.body.username and
+      req.body.password. If the HTML form uses different field names (e.g. email,
+      pass, user_email), but usernameField and passwordField options are not set to
+      match, the strategy silently fails with HTTP 400 'Missing credentials'.
+      The actual field values are present in the request but the strategy cannot
+      find them because it looks for the wrong field names.
+    postconditions:
+      # Evidence: https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js#L49-L50
+      # Source confirms defaults: this._usernameField = options.usernameField || 'username'
+      # and this._passwordField = options.passwordField || 'password'
+      # The lookup then uses these field names against req.body — wrong name = null result.
+      - id: field-name-mismatch-silent-400
+        condition: "form field names differ from default 'username'/'password' but options not configured"
+        throws: "HTTP 400 'Missing credentials' — authentication silently fails"
+        required_handling: >
+          When the login form uses non-default field names, LocalStrategy options MUST
+          be explicitly configured to match:
+
+            new LocalStrategy(
+              { usernameField: 'email', passwordField: 'pass' },
+              function(email, pass, done) { ... }
+            )
+
+          Without this configuration, the strategy looks for req.body.username and
+          req.body.password, finds undefined for both, and returns HTTP 400 'Missing credentials'
+          even though the client sent credentials in the correct field names.
+          The mismatch produces no server-side warning — developers must trace the 400
+          response back through the strategy source to discover the cause.
+        sources:
+          - "https://github.com/jaredhanson/passport-local/blob/master/lib/strategy.js"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: low
 
   - name: "serializeUser"
     import_path: "passport-local"
