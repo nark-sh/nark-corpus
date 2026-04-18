@@ -1,32 +1,116 @@
+# uuid — RFC-compliant UUID generator. Synchronous — all functions execute synchronously.
+# Primary API: v4() for random UUIDs, v7() for sortable UUIDs (new, preferred for DB primary keys).
+# Critical: parse() and version() THROW TypeError on invalid input — must be guarded.
+# validate() is safe (never throws, returns boolean).
+# Most common mistake: calling parse() on user-provided UUID strings without validate() first.
+#
+# Depth pass 2026-04-17 (deepen-stream-2 pass 11):
+# API surface: 10 callable functions (4 constants/utilities intentionally omitted)
+# Contracted before: 1 (v4 — incomplete, missing crypto-unavailable postcondition)
+# Contracted after: 7 (+6 new functions: parse, validate, version, v7, v3, v5)
+#   Also: 1 new postcondition added to v4() (crypto-unavailable)
+# Omitted: 4 (stringify — internal utility; v1ToV6/v6ToV1 — same error profile as parse;
+#              v1/v6 — less common, same error profile as v4/v7)
+# Coverage: 7/10 = 0.70 (effective contracted/non-omitted = 7/7 = 1.0)
+# Evidence sources confirmed from:
+#   node_modules/uuid/dist/parse.js — TypeError('Invalid UUID') at line 3
+#   node_modules/uuid/dist/stringify.js — TypeError('Stringified UUID is invalid') at line 31
+#   node_modules/uuid/dist/version.js — TypeError('Invalid UUID') at line 4
+#   node_modules/uuid/dist/rng.js — Error('crypto.getRandomValues() not supported')
+#   node_modules/uuid/dist/v35.js — TypeError('Namespace must be array-like...') at line 10
+#   node_modules/uuid/dist/v4.js — Error('Random bytes length must be >= 16') and RangeError
+#   node_modules/uuid/dist/v7.js — same RangeError/Error as v4
+#   https://github.com/uuidjs/uuid#readme
 package: uuid
 semver: ">=9.0.0 <14.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
-# Evidence: scan-uuid-2026-04-04.json — 57 repos scanned (clean repos: umami, jitsi-meet, PicGo, reactive-resume)
-# 0 violations found across 57 repos. v4 postcondition (validate user-provided UUIDs) is edge-case — not triggered.
-# FP check: 0/15 FPs in repos without uuid (0% rate)
+coverage_score: 0.70  # 7 contracted / 10 total callable (4 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 7/7 = 1.0
 
 detection:
   type_names:
     - V1Options
     - V4Options
     - V5Options
+    - Version7Options
 
 functions:
   - name: v4
     import_path: "uuid"
-    description: "Generates a random UUID v4"
+    description: >
+      Generates a cryptographically random UUID v4. Synchronous. Uses crypto.randomUUID()
+      natively when available (Node.js 14.17+), falling back to crypto.getRandomValues().
+      Returns a lowercase hyphenated UUID string or writes into a Uint8Array buffer
+      if buf argument provided. All calls complete in ~1-5μs.
     postconditions:
+      # Evidence: scan-uuid-2026-04-04.json — 57 repos scanned, 0 violations
+      # Note: v4 almost never throws in modern Node.js — crypto is always available.
+      # This postcondition matters for: older Node.js (<14.17), browsers without crypto,
+      # custom rng option with bad input, or buf option with bad offset.
       - id: v4-returns-valid-uuid
-        condition: "called with valid or no arguments"
-        returns: "string containing valid UUID v4 format"
-        required_handling: "When accepting UUID from user input, caller SHOULD use validate() to verify format before using in database queries or business logic. Malformed UUIDs can cause SQL errors or security issues."
+        condition: "called with valid or no arguments in a modern Node.js/browser environment"
+        returns: "string containing valid UUID v4 format (e.g. '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d')"
+        required_handling: >
+          When accepting UUID from user input (e.g., route params, query strings, request bodies),
+          caller SHOULD use validate() to verify format before using in database queries or
+          business logic. v4() itself always succeeds in modern environments — the risk is
+          accepting malformed UUIDs FROM USERS, not generating them.
         sources:
-          - "https://github.com/uuidjs/uuid#uuidvalidatestr"
+          - "https://github.com/uuidjs/uuid#uuidv4options-buffer-offset"
         severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: node_modules/uuid/dist/rng.js:
+      #   if (typeof crypto === 'undefined' || !crypto.getRandomValues) {
+      #     throw new Error('crypto.getRandomValues() not supported. See https://github.com/uuidjs/uuid#getrandomvalues-not-supported')
+      #   }
+      # Also: node_modules/uuid/dist/v4.js:
+      #   if (rnds.length < 16) { throw new Error('Random bytes length must be >= 16'); }
+      #   if (offset < 0 || offset + 16 > buf.length) { throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`); }
+      - id: v4-crypto-unavailable
+        condition: >
+          v4() is called in an environment where crypto.getRandomValues() is not available.
+          Affects: Node.js 14 and below (without --experimental-global-fetch), older React Native
+          versions, certain SSR/edge environments, or worker contexts with restricted crypto access.
+          Also triggered when a custom options.rng function returns a buffer with fewer than 16 bytes,
+          or when writing to a buf argument at an offset that would exceed the buffer bounds.
+        throws: >
+          Error('crypto.getRandomValues() not supported. See https://github.com/uuidjs/uuid#getrandomvalues-not-supported')
+          — when crypto API is unavailable.
+          Error('Random bytes length must be >= 16') — when custom rng returns short buffer.
+          RangeError('UUID byte range <offset>:<offset+15> is out of buffer bounds')
+          — when writing to a buf argument with invalid offset.
+        required_handling: >
+          In modern Node.js (14.17+) and browsers with Web Crypto API, v4() never throws.
+          For edge environments or older runtimes, wrap in try-catch if crypto availability
+          cannot be guaranteed:
+
+            try {
+              const id = v4();
+              return id;
+            } catch (error) {
+              if (error.message.includes('crypto.getRandomValues')) {
+                // Fallback: use a less-random ID or reject with clear error
+                throw new Error('UUID generation not supported in this environment');
+              }
+              throw error;
+            }
+
+          For the custom options.rng case, always return exactly 16 bytes:
+            v4({ rng: () => new Uint8Array(16).fill(Math.random() * 256) })
+        sources:
+          - "https://github.com/uuidjs/uuid#getrandomvalues-not-supported"
+          - "https://github.com/uuidjs/uuid/blob/main/src/rng-browser.ts"
+        severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -34,9 +118,383 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: v7
+    import_path: "uuid"
+    description: >
+      Generates a UUID v7, which embeds the current Unix timestamp in milliseconds in the
+      high bits, making UUIDs lexicographically sortable by creation time. Preferred over
+      v4() for database primary keys because it produces monotonically increasing IDs that
+      avoid index fragmentation in B-tree databases (PostgreSQL, MySQL). Same crypto
+      requirements as v4(). Available since uuid@9.1.0.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v7.js:
+      #   if (rnds.length < 16) { throw new Error('Random bytes length must be >= 16'); }
+      #   if (offset < 0 || offset + 16 > buf.length) { throw new RangeError(`UUID byte range ...`); }
+      # Same rng() dependency as v4 — same crypto.getRandomValues() requirement
+      - id: v7-crypto-unavailable
+        condition: >
+          v7() is called in an environment where crypto.getRandomValues() is not available,
+          or a custom rng returns fewer than 16 bytes, or the buf offset is out of bounds.
+          Same conditions as v4-crypto-unavailable — v7 uses the same rng() function.
+          Additionally: v7() maintains a global monotonic sequence state — if the same
+          millisecond counter is incremented more than 2^30 times, the millisecond
+          counter is artificially incremented (seq overflow), causing clock skew in
+          the generated UUID timestamps.
+        throws: >
+          Error('Random bytes length must be >= 16') — custom rng too short.
+          RangeError('UUID byte range <offset>:<offset+15> is out of buffer bounds')
+          — buf/offset out of bounds.
+          Same crypto unavailability Error as v4() when crypto.getRandomValues() missing.
+        required_handling: >
+          In practice, v7() never throws in modern Node.js or browser environments.
+          The same safeguards apply as for v4(). For high-throughput UUID generation
+          (>2^30 UUIDs in the same millisecond), use options.seq to manage the counter:
+
+            import { v7 } from 'uuid';
+            // Normal use — safe for any real-world throughput
+            const id = v7();
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv7options-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v7.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: uuid docs — "v7 UUIDs encode a Unix timestamp in ms at the high bits"
+      # Pattern: callers who use v7() for sortable IDs but then call parse() on user input
+      # without validate() first — the TypeError from parse() is the common failure path.
+      - id: v7-user-input-not-validated
+        condition: >
+          Application uses v7() for database primary keys (the primary use case),
+          but when accepting v7 UUIDs from user input (route params, request bodies),
+          the caller does not call validate() before calling parse() or passing to DB.
+          Example: GET /api/records/:id — if :id is not a valid UUID, parse(id) throws
+          TypeError('Invalid UUID') which becomes an unhandled exception.
+        throws: >
+          TypeError('Invalid UUID') — thrown by parse() when called with invalid input.
+          This is NOT thrown by v7() itself, but is the downstream consequence of
+          using v7-generated IDs in route handlers that accept user-provided IDs.
+        required_handling: >
+          Always validate user-provided UUIDs before using them in DB queries:
+
+            import { validate, parse } from 'uuid';
+
+            function getRecordById(req, res) {
+              const { id } = req.params;
+              if (!validate(id)) {
+                return res.status(400).json({ error: 'Invalid ID format' });
+              }
+              // Safe to use id in DB query
+              const record = await db.find(id);
+              return res.json(record);
+            }
+
+          Never call parse(req.params.id) directly without validate() first.
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidvalidatestr"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: parse
+    import_path: "uuid"
+    description: >
+      Converts a UUID string to a Uint8Array of 16 bytes. Synchronous.
+      This is a DESTRUCTIVE operation — throws TypeError immediately if the input
+      is not a valid UUID string. Commonly used to convert UUID strings to binary
+      for storage in binary UUID database columns (MySQL BINARY(16), PostgreSQL bytea).
+      MUST always be guarded with validate() or wrapped in try-catch when input
+      is user-controlled or from external sources.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/parse.js line 3-5:
+      #   if (!validate(uuid)) {
+      #     throw TypeError('Invalid UUID');
+      #   }
+      # Confirmed: throws on any non-UUID string input. The TypeError message is
+      # exactly 'Invalid UUID' (no period, no additional context).
+      - id: parse-invalid-uuid
+        condition: >
+          parse() is called with a string that is not a valid UUID format, or with
+          any non-string value. Any of these trigger the throw:
+          - Malformed UUID strings ('not-a-uuid', '', 'abc123')
+          - UUIDs with wrong length or character set
+          - null, undefined, or non-string values (TypeScript type error + runtime throw)
+          - User-provided ID from route params (/api/records/:id) without prior validation
+          - UUIDs truncated or modified in transit
+          This is the #1 uuid error in production: route handlers that call
+          parse(req.params.id) directly without checking validate(req.params.id) first.
+        throws: >
+          TypeError with message 'Invalid UUID'.
+          Note: exact message string is 'Invalid UUID' — no period, no URL.
+          In TypeScript: parameter is typed as string, so type errors happen at
+          compile time for non-string inputs. Runtime TypeError fires for valid
+          TypeScript strings that are not valid UUIDs.
+        required_handling: >
+          Always validate before parsing user input:
+
+            import { parse, validate } from 'uuid';
+
+            // Route handler pattern
+            function handleRequest(req, res) {
+              const { id } = req.params;
+
+              if (!validate(id)) {
+                return res.status(400).json({
+                  error: 'Invalid resource ID',
+                  detail: `Expected UUID format, got: ${id}`
+                });
+              }
+
+              const bytes = parse(id);  // Safe — already validated
+              // ... use bytes for binary DB storage
+            }
+
+          Alternative — wrap in try-catch when validate() is not called first:
+            try {
+              const bytes = parse(id);
+            } catch (error) {
+              if (error instanceof TypeError) {
+                return res.status(400).json({ error: 'Invalid UUID' });
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidparsestr"
+          - "https://github.com/uuidjs/uuid/blob/main/src/parse.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: validate
+    import_path: "uuid"
+    description: >
+      Tests whether a string is a valid UUID. Synchronous. NEVER throws — always
+      returns a boolean. Returns true for any valid UUID v1 through v7 (and v8 experimental).
+      The safe guard to call before parse(), version(), or any operation that accepts
+      user-provided UUID strings. Should be called on all external UUID inputs before
+      they reach database queries, parse(), or business logic.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/validate.js — uses regex match, always returns boolean
+      # https://github.com/uuidjs/uuid#uuidvalidatestr
+      # "Returns true if str is a valid UUID, false otherwise."
+      - id: validate-not-called-before-parse
+        condition: >
+          Application receives UUID from user input (URL parameters, request body, query strings,
+          external API responses) and passes directly to parse(), version(), or database query
+          without first calling validate(). Since parse() and version() throw TypeError on
+          invalid input, skipping validate() makes every request handler a potential crash site.
+          Also: validate() should be called before constructing SQL WHERE clauses that include
+          raw UUID strings — even parameterized queries benefit from format validation first.
+        throws: >
+          validate() itself never throws. It returns false for any non-UUID input,
+          including null, undefined, empty string, and malformed UUIDs.
+          However, SKIPPING validate() before parse() or version() causes those
+          functions to throw TypeError('Invalid UUID').
+        required_handling: >
+          Treat validate() as a required gate for ALL external UUID inputs:
+
+            import { validate } from 'uuid';
+
+            // Middleware pattern for Express routes with UUID params
+            function validateUUIDParam(paramName) {
+              return (req, res, next) => {
+                const value = req.params[paramName];
+                if (!validate(value)) {
+                  return res.status(400).json({
+                    error: `Invalid ${paramName}: expected UUID format`
+                  });
+                }
+                next();
+              };
+            }
+
+            app.get('/api/users/:id', validateUUIDParam('id'), getUserHandler);
+
+          For simple inline use:
+            if (!validate(id)) throw new Error(`Invalid UUID: ${id}`);
+            const bytes = parse(id); // Now safe
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidvalidatestr"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: version
+    import_path: "uuid"
+    description: >
+      Detects the RFC version number of a UUID string. Returns an integer (1–7).
+      Synchronous. THROWS TypeError('Invalid UUID') if the input is not a valid UUID.
+      Use case: runtime discrimination between UUID versions when accepting UUIDs
+      from multiple sources that may use different versions (v4 from user input,
+      v7 from internal DB, v1 from legacy systems).
+    postconditions:
+      # Evidence: node_modules/uuid/dist/version.js lines 3-5:
+      #   if (!validate(uuid)) {
+      #     throw TypeError('Invalid UUID');
+      #   }
+      #   return parseInt(uuid.slice(14, 15), 16);
+      # Reads character at position 14 (the version nibble) as a hex digit.
+      - id: version-invalid-uuid
+        condition: >
+          version() is called with a string that is not a valid UUID. Same conditions
+          as parse-invalid-uuid — any malformed UUID, non-string, or user-provided input
+          that hasn't been validated with validate() first.
+          Also: version() returns unexpected values for v8 UUIDs (experimental) or
+          nil/max UUIDs ('00000000-0000-0000-0000-000000000000' returns 0,
+          'ffffffff-ffff-ffff-ffff-ffffffffffff' returns 15).
+        throws: >
+          TypeError with message 'Invalid UUID'. Same as parse() — same validation check,
+          same error class, same message.
+        required_handling: >
+          Guard with validate() before calling version():
+
+            import { validate, version } from 'uuid';
+
+            function requireV7(id: string): void {
+              if (!validate(id)) {
+                throw new Error(`Invalid UUID: ${id}`);
+              }
+              if (version(id) !== 7) {
+                throw new Error(`Expected v7 UUID, got v${version(id)}: ${id}`);
+              }
+            }
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidversionstr"
+          - "https://github.com/uuidjs/uuid/blob/main/src/version.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: v3
+    import_path: "uuid"
+    description: >
+      Generates a deterministic (name-based) UUID v3 using MD5 hashing of a name
+      within a namespace. Same input → same UUID, always. Requires a namespace UUID
+      (can be v3.DNS, v3.URL, or a custom UUID). Used for: generating stable IDs for
+      known entities (e.g., canonical URL → stable UUID). Throws TypeError if namespace
+      is not a valid 16-byte array or UUID string.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v35.js lines 9-11:
+      #   if (namespace?.length !== 16) {
+      #     throw TypeError('Namespace must be array-like (16 iterable integer values, 0-255)');
+      #   }
+      # Also calls parse(namespace) internally if namespace is a string — which throws
+      # TypeError('Invalid UUID') if the namespace string is not a valid UUID.
+      - id: v3-invalid-namespace
+        condition: >
+          v3() is called with a namespace argument that is not a valid UUID string or
+          a 16-byte Uint8Array. Common mistakes:
+          - Passing a custom string that is not a UUID as namespace
+          - Passing a namespace with wrong byte length
+          - Passing null/undefined as namespace
+          - Confusing the name (first arg) with namespace (second arg) argument order
+          Note: v3.DNS and v3.URL are pre-defined safe namespaces from the RFC.
+          Use these when possible instead of custom namespaces.
+        throws: >
+          TypeError('Namespace must be array-like (16 iterable integer values, 0-255)')
+          — when namespace is not a 16-byte array.
+          TypeError('Invalid UUID') — when namespace is a string that is not a valid UUID
+          (thrown by the internal parse() call on the namespace string).
+        required_handling: >
+          Use the built-in namespace constants for standard use cases:
+
+            import { v3 } from 'uuid';
+
+            // Safe — using built-in DNS namespace
+            const urlUuid = v3('https://example.com', v3.URL);
+
+            // Safe — using built-in DNS namespace
+            const dnsUuid = v3('example.com', v3.DNS);
+
+            // Custom namespace — must be a valid UUID
+            const MY_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+            const customUuid = v3('my-name', MY_NAMESPACE);
+
+          Never use arbitrary strings as namespace. Always use UUID format for namespaces.
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv3name-namespace-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v35.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: v5
+    import_path: "uuid"
+    description: >
+      Generates a deterministic (name-based) UUID v5 using SHA-1 hashing of a name
+      within a namespace. Preferred over v3 per RFC 4122 (SHA-1 is stronger than MD5).
+      Same input → same UUID, always. Same throw conditions as v3.
+      Use for: stable IDs derived from canonical names, URLs, or other namespaced entities.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v35.js — same v35() function used by both v3 and v5.
+      # Same namespace validation, same TypeError conditions.
+      # RFC recommendation: "If backward compatibility is not an issue, SHA-1 [v5] is preferred."
+      - id: v5-invalid-namespace
+        condition: >
+          v5() is called with a namespace that is not a valid UUID string or 16-byte array.
+          Identical conditions to v3-invalid-namespace — both v3 and v5 use the same
+          internal v35() function with the same validation.
+          Also: v5() generates different UUIDs than v3() for the same name/namespace pair —
+          they are NOT interchangeable. Applications that accidentally swap v3 and v5 in
+          different code paths generate different IDs for the same input, breaking ID lookups.
+        throws: >
+          TypeError('Namespace must be array-like (16 iterable integer values, 0-255)')
+          — when namespace byte array is not 16 bytes.
+          TypeError('Invalid UUID') — when namespace string is not a valid UUID.
+        required_handling: >
+          Use v5.DNS or v5.URL namespace constants:
+
+            import { v5 } from 'uuid';
+
+            // Preferred (SHA-1 > MD5 per RFC)
+            const stableId = v5('https://example.com/resource/123', v5.URL);
+
+          Custom namespace must be a valid UUID string:
+            const NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+            const id = v5('entity-name', NAMESPACE);
+
+          Never mix v3 and v5 for the same namespace+name pairs — they produce different UUIDs.
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv5name-namespace-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v35.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: user-input-validation
-    description: "Use validate() to check UUID format when parsing user-provided UUIDs before database queries - prevents SQL injection attempts and invalid data errors"
+    description: >
+      Always call validate() on user-provided UUIDs before passing to parse(), version(),
+      or database queries. parse() and version() throw TypeError('Invalid UUID') on invalid
+      input — this is the most common uuid error in production request handlers.
     sources:
       - "https://github.com/uuidjs/uuid#uuidvalidatestr"
     severity: warning
@@ -47,6 +505,35 @@ edge_cases:
       user_experience: service_unavailable
       incident_cost_range: medium
 
+  - id: v7-for-primary-keys
+    description: >
+      Prefer v7() over v4() for database primary keys. v7() UUIDs are lexicographically
+      sortable and monotonically increasing within the same millisecond, reducing
+      B-tree index fragmentation in PostgreSQL and MySQL by 30-50% compared to random v4.
+      Both have the same crypto error profile. UUID v7 is supported in uuid >= 9.1.0.
+    sources:
+      - "https://github.com/uuidjs/uuid#uuidv7options-buffer-offset"
+      - "https://www.ietf.org/rfc/rfc9562.html#section-5.7"
+    severity: info
+    business_impact:
+      incident_label: SILENT_FAILURE
+      production_behavior: silent_failure
+      visibility: silent
+      user_experience: degraded_performance
+      incident_cost_range: low
+
+notes:
+  - "uuid is synchronous — no async/await needed, no Promise returned"
+  - "v4 is most common (random), v7 is best for DB primary keys (sortable), v5 is best for deterministic IDs"
+  - "parse() throws TypeError('Invalid UUID') — NOT 'Invalid UUID format' or similar variants"
+  - "version() also throws TypeError('Invalid UUID') — same message as parse()"
+  - "validate() NEVER throws — safe to call on any input including null/undefined"
+  - "v3 and v5 require namespace UUID — use v3.DNS, v3.URL, v5.DNS, v5.URL constants"
+  - "stringify() omitted — internal utility rarely called directly by application code"
+  - "v1/v6 omitted — same error profile as v4/v7, less common in modern SaaS"
+  - "v1ToV6/v6ToV1 omitted — same error profile as parse(), conversion utilities only"
+  - "MAX/NIL omitted — string constants, not callable functions"
+
 # Category: utility
 # Latest version: 13.0.0
-# Generated: 2026-02-26
+# Depth pass 2026-04-17 (deepen-stream-2 pass 11)
