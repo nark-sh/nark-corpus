@@ -63,8 +63,7 @@ export async function dollarFetchWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function rawNoCatch() {
-  // SHOULD_FIRE: raw-still-throws-on-error — ofetch.raw() still throws FetchError on non-2xx,
-  // unlike native fetch(). The "raw" suffix refers to the return type (FetchResponse), not bypassing errors.
+  // SHOULD_FIRE: raw-still-throws-on-error — ofetch.raw() still throws FetchError on non-2xx; "raw" means raw response type, not bypassing errors
   const response = await ofetch.raw("/api/data");
   return response._data;
 }
@@ -82,8 +81,7 @@ export async function rawWithCatch() {
 }
 
 export async function rawWithIgnoreError() {
-  // SHOULD_NOT_FIRE: ignoreResponseError: true makes ofetch.raw() behave like native fetch()
-  // — returns response for all status codes without throwing
+  // SHOULD_NOT_FIRE: ignoreResponseError: true makes ofetch.raw() behave like native fetch() — returns response for all status codes without throwing
   const response = await ofetch.raw("/api/data", { ignoreResponseError: true });
   if (!response.ok) {
     console.error("Request failed with status", response.status);
@@ -96,8 +94,7 @@ export async function rawWithIgnoreError() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function fetchWithTimeoutNoCatch() {
-  // SHOULD_FIRE: ofetch-timeout-unhandled — timeout fires a FetchError wrapping TimeoutError;
-  // without try-catch the timeout causes unhandled exception
+  // SHOULD_FIRE: ofetch-timeout-unhandled — timeout fires a FetchError wrapping TimeoutError; without try-catch the timeout causes unhandled exception
   const data = await ofetch("/api/slow-endpoint", { timeout: 5000 });
   return data;
 }

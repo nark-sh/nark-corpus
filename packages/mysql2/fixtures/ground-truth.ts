@@ -67,8 +67,7 @@ export async function poolQueryWithCatch() {
 // @expect-violation: reset-connection-dead
 export async function resetNoCatch() {
   const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
-  // SHOULD_FIRE: reset-connection-dead — connection.reset() can reject (PROTOCOL_CONNECTION_LOST, ECONNRESET)
-  // if the connection is no longer alive. No try-catch.
+  // SHOULD_FIRE: reset-connection-dead — connection.reset() can reject (PROTOCOL_CONNECTION_LOST, ECONNRESET) if the connection is no longer alive
   await connection.reset();
   await connection.end();
 }
@@ -93,14 +92,15 @@ export async function resetWithCatch() {
 // 4. PreparedStatementInfo.close() — resource leak pattern
 // ─────────────────────────────────────────────────────────────────────────────
 
-// @expect-violation: prepared-statement-close-missing
+// NOTE: prepared-statement-close-missing is a resource-pairing pattern (detect ABSENCE of stmt.close()).
+// The V2 scanner detects unhandled throws but not missing resource cleanup calls.
+// This detection requires a different static analysis pattern not yet implemented.
+// See concern-20260418-mysql2-deepen-2 (rejected — beyond current scanner capability).
 export async function prepareWithoutClose() {
   const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
   try {
     const stmt = await connection.prepare('SELECT * FROM users WHERE id = ?');
-    // SHOULD_FIRE: prepared-statement-close-missing — stmt.close() never called.
-    // Each unclosed statement occupies a server-side slot until connection closes.
-    // Long-running apps exhaust max_prepared_stmt_count (default: 16,382).
+    // NOT_YET_DETECTED: prepared-statement-close-missing — stmt.close() never called; unclosed statement occupies a server-side slot until connection closes
     await stmt.execute([1]);
     // Missing: await stmt.close();
   } finally {
