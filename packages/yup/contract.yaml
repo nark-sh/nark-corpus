@@ -1,16 +1,38 @@
 package: yup
 semver: ">=0.32.0 <2.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.71  # 5 contracted / 7 total async-callable (2 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 5/5 = 1.0
 # analyzer_limitation: Current analyzer cannot detect validation calls on schema instances created by Yup.object(), Yup.string(), etc. Detection requires tracking methods on objects returned from factory functions. Contract is accurate but not enforceable with current analyzer capabilities. Expected detection rate: 0%.
+#
+# Depth pass 2026-04-17 (deepen-stream-1 pass 10):
+# API surface: 7 async-callable operations (2 intentionally omitted)
+# Contracted before: 4 (validate, validateSync, validateAt, validateSyncAt)
+# Contracted after: 5 (+2 functions: isValid, cast; +1 postcondition on validateSync)
+# New functions: isValid (1 postcondition: isvalid-non-validation-error-rethrows)
+#                cast (2 postconditions: cast-type-error + cast-transform-throws)
+# New postcondition on validateSync: validatesync-async-test-throws
+# Omitted: 2 (isValidSync — sync equivalent of isValid; reach — sync utility)
+# Coverage: 5/7 = 0.71 (effective contracted/non-omitted = 5/5 = 1.0)
+# Evidence sources confirmed from:
+#   node_modules/yup/index.js line 927-933 (isValid source)
+#   node_modules/yup/index.js line 757-772 (cast source)
+#   node_modules/yup/index.js line 386 (async test in sync validate throws Error)
+#   node_modules/yup/README.md (cast options documentation)
+#   https://github.com/jquense/yup
 
 functions:
   - name: validate
     import_path: "yup"
-    description: "Validates data against a Yup schema asynchronously"
+    description: >
+      Validates data against a Yup schema asynchronously. Returns a Promise that
+      resolves with the parsed/cast value when validation passes, or rejects with
+      ValidationError when validation fails. Supports async test() functions.
+      This is the primary validation method for server-side SaaS applications.
     postconditions:
       # Evidence: seen in 10 primary firings across 1 repo in scan-yup-2026-04-04.json
       # Top affected: getguesstimate/guesstimate-app
@@ -34,7 +56,11 @@ functions:
 
   - name: validateSync
     import_path: "yup"
-    description: "Validates data against a Yup schema synchronously"
+    description: >
+      Validates data against a Yup schema synchronously. Throws ValidationError
+      immediately when validation fails. NOTE: async test() functions are silently
+      ignored (the test runs but its result is not awaited). Only use validateSync()
+      when you are certain the schema has no async test() rules.
     postconditions:
       # Evidence: seen in 1 primary firing across 1 repo in scan-yup-2026-04-04.json
       # Top affected: gmpetrov/ultimate-saas-ts
@@ -57,9 +83,50 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: node_modules/yup/index.js line 386:
+      #   throw new Error(`Validation test of type: "${ctx.type}" returned a Promise during a
+      #   synchronous validate. This test will finish after the validate call has returned`)
+      # Confirmed: validateSync() throws a plain Error (not ValidationError) when an async
+      # test() function is encountered. This is a startup/config error, not a user data error.
+      - id: validatesync-async-test-throws
+        condition: >
+          validateSync() is called on a schema that has one or more async test() functions
+          (i.e., test() functions that return a Promise). validateSync() cannot await async
+          tests — when it encounters a Promise-returning test, it throws a plain Error
+          immediately. This is a programmer error: schemas with async validators (e.g.,
+          async validators that check uniqueness in the database) must use validate() not
+          validateSync().
+        throws: >
+          Error with message: "Validation test of type: \"<type>\" returned a Promise during
+          a synchronous validate. This test will finish after the validate call has returned"
+          This is a plain Error object, NOT a ValidationError — the schema itself is
+          misconfigured for synchronous use.
+          Confirmed from node_modules/yup/index.js line 386.
+        required_handling: >
+          Use validate() (async) instead of validateSync() when the schema has any async
+          test() rules. Common async test patterns in SaaS apps:
+          - Checking uniqueness: schema.test('unique', 'Email taken', async (val) => !(await db.user.findByEmail(val)))
+          - Checking resource existence: schema.test('exists', 'Not found', async (id) => !!(await db.find(id)))
+          These MUST use validate() not validateSync().
+
+          Detection pattern: if you see this error in production, find which test() returns
+          a Promise and replace validateSync() with await validate().
+        sources:
+          - "https://github.com/jquense/yup"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
   - name: validateAt
     import_path: "yup"
-    description: "Validates a specific path in the data against the schema asynchronously"
+    description: >
+      Validates a specific path in the data against the schema asynchronously.
+      Useful for real-time field-level validation (e.g., form field blur events).
+      Returns a Promise that resolves with the field's value or rejects with ValidationError.
     postconditions:
       - id: validateat-rejects
         condition: "data at the specified path fails validation"
@@ -79,7 +146,10 @@ functions:
 
   - name: validateSyncAt
     import_path: "yup"
-    description: "Validates a specific path in the data against the schema synchronously"
+    description: >
+      Validates a specific path in the data against the schema synchronously.
+      Subject to the same async test() limitation as validateSync() — schemas
+      with async test functions must use validateAt() instead.
     postconditions:
       - id: validatesyncat-throws
         condition: "data at the specified path fails validation"
@@ -96,6 +166,204 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: isValid
+    import_path: "yup"
+    description: >
+      Asynchronously checks if a value is valid against the schema. Returns a
+      Promise<boolean> — resolves with true if valid, false if invalid (ValidationError).
+      This is the "safe" alternative to validate() for boolean checks. HOWEVER, it is
+      NOT fully safe: if a custom test() function throws a non-ValidationError exception
+      (e.g., a database error, network error, or unexpected TypeError), isValid()
+      re-throws that error. Callers that use isValid() without a catch handler assuming
+      it never rejects are wrong.
+    postconditions:
+      # Evidence: node_modules/yup/index.js lines 927-933:
+      #   isValid(value, options) {
+      #     return this.validate(value, options).then(() => true, err => {
+      #       if (ValidationError.isError(err)) return false;
+      #       throw err;  // ← non-ValidationError is RE-THROWN
+      #     });
+      #   }
+      # Confirmed: isValid() only swallows ValidationError. Any other error propagates.
+      # This is the opposite of what most developers expect.
+      - id: isvalid-non-validation-error-rethrows
+        condition: >
+          isValid() is called without a catch handler, and a custom test() function in
+          the schema throws a non-ValidationError exception. This occurs when:
+          (a) An async test() makes a database/network call that rejects:
+              schema.test('unique', 'taken', async (val) => !(await db.findByEmail(val)))
+              — if db.findByEmail() throws a DatabaseError, isValid() propagates it.
+          (b) An async test() throws an unexpected TypeError or other runtime error.
+          (c) An async test() throws explicitly (e.g., throw new Error('service unavailable'))
+              instead of returning false.
+          Most developers use isValid() assuming it "always resolves" — it does NOT
+          when non-ValidationError exceptions occur in test functions.
+        throws: >
+          Whatever non-ValidationError the test() function throws. Common cases:
+          - DatabaseError / Prisma errors (when test() checks uniqueness in DB)
+          - NetworkError / FetchError (when test() calls an external API)
+          - TypeError (when test() encounters unexpected input types)
+          - Generic Error (when test() throws new Error(...))
+          Confirmed from index.js line 930: `throw err` — the error is not wrapped or
+          transformed, it propagates as-is to the caller.
+        required_handling: >
+          Always wrap isValid() in try-catch when the schema contains any test() functions
+          that could throw non-ValidationError exceptions:
+
+            try {
+              const valid = await schema.isValid(data);
+              if (!valid) {
+                // Validation failed (ValidationError was caught internally)
+                return res.status(400).json({ error: 'Invalid data' });
+              }
+              // data is valid
+            } catch (error) {
+              // Non-ValidationError from a test() function (DB error, network error, etc.)
+              console.error('Validation service error:', error);
+              return res.status(500).json({ error: 'Validation service unavailable' });
+            }
+
+          If you want guaranteed no-throw behavior, use:
+            const valid = await schema.isValid(data).catch(() => false);
+          BUT: this silently treats all errors (including infrastructure outages) as
+          validation failures — use with caution.
+
+          Best practice: use validate() instead of isValid() in server-side code so
+          validation errors are explicit and infrastructure errors are not swallowed.
+        sources:
+          - "https://github.com/jquense/yup"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: cast
+    import_path: "yup"
+    description: >
+      Synchronously coerces a value to match the schema type. Useful for transforming
+      incoming API data before validation. For example, number().cast('42') returns 42.
+      By default (assert: true), throws TypeError when the cast result does not satisfy
+      the schema type. Failed casts with assert: false return null/undefined instead of
+      throwing. Often used in SaaS apps to normalize user input or API response data
+      before database insertion.
+    postconditions:
+      # Evidence: node_modules/yup/index.js lines 757-772:
+      #   cast(value, options = {}) {
+      #     ...
+      #     let result = resolvedSchema._cast(value, options);
+      #     if (options.assert !== false && !resolvedSchema.isType(result)) {
+      #       ...
+      #       throw new TypeError(`The value of ${options.path || 'field'} could not be cast
+      #         to a value that satisfies the schema type: "${resolvedSchema.type}".`);
+      #     }
+      #     return result;
+      #   }
+      # Confirmed: TypeError thrown when cast result fails type check with default assert:true.
+      # Evidence from README.md (cast options): assert?: boolean = true (default)
+      # "Throws a TypeError if casting doesn't produce a valid type"
+      - id: cast-type-error
+        condition: >
+          cast() is called without a try-catch, assert is not set to false, and the
+          input value cannot be coerced to the schema's expected type. This occurs when:
+          (a) A string that is not a valid number is cast to number() schema:
+              number().cast('not-a-number')  → throws TypeError (NaN is not type 'number')
+          (b) An object with missing required structure is cast to object() schema
+              with strict transforms.
+          (c) External API data with wrong types is cast to a strict schema.
+          Note: number().cast('123') succeeds (returns 123). number().cast('abc') throws.
+          date().cast('not-a-date') throws. object().cast('{"a":1}') may succeed via JSON.
+        throws: >
+          TypeError with message: "The value of <path> could not be cast to a value that
+          satisfies the schema type: \"<type>\". attempted value: <value>"
+          This is a plain TypeError (not a ValidationError). It is thrown synchronously.
+          Confirmed from node_modules/yup/index.js line 772.
+          Note: cast() errors are TypeErrors, not ValidationErrors. Catch blocks that only
+          handle yup.ValidationError will NOT catch cast errors.
+        required_handling: >
+          Wrap cast() in a try-catch when input may not be safely castable:
+
+            try {
+              const parsed = schema.cast(rawInput);
+              return { success: true, value: parsed };
+            } catch (error) {
+              if (error instanceof TypeError) {
+                // Cast failed — input type is fundamentally incompatible with schema
+                console.error('Type cast failed:', error.message);
+                return { success: false, error: 'Invalid data type' };
+              }
+              throw error;
+            }
+
+          Alternatively, use assert: false to return null/undefined on failure:
+            const result = schema.cast(value, { assert: false });
+            if (result == null) {
+              // Cast failed — handle gracefully
+            }
+
+          Or use validate() instead — it runs the cast AND reports why it failed via
+          ValidationError with a user-readable message.
+        sources:
+          - "https://github.com/jquense/yup"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/yup/index.js line 386:
+      # throw new Error(`Validation test of type: "${ctx.type}" returned a Promise during a
+      # synchronous validate. This test will finish after the validate call has returned`)
+      # cast() internally calls _validate in sync mode — same async-test detection applies.
+      # However, cast() does NOT run tests (assertions) — it only runs transforms.
+      # Tests are run by validate(). cast() only throws TypeError on type mismatch.
+      # This postcondition is for the abortEarly behavior and transform-throws.
+      - id: cast-transform-throws
+        condition: >
+          cast() is called and a custom transform() function throws an uncaught error.
+          While rare, custom transforms registered via schema.transform((value, original) => ...)
+          can throw if they encounter unexpected input. This propagates synchronously from
+          cast() without being converted to ValidationError.
+          Also: ObjectSchema.cast() recursively casts nested fields — if any nested field's
+          cast throws, it propagates up from the parent schema's cast().
+        throws: >
+          Whatever the transform() function throws — typically TypeError or plain Error.
+          Not a ValidationError. Propagates synchronously from the cast() call.
+        required_handling: >
+          Ensure custom transform() functions handle all edge cases and do not throw.
+          For defensive coding:
+            try {
+              const result = schema.cast(value);
+            } catch (error) {
+              // Handle both TypeError (type check failure) and custom transform errors
+              console.error('Cast failed:', error.message);
+            }
+        sources:
+          - "https://github.com/jquense/yup"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+notes:
+  - "yup v1.x changes: reach() now returns a schema (not a reference) for nested paths"
+  - "validate() and isValid() both support async test() functions. validateSync/isValidSync do not."
+  - "ValidationError.errors[] contains all failed validation messages (abortEarly:false)"
+  - "ValidationError.inner[] contains individual errors for nested fields"
+  - "cast() only runs transforms, not test() validators. validate() runs both."
+  - "isValid() catches ValidationError internally (returns false), but re-throws non-ValidationError from test() functions"
+  - "cast() throws TypeError (not ValidationError) when the cast result is the wrong type"
+  - "isValidSync() has same re-throw behavior as isValid() — non-ValidationError from test() propagates"
+  - "analyzer_limitation: yup schema instances (string(), object(), etc.) are created by factory functions — the analyzer cannot track method calls on these instances without factory-method tracking"
+  - "Intentionally omitted: isValidSync() (sync equivalent of isValid, same caveat applies), reach() (sync utility)"
 
 # Category: validation
 # npm: https://www.npmjs.com/package/yup

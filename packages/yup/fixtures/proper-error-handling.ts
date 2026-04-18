@@ -182,35 +182,49 @@ async function nestedValidation(data: unknown) {
 }
 
 /**
- * ✅ PROPER: Using isValid (safe method, no try-catch needed)
+ * ✅ PROPER: Using isValid with try-catch
+ * Note: isValid() is NOT fully safe — if a custom test() function throws a
+ * non-ValidationError exception (e.g., DB error, network error), isValid()
+ * re-throws it. Always use try-catch when the schema has async test() functions.
  */
 async function checkIfValid(data: unknown) {
-  // isValid returns boolean, doesn't throw
-  const valid = await userSchema.isValid(data);
-
-  if (!valid) {
-    console.log('Data is invalid');
-    return false;
+  // isValid catches ValidationError (returns false) but re-throws non-ValidationError
+  // from async test() functions. Use try-catch when schema has async tests.
+  try {
+    const valid = await userSchema.isValid(data);
+    if (!valid) {
+      console.log('Data is invalid');
+      return false;
+    }
+    console.log('Data is valid');
+    return true;
+  } catch (error) {
+    // Non-ValidationError from async test() function (e.g., DB error, network error)
+    console.error('Validation service error:', error);
+    throw error;
   }
-
-  console.log('Data is valid');
-  return true;
 }
 
 /**
- * ✅ PROPER: Using isValidSync (safe method, no try-catch needed)
+ * ✅ PROPER: Using isValidSync with try-catch
+ * Note: isValidSync() has the same re-throw behavior as isValid() — non-ValidationError
+ * from test() functions will propagate.
  */
 function checkIfValidSync(data: unknown) {
-  // isValidSync returns boolean, doesn't throw
-  const valid = userSchema.isValidSync(data);
-
-  if (!valid) {
-    console.log('Data is invalid (sync)');
-    return false;
+  // isValidSync catches ValidationError (returns false) but re-throws non-ValidationError
+  try {
+    const valid = userSchema.isValidSync(data);
+    if (!valid) {
+      console.log('Data is invalid (sync)');
+      return false;
+    }
+    console.log('Data is valid (sync)');
+    return true;
+  } catch (error) {
+    // Non-ValidationError from test() function
+    console.error('Validation error:', error);
+    throw error;
   }
-
-  console.log('Data is valid (sync)');
-  return true;
 }
 
 /**
