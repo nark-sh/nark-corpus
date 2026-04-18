@@ -393,9 +393,7 @@ export async function detachPaymentMethodWithCatch(pmId: string) {
 // @expect-violation: construct-event-async-signature-failed
 // @expect-violation: construct-event-async-timestamp-tolerance
 export async function constructEventAsyncNoCatch(payload: string, sig: string, secret: string) {
-  // FUTURE_SHOULD_FIRE: construct-event-async-signature-failed — async webhook verification
-  // throws StripeSignatureVerificationError, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-1)
+  // SHOULD_FIRE: construct-event-async-signature-failed — async webhook verification throws StripeSignatureVerificationError no try-catch
   const event = await stripe.webhooks.constructEventAsync(payload, sig, secret);
   return event;
 }
@@ -420,9 +418,7 @@ export async function constructEventAsyncWithCatch(payload: string, sig: string,
 // @expect-violation: finalize-no-payment-method-types
 // @expect-violation: finalize-invoice-not-editable
 export async function finalizeInvoiceNoCatch(invoiceId: string) {
-  // FUTURE_SHOULD_FIRE: finalize-no-payment-method-types — stripe.invoices.finalizeInvoice throws
-  // when customer has no payment method, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-2)
+  // SHOULD_FIRE: finalize-no-payment-method-types — stripe.invoices.finalizeInvoice throws when customer has no payment method no try-catch
   const invoice = await stripe.invoices.finalizeInvoice(invoiceId);
   return invoice;
 }
@@ -450,9 +446,7 @@ export async function finalizeInvoiceWithCatch(invoiceId: string) {
 // @expect-violation: pay-card-declined
 // @expect-violation: pay-invoice-not-payable
 export async function payInvoiceNoCatch(invoiceId: string) {
-  // FUTURE_SHOULD_FIRE: pay-requires-action — stripe.invoices.pay throws when 3DS required,
-  // no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-3)
+  // SHOULD_FIRE: pay-requires-action — stripe.invoices.pay throws when 3DS required no try-catch
   const invoice = await stripe.invoices.pay(invoiceId);
   return invoice;
 }
@@ -481,8 +475,7 @@ export async function payInvoiceWithCatch(invoiceId: string) {
 // @expect-violation: send-invoice-not-open
 // @expect-violation: send-invoice-invalid-email
 export async function sendInvoiceNoCatch(invoiceId: string) {
-  // FUTURE_SHOULD_FIRE: send-invoice-not-open — stripe.invoices.sendInvoice throws on non-open invoice
-  // (detection rule queued as concern-20260418-stripe-deepen-4)
+  // SHOULD_FIRE: send-invoice-not-open — stripe.invoices.sendInvoice throws on non-open invoice no try-catch
   const invoice = await stripe.invoices.sendInvoice(invoiceId);
   return invoice;
 }
@@ -508,9 +501,7 @@ export async function sendInvoiceWithCatch(invoiceId: string) {
 // @expect-violation: void-invoice-invalid-state
 // @expect-violation: void-invoice-rate-limit
 export async function voidInvoiceNoCatch(invoiceId: string) {
-  // FUTURE_SHOULD_FIRE: void-invoice-invalid-state — stripe.invoices.voidInvoice throws on
-  // non-open/non-uncollectible invoice, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-5)
+  // SHOULD_FIRE: void-invoice-invalid-state — stripe.invoices.voidInvoice throws on non-open invoice no try-catch
   const invoice = await stripe.invoices.voidInvoice(invoiceId);
   return invoice;
 }
@@ -535,9 +526,7 @@ export async function voidInvoiceWithCatch(invoiceId: string) {
 
 // @expect-violation: mark-uncollectible-invalid-state
 export async function markUncollectibleNoCatch(invoiceId: string) {
-  // FUTURE_SHOULD_FIRE: mark-uncollectible-invalid-state — stripe.invoices.markUncollectible
-  // throws on non-open invoice, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-6)
+  // SHOULD_FIRE: mark-uncollectible-invalid-state — stripe.invoices.markUncollectible throws on non-open invoice no try-catch
   const invoice = await stripe.invoices.markUncollectible(invoiceId);
   return invoice;
 }
@@ -563,9 +552,7 @@ export async function markUncollectibleWithCatch(invoiceId: string) {
 // @expect-violation: resume-invalid-state
 // @expect-violation: resume-payment-required
 export async function resumeSubscriptionNoCatch(subId: string) {
-  // FUTURE_SHOULD_FIRE: resume-invalid-state — stripe.subscriptions.resume throws when
-  // subscription is not paused, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-7)
+  // SHOULD_FIRE: resume-invalid-state — stripe.subscriptions.resume throws when subscription is not paused no try-catch
   const sub = await stripe.subscriptions.resume(subId);
   return sub;
 }
@@ -596,9 +583,7 @@ export async function resumeSubscriptionWithCatch(subId: string) {
 // @expect-violation: increment-authorization-card-declined
 // @expect-violation: increment-authorization-invalid-state
 export async function incrementAuthorizationNoCatch(piId: string, amount: number) {
-  // FUTURE_SHOULD_FIRE: increment-authorization-card-declined — stripe.paymentIntents.incrementAuthorization
-  // throws StripeCardError on issuer decline, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-8)
+  // SHOULD_FIRE: increment-authorization-card-declined — stripe.paymentIntents.incrementAuthorization throws StripeCardError no try-catch
   const pi = await stripe.paymentIntents.incrementAuthorization(piId, { amount });
   return pi;
 }
@@ -627,9 +612,7 @@ export async function incrementAuthorizationWithCatch(piId: string, amount: numb
 // @expect-violation: verify-microdeposits-attempts-exceeded
 // @expect-violation: verify-microdeposits-timeout
 export async function verifyMicrodepositsNoCatch(piId: string, amounts: number[]) {
-  // FUTURE_SHOULD_FIRE: verify-microdeposits-amounts-mismatch — stripe.paymentIntents.verifyMicrodeposits
-  // throws when amounts don't match, no try-catch
-  // (detection rule queued as concern-20260418-stripe-deepen-9)
+  // SHOULD_FIRE: verify-microdeposits-amounts-mismatch — stripe.paymentIntents.verifyMicrodeposits throws when amounts don't match no try-catch
   const pi = await stripe.paymentIntents.verifyMicrodeposits(piId, { amounts });
   return pi;
 }

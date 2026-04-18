@@ -1,10 +1,23 @@
 package: typescript
 semver: ">=4.0.0 <6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.70
+# Depth pass 2026-04-18 (deepen-stream-1 pass 8):
+# API surface: ~20 callable Compiler API functions with distinct behavioral contracts
+# Contracted before: 5 (sys.readFile, sys.readDirectory, sys.writeFile, createProgram, createCompilerHost)
+# Contracted after: 14 (+9 new: transpileModule, program.emit, program.getSemanticDiagnostics,
+#   readConfigFile, parseJsonConfigFileContent, createSourceFile,
+#   LanguageService.getSyntacticDiagnostics, LanguageService.getSemanticDiagnostics, getPreEmitDiagnostics)
+# Intentionally omitted: 6 (createWatchProgram, createWatchCompilerHost, parseCommandLine,
+#   tokenToString, textSpan* utilities, sys.createDirectory — niche/utility with no unique error contract)
+# Coverage: 14/20 = 0.70
+# Evidence sources confirmed from:
+#   node_modules/typescript/lib/typescript.js — throw sites and implementation
+#   https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
 
 functions:
   - name: readFile
@@ -235,6 +248,55 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: node_modules/typescript/lib/typescript.js line 126937-126943
+      # createProgram iterates commandLineOptionOfCustomType and checks if any option
+      # is a string (meaning it was not parsed from JSON into the enum value):
+      #   throw new Error(`${option.name} is a string value; tsconfig JSON must be parsed
+      #     with parseJsonSourceFileConfigFileContent or getParsedCommandLineOfConfigFile
+      #     before passing to createProgram`)
+      # This is a REAL THROW — not a diagnostic. Occurs when raw tsconfig JSON is passed.
+      - id: create-program-string-option-throws
+        condition: >
+          A compiler option that requires an enum value (e.g., target, module, moduleResolution,
+          jsx, lib) is passed as a raw string (e.g., "ES2020") instead of the TypeScript enum
+          value (e.g., ts.ScriptTarget.ES2020). This occurs when tsconfig JSON is passed
+          directly to createProgram without parsing via parseJsonConfigFileContent first.
+        throws: "Error: '<optionName> is a string value; tsconfig JSON must be parsed with parseJsonSourceFileConfigFileContent or getParsedCommandLineOfConfigFile before passing to createProgram'"
+        required_handling: >
+          Always parse tsconfig JSON before passing to createProgram:
+
+            import * as ts from 'typescript';
+            import * as path from 'path';
+
+            // WRONG — passing raw JSON with string "target" value throws
+            const rawConfig = { compilerOptions: { target: 'ES2020', module: 'CommonJS' } };
+            ts.createProgram(files, rawConfig.compilerOptions);  // THROWS!
+
+            // CORRECT — parse through parseJsonConfigFileContent first
+            const configPath = ts.findConfigFile('./', ts.sys.fileExists, 'tsconfig.json');
+            const { config } = ts.readConfigFile(configPath!, ts.sys.readFile);
+            const { options, fileNames } = ts.parseJsonConfigFileContent(
+              config, ts.sys, path.dirname(configPath!)
+            );
+            const program = ts.createProgram(fileNames, options);  // options has enum values
+
+          Alternatively, use enum values directly:
+            ts.createProgram(files, {
+              target: ts.ScriptTarget.ES2020,   // enum value, not string
+              module: ts.ModuleKind.CommonJS,   // enum value, not string
+            });
+
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
       - id: invalid-compiler-options
         condition: "compiler options are invalid or incompatible"
         throws: "May throw Error or return program with diagnostics"
@@ -315,3 +377,656 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: transpileModule
+    import_path: "typescript"
+    description: >
+      Transpiles a single TypeScript source string to JavaScript. Does NOT perform type checking —
+      it only performs syntactic transformations. Returns a TranspileOutput with outputText,
+      diagnostics, and optionally sourceMapText. This is the function used by ts-jest, ts-node,
+      babel-plugin-transform-typescript, and many webpack/rollup transformers. Does NOT throw
+      for type errors (they are not checked). However, it will throw if custom transformers
+      crash or if internal invariants are violated.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 145463+ (transpileWorker)
+      # transpileModule calls transpileWorker which calls createProgram + program.emit internally
+      # Custom transformers run inside program.emit() — any uncaught throw propagates out
+      # The function uses Debug.fail("Output generation failed") if no output was produced,
+      # but this is an internal invariant and should not occur with valid input
+      # Source: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: transpile-custom-transformer-throws
+        condition: >
+          A custom transformer function (passed via transpileOptions.transformers) throws
+          an unhandled exception during node visitation. Custom transformers run inside
+          program.emit() which does not have a catch-all for transformer errors. Any
+          uncaught exception from a transformer propagates directly to the caller.
+        throws: "The error thrown by the custom transformer (type depends on transformer implementation)"
+        required_handling: >
+          Wrap ts.transpileModule() in a try-catch when using custom transformers:
+
+            import * as ts from 'typescript';
+
+            // WRONG — throws if transformer crashes (e.g., on unexpected AST node)
+            const result = ts.transpileModule(sourceCode, {
+              compilerOptions: { module: ts.ModuleKind.CommonJS },
+              transformers: { before: [myCustomTransformer] }
+            });
+
+            // CORRECT — wrap when using transformers
+            try {
+              const result = ts.transpileModule(sourceCode, {
+                compilerOptions: { module: ts.ModuleKind.CommonJS },
+                transformers: { before: [myCustomTransformer] }
+              });
+              return result.outputText;
+            } catch (error) {
+              throw new Error(`Transpilation failed: ${error.message}`);
+            }
+
+          For transformers that don't crash on valid input, the result.diagnostics array
+          always contains any syntax errors (TypeScript does not type-check during transpileModule).
+        sources:
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/transpile.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: The TypeScript Compiler API follows a "diagnostics not throws" pattern for
+      # compilation errors. transpileModule collects diagnostics but does NOT throw for type errors.
+      # Callers frequently assume that a successful return means valid code — they skip diagnostics.
+      - id: transpile-diagnostics-not-checked
+        condition: >
+          The caller does not check result.diagnostics after calling transpileModule with
+          reportDiagnostics: true. Syntax errors (not type errors) are captured in diagnostics.
+          If diagnostics are not checked, the caller emits JavaScript from invalid TypeScript
+          and the downstream runtime behavior is unpredictable.
+        returns: >
+          TranspileOutput with non-empty diagnostics array containing syntax error Diagnostics.
+          The outputText may be empty string, partial code, or JS equivalent of erroneous TS.
+        required_handling: >
+          Always check result.diagnostics when transpileModule is called with reportDiagnostics:
+
+            const result = ts.transpileModule(input, {
+              compilerOptions: options,
+              reportDiagnostics: true,
+            });
+
+            if (result.diagnostics && result.diagnostics.length > 0) {
+              const errorMessages = result.diagnostics.map(d =>
+                ts.flattenDiagnosticMessageText(d.messageText, '\n')
+              );
+              throw new Error(`Transpilation errors: ${errorMessages.join('; ')}`);
+            }
+
+            return result.outputText;
+
+          Note: transpileModule does NOT perform type checking. Only syntax errors appear in
+          diagnostics. For type safety, use createProgram + getSemanticDiagnostics.
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/transpile.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: program.emit
+    import_path: "typescript"
+    description: >
+      Emits the compiled JavaScript output for the program or a specific source file.
+      Returns an EmitResult containing emitSkipped (boolean) and diagnostics. This is
+      a fundamental API: callers that ignore emitSkipped or result.diagnostics will
+      silently ship broken JavaScript to production. Also throws OperationCanceledException
+      if the cancellation token fires during emit.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 127893
+      # program.emit calls runWithCancellationToken which re-throws OperationCanceledException
+      # See: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: emit-operation-canceled
+        condition: >
+          A CancellationToken is passed (via the cancellationToken parameter) and the token's
+          throwIfCancellationRequested() method throws OperationCanceledException during emit.
+          Typically occurs in IDE/LSP contexts where the user triggers a new compilation while
+          one is already running. In batch compilation scenarios, cancellation tokens are
+          not commonly used, so this is primarily a concern for language service integrations.
+        throws: "OperationCanceledException (ts.OperationCanceledException — a class, not extending Error)"
+        required_handling: >
+          When using a cancellation token with program.emit(), catch OperationCanceledException:
+
+            import * as ts from 'typescript';
+
+            try {
+              const emitResult = program.emit(
+                undefined, undefined, cancellationToken
+              );
+            } catch (e) {
+              if (e instanceof ts.OperationCanceledException) {
+                // User cancelled — clean up and retry or return
+                return;
+              }
+              throw e;  // Re-throw unexpected errors
+            }
+
+          Note: OperationCanceledException is NOT a subclass of Error in TypeScript's
+          implementation. Use instanceof ts.OperationCanceledException for detection.
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      # The wiki shows: "Exit code used by getEmitOutput function to indicate status"
+      # and demonstrates pattern: process.exit(emitResult.emitSkipped ? 1 : 0)
+      # emitSkipped === true means files were NOT written — callers who ignore this silently succeed
+      - id: emit-skipped-not-checked
+        condition: >
+          The caller does not check emitResult.emitSkipped after program.emit(). When compilation
+          errors prevent emit (e.g., --noEmitOnError option is set, or declaration emit fails),
+          emitSkipped is true and NO output files were written. Callers who skip this check
+          believe compilation succeeded and proceed to deploy or use the non-existent output.
+        returns: >
+          EmitResult with emitSkipped: true and non-empty diagnostics array. No output files
+          are written to disk (the writeFile callback is not invoked for the output files).
+        required_handling: >
+          Always check emitResult.emitSkipped and emitResult.diagnostics after emit:
+
+            import * as ts from 'typescript';
+
+            const emitResult = program.emit();
+
+            // Check for pre-emit errors (type errors)
+            const allDiagnostics = ts
+              .getPreEmitDiagnostics(program)
+              .concat(emitResult.diagnostics);
+
+            if (allDiagnostics.length > 0) {
+              allDiagnostics.forEach(diagnostic => {
+                if (diagnostic.file) {
+                  const { line, character } = ts.getLineAndCharacterOfPosition(
+                    diagnostic.file,
+                    diagnostic.start!
+                  );
+                  const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
+                  console.error(`${diagnostic.file.fileName} (${line + 1},${character + 1}): ${message}`);
+                } else {
+                  console.error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+                }
+              });
+            }
+
+            process.exit(emitResult.emitSkipped ? 1 : 0);
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: program.getSemanticDiagnostics
+    import_path: "typescript"
+    description: >
+      Returns semantic (type-checking) diagnostics for the program or a specific source file.
+      This is a pure read operation that does NOT emit files. Returns a readonly Diagnostic array.
+      Throws OperationCanceledException if a cancellation token fires during type checking.
+      The first call initializes the type checker, which can be expensive on large codebases.
+      Callers who fail to iterate the returned array assume no type errors exist.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 6043
+      # getSemanticDiagnostics is on the Program interface; internally runs type checker
+      # which calls cancellationToken.throwIfCancellationRequested periodically
+      # Source confirmed: typescript.js line 55832-55833
+      - id: get-semantic-diagnostics-canceled
+        condition: >
+          A cancellation token is in effect (passed to createProgram or via the compiler host)
+          and throwIfCancellationRequested() fires during the type-checking pass.
+          This is the same cancellation mechanism as program.emit().
+        throws: "OperationCanceledException (ts.OperationCanceledException)"
+        required_handling: >
+          Wrap getSemanticDiagnostics in try-catch when operating in cancellable contexts:
+
+            try {
+              const diagnostics = program.getSemanticDiagnostics();
+              // process diagnostics...
+            } catch (e) {
+              if (e instanceof ts.OperationCanceledException) {
+                return; // Type-checking was cancelled; retry or abort
+              }
+              throw e;
+            }
+
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: Callers frequently call getSemanticDiagnostics() and then call program.emit()
+      # without checking if there ARE any diagnostics, leading to emitting broken code.
+      # The wiki clearly shows this pattern must be checked.
+      - id: semantic-diagnostics-not-checked-before-emit
+        condition: >
+          The caller calls program.emit() without first checking getSemanticDiagnostics() (or
+          getPreEmitDiagnostics()) for errors. When type errors exist, emit may still proceed
+          (unless noEmitOnError: true), producing JavaScript that encodes the broken TypeScript
+          — typically with type assertions cast away, undefined references, or missing members.
+        returns: >
+          Readonly Diagnostic[] with length > 0. If unchecked, program.emit() may still
+          run and produce malformed or incorrect JavaScript files.
+        required_handling: >
+          Call getPreEmitDiagnostics (which combines syntactic + semantic) before emitting:
+
+            const diagnostics = ts.getPreEmitDiagnostics(program);
+            if (diagnostics.length > 0) {
+              // Handle type errors before emitting
+              diagnostics.forEach(d => console.error(ts.flattenDiagnosticMessageText(d.messageText, '\n')));
+              process.exit(1);
+            }
+            program.emit();
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: readConfigFile
+    import_path: "typescript"
+    description: >
+      Reads a tsconfig.json file using the provided readFile function and parses its contents.
+      Returns {config?: any, error?: Diagnostic} — NOT a throw-based API. The error property
+      is set when the file cannot be read (the readFile callback returns undefined or throws)
+      OR when the JSON is malformed. Callers who check only for a truthy config and ignore
+      the error property silently operate with incorrect/empty compiler options.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 42489-42492
+      # readConfigFile = tryReadFile → parseConfigFileTextToJson → {config, error}
+      # tryReadFile catches exceptions from readFile and returns a Diagnostic (not throw)
+      # The error property is a ts.Diagnostic object with messageText field
+      # Source: typescript.js line 42509-42521 (tryReadFile)
+      - id: readconfigfile-error-not-checked
+        condition: >
+          The caller reads result.config without checking result.error first. When the tsconfig
+          file cannot be read (ENOENT, EACCES, readFile returns undefined) or contains
+          malformed JSON, result.error is set and result.config is {} (empty object).
+          Using {} as compiler options silently disables all project-specific compiler settings.
+        returns: >
+          { config: {}, error: Diagnostic } where error.messageText describes the failure.
+          In Node.js, pass ts.sys.readFile as the readFile argument.
+        required_handling: >
+          Always check result.error before using result.config:
+
+            import * as ts from 'typescript';
+
+            const configPath = ts.findConfigFile('./', ts.sys.fileExists, 'tsconfig.json');
+            if (!configPath) {
+              throw new Error('Could not find tsconfig.json');
+            }
+
+            const { config, error } = ts.readConfigFile(configPath, ts.sys.readFile);
+
+            // MUST check error — result.config is {} on failure, not undefined
+            if (error) {
+              const message = ts.flattenDiagnosticMessageText(error.messageText, '\n');
+              throw new Error(`Failed to read tsconfig.json: ${message}`);
+            }
+
+            const { options, fileNames, errors: parseErrors } = ts.parseJsonConfigFileContent(
+              config, ts.sys, path.dirname(configPath)
+            );
+            if (parseErrors.length > 0) {
+              parseErrors.forEach(e => console.error(ts.flattenDiagnosticMessageText(e.messageText, '\n')));
+            }
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: parseJsonConfigFileContent
+    import_path: "typescript"
+    description: >
+      Parses the content of a tsconfig.json object into CompilerOptions, file names, and
+      project references. Returns ParsedCommandLine with options, fileNames, errors[],
+      and projectReferences. Does NOT throw — all issues are returned in the errors array.
+      Callers who ignore errors[] may use invalid compiler options that cause silent
+      miscompilations or unexpected behavior.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 9257 (type declaration)
+      # parseJsonConfigFileContent returns errors in ParsedCommandLine.errors
+      # Common mistakes: invalid target, unknown options, conflicting settings
+      # Source: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: parsejson-errors-not-checked
+        condition: >
+          The caller uses result.options and result.fileNames without checking result.errors.
+          When the tsconfig JSON contains invalid option values (e.g., unknown "target" value,
+          conflicting "module" and "moduleResolution" settings, invalid "paths" entries),
+          errors are populated but options may be partial or have default values applied.
+        returns: >
+          ParsedCommandLine with non-empty errors[] array. The options object may be partially
+          populated — some valid options are applied while invalid ones are skipped.
+        required_handling: >
+          Always check result.errors after parseJsonConfigFileContent:
+
+            const result = ts.parseJsonConfigFileContent(
+              config, ts.sys, path.dirname(configPath)
+            );
+
+            if (result.errors.length > 0) {
+              result.errors.forEach(e => {
+                console.error(ts.flattenDiagnosticMessageText(e.messageText, '\n'));
+              });
+              throw new Error('tsconfig.json has invalid options');
+            }
+
+            // Safe to use result.options and result.fileNames
+            const program = ts.createProgram(result.fileNames, result.options);
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: createSourceFile
+    import_path: "typescript"
+    description: >
+      Parses a TypeScript source string into a SourceFile AST. Does NOT throw for syntax errors
+      in the source text — syntax errors are embedded in the returned SourceFile as
+      parseDiagnostics. Throws for internal TypeScript invariant violations only (rare).
+      Used in tools that inspect or transform TypeScript ASTs. Callers who skip
+      sourceFile.parseDiagnostics silently work with a broken AST.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js — createSourceFile returns
+      # a SourceFile object with parseDiagnostics for syntax errors (no throw for syntax errors)
+      # The function creates an AST even for syntactically invalid code (error recovery)
+      # Source: typescript.d.ts line 9192
+      - id: createsourcefile-parse-errors-not-checked
+        condition: >
+          The caller does not check sourceFile.parseDiagnostics (or equivalent getSyntacticDiagnostics)
+          for syntax errors after calling createSourceFile. TypeScript's parser uses error recovery
+          to produce an AST even for syntactically invalid code. Downstream tools that transform
+          this AST may produce incorrect output or crash on unexpected node shapes.
+        returns: >
+          SourceFile with non-empty parseDiagnostics array. The AST is partially valid —
+          error-recovery nodes may be present with unexpected types or missing children.
+        required_handling: >
+          Check parseDiagnostics before operating on the AST:
+
+            import * as ts from 'typescript';
+
+            const sourceFile = ts.createSourceFile(
+              'input.ts',
+              sourceText,
+              ts.ScriptTarget.Latest,
+              /*setParentNodes*/ true  // Set true if you need node.parent
+            );
+
+            // Check for syntax errors before transforming
+            if (sourceFile.parseDiagnostics && sourceFile.parseDiagnostics.length > 0) {
+              const errors = sourceFile.parseDiagnostics.map(d =>
+                ts.flattenDiagnosticMessageText(d.messageText, '\n')
+              );
+              throw new Error(`Syntax errors in input: ${errors.join('; ')}`);
+            }
+
+            // Safe to traverse or transform sourceFile.statements
+
+          Note: parseDiagnostics is a TypeScript internal field. Use a program and
+          program.getSyntacticDiagnostics(sourceFile) for the public diagnostic API.
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/parser.ts"
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: LanguageService.getSyntacticDiagnostics
+    import_path: "typescript"
+    description: >
+      Returns syntactic (parse) errors for a specific file in the language service.
+      THROWS Error("Could not find source file: '<fileName>'") if the fileName is not
+      registered in the LanguageServiceHost's getScriptFileNames(). This is a critical
+      difference from program.getSyntacticDiagnostics() — the LanguageService version throws
+      rather than returning an empty array for unknown files.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 152746-152752
+      # function getValidSourceFile(fileName) {
+      #   const sourceFile = program.getSourceFile(fileName);
+      #   if (!sourceFile) {
+      #     const error = new Error(`Could not find source file: '${fileName}'.`);
+      #     error.ProgramFiles = program.getSourceFiles().map((f) => f.fileName);
+      #     throw error;
+      #   }
+      #   return sourceFile;
+      # }
+      # Line 153009: getSyntacticDiagnostics calls getValidSourceFile(fileName)
+      - id: language-service-file-not-found-throws
+        condition: >
+          The fileName passed to LanguageService.getSyntacticDiagnostics() is not present
+          in the LanguageServiceHost's getScriptFileNames() return value. Common causes:
+          - A new file was added to the project but the host was not updated
+          - The fileName uses a different path separator (/ vs \) than what the host returns
+          - The fileName is an absolute path but the host returns relative paths (or vice versa)
+          - The file was removed from the project but the caller still references it
+        throws: "Error: Could not find source file: '<fileName>' (has error.ProgramFiles listing known files)"
+        required_handling: >
+          Validate that the fileName is registered before calling LanguageService methods:
+
+            import * as ts from 'typescript';
+
+            // WRONG — throws if fileName not in host's file list
+            const diagnostics = languageService.getSyntacticDiagnostics(fileName);
+
+            // CORRECT — check the host's program first
+            const program = languageService.getProgram();
+            if (!program || !program.getSourceFile(fileName)) {
+              // File is not in the project — update the host or skip
+              return [];
+            }
+            const diagnostics = languageService.getSyntacticDiagnostics(fileName);
+
+          The error object has a ProgramFiles property listing all currently registered
+          files — useful for debugging path mismatches.
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/services/services.ts#L752"
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: LanguageService.getSemanticDiagnostics
+    import_path: "typescript"
+    description: >
+      Returns semantic (type-checking) errors for a specific file. Like getSyntacticDiagnostics,
+      THROWS Error("Could not find source file") for unknown files. Additionally, may throw
+      OperationCanceledException if the host provides a cancellation token. The first call
+      to getSemanticDiagnostics initializes the full type checker — can be slow on large projects.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.js line 153013-153023
+      # getSemanticDiagnostics calls getValidSourceFile(fileName) which throws for unknown files
+      # Source confirmed from same getValidSourceFile function at line 152746
+      - id: language-service-semantic-file-not-found-throws
+        condition: >
+          The fileName passed to LanguageService.getSemanticDiagnostics() is not in the
+          LanguageServiceHost's file list. Same causes as getSyntacticDiagnostics —
+          file not registered, path separator mismatch, or stale reference after file removal.
+        throws: "Error: Could not find source file: '<fileName>'"
+        required_handling: >
+          Same pattern as getSyntacticDiagnostics — validate file presence before calling:
+
+            const program = languageService.getProgram();
+            if (!program || !program.getSourceFile(fileName)) {
+              return [];
+            }
+            const semanticErrors = languageService.getSemanticDiagnostics(fileName);
+
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/services/services.ts"
+          - "https://github.com/microsoft/TypeScript-wiki/blob/main/Using-the-Compiler-API.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: getPreEmitDiagnostics
+    import_path: "typescript"
+    description: >
+      Convenience function that retrieves all diagnostics that would prevent successful emit:
+      syntactic diagnostics + global diagnostics + semantic diagnostics + declaration diagnostics.
+      Returns a readonly Diagnostic[]. Throws OperationCanceledException if the cancellation
+      token fires during the semantic analysis pass. This is the recommended function to call
+      before program.emit() to catch all compilation errors at once.
+    postconditions:
+      # Evidence: node_modules/typescript/lib/typescript.d.ts line 9520
+      # getPreEmitDiagnostics(program, sourceFile?, cancellationToken?)
+      # Internally calls getSemanticDiagnostics which uses runWithCancellationToken
+      # Source: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: preemit-diagnostics-operation-canceled
+        condition: >
+          A cancellation token is provided (third argument) and throwIfCancellationRequested()
+          fires during the semantic analysis pass. This is the same cancellation mechanism
+          as program.getSemanticDiagnostics(). In IDE/LSP integrations, a new edit may cancel
+          an in-progress diagnostic collection.
+        throws: "OperationCanceledException (ts.OperationCanceledException)"
+        required_handling: >
+          Wrap in try-catch when passing a cancellation token:
+
+            try {
+              const allDiagnostics = ts.getPreEmitDiagnostics(program, undefined, cancellationToken);
+              if (allDiagnostics.length > 0) {
+                // handle errors
+              }
+              program.emit(undefined, undefined, cancellationToken);
+            } catch (e) {
+              if (e instanceof ts.OperationCanceledException) {
+                // Retry on next opportunity
+                return;
+              }
+              throw e;
+            }
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: The most common mistake in the TypeScript Compiler API is emitting
+      # without checking pre-emit diagnostics. The wiki explicitly shows this pattern.
+      # Source: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: preemit-diagnostics-not-called-before-emit
+        condition: >
+          The caller calls program.emit() without calling ts.getPreEmitDiagnostics() first.
+          When type errors exist, emit may still succeed (produces JavaScript from broken
+          TypeScript) unless noEmitOnError: true is set. The result is JavaScript that
+          crashes at runtime with undefined references, wrong types, or missing properties.
+        returns: >
+          getPreEmitDiagnostics returns non-empty Diagnostic[] that was never checked.
+          program.emit() proceeds to write incorrect JavaScript files.
+        required_handling: >
+          The canonical TypeScript Compiler API pattern requires checking pre-emit diagnostics:
+
+            const program = ts.createProgram(fileNames, options);
+
+            // REQUIRED: Check diagnostics before emit
+            const preEmitDiagnostics = ts.getPreEmitDiagnostics(program);
+
+            if (preEmitDiagnostics.length > 0) {
+              preEmitDiagnostics.forEach(diagnostic => {
+                if (diagnostic.file) {
+                  const { line, character } = ts.getLineAndCharacterOfPosition(
+                    diagnostic.file, diagnostic.start!
+                  );
+                  console.error(
+                    `${diagnostic.file.fileName}(${line + 1},${character + 1}):`,
+                    ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')
+                  );
+                } else {
+                  console.error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+                }
+              });
+              process.exit(1);  // Do not emit when there are errors
+            }
+
+            const emitResult = program.emit();
+            process.exit(emitResult.emitSkipped ? 1 : 0);
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
