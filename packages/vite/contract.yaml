@@ -1,10 +1,27 @@
 package: vite
-semver: ">=5.0.0 <8.0.0"
-contract_version: "1.0.0"
+semver: ">=5.0.0 <9.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 10 contracted / 10 async-callable non-omitted functions
+# Depth pass 2026-04-18 (deepen-stream-1 pass 7):
+# API surface (vite@8.x): 10 public async-callable functions + 8 internal methods
+# Contracted before: 3 (build, createServer, preview)
+# Contracted after: 10 (+7: server.listen, server.close, server.restart,
+#   resolveConfig, loadConfigFromFile, createBuilder, transformWithOxc)
+# Intentionally omitted: optimizeDeps (deprecated — now warns + auto-runs),
+#   transformWithEsbuild (deprecated — requires esbuild separately),
+#   preprocessCSS (internal CSS pipeline, no user-facing error contract),
+#   runnerImport (internal config loading utility),
+#   formatPostcssSourceMap (pure data transformation — no error contract),
+#   server.transformRequest/transformIndexHtml/warmupRequest/reloadModule/
+#   waitForRequestsIdle/fetchModule (internal dev-server plumbing — not for direct use)
+# Evidence confirmed from:
+#   node_modules/vite/dist/node/chunks/node.js (source lines 10658-10663, 26150, 26299,
+#   34203, 34494, 34513, 2677, 3720-3800, 19556, 19709, 26003-26004, 26156)
+#   https://vite.dev/guide/api-javascript (API signatures confirmed)
 
 functions:
   - name: build
@@ -188,3 +205,390 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: server.listen
+    import_path: "vite"
+    description: >
+      Starts the Vite dev server HTTP listener on the configured port. Returns a
+      Promise<ViteDevServer>. Must be called after createServer() to actually bind
+      the port. Cannot be called in middleware mode (when server.middlewareMode is true).
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 26299, 10658-10663
+      # Confirmed: "Cannot call server.listen in middleware mode." thrown at line 26299
+      # Confirmed: Port already in use throws "Port N is already in use" at line 10660
+      - id: server-listen-middleware-mode-forbidden
+        condition: "server.middlewareMode is true (Vite is used as middleware in another HTTP framework)"
+        throws: >
+          Error: "Cannot call server.listen in middleware mode."
+          The underlying httpServer is null in middleware mode, so listen() always throws.
+        required_handling: >
+          Caller MUST check server.config.server.middlewareMode before calling listen().
+          In middleware mode, the parent framework (Express, Fastify, etc.) controls the
+          server lifecycle — do NOT call server.listen() at all. The Vite dev server
+          integrates via server.middlewares (a connect app).
+        sources:
+          - "https://vite.dev/guide/api-javascript#createserver"
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: server-listen-port-conflict
+        condition: "configured port is already in use by another process AND server.strictPort is true"
+        throws: >
+          Error: "Port N is already in use" — thrown by httpServerStart() when
+          strictPort is true and the port cannot be bound.
+          When strictPort is false (default), Vite auto-increments the port up to 65535
+          before throwing "No available ports found between M and 65535".
+        required_handling: >
+          Caller MUST wrap server.listen() in try/catch. If port conflicts are expected
+          (e.g., multiple dev servers), set strictPort: false (the default) and check
+          server.resolvedUrls after listen() returns to get the actual port used.
+          Caller MUST also call server.close() in a finally block or process signal handler
+          to free resources on any failure.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/index.ts"
+          - "https://vite.dev/config/server-options#server-strictport"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: server.close
+    import_path: "vite"
+    description: >
+      Closes the Vite dev server, releasing the HTTP port, stopping file watchers,
+      terminating WebSocket connections, and cleaning up plugin resources. Returns
+      Promise<void>. Idempotent — calling close() multiple times is safe (reuses the
+      same promise from the first call).
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js line 26144-26147
+      # closeServerPromise guards against double-close
+      # ViteDevServer processes SIGTERM/SIGINT automatically when not in middleware mode
+      - id: server-close-not-awaited
+        condition: >
+          server.close() is called but the returned Promise is not awaited before
+          process exit (e.g., in a fire-and-forget call)
+        throws: >
+          Does not throw, but: if close() completes after process.exit() is called,
+          file watchers and WebSocket connections may not be properly terminated,
+          causing port occupation on next start and orphaned chokidar processes.
+        required_handling: >
+          Caller MUST await server.close() before allowing the process to exit.
+          The correct pattern is:
+            process.on('SIGTERM', async () => { await server.close(); process.exit(0); });
+          Note: when NOT in middleware mode, Vite automatically registers SIGTERM/SIGINT
+          handlers that call server.close(). In middleware mode, callers are responsible
+          for calling server.close() themselves.
+        sources:
+          - "https://vite.dev/guide/api-javascript#createserver"
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: server.restart
+    import_path: "vite"
+    description: >
+      Restarts the Vite dev server in-place (re-runs createServer + listen with the
+      same config). Useful for programmatic hot-reload of config changes. Async —
+      restarts can fail for any reason createServer() can fail (port conflicts,
+      plugin errors, config errors). Concurrent restart() calls are coalesced into
+      a single restart promise.
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 26156-26166
+      # restartServer() internally calls _createServer() then listen() — same failure surface
+      - id: server-restart-port-conflict
+        condition: >
+          Port is taken by a different process during the restart window (rare race condition
+          when the old server releases and the new server tries to bind)
+        throws: >
+          Error: "Port N is already in use" — propagated from the internal listen() call
+          during restart. The old server has already been closed at this point, so the
+          dev server is completely down until restart() resolves or rejects.
+        required_handling: >
+          Caller MUST wrap server.restart() in try/catch. If restart fails, the dev server
+          is in a closed state and a new createServer() + listen() sequence is required
+          to recover. Log the error and surface it to the developer immediately.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/index.ts"
+          - "https://vite.dev/guide/api-javascript#createserver"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: resolveConfig
+    import_path: "vite"
+    description: >
+      Resolves the full Vite configuration object by loading vite.config.* files,
+      merging inline config, running plugin config hooks, and normalizing all options.
+      Used internally by createServer(), build(), and preview() — but also exported for
+      tools that need to inspect resolved Vite config without starting a server.
+      Async — may reject on config file parse errors, plugin hook failures, or
+      invalid environment configurations.
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 34109-34203
+      # Specific throw at 34203: "Required environments configuration were stripped out"
+      # Delegated throw from loadConfigFromFile: "config must export or return an object"
+      # Plugin configHook can throw any error
+      - id: resolveconfig-config-hook-throws
+        condition: >
+          A vite plugin's configHook or configResolvedHook throws an error during
+          the plugin resolution phase (e.g., plugin validates config and rejects it)
+        throws: >
+          Any Error thrown by the plugin — propagated directly. Error type, message, and
+          shape depend on the plugin. Common pattern: Error with message describing
+          misconfiguration.
+        required_handling: >
+          Caller MUST wrap resolveConfig() in try/catch. For tools building on top of
+          Vite, display the plugin name (e.g., via error.plugin or by scanning the
+          error message) to help users identify which plugin caused the failure.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+          - "https://vite.dev/guide/api-javascript#resolveconfig"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: resolveconfig-environments-stripped
+        condition: >
+          A plugin's config hook removes or nullifies the required client/ssr environment
+          configurations (config.environments.client is falsy after plugin hooks run)
+        throws: >
+          Error: "Required environments configuration were stripped out in the config hook"
+          Thrown at the end of resolveConfig() as a safety check.
+        required_handling: >
+          Plugin authors MUST NOT delete config.environments.client or config.environments.ssr
+          from the resolved config. Callers of resolveConfig() who see this error should
+          audit their plugin list for plugins that mutate the environments object destructively.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: loadConfigFromFile
+    import_path: "vite"
+    description: >
+      Loads and parses a vite.config.ts/js/mjs/cjs file from disk. Bundles the config
+      file with rolldown (default), executes it in a temporary module context, and
+      returns the exported config object plus file dependency paths. Returns null if
+      no config file is found (not an error). Throws if the config file exists but
+      cannot be parsed, loaded, or does not export an object.
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 34493-34530
+      # Confirmed throws: "Unsupported configLoader" at 34494
+      # Confirmed throws: "config must export or return an object." at 34513
+      # Confirmed throws: re-throws parse/bundling errors after logging
+      - id: loadconfig-invalid-loader
+        condition: >
+          configLoader parameter is not one of 'bundle', 'runner', or 'native'
+        throws: >
+          Error: "Unsupported configLoader: X. Accepted values are 'bundle', 'runner', and 'native'."
+          Thrown synchronously before any file I/O.
+        required_handling: >
+          Callers providing a dynamic configLoader value MUST validate it against
+          ['bundle', 'runner', 'native'] before calling loadConfigFromFile(). This is
+          typically a programming error, not a runtime failure.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: loadconfig-not-an-object
+        condition: >
+          The config file's default export is not an object (e.g., exports a string,
+          number, or array instead of a config object)
+        throws: >
+          Error: "config must export or return an object."
+          Thrown after the config file is loaded and its export is evaluated.
+        required_handling: >
+          Config files MUST export a plain object or a function returning a plain object
+          (or Promise<object>). Callers of loadConfigFromFile() MUST wrap it in try/catch
+          and report the config file path to help users locate the invalid export.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+          - "https://vite.dev/guide/api-javascript#loadconfigfromfile"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: loadconfig-esm-only-dependency
+        condition: >
+          Config file uses require() to load an ESM-only package (common in .cjs config files
+          trying to import ESM-only Vite plugins)
+        throws: >
+          Error: "Failed to resolve X. This package is ESM only but it was tried to load
+          by `require`. See https://vite.dev/guide/troubleshooting.html#this-package-is-esm-only"
+          Thrown during the rolldown bundling phase of the config file.
+        required_handling: >
+          Callers MUST wrap loadConfigFromFile() in try/catch. For tooling, surface the
+          error message directly — it includes the package name and a documentation link.
+          The fix is to use .mjs or .ts config files instead of .cjs when depending on
+          ESM-only plugins.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+          - "https://vite.dev/guide/troubleshooting#this-package-is-esm-only"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: loadconfig-tsx-jiti-missing
+        condition: >
+          Config file is a TypeScript file (.ts) and neither 'tsx' nor 'jiti' is installed
+          (required for TypeScript config execution in 'runner' configLoader mode)
+        throws: >
+          Error: "'tsx' or 'jiti' is required for the TypeScript configuration files.
+          Make sure it is installed"
+          Only thrown in 'runner' mode — the default 'bundle' mode handles TS via rolldown+oxc.
+        required_handling: >
+          When using configLoader: 'runner', ensure 'tsx' or 'jiti' is in devDependencies.
+          Callers MUST wrap in try/catch and surface the missing dependency name to the user.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/config.ts"
+          - "https://vite.dev/guide/api-javascript#loadconfigfromfile"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: createBuilder
+    import_path: "vite"
+    description: >
+      Creates a ViteBuilder instance for orchestrating multi-environment production builds.
+      New in Vite 6+. Internally calls resolveConfig() and initializes all configured
+      build environments. Returns a ViteBuilder with buildApp(), build(environment),
+      and environments properties. Async — may reject for any reason resolveConfig()
+      or environment initialization can fail.
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 33346-33440
+      # createBuilder() calls resolveConfigToBuild() → resolveConfig() → can throw
+      # environment.init() is called per-environment and can throw from plugins
+      - id: createbuilder-config-resolution-failure
+        condition: >
+          Config file fails to load (syntax errors, missing exports, plugin hook throws,
+          or invalid environment configuration) — same failure surface as resolveConfig()
+        throws: >
+          Any Error from the config resolution chain — typically Error with message from
+          the failing plugin or config file. Error types depend on what the config file
+          or plugins throw.
+        required_handling: >
+          Caller MUST wrap createBuilder() in try/catch. This is typically used in build
+          scripts where the process should exit non-zero on failure. Log the full error
+          (including stack) and process.exit(1) to ensure CI pipelines detect the failure.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/build.ts"
+          - "https://vite.dev/guide/api-javascript#createbuilder"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: createbuilder-environment-init-failure
+        condition: >
+          A build environment's init() method throws — e.g., a plugin's buildStart
+          hook rejects, or the environment configuration is invalid
+        throws: >
+          Any Error from the environment init chain. Multiple environments are initialized
+          in parallel via Promise.all(), so the first rejection is surfaced.
+        required_handling: >
+          Caller MUST wrap createBuilder() in try/catch. Since environments init in
+          parallel, failures from any environment are surfaced. The builder is NOT
+          usable if createBuilder() rejects — do not attempt partial builds.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/build.ts"
+          - "https://vite.dev/guide/api-javascript#createbuilder"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transformWithOxc
+    import_path: "vite"
+    description: >
+      Transforms TypeScript/JavaScript code using the Oxc compiler (Rolldown's native
+      transformer). Replaces the deprecated transformWithEsbuild(). Used in custom Vite
+      plugins that need to transform code outside the normal build pipeline. Async
+      wrapper around the synchronous oxc transformSync() — rejects if the code has
+      parse or transform errors.
+
+    postconditions:
+      # Evidence: node_modules/vite/dist/node/chunks/node.js lines 3720-3800
+      # Confirmed: throws Error with message "Transform failed with N error(s):\n..."
+      # error.errors array contains individual OxcTransformError objects
+      - id: transformwithoxc-parse-error
+        condition: >
+          Input code has TypeScript/JavaScript syntax errors, invalid JSX, or unsupported
+          language features for the inferred file extension
+        throws: >
+          Error with message: "Transform failed with N error(s):\n[error details]"
+          The thrown Error object has an .errors property (array of OxcTransformError)
+          with per-error details including the code location and description.
+          The .errors array is accessible via Object.defineProperty (enumerable: true).
+        required_handling: >
+          Caller MUST wrap transformWithOxc() in try/catch. To display useful errors,
+          access error.errors (the OxcTransformError array) — each item has location info.
+          The error.message contains a formatted summary of all errors (up to 5 shown).
+          Callers building Vite plugins SHOULD re-throw with the original error to allow
+          Vite's error overlay to display it correctly.
+        sources:
+          - "https://github.com/vitejs/vite/blob/main/packages/vite/src/node/plugins/oxc.ts"
+          - "https://vite.dev/guide/api-javascript#transformwithoxc"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
