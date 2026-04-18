@@ -351,3 +351,98 @@ export async function deleteByWithTryCatch(categoryId: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. New functions from pass 9: addOrUpdateObject, indexExists, waitForAppTask,
+//    saveObjectsWithTransformation, partialUpdateObjects (plural helper)
+//    All cast to `any` due to v4 index-based compat
+//    KNOWN ANALYZER LIMITATION: type erasure prevents detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: addorupdateobject-no-try-catch
+export async function bareAddOrUpdateObjectNoCatch(objectID: string, product: Product) {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; addorupdateobject-no-try-catch
+  // not detected through type erasure; missing objectID throws synchronous Error
+  await v5Client.addOrUpdateObject({
+    indexName: 'products',
+    objectID,
+    body: product,
+  });
+}
+
+export async function addOrUpdateObjectWithTryCatch(objectID: string, product: Product) {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.addOrUpdateObject({
+      indexName: 'products',
+      objectID,
+      body: product,
+    });
+  } catch (err) {
+    console.error('addOrUpdateObject failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: indexexists-auth-network-throw
+export async function bareIndexExistsNoCatch() {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; indexexists-auth-network-throw
+  // not detected through type erasure; 401/403/RetryError still throw even though 404 returns false
+  const exists = await v5Client.indexExists({ indexName: 'products' });
+  return exists;
+}
+
+export async function indexExistsWithTryCatch() {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    const exists = await v5Client.indexExists({ indexName: 'products' });
+    return exists;
+  } catch (err) {
+    console.error('indexExists failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: waitforapptask-max-retries-exceeded
+export async function bareWaitForAppTaskNoCatch(taskID: number) {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; waitforapptask-max-retries-exceeded
+  // not detected through type erasure; max retries exceeded throws native Error
+  await v5Client.waitForAppTask({ taskID });
+}
+
+export async function waitForAppTaskWithTryCatch(taskID: number) {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.waitForAppTask({ taskID });
+  } catch (err) {
+    console.error('waitForAppTask failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: saveobjectswithtransformation-missing-region
+export async function bareSaveObjectsWithTransformationNoCatch(products: Product[]) {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; saveobjectswithtransformation-missing-region
+  // not detected through type erasure; throws synchronous Error if region not configured
+  await v5Client.saveObjectsWithTransformation({
+    indexName: 'products',
+    objects: products,
+  });
+}
+
+export async function saveObjectsWithTransformationWithTryCatch(products: Product[]) {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.saveObjectsWithTransformation({
+      indexName: 'products',
+      objects: products,
+    });
+  } catch (err) {
+    console.error('saveObjectsWithTransformation failed:', err);
+    throw err;
+  }
+}

@@ -1,11 +1,26 @@
+# Depth pass 2026-04-18 (deepen-stream-2 pass 9):
+# API surface: 23 async-callable functions (v5 SearchClient + Algoliasearch helpers)
+# Contracted before: 15 (coverage_score: 0.65)
+# Contracted after: 20 (+5 this pass: partialUpdateObjects, addOrUpdateObject, indexExists,
+#   waitForAppTask, saveObjectsWithTransformation)
+# Omitted: 3 (searchForHits/searchForFacets — thin wrappers over search(), same error profile;
+#             partialUpdateObjectsWithTransformation/replaceAllObjectsWithTransformation — same
+#             error profile as saveObjectsWithTransformation)
+# Coverage: 20/23 = 0.87 (effective contracted/non-omitted = 20/20 = 1.0)
+# Evidence sources confirmed from:
+#   @algolia/client-search/dist/src/searchClient.js — indexExists, waitForAppTask, addOrUpdateObject source
+#   algoliasearch/dist/node.js — saveObjectsWithTransformation configuration error
+#   @algolia/client-common/dist/common.d.ts — error class hierarchy (ApiError, RetryError, AlgoliaError)
+#   https://www.algolia.com/doc/rest-api/search/add-or-update-object — HTTP error codes confirmed
+#   https://www.algolia.com/doc/rest-api/search/partial-update-object — HTTP error codes confirmed
 package: algoliasearch
 semver: ">=4.0.0 <6.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.65
+coverage_score: 0.87  # 20 contracted / 23 total async-callable (3 intentionally omitted)
 
 detection:
   factory_methods:
@@ -25,6 +40,7 @@ detection:
     - ".deleteObjects("
     - ".waitForTask("
     - ".waitTask("
+    - ".waitForAppTask("
     - ".setSettings("
     - ".replaceAllObjects("
     - ".chunkedBatch("
@@ -33,6 +49,11 @@ detection:
     - ".clearObjects("
     - ".searchForFacetValues("
     - ".deleteBy("
+    - ".addOrUpdateObject("
+    - ".indexExists("
+    - ".saveObjectsWithTransformation("
+    - ".partialUpdateObjectsWithTransformation("
+    - ".replaceAllObjectsWithTransformation("
 
 functions:
   - name: search
@@ -495,6 +516,298 @@ functions:
         sources:
           - "https://www.algolia.com/doc/api-reference/api-methods/delete-by/"
 
+  - name: partialUpdateObjects
+    import_path: "algoliasearch"
+    description: >
+      v5 helper: Updates specific attributes across multiple records in batches. Internally
+      calls chunkedBatch() with action "partialUpdateObject" (createIfNotExists=true, default)
+      or "partialUpdateObjectNoCreate" (createIfNotExists=false). When createIfNotExists=false
+      and an object does not exist, the batch still succeeds but the missing object is silently
+      skipped — no error, no indication in the response. Requires addObject ACL.
+      Distinct from partialUpdateObject (singular, single-record PUT).
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/rest-api/search/partial-update-object
+      # Documented HTTP errors: 400 (bad request), 402 (feature not enabled), 403 (missing addObject ACL), 404 (index not found)
+      # Confirmed from @algolia/client-search/dist/src/searchClient.js:
+      #   partialUpdateObjects() calls chunkedBatch() → batch() → transporter.request()
+      #   createIfNotExists=false uses "partialUpdateObjectNoCreate" action
+      #   Missing objects with partialUpdateObjectNoCreate: silently skipped (no error in BatchResponse)
+      - id: partialupdateobjects-no-try-catch
+        severity: error
+        condition: >
+          partialUpdateObjects() called without surrounding try/catch. Common in webhook handlers
+          and background sync jobs that update many records (e.g. update search data after
+          bulk database events). Auth failure, invalid payload, or rate limits cause all batches
+          to fail silently.
+        throws: >
+          ApiError (status 400) — malformed attributesToUpdate payload.
+          ApiError (status 402) — feature not enabled on the current Algolia plan.
+          ApiError (status 403) — missing addObject ACL on the API key.
+          ApiError (status 404) — index not found.
+          RetryError — all Algolia hosts unreachable.
+        required_handling: >
+          Caller MUST wrap in try/catch. For large batch updates, log the object count and
+          batch size for debugging. If createIfNotExists=false is used, the response does not
+          indicate how many objects were skipped — callers cannot distinguish "updated" from
+          "silently skipped" without separate verification.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/partial-update-object"
+
+      # Evidence: Confirmed from @algolia/client-search/dist/src/searchClient.js
+      #   partialUpdateObjects({ createIfNotExists: false }) sends "partialUpdateObjectNoCreate" action
+      #   The batch response contains BatchResponse[] — no error field, no count of skipped objects
+      #   Missing objects are silently ignored — update does not happen, no signal to caller
+      - id: partialupdateobjects-silent-skip-on-missing
+        severity: warning
+        condition: >
+          partialUpdateObjects() is called with createIfNotExists=false (or the default createIfNotExists=true
+          is intended to update existing records only), but the objectIDs in the batch do not
+          exist in the index. With createIfNotExists=false, missing objects are silently skipped —
+          the response is a success (BatchResponse[]) with no indication that objects were not found.
+          With createIfNotExists=true (default), missing objects are CREATED, which may also be
+          unexpected if the intent was to update-only.
+        throws: >
+          Does not throw. Returns BatchResponse[] even when all objects were missing.
+          No error, no per-object status in the response.
+        required_handling: >
+          When updating specific records, verify their existence with getObject() or getObjects()
+          before calling partialUpdateObjects() if missing-object silencing is unacceptable.
+          Or use saveObjects() (which always creates/replaces) when object existence is uncertain.
+          If using createIfNotExists=false for "update-only" semantics, log and monitor the case
+          where no updates are expected but the call succeeds — silent skips are invisible.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/partial-update-object"
+
+  - name: addOrUpdateObject
+    import_path: "algoliasearch"
+    description: >
+      v5 method: Upserts a record in the index using a specific objectID. If a record with the
+      given objectID exists, it is completely replaced. If it does not exist, it is created.
+      Distinct from saveObject (which auto-generates objectID if not provided) and
+      partialUpdateObject (which only updates specific attributes). Requires addObject ACL.
+      Throws native Error (before network request) if indexName, objectID, or body is missing.
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/rest-api/search/add-or-update-object
+      # Documented HTTP errors: 400 (bad request), 402 (feature not enabled), 403 (missing addObject ACL), 404 (index not found)
+      # Confirmed from @algolia/client-search/dist/src/searchClient.js lines 571-577:
+      #   throw new Error("Parameter `indexName` is required when calling `addOrUpdateObject`.")
+      #   throw new Error("Parameter `objectID` is required when calling `addOrUpdateObject`.")
+      #   throw new Error("Parameter `body` is required when calling `addOrUpdateObject`.")
+      #   These are synchronous native Error throws BEFORE the network request.
+      - id: addorupdateobject-no-try-catch
+        severity: error
+        condition: >
+          addOrUpdateObject() called without surrounding try/catch. Throws synchronous native Error
+          if required parameters (indexName, objectID, body) are missing. Also throws ApiError on
+          API failures and RetryError on network failures. Common in data synchronization flows
+          where external data is mapped to Algolia records by a known objectID (e.g. database ID).
+        throws: >
+          Error (native, synchronous) — if indexName, objectID, or body is missing/falsy.
+          ApiError (status 400) — malformed record body.
+          ApiError (status 402) — feature not enabled on plan.
+          ApiError (status 403) — missing addObject ACL on the API key.
+          ApiError (status 404) — index not found.
+          RetryError — all Algolia hosts unreachable.
+        required_handling: >
+          Caller MUST wrap in try/catch. Handle both synchronous parameter validation errors
+          (native Error) and asynchronous API errors (ApiError, RetryError). This method
+          REPLACES the entire record — ensure the body contains all desired attributes,
+          not just the ones being updated (use partialUpdateObject for partial updates).
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/add-or-update-object"
+
+  - name: indexExists
+    import_path: "algoliasearch"
+    description: >
+      v5 helper: Checks whether an index exists. Returns true if the index exists, false if
+      it does not (catches 404 internally). DOES NOT throw on 404. However, it DOES throw
+      on auth failures (401/403) and network errors. Callers often assume this method is
+      "safe" and omit try/catch, but credential and network failures still propagate.
+      Internally calls getSettings() and catches ApiError with status 404.
+
+    postconditions:
+      # Evidence: Confirmed from @algolia/client-search/dist/src/searchClient.js:
+      #   async indexExists({ indexName }) {
+      #     try {
+      #       await this.getSettings({ indexName });
+      #     } catch (error) {
+      #       if (error instanceof ApiError && error.status === 404) { return false; }
+      #       throw error;  // ← rethrows non-404 errors including 401, 403, RetryError
+      #     }
+      #     return true;
+      #   }
+      - id: indexexists-auth-network-throw
+        severity: error
+        condition: >
+          indexExists() called without surrounding try/catch. Callers commonly omit try/catch
+          because the method "returns a boolean" and feels safe. But 401 (invalid API key),
+          403 (missing search ACL), and RetryError (network failure) still throw — they are
+          not caught internally. Only 404 is caught and converted to false. This is a
+          common false-safety assumption.
+        throws: >
+          ApiError (status 401) — invalid API key.
+          ApiError (status 403) — missing search ACL on the API key.
+          RetryError — all Algolia hosts unreachable.
+          Note: ApiError (status 404) is caught internally and returned as false.
+        required_handling: >
+          Caller MUST wrap in try/catch even though the method returns a boolean.
+          The 404 case is safe (returns false), but auth and network failures still throw:
+
+            try {
+              const exists = await client.indexExists({ indexName });
+              if (!exists) {
+                // Index needs to be created
+              }
+            } catch (error) {
+              if (error instanceof ApiError) {
+                console.error('Auth or API error checking index:', error.status, error.message);
+              }
+              throw error;
+            }
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/libraries/javascript/v5/methods/search/"
+
+  - name: waitForAppTask
+    import_path: "algoliasearch"
+    description: >
+      v5 helper: Polls the app-level task status until it reaches "published" state.
+      Similar to waitForTask() but for tasks that operate at the application level (not
+      index level). Used after operations like dictionary batch updates. Polls with
+      exponential backoff (starts at 200ms, max 5000ms per retry). Throws when maxRetries
+      (default 50) is exhausted.
+
+    postconditions:
+      # Evidence: Confirmed from @algolia/client-search/dist/src/searchClient.js:
+      #   error: {
+      #     validate: () => retryCount >= maxRetries,
+      #     message: () => `The maximum number of retries exceeded. (${retryCount}/${maxRetries})`
+      #   }
+      # Error is thrown via createIterablePromise which throws native Error (not ApiError).
+      - id: waitforapptask-max-retries-exceeded
+        severity: error
+        condition: >
+          waitForAppTask() called without surrounding try/catch. If the app-level task does not
+          reach "published" status within maxRetries attempts (default 50 retries × up to 5000ms
+          per retry = ~4 minutes total), throws an Error with "The maximum number of retries
+          exceeded." This is a native Error, not an ApiError or RetryError.
+          Also throws if getAppTask() polling encounters an API or network error.
+        throws: >
+          Error (native) — "The maximum number of retries exceeded. (50/50)" when polling
+          exhausted without task completion.
+          ApiError — if getAppTask() returns an API error during polling.
+          RetryError — if all Algolia hosts unreachable during polling.
+        required_handling: >
+          Caller MUST wrap in try/catch. Handle both the timeout Error and API errors:
+
+            try {
+              await client.waitForAppTask({ taskID: response.taskID });
+            } catch (error) {
+              if (error.message?.includes('maximum number of retries')) {
+                console.error('App task timed out — check Algolia dashboard:', taskID);
+              } else if (error instanceof ApiError) {
+                console.error('API error while waiting for task:', error.status);
+              }
+              throw error;
+            }
+
+          To extend the timeout, pass maxRetries or a custom timeout function:
+            waitForAppTask({ taskID, maxRetries: 100 })
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/libraries/javascript/v5/methods/search/"
+
+  - name: saveObjectsWithTransformation
+    import_path: "algoliasearch"
+    description: >
+      v5 method (on Algoliasearch, not SearchClient): Saves objects through the Algolia
+      Push connector Transformation pipeline. Requires a Push connector to be configured
+      in the Algolia dashboard AND the transformation.region option to be passed when
+      creating the client. Throws synchronous native Error (not ApiError) when the
+      transformation.region was not provided at client initialization. Also throws WatchResponse
+      errors from the Ingestion API on pipeline failures.
+
+    postconditions:
+      # Evidence: Confirmed from algoliasearch/dist/node.js:
+      #   if (!ingestionTransporter) {
+      #     throw new Error("`transformation.region` must be provided at client instantiation before calling this method.");
+      #   }
+      #   if (!(options?.transformation?.region)) {
+      #     throw new Error("`region` must be provided when leveraging the transformation pipeline");
+      #   }
+      - id: saveobjectswithtransformation-missing-region
+        severity: error
+        condition: >
+          saveObjectsWithTransformation() called when the Algoliasearch client was initialized
+          WITHOUT the transformation.region option. This is a configuration error — the client
+          must be initialized as:
+            algoliasearch(appId, apiKey, { transformation: { region: 'eu' } })
+          Calling saveObjectsWithTransformation() on a client without transformation.region
+          throws synchronously (before any network request). This is distinct from the normal
+          SearchClient — only the full Algoliasearch client has this method.
+        throws: >
+          Error (native, synchronous) — "`transformation.region` must be provided at client
+          instantiation before calling this method." or "`region` must be provided when
+          leveraging the transformation pipeline".
+        required_handling: >
+          Ensure the Algoliasearch client is initialized with transformation.region before
+          calling this method. Wrap in try/catch to handle both configuration errors and
+          Ingestion API (WatchResponse) errors from the pipeline:
+
+            const client = algoliasearch(appId, apiKey, {
+              transformation: { region: 'eu' }
+            });
+            try {
+              await client.saveObjectsWithTransformation({ indexName, objects });
+            } catch (error) {
+              console.error('Transformation pipeline error:', error.message);
+              throw error;
+            }
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/guides/sending-and-managing-data/send-and-update-your-data/connectors/push/"
+
 notes:
   - "algoliasearch uses throw-based error model — NO result-object pattern (unlike resend)"
   - "v4 errors: plain objects with .name property (not instanceof Error)"
@@ -507,3 +820,10 @@ notes:
   - "clearObjects documented errors: 400, 402 (feature not enabled), 403 (missing deleteIndex ACL), 404"
   - "deleteBy explicitly rejects empty filters — ApiError 400; always validate filters are non-empty"
   - "searchForFacetValues: facet must be configured as facetable attribute in settings or returns empty results (no error)"
+  - "indexExists: returns false for 404, but 401/403/RetryError still throw — NOT a safe unchecked call"
+  - "partialUpdateObjects: createIfNotExists=false silently skips missing objects — no error, no count"
+  - "addOrUpdateObject: throws synchronous native Error for missing params before network request"
+  - "waitForAppTask: max-retries-exceeded throws native Error (not ApiError) — distinct from ApiError handling"
+  - "saveObjectsWithTransformation: throws synchronous Error if transformation.region not set at client init"
+  - "searchForHits/searchForFacets: thin type-narrowing wrappers over search() — same error profile, omitted"
+  - "partialUpdateObjectsWithTransformation/replaceAllObjectsWithTransformation: same error profile as saveObjectsWithTransformation, omitted (duplicate contract)"
