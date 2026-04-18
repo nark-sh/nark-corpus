@@ -2,18 +2,19 @@ package: validator
 semver: ">=13.15.20"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.12
+coverage_score: 0.18
 # Scan note: scan-validator-2026-04-03.json — 0 repos successfully scanned (2 skipped, 20 errored)
 # FP check: 0/15 FPs in repos without validator (0% rate) — no false positives detected
 #
 # API Surface: ~95 exported functions (validators + sanitizers)
-# Contracted: 11 functions (escape, normalizeEmail, isEmail, isURL, isJSON,
-#             isStrongPassword, isJWT, stripLow, toDate, toFloat/toInt, isCreditCard)
-# Omitted: ~84 pure-format validators with no unique error contracts
-# Coverage: 11/95 raw (but 11/11 contractable = 100% effective)
+# Contracted: 17 functions (escape, normalizeEmail, isEmail, isURL, isJSON,
+#             isStrongPassword, isJWT, stripLow, toDate, toFloat, toInt, isCreditCard,
+#             matches, isCurrency, isBase64, isLength, isISO8601)
+# Omitted: ~78 pure-format validators with no unique error contracts
+# Coverage: 17/95 raw
 #
 # CRITICAL CORRECTION (2026-04-17):
 # Previous comment stated "validator.js does NOT throw exceptions" — THIS IS WRONG.
@@ -668,6 +669,257 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: matches
+    import_path: "validator"
+    description: >
+      Tests a string against a regex pattern. Returns boolean. Accepts string pattern
+      (converted to RegExp internally) or RegExp object. Throws TypeError on non-string
+      input. CRITICAL: The official README explicitly warns that user-provided patterns
+      are NOT checked for ReDoS attacks.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # README explicitly states: "The pattern is not checked for possible ReDoS attacks.
+      # We do not recommend that the user can provide their own pattern."
+      # Source: node_modules/validator/lib/matches.js — pattern converted via new RegExp(pattern, modifiers)
+      - id: matches-redos-user-pattern
+        condition: "matches() called with a user-supplied pattern or modifiers"
+        returns: "boolean — but string pattern compiled without ReDoS protection"
+        required_handling: >
+          CRITICAL: The validator README explicitly states matches() patterns are NOT
+          checked for ReDoS attacks and user-provided patterns are NOT recommended.
+          When the pattern argument is a string (not a RegExp literal), it is compiled
+          via new RegExp(pattern, modifiers) at runtime. A malicious user can supply
+          a catastrophic backtracking pattern like "(a+)+" that causes exponential
+          backtracking, halting the Node.js event loop.
+          Callers MUST: (1) never pass user-supplied strings directly as the pattern,
+          (2) only use hardcoded RegExp literals as the pattern argument, or (3) use
+          a ReDoS-safe regex library (e.g., safe-regex, re2) for user-supplied patterns.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: matches-non-string-throws
+        condition: "matches() passed null, undefined, or non-string as the first argument"
+        throws: "TypeError: Expected a string but received a null/undefined/..."
+        required_handling: >
+          Caller MUST ensure the str argument is a string before calling matches().
+          Pattern: matches(req.body.field, /regex/) where the body field is missing
+          (undefined) throws TypeError, crashing the request handler.
+          Guard with: if (typeof field === 'string' && matches(field, /pattern/)) { ... }
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: isCurrency
+    import_path: "validator"
+    description: >
+      Validates currency amount strings. Returns boolean. Throws TypeError on non-string
+      input. Default options assume US format ($ symbol, comma thousands separator, period
+      decimal separator). International currencies require explicit options configuration.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/isCurrency.js — confirmed default options
+      - id: currency-locale-mismatch
+        condition: "isCurrency() used to validate non-US currency without locale options"
+        returns: "false for valid non-US currency strings (e.g. EUR '1.234,56' fails)"
+        required_handling: >
+          isCurrency() defaults to US format: symbol '$', thousands_separator ',',
+          decimal_separator '.'. European-format amounts like "1.234,56" (German EUR)
+          or "£1,234.56" (GBP) fail validation with default options because the thousands
+          and decimal separators are reversed. Multi-currency applications MUST configure:
+          isCurrency(amount, { symbol: '€', thousands_separator: '.', decimal_separator: ',' })
+          for EU formats. Silently rejecting valid foreign currency amounts causes payment
+          form rejection and lost transactions.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: currency-symbol-not-required
+        condition: "isCurrency() used for financial input where symbol presence is required"
+        returns: "true for bare numbers like '1234.56' (symbol optional by default)"
+        required_handling: >
+          By default, require_symbol is false — isCurrency() accepts bare numeric strings
+          like "1234.56" without a currency symbol. If your application requires a symbol
+          to distinguish currency from plain numbers, use:
+          isCurrency(amount, { require_symbol: true }).
+          Without this, user input lacking a currency symbol passes validation, potentially
+          causing incorrect storage or display of amounts in multi-currency contexts.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isBase64
+    import_path: "validator"
+    description: >
+      Validates base64 encoded strings. Returns boolean. Default checks standard base64
+      (with padding, using +/= characters). URL-safe base64 (used in JWTs, URL tokens)
+      uses different characters (-_) and requires explicit urlSafe: true option.
+      Throws TypeError on non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # Source: node_modules/validator/lib/isBase64.js — confirmed urlSafe/padding options
+      - id: base64-urlsafe-confusion
+        condition: "isBase64() used to validate JWT payloads, URL tokens, or OAuth state without urlSafe: true"
+        returns: "false for valid base64url strings (- and _ chars fail standard base64 check)"
+        required_handling: >
+          Standard base64 uses + and / characters. URL-safe base64 (base64url) uses
+          - and _ instead. JWT headers and payloads use base64url encoding. Default
+          isBase64() with { urlSafe: false } will return false for valid JWT segments
+          because they contain - and _ characters. Always use:
+          isBase64(str, { urlSafe: true }) when validating JWT parts, OAuth state tokens,
+          or any URL-embedded base64. Using wrong encoding causes false rejections of
+          valid tokens, breaking authentication flows.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://datatracker.ietf.org/doc/html/rfc4648#section-5"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: base64-empty-string-valid
+        condition: "isBase64('') used as truthy guard for non-empty input"
+        returns: "true for empty string ''"
+        required_handling: >
+          isBase64() returns true for empty string '' — an empty string is considered
+          a valid (zero-byte) base64 value. Callers using isBase64() as a guard before
+          decoding must also check for non-empty input:
+          if (str && isBase64(str)) { ... }
+          Otherwise, empty string passes the base64 check and atob('') or Buffer.from('', 'base64')
+          succeeds silently, resulting in empty output that may not be detected.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isBase64.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isLength
+    import_path: "validator"
+    description: >
+      Validates string length falls within specified range. Returns boolean. This function
+      accounts for surrogate pairs (emoji, some CJK characters) — a single visible
+      character may count as 1 despite str.length returning 2. Throws TypeError on
+      non-string input.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # README states: "Note: this function takes into account surrogate pairs."
+      # Source: node_modules/validator/lib/isLength.js — confirmed surrogate pair counting
+      - id: length-vs-string-length-mismatch
+        condition: "isLength() result compared with str.length for same string"
+        returns: "true for strings where isLength(str, {max: N}) === true but str.length > N"
+        required_handling: >
+          isLength() counts grapheme clusters — surrogate pairs (emoji like 😀, some CJK
+          characters) count as 1 character in isLength() but 2 in str.length. A string
+          like "Hello😀" passes isLength(str, {max: 6}) but str.length returns 7.
+          Callers that enforce database column limits MUST use isLength() (not str.length)
+          to avoid truncation on storage. Conversely, callers computing byte sizes for
+          binary protocols must use Buffer.byteLength() — isLength() counts visible chars,
+          not bytes. Mixing these causes either data truncation or incorrect validation.
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://unicode.org/faq/utf_bom.html#utf16-2"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: isISO8601
+    import_path: "validator"
+    description: >
+      Validates ISO 8601 date strings (e.g. "2024-01-15", "2024-01-15T10:30:00Z").
+      Returns boolean. Without strict: true, accepts structurally valid but calendar-invalid
+      dates like "2009-02-29" (Feb 29 in a non-leap year). Throws TypeError on non-string.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/README.md
+      # README states: "If strict is true, date strings with invalid dates like
+      # 2009-02-29 will be invalid."
+      # Source: node_modules/validator/lib/isISO8601.js — isValidDate() only called when strict=true
+      - id: iso8601-non-strict-invalid-dates
+        condition: "isISO8601() used without strict: true to validate calendar dates for storage"
+        returns: "true for structurally valid but calendar-invalid dates (e.g. '2009-02-29')"
+        required_handling: >
+          Without { strict: true }, isISO8601() validates the string format only — not
+          calendar validity. "2009-02-29" (February 29 in a non-leap year) returns true
+          because the format is correct even though the date does not exist. When this
+          invalid date is then parsed (Date.parse, new Date()), the result may be rolled
+          over to March 1, silently storing incorrect dates. For any application storing
+          calendar dates (appointments, birthdays, deadlines), ALWAYS use:
+          isISO8601(dateStr, { strict: true })
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: iso8601-strict-separator
+        condition: "isISO8601() used for API interoperability without strictSeparator: true"
+        returns: "true for '2024-01-15 10:30:00' (space separator) when only T separator required"
+        required_handling: >
+          Without { strictSeparator: true }, isISO8601() accepts both 'T' and space as
+          the date-time separator. RFC 3339 and most REST APIs require the 'T' separator.
+          "2024-01-15 10:30:00Z" passes isISO8601() but may be rejected by strict API
+          parsers (PostgreSQL TIMESTAMPTZ, Go's time.Parse with RFC3339 layout, Java's
+          Instant.parse). For API-to-API data exchange, use:
+          isISO8601(str, { strict: true, strictSeparator: true })
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://datatracker.ietf.org/doc/html/rfc3339"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
         evidence_quality: confirmed
 
 # SOURCES.md has comprehensive documentation of all error conditions

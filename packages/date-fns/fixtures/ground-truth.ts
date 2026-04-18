@@ -25,8 +25,17 @@ import {
   formatDistanceToNow,
   formatDistanceToNowStrict,
   formatISO,
+  formatISO9075,
+  formatRelative,
+  formatRFC3339,
+  formatRFC7231,
+  interval,
+  intlFormat,
+  intlFormatDistance,
+  lightFormat,
   isMatch,
   isValid,
+  isBefore,
 } from 'date-fns';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,4 +202,161 @@ export function safeParseAfterMatch(userInput: string): Date | null {
     return null;
   }
   return parse(userInput, 'MM/dd/yyyy', new Date());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. formatISO9075() — throws RangeError("Invalid time value") on Invalid Date
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function formatISO9075WithoutValidation(date: Date): string {
+  // SHOULD_FIRE: format-iso9075-invalid-date — no isValid check before formatISO9075
+  return formatISO9075(date);
+}
+
+export function formatISO9075WithValidation(date: Date | null | undefined): string | null {
+  if (!date || !isValid(date)) {
+    return null;
+  }
+  // SHOULD_NOT_FIRE: guarded by null check and isValid()
+  return formatISO9075(date);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. formatRelative() — throws RangeError on Invalid Date for either argument
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function formatRelativeWithoutValidation(date: Date): string {
+  // SHOULD_FIRE: format-relative-invalid-date — no isValid check before formatRelative
+  return formatRelative(date, new Date());
+}
+
+export function formatRelativeBothDatesUnsafe(eventDate: Date, baseDate: Date): string {
+  // SHOULD_FIRE: format-relative-invalid-date — neither date validated
+  return formatRelative(eventDate, baseDate);
+}
+
+export function formatRelativeWithValidation(date: Date, baseDate: Date): string {
+  if (!isValid(date) || !isValid(baseDate)) {
+    return 'unknown time';
+  }
+  // SHOULD_NOT_FIRE: both dates guarded
+  return formatRelative(date, baseDate);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. formatRFC3339() — throws RangeError("Invalid time value") on Invalid Date
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function formatRFC3339WithoutValidation(date: Date): string {
+  // SHOULD_FIRE: format-rfc3339-invalid-date — no isValid check before formatRFC3339
+  return formatRFC3339(date);
+}
+
+export function formatRFC3339WithValidation(date: Date | null | undefined): string | null {
+  if (!date || !isValid(date)) {
+    return null;
+  }
+  // SHOULD_NOT_FIRE: guarded
+  return formatRFC3339(date);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. formatRFC7231() — throws RangeError("Invalid time value") on Invalid Date
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function formatRFC7231WithoutValidation(date: Date): string {
+  // SHOULD_FIRE: format-rfc7231-invalid-date — no isValid check before formatRFC7231
+  return formatRFC7231(date);
+}
+
+export function formatRFC7231WithValidation(date: Date | null | undefined): string | null {
+  if (!date || !isValid(date)) {
+    return null;
+  }
+  // SHOULD_NOT_FIRE: guarded
+  return formatRFC7231(date);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. interval() — throws TypeError("Start date is invalid" / "End date is invalid")
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function createIntervalWithoutValidation(start: Date, end: Date) {
+  // SHOULD_FIRE: interval-invalid-start-date / interval-invalid-end-date — no isValid check
+  return interval(start, end);
+}
+
+export function createIntervalWithValidation(start: Date, end: Date) {
+  if (!isValid(start) || !isValid(end)) {
+    throw new Error('Invalid date in range');
+  }
+  // SHOULD_NOT_FIRE: both dates guarded
+  return interval(start, end);
+}
+
+export function createPositiveIntervalUnsafe(start: Date, end: Date) {
+  // SHOULD_FIRE: interval-end-before-start — no check that end > start before assertPositive
+  return interval(start, end, { assertPositive: true });
+}
+
+export function createPositiveIntervalSafe(start: Date, end: Date) {
+  if (!isValid(start) || !isValid(end)) {
+    throw new Error('Invalid date');
+  }
+  if (!isBefore(start, end)) {
+    throw new Error('End must be after start');
+  }
+  // SHOULD_NOT_FIRE: order validated before assertPositive
+  return interval(start, end, { assertPositive: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. intlFormat() — throws on Invalid Date via Intl.DateTimeFormat
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function intlFormatWithoutValidation(date: Date): string {
+  // SHOULD_FIRE: intl-format-invalid-date — no isValid check before intlFormat
+  return intlFormat(date);
+}
+
+export function intlFormatWithValidation(date: Date): string {
+  if (!isValid(date)) {
+    return 'Invalid date';
+  }
+  // SHOULD_NOT_FIRE: guarded by isValid()
+  return intlFormat(date, { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. intlFormatDistance() — throws on Invalid Date via Intl.RelativeTimeFormat
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function intlFormatDistanceWithoutValidation(laterDate: Date, earlierDate: Date): string {
+  // SHOULD_FIRE: intl-format-distance-invalid-date — no isValid check
+  return intlFormatDistance(laterDate, earlierDate);
+}
+
+export function intlFormatDistanceWithValidation(laterDate: Date, earlierDate: Date): string {
+  if (!isValid(laterDate) || !isValid(earlierDate)) {
+    return 'unknown';
+  }
+  // SHOULD_NOT_FIRE: both dates guarded
+  return intlFormatDistance(laterDate, earlierDate);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. lightFormat() — throws RangeError("Invalid time value") on Invalid Date
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function lightFormatWithoutValidation(date: Date): string {
+  // SHOULD_FIRE: light-format-invalid-date — no isValid check before lightFormat
+  return lightFormat(date, 'yyyy-MM-dd HH:mm:ss');
+}
+
+export function lightFormatWithValidation(date: Date): string {
+  if (!isValid(date)) {
+    throw new Error('Invalid date');
+  }
+  // SHOULD_NOT_FIRE: guarded by isValid()
+  return lightFormat(date, 'yyyy-MM-dd HH:mm:ss');
 }

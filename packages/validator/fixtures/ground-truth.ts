@@ -267,9 +267,127 @@ function preValidateCardFormat(cardNumber: string): boolean {
 }
 
 // =============================================================================
+// matches — deepen pass 2026-04-18
+// =============================================================================
+
+// @expect-violation: matches-redos-user-pattern
+function validateUserPattern(input: string, userPattern: string): boolean {
+  // ❌ User-supplied pattern string — ReDoS vulnerability
+  // README explicitly warns against this
+  return validator.matches(input, userPattern);
+}
+
+// @expect-violation: matches-redos-user-pattern
+function filterByUserRegex(value: string, regex: string, flags: string): boolean {
+  // ❌ Both pattern and modifiers from user input — ReDoS risk
+  return validator.matches(value, regex, flags);
+}
+
+// @expect-clean
+function validateSlug(value: string): boolean {
+  // ✅ Hardcoded RegExp literal — safe, no user-controlled pattern
+  return validator.matches(value, /^[a-z0-9-]+$/);
+}
+
+// =============================================================================
+// isCurrency — deepen pass 2026-04-18
+// =============================================================================
+
+// @expect-violation: currency-locale-mismatch
+function validateEurAmount(amount: string): boolean {
+  // ❌ Default USD options — "1.234,56" (German EUR format) returns false
+  return validator.isCurrency(amount);
+}
+
+// @expect-violation: currency-locale-mismatch
+function validateGbpAmount(amount: string): boolean {
+  // ❌ Default $ symbol — £1,234.56 fails because symbol doesn't match
+  return validator.isCurrency(amount);
+}
+
+// @expect-clean
+function validateEurAmountCorrect(amount: string): boolean {
+  // ✅ Explicit EU locale options
+  return validator.isCurrency(amount, {
+    symbol: '€',
+    thousands_separator: '.',
+    decimal_separator: ',',
+  });
+}
+
+// =============================================================================
+// isBase64 — deepen pass 2026-04-18
+// =============================================================================
+
+// @expect-violation: base64-urlsafe-confusion
+function validateJwtSegment(segment: string): boolean {
+  // ❌ JWT uses base64url — standard isBase64() returns false for - and _
+  return validator.isBase64(segment);
+}
+
+// @expect-violation: base64-urlsafe-confusion
+function validateOAuthState(state: string): boolean {
+  // ❌ OAuth state tokens often use base64url encoding
+  return validator.isBase64(state);
+}
+
+// @expect-clean
+function validateJwtSegmentCorrect(segment: string): boolean {
+  // ✅ urlSafe: true for JWT and URL-safe base64
+  return validator.isBase64(segment, { urlSafe: true });
+}
+
+// =============================================================================
+// isLength — deepen pass 2026-04-18
+// =============================================================================
+
+// @expect-violation: length-vs-string-length-mismatch
+function enforceDbColumnLimit(value: string): boolean {
+  // ❌ str.length counts surrogate pairs as 2 — inconsistent with isLength
+  // "Hello😀" has str.length=7 but isLength counts it as 6 chars
+  if (value.length > 100) {
+    return false; // Wrong: emoji-heavy string may pass length check but fail DB column
+  }
+  return true;
+}
+
+// @expect-clean
+function enforceDbColumnLimitCorrect(value: string): boolean {
+  // ✅ isLength counts grapheme clusters correctly for user-visible chars
+  return validator.isLength(value, { max: 100 });
+}
+
+// =============================================================================
+// isISO8601 — deepen pass 2026-04-18
+// =============================================================================
+
+// @expect-violation: iso8601-non-strict-invalid-dates
+function validateAppointmentDate(dateStr: string): boolean {
+  // ❌ Non-strict mode accepts "2009-02-29" (Feb 29 in non-leap year)
+  return validator.isISO8601(dateStr);
+}
+
+// @expect-violation: iso8601-non-strict-invalid-dates
+function storeEventDate(dateStr: string): void {
+  if (!validator.isISO8601(dateStr)) {
+    throw new Error('Invalid date');
+  }
+  // ❌ "2009-02-29" passes non-strict check and gets stored
+  // Date.parse("2009-02-29") returns March 1 silently
+  storeDate(dateStr);
+}
+
+// @expect-clean
+function validateAppointmentDateStrict(dateStr: string): boolean {
+  // ✅ strict: true rejects calendar-invalid dates like 2009-02-29
+  return validator.isISO8601(dateStr, { strict: true, strictSeparator: true });
+}
+
+// =============================================================================
 // Helper stubs (not under test)
 // =============================================================================
 
 async function fetchUserById(id: number): Promise<any> { return null; }
 function chargeCard(card: string, amount: number): void { }
 function saveCard(card: string, meta: any): void { }
+function storeDate(date: string): void { }
