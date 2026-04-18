@@ -2,9 +2,10 @@ package: nock
 semver: '>=9.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-03'
+last_verified: '2026-04-18'
 status: production
 evidence_quality: confirmed
+coverage_score: 0.89
 functions:
   - name: nock
     import_path: nock
@@ -209,3 +210,172 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
         required_handling: No action required — use the returned value as needed.
+  - name: load
+    import_path: nock
+    description: >
+      Synchronously reads a JSON fixture file from disk and returns an array of Scope objects with
+      interceptors defined from the fixture definitions. Used in test setup to replay recorded HTTP
+      interactions. Internally calls loadDefs() then define().
+    postconditions:
+      # Evidence: nock/lib/scope.js loadDefs() source — fs.readFileSync(path) + JSON.parse(contents)
+      # Confirmed: throws ENOENT when path does not exist, SyntaxError when file is invalid JSON
+      - id: load-file-not-found
+        severity: error
+        condition: >
+          The path argument does not point to an existing file, or the process lacks read
+          permission for the file
+        throws: >
+          Error with code ENOENT from fs.readFileSync — "no such file or directory, open '<path>'"
+        required_handling: >
+          Wrap nock.load() in a try-catch. A missing fixture file means all interceptors are absent
+          and all HTTP calls in the test will fail or hit the real network. Test setup MUST validate
+          the fixture path exists before calling load().
+        sources:
+          - https://github.com/nock/nock#saving-and-loading-interceptors
+          - https://nodejs.org/api/fs.html#fsreadfilesyncpath-options
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+      - id: load-invalid-json
+        severity: error
+        condition: >
+          The fixture file exists but contains invalid JSON (e.g. truncated recording, manual
+          edit error, encoding issue)
+        throws: >
+          SyntaxError from JSON.parse — "Unexpected token ... in JSON at position N"
+        required_handling: >
+          Validate fixture files are well-formed JSON before committing them. A SyntaxError from
+          nock.load() crashes the entire test suite setup (beforeAll/beforeEach fails), causing all
+          tests in the suite to error rather than fail, making the root cause harder to diagnose.
+        sources:
+          - https://github.com/nock/nock#saving-and-loading-interceptors
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+  - name: loadDefs
+    import_path: nock
+    description: >
+      Synchronously reads a JSON fixture file and returns raw Definition objects (not Scope objects).
+      Used when you need to inspect or transform fixture definitions before replaying them.
+      Has the same file-reading error profile as load().
+    postconditions:
+      # Evidence: nock/lib/scope.js loadDefs() — identical readFileSync+JSON.parse path as load()
+      - id: loaddefs-file-not-found
+        severity: error
+        condition: The path argument does not point to an existing file
+        throws: Error with code ENOENT from fs.readFileSync
+        required_handling: >
+          Same as nock.load() — wrap in try-catch. Missing fixture means all definitions are
+          absent. Callers that transform definitions before passing to nock.define() must guard
+          against this error in the transformation pipeline.
+        sources:
+          - https://github.com/nock/nock#saving-and-loading-interceptors
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+  - name: Scope.done
+    import_path: nock
+    description: >
+      Asserts that all interceptors defined on this scope have been consumed (matched by at least
+      one real HTTP request). Throws an AssertionError if any mock remains unused. This is the
+      strict version of scope.isDone() — use done() to enforce that all expected requests were made.
+    postconditions:
+      # Evidence: nock/lib/scope.js done() — uses assert.ok(this.isDone(), ...) with pendingMocks()
+      # Confirmed: throws AssertionError (from Node assert module) when scope is not done
+      - id: scope-done-unused-mocks-throw
+        severity: error
+        condition: >
+          One or more interceptors on the scope have not been matched by a real HTTP request
+          when scope.done() is called
+        throws: >
+          AssertionError: "Mocks not yet satisfied:\n<method> <url>" — lists each pending mock
+        required_handling: >
+          Call scope.done() only after the code under test has had the opportunity to make all
+          expected HTTP calls. If done() throws, the test has a logic error: either the code
+          under test did not make the expected request, or the mock URL/method/body does not
+          match the actual request. Do not suppress the AssertionError — it is an intentional
+          test signal.
+        sources:
+          - https://github.com/nock/nock#asserting-expectations-after-execution
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+      - id: scope-done-swallowed-in-async-callback
+        severity: warning
+        condition: >
+          scope.done() is called inside an async callback (setTimeout, promise .then, or event
+          handler) without the test framework being aware of the async assertion
+        description: >
+          If done() throws inside an unguarded async callback, the AssertionError propagates as
+          an unhandled rejection or uncaught exception rather than a test failure. The test may
+          pass while an interceptor remains unused, hiding a real bug.
+        required_handling: >
+          Always call scope.done() synchronously at the end of the test body, or ensure the test
+          framework is awaiting async assertions (use expect.assertions(n) in Jest, or return the
+          promise from the test function).
+        sources:
+          - https://github.com/nock/nock#asserting-expectations-after-execution
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+  - name: back
+    import_path: nock
+    description: >
+      The nock.back() function provides a record/replay mechanism for HTTP interactions. In
+      'record' mode it makes real HTTP calls and saves them to a fixture file. In 'lockdown' or
+      'dryrun' mode it replays from the fixture. Returns a Promise resolving to {nockDone, context}
+      when called without a callback. nock.back.fixtures must be set before use.
+    postconditions:
+      # Evidence: nock/lib/back.js — explicit throw when fixtures path not set (line 47-50)
+      # Confirmed: throw Error('Back requires nock.back.fixtures to be set') before any async work
+      - id: back-fixtures-not-set
+        severity: error
+        condition: >
+          nock.back.fixtures has not been set to a directory path before calling nock.back()
+        throws: >
+          Error: "Back requires nock.back.fixtures to be set\n\tnock.back.fixtures = '/path/to/fixtures/'"
+        required_handling: >
+          Set nock.back.fixtures = path.join(__dirname, 'fixtures') in a top-level beforeAll
+          hook before any test that uses nock.back(). Missing this causes an immediate throw
+          (not a rejected Promise) — the error surfaces synchronously during the call.
+        sources:
+          - https://github.com/nock/nock#nock-back
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+      - id: back-unknown-mode
+        severity: error
+        condition: >
+          nock.back.setMode() is called with a string that is not one of 'wild', 'dryrun',
+          'record', 'update', or 'lockdown'
+        throws: 'Error — "Unknown mode: <value>"'
+        required_handling: >
+          Use only the five documented BackMode values. The mode is typically set from an
+          environment variable (process.env.NOCK_BACK_MODE). Validate the env var value against
+          the allowed set before passing to setMode().
+        sources:
+          - https://github.com/nock/nock#nock-back
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
