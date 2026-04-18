@@ -1,15 +1,36 @@
 package: passport-jwt
 semver: ">=4.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-17"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.67  # 2 contracted / 3 total callable-with-error-contract (4 sync-no-throw omitted)
+# Depth pass 2026-04-17 (deepen-stream-2 pass 1):
+# API surface: 7 total exports (1 Strategy class, 6 ExtractJwt factories)
+# Contracted before: 1 (Strategy, 4 postconditions)
+# Contracted after: 2 (+1 new: ExtractJwt.fromExtractors)
+# New postconditions on Strategy: +3 (both-secret-throws, missing-verify-throws, missing-jwt-from-request-throws)
+# Omitted: 5 (fromHeader, fromBodyField, fromUrlQueryParameter, fromAuthHeaderWithScheme,
+#             fromAuthHeaderAsBearerToken — sync factories, return null on failure, no throw)
+# Coverage: 2/7 total = 0.29; but effective (contracted/non-omitted) = 2/2 = 1.0
+# Evidence confirmed from:
+#   node_modules/passport-jwt/lib/strategy.js — throw sites lines 37, 45, 50, 55
+#   node_modules/passport-jwt/lib/extract_jwt.js — throw site line 77
+#   node_modules/passport-jwt/lib/verify_jwt.js — delegates to jsonwebtoken
+#   https://www.passportjs.org/packages/passport-jwt/
+#   https://github.com/mikenicholson/passport-jwt/blob/master/lib/strategy.js
 
 functions:
   - name: Strategy
     import_path: "passport-jwt"
-    description: "Constructor for JWT authentication strategy. Validates JWT tokens from requests and calls the verify callback with the decoded payload."
+    description: >
+      Constructor for JWT authentication strategy. Accepts options (secretOrKey or
+      secretOrKeyProvider, jwtFromRequest, and optional issuer/audience/algorithms/ignoreExpiration)
+      and a verify callback. Throws synchronously on misconfiguration. When used with
+      passport.authenticate('jwt'), calls the verify callback on each request with the
+      decoded JWT payload. The verify callback MUST call done() to signal authentication
+      result.
 
     preconditions:
       - id: secret-or-key-required
@@ -44,7 +65,7 @@ functions:
       # passport-jwt usage patterns being callback-based rather than awaited directly
       - id: missing-secret-throws
         condition: "secretOrKey and secretOrKeyProvider are both absent from options"
-        throws: "Error: JwtStrategy requires a secret or key"
+        throws: "TypeError: JwtStrategy requires a secret or key"
         required_handling: >
           Caller MUST provide either secretOrKey or secretOrKeyProvider in options.
           This error is thrown synchronously during strategy instantiation.
@@ -53,6 +74,117 @@ functions:
         sources:
           - "https://www.passportjs.org/packages/passport-jwt/"
           - "https://github.com/mikenicholson/passport-jwt/issues/206"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/passport-jwt/lib/strategy.js line 37:
+      #   throw new TypeError('JwtStrategy has been given both a secretOrKey and a secretOrKeyProvider')
+      # This throws synchronously in the constructor. A common mistake when refactoring auth config
+      # — the developer adds secretOrKeyProvider for flexibility but forgets to remove the old secretOrKey.
+      - id: both-secret-and-provider-throws
+        condition: >
+          Both secretOrKey and secretOrKeyProvider are provided in options. Only one of
+          these is allowed. Providing both indicates a configuration mistake — the strategy
+          cannot determine which key source to use.
+        throws: "TypeError: JwtStrategy has been given both a secretOrKey and a secretOrKeyProvider"
+        required_handling: >
+          Use EITHER secretOrKey (for static secrets) OR secretOrKeyProvider (for dynamic key
+          lookup, e.g., multi-tenant or JWKS endpoint). Never both at the same time.
+
+            // Correct: static secret only
+            new Strategy({ secretOrKey: process.env.JWT_SECRET, jwtFromRequest: ... }, verify);
+
+            // Correct: dynamic provider only
+            new Strategy({ secretOrKeyProvider: myProvider, jwtFromRequest: ... }, verify);
+
+            // WRONG: both provided — throws TypeError at startup
+            new Strategy({ secretOrKey: 'secret', secretOrKeyProvider: myProvider, jwtFromRequest: ... }, verify);
+
+          This error is thrown synchronously at application startup, so it will crash the
+          server process during initialization if not caught.
+        sources:
+          - "https://github.com/mikenicholson/passport-jwt/blob/master/lib/strategy.js#L37"
+          - "https://www.passportjs.org/packages/passport-jwt/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/passport-jwt/lib/strategy.js line 50:
+      #   throw new TypeError('JwtStrategy requires a verify callback')
+      # Thrown synchronously when Strategy is constructed without a verify function.
+      # Less common than missing-secret-throws but occurs when new Strategy(options) is called
+      # without the second argument.
+      - id: missing-verify-callback-throws
+        condition: >
+          The verify callback (second argument to new Strategy()) is not provided or is
+          undefined/null. The verify callback is required to validate the decoded JWT payload
+          and call done() with the authenticated user (or false on failure).
+        throws: "TypeError: JwtStrategy requires a verify callback"
+        required_handling: >
+          Always provide a verify callback as the second argument:
+
+            passport.use(new Strategy(options, function(jwt_payload, done) {
+              User.findById(jwt_payload.sub, function(err, user) {
+                if (err) return done(err, false);
+                if (user) return done(null, user);
+                return done(null, false);
+              });
+            }));
+
+          The verify callback signature is:
+            (jwt_payload, done) — when passReqToCallback is false (default)
+            (req, jwt_payload, done) — when passReqToCallback is true
+        sources:
+          - "https://github.com/mikenicholson/passport-jwt/blob/master/lib/strategy.js#L50"
+          - "https://www.passportjs.org/packages/passport-jwt/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/passport-jwt/lib/strategy.js line 55:
+      #   throw new TypeError('JwtStrategy requires a function to retrieve jwt from requests (see option jwtFromRequest)')
+      # Thrown synchronously when jwtFromRequest is missing from options.
+      - id: missing-jwt-from-request-throws
+        condition: >
+          options.jwtFromRequest is not provided. This function tells the strategy where to
+          find the JWT in each incoming request. Without it, the strategy cannot extract
+          the token from any request and throws synchronously at construction.
+        throws: "TypeError: JwtStrategy requires a function to retrieve jwt from requests (see option jwtFromRequest)"
+        required_handling: >
+          Always include jwtFromRequest in options. Use one of the built-in extractors:
+
+            const { ExtractJwt } = require('passport-jwt');
+
+            // Most common: Bearer token in Authorization header
+            opts.jwtFromRequest = ExtractJwt.fromAuthHeaderAsBearerToken();
+
+            // From custom header
+            opts.jwtFromRequest = ExtractJwt.fromHeader('x-access-token');
+
+            // From request body
+            opts.jwtFromRequest = ExtractJwt.fromBodyField('access_token');
+
+            // Combine multiple extractors (tries each in order)
+            opts.jwtFromRequest = ExtractJwt.fromExtractors([
+              ExtractJwt.fromAuthHeaderAsBearerToken(),
+              ExtractJwt.fromUrlQueryParameter('token'),
+            ]);
+        sources:
+          - "https://github.com/mikenicholson/passport-jwt/blob/master/lib/strategy.js#L55"
+          - "https://www.passportjs.org/packages/passport-jwt/"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -135,3 +267,61 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: ExtractJwt.fromExtractors
+    import_path: "passport-jwt"
+    description: >
+      Creates a combinator extractor that tries each provided extractor function in order,
+      returning the first non-null token found. Takes an array of extractor functions
+      (created by the other ExtractJwt.from* methods). Throws TypeError synchronously
+      if the argument is not an array. The returned extractor function is passed to
+      options.jwtFromRequest.
+    postconditions:
+      # Evidence: node_modules/passport-jwt/lib/extract_jwt.js line 77:
+      #   throw new TypeError('extractors.fromExtractors expects an array')
+      # This is a synchronous throw at the time fromExtractors() is called (during Strategy setup),
+      # not at request time. The throw occurs when a non-array (e.g., a single extractor function,
+      # or undefined) is passed instead of an array.
+      - id: from-extractors-non-array-throws
+        condition: >
+          ExtractJwt.fromExtractors() is called with a non-array argument. Common mistakes:
+          - Passing a single extractor function directly instead of wrapping in an array
+          - Passing undefined (e.g., a variable that was not initialized)
+          - Passing null or a string
+        throws: "TypeError: extractors.fromExtractors expects an array"
+        required_handling: >
+          Always wrap extractor functions in an array:
+
+            // WRONG — passes function directly, throws TypeError
+            opts.jwtFromRequest = ExtractJwt.fromExtractors(
+              ExtractJwt.fromAuthHeaderAsBearerToken()
+            );
+
+            // CORRECT — array of extractor functions
+            opts.jwtFromRequest = ExtractJwt.fromExtractors([
+              ExtractJwt.fromAuthHeaderAsBearerToken(),
+              ExtractJwt.fromUrlQueryParameter('token'),
+            ]);
+
+          This error is thrown synchronously during application initialization
+          (when the Strategy is configured), before any requests are processed.
+          It will crash the server startup if uncaught.
+        sources:
+          - "https://github.com/mikenicholson/passport-jwt/blob/master/lib/extract_jwt.js#L77"
+          - "https://www.passportjs.org/packages/passport-jwt/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+notes:
+  - "passport-jwt v4.x is callback-based — the verify function receives a done() callback, not a Promise."
+  - "The Strategy.authenticate() method is called internally by passport framework — not called directly by users."
+  - "ExtractJwt.fromHeader/fromBodyField/fromUrlQueryParameter/fromAuthHeaderWithScheme/fromAuthHeaderAsBearerToken are sync factories that cannot throw — intentionally omitted."
+  - "JWT verification is delegated to jsonwebtoken — see the jsonwebtoken contract for verify() error types (JsonWebTokenError, TokenExpiredError, NotBeforeError)."
+  - "secretOrKeyProvider pattern is for JWKS (JSON Web Key Set) lookups — the provider receives the raw token to extract the key ID (kid) and fetch the correct public key."
+  - "passport-jwt v4 uses jsonwebtoken v8/v9 internally — any algorithms not in the jsonwebtoken supported list will cause a silent failure or error in the verifier."
+  - "Async verify callbacks (returning Promise) are NOT natively supported in passport-jwt v4 — async errors in the verify function are caught by the try/catch in authenticate() and passed to self.error(ex)."
