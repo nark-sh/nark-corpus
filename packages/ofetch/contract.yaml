@@ -1,16 +1,24 @@
 package: ofetch
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.85
+coverage_score: 1.0
+# coverage_score note: 3 async-callable functions (ofetch, $fetch, ofetch.raw).
+# ofetch.create(), createFetch(), createFetchError() are sync factories/utilities — intentionally omitted.
+# ofetch.native is a property (pass-through to native fetch), not a callable contract surface.
 
 functions:
   - name: ofetch
     import_path: "ofetch"
-    description: "Make an HTTP request using ofetch — automatically throws FetchError on non-2xx responses"
+    description: >
+      Make an HTTP request using ofetch. Unlike native fetch(), ofetch automatically
+      throws FetchError when response.ok is false (any 4xx or 5xx status). Also
+      throws FetchError wrapping a TimeoutError when the timeout option fires.
+      GET/HEAD requests automatically retry once on status codes 408, 409, 425, 429,
+      500, 502, 503, 504; POST/PUT/PATCH default to 0 retries.
 
     postconditions:
       # Evidence: seen in 31 primary firings across 2 repos in scan-ofetch-2026-04-03.json
@@ -35,9 +43,88 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: source confirmed from dist/shared/ofetch.BBShr9Pz.cjs:
+      #   const error = new Error("[TimeoutError]: The operation was aborted due to timeout");
+      #   error.name = "TimeoutError"; error.code = 23;
+      #   controller.abort(error);
+      #   // Then caught and wrapped: const fetchError = createFetchError(context)
+      # The thrown error is a FetchError; error.cause is the TimeoutError.
+      - id: ofetch-timeout-unhandled
+        condition: >
+          ofetch() called with the timeout option set (e.g., { timeout: 3000 })
+          and the request does not complete within the timeout window.
+        throws: >
+          FetchError wrapping a TimeoutError as its cause. The FetchError message
+          includes "[TimeoutError]: The operation was aborted due to timeout". The
+          cause error has name "TimeoutError" and code 23 (DOMException TIMEOUT_ERR).
+          This is distinct from network-error FetchErrors which have no .cause.
+        required_handling: >
+          Caller MUST wrap ofetch() in try/catch when using the timeout option:
+            try {
+              const data = await ofetch('/api/data', { timeout: 5000 });
+            } catch (error) {
+              if (error.cause?.name === 'TimeoutError') {
+                // Request timed out — retry, return cached, or surface error to user
+              }
+              throw error;
+            }
+          Without try/catch, a timeout causes an unhandled FetchError that crashes
+          the calling async context. Timeout errors are NOT retried (retries are
+          suppressed for timeout-triggered aborts per source: isAbort check excludes
+          errors where context.options.timeout is set).
+        sources:
+          - https://github.com/unjs/ofetch/blob/main/src/fetch.ts
+          - https://github.com/unjs/ofetch#-timeout
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: source confirmed from dist/shared/ofetch.BBShr9Pz.cjs:
+      #   retries = isPayloadMethod(context.options.method) ? 0 : 1;
+      #   isPayloadMethod checks: POST, PUT, PATCH, DELETE
+      # retryStatusCodes default: [408, 409, 425, 429, 500, 502, 503, 504]
+      - id: ofetch-retry-post-disabled
+        condition: >
+          ofetch() called with a POST, PUT, PATCH, or DELETE method (explicitly set
+          or inferred from body presence) and the server returns a retryable status
+          code (500, 502, 503, 504, 429, etc.) but the caller expects automatic retry.
+        throws: >
+          FetchError immediately after the first failure — no automatic retry occurs.
+          The default retry count for POST/PUT/PATCH is 0 (disabled) to avoid
+          unintended side effects from repeated writes.
+        required_handling: >
+          For idempotent POST/PUT operations that should retry, explicitly set retry:
+            await ofetch('/api/resource', {
+              method: 'POST',
+              body: { ... },
+              retry: 3,             // explicit retry count overrides the default
+              retryDelay: 500,      // ms between retries
+            });
+          For non-idempotent writes, do NOT enable retry — repeated execution can
+          cause duplicate records, double-charges, or duplicate emails. Wrap in
+          try/catch and implement application-level retry with idempotency keys instead.
+        sources:
+          - https://github.com/unjs/ofetch#-auto-retry
+          - https://github.com/unjs/ofetch/blob/main/src/fetch.ts
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
   - name: $fetch
     import_path: "ofetch"
-    description: "Make an HTTP request using $fetch (alias for ofetch) — automatically throws FetchError on non-2xx responses"
+    description: >
+      Make an HTTP request using $fetch (alias for ofetch). Identical behavior:
+      automatically throws FetchError on non-2xx responses, supports timeout,
+      retry, and all FetchOptions. $fetch is the conventional import name in
+      Nuxt.js and other UnJS ecosystem projects.
 
     postconditions:
       # Evidence: seen in 4 primary firings across 2 repos in scan-ofetch-2026-04-03.json
@@ -52,6 +139,80 @@ functions:
         sources:
           - https://github.com/unjs/ofetch
           - https://raw.githubusercontent.com/unjs/ofetch/main/README.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: raw
+    import_path: "ofetch"
+    namespace: "ofetch"
+    description: >
+      ofetch.raw() returns the full FetchResponse object (with headers, status, and
+      parsed ._data). Unlike native fetch(), ofetch.raw() still throws FetchError
+      on non-2xx status codes by default — the same error behavior as ofetch().
+      The key difference from ofetch() is the return value: callers get the response
+      object with ._data, not just the parsed body. Use when you need access to
+      response headers or status code alongside the parsed body.
+
+    postconditions:
+      # Evidence: source confirmed from dist/shared/ofetch.BBShr9Pz.cjs:
+      #   $fetch.raw = $fetchRaw;  // $fetchRaw is the core async function
+      #   $fetch(request, options) { const r = await $fetchRaw(request, options); return r._data; }
+      #   Both share the same onError() path that calls createFetchError() and throws FetchError.
+      # Documentation: https://github.com/unjs/ofetch#-access-to-raw-response
+      - id: raw-still-throws-on-error
+        condition: >
+          ofetch.raw() is called without try/catch and the server returns a 4xx or 5xx
+          status code. Callers who switch from native fetch() to ofetch.raw() expecting
+          the native fetch() behavior (no throw on non-2xx) will be surprised.
+        throws: >
+          FetchError — identical to ofetch(). The raw suffix refers to the return type
+          (full FetchResponse object vs. just ._data), NOT to bypassing error handling.
+          FetchError.response contains the full response; FetchError.data contains the
+          parsed error body; FetchError.status contains the HTTP status code.
+        required_handling: >
+          Caller MUST wrap ofetch.raw() in try/catch:
+            try {
+              const response = await ofetch.raw('/api/data');
+              console.log(response.status, response.headers.get('x-request-id'));
+              const data = response._data;
+            } catch (error) {
+              // error is FetchError — use error.status, error.data, error.response
+              if (error.status === 404) { ... }
+            }
+          To bypass error throwing (and inspect all responses including errors),
+          use ignoreResponseError: true option — this makes ofetch.raw() behave like
+          native fetch() and return the response for all status codes.
+        sources:
+          - https://github.com/unjs/ofetch#-access-to-raw-response
+          - https://github.com/unjs/ofetch/blob/main/src/fetch.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: source confirmed — same $fetchRaw function handles timeouts
+      # Both ofetch() and ofetch.raw() go through $fetchRaw which has the timeout logic
+      - id: raw-timeout-unhandled
+        condition: >
+          ofetch.raw() called with timeout option and the request does not complete
+          within the specified timeout window.
+        throws: >
+          FetchError wrapping TimeoutError as cause. Identical timeout behavior to
+          ofetch() — same $fetchRaw internal function, same error path.
+        required_handling: >
+          Same as ofetch() with timeout: wrap in try/catch and check
+          error.cause?.name === 'TimeoutError' to distinguish timeout from HTTP errors.
+        sources:
+          - https://github.com/unjs/ofetch/blob/main/src/fetch.ts
+          - https://github.com/unjs/ofetch#-timeout
         severity: error
         business_impact:
           incident_label: DOWNTIME

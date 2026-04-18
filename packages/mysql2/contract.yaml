@@ -1,11 +1,29 @@
 package: mysql2
 semver: ">=3.9.8"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-04-18"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.87
+coverage_score: 0.79
+# Depth pass 2026-04-18 (deepen-stream-1 pass 5):
+# API surface: 19 async-callable functions (mysql2/promise API)
+# Contracted before: 13 (connect, query, execute, getConnection, beginTransaction,
+#   commit, rollback, createConnection, end, prepare, PreparedStatementInfo.execute,
+#   changeUser, ping)
+# Contracted after: 15 (+2: reset, PreparedStatementInfo.close)
+# Intentionally omitted: 4
+#   - Connection.[Symbol.asyncDispose]() — just calls end(), same error surface as end()
+#   - PoolCluster.end() — PoolCluster is rarely used in SaaS apps
+#   - PoolCluster.getConnection() — PoolCluster is rarely used in SaaS apps
+#   - Pool.releaseConnection() — synchronous, returns void, no async error contract
+# Coverage: 15/19 raw = 0.79; effective (contracted / non-omitted) = 15/15 = 1.0
+# Evidence sources confirmed from:
+#   node_modules/mysql2/lib/promise/connection.js (lines 121-138: reset())
+#   node_modules/mysql2/lib/promise/prepared_statement_info.js (lines 24-28: close())
+#   node_modules/mysql2/lib/commands/reset_connection.js (clears _statements cache)
+#   node_modules/mysql2/lib/commands/prepare.js (PreparedStatementInfo.close() delegates to CloseStatement)
+#   https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements
 
 # CRITICAL SECURITY NOTE:
 # mysql2 has 5 CRITICAL CVEs in versions < 3.9.8:
@@ -708,4 +726,180 @@ functions:
           MySQL is no longer alive. This is the expected outcome in keepalive checks
           when the server has closed the connection due to wait_timeout or
           interactive_timeout. The error.code field identifies the specific failure.
+        evidence_quality: confirmed
+
+  - name: reset
+    import_path: "mysql2/promise"
+    description: >
+      Sends COM_RESET_CONNECTION to the MySQL server, resetting the connection to
+      its initial authenticated state without closing and reopening the TCP connection.
+      Resets: temporary tables, session variables, user variables, SET NAMES charset,
+      and all server-side prepared statements. Faster than changeUser() for clearing
+      session state. Returns the connection to a clean state for reuse.
+    postconditions:
+      # Evidence: mysql2/lib/promise/connection.js lines 121-138
+      # Source: c.reset() wraps coreConnection.reset() which sends COM_RESET_CONNECTION
+      # Error path: rejects with err.code, err.errno, err.sqlState, err.sqlMessage copied
+      # Evidence: mysql2/lib/commands/reset_connection.js lines 16-19:
+      #   if (connection._statements) { connection._statements.clear(); }
+      # Documentation: https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements
+      #   "you should not use statement after connection reset (changeUser(), reset() or disconnect)"
+      - id: reset-connection-dead
+        condition: >
+          The connection is no longer alive (server closed due to wait_timeout, network failure,
+          or the connection was destroyed) when reset() is called. The COM_RESET_CONNECTION
+          packet cannot be sent on a dead socket.
+        throws: >
+          Promise rejects with PROTOCOL_CONNECTION_LOST, ECONNRESET, or ECONNREFUSED.
+          Same error codes as ping() — the connection is permanently unusable after this error.
+        required_handling: >
+          Wrap await connection.reset() in try-catch. On error, destroy the connection
+          and create a new one — do not attempt to reuse. In pool scenarios, call
+          connection.destroy() rather than connection.release() when reset() fails.
+
+            const connection = await pool.getConnection();
+            try {
+              await connection.reset();
+              // Use connection...
+            } catch (resetErr) {
+              connection.destroy(); // NOT release() — this connection is broken
+              throw resetErr;
+            } finally {
+              // Only release if no error (destroy() handles cleanup on error)
+            }
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/connection.js"
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/commands/reset_connection.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Rejects with PROTOCOL_CONNECTION_LOST or ECONNRESET when the connection to MySQL
+          is no longer alive. After a failed reset(), the connection is unusable and must
+          be destroyed (not released back to pool).
+        evidence_quality: confirmed
+
+      - id: reset-invalidates-prepared-statements
+        condition: >
+          reset() is called on a connection that has cached PreparedStatementInfo objects
+          (created via connection.prepare()). reset() sends COM_RESET_CONNECTION which
+          causes the MySQL server to invalidate all prepared statements for this connection.
+          The mysql2 client also clears its local _statements LRU cache on reset.
+          Any PreparedStatementInfo objects held by the caller are now stale and will
+          fail when execute() is called on them.
+        throws: >
+          reset() itself succeeds (resolves). Subsequent stmt.execute() on a stale
+          PreparedStatementInfo rejects with unknown statement ID error or
+          PROTOCOL_CONNECTION_LOST.
+        required_handling: >
+          After calling reset(), invalidate and discard all PreparedStatementInfo objects
+          associated with that connection. Re-call connection.prepare() before executing
+          any statements on the connection.
+
+            await connection.reset();
+            // All PreparedStatementInfo from before reset() are now invalid.
+            // Re-prepare any statements you need.
+            const stmt = await connection.prepare('SELECT * FROM users WHERE id = ?');
+            const [rows] = await stmt.execute([userId]);
+            await stmt.close();
+
+          Note: connection.execute() (not prepare()) uses an auto-managed LRU cache
+          that mysql2 clears automatically on reset() — only manually prepared statements
+          via connection.prepare() require manual re-preparation.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/commands/reset_connection.js"
+          - "https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          reset() clears both the server-side prepared statement cache and the mysql2
+          client-side _statements LRU cache. PreparedStatementInfo objects held in
+          application code become stale — executing them after reset() causes an unknown
+          statement ID error from the MySQL server.
+        evidence_quality: confirmed
+
+  - name: PreparedStatementInfo.close
+    import_path: "mysql2/promise"
+    description: >
+      Explicitly closes a server-side prepared statement created via connection.prepare().
+      Sends COM_STMT_CLOSE to the MySQL server. MySQL does not send an acknowledgment
+      packet for COM_STMT_CLOSE, so this is fire-and-forget — the Promise always resolves
+      regardless of connection state. Must be called when finished with a manually-prepared
+      statement to avoid server-side prepared statement resource leaks. MySQL enforces
+      a global max_prepared_stmt_count limit (default: 16,382) — failing to close
+      statements causes this limit to be reached, preventing new prepared statements
+      from being created across all connections.
+    postconditions:
+      # Evidence: mysql2/lib/promise/prepared_statement_info.js lines 24-28
+      # Source: close() always resolves — no reject path in Promise wrapper
+      #   return new this.Promise((resolve) => {
+      #     this.statement.close();   // sends COM_STMT_CLOSE via addCommand(new CloseStatement(id))
+      #     resolve();                // always resolves immediately
+      #   });
+      # Evidence: mysql2/lib/commands/close_statement.js lines 10-14:
+      #   start(packet, connection) {
+      #     connection.writePacket(new Packets.CloseStatement(this.id).toPacket(1));
+      #     return null;  // no ack expected — MySQL spec: no response for COM_STMT_CLOSE
+      #   }
+      # Documentation: https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements
+      #   "Manually prepared statements doesn't come with LRU cache and SHOULD be closed using statement.close()"
+      - id: prepared-statement-close-missing
+        condition: >
+          connection.prepare() is called but statement.close() is never called after
+          the prepared statement is no longer needed. Each unclosed prepared statement
+          occupies a slot on the MySQL server. MySQL's global max_prepared_stmt_count
+          (default: 16,382) limits the total number of prepared statements across all
+          connections. Long-running services that repeatedly call connection.prepare()
+          without close() will eventually exhaust this limit.
+        throws: >
+          Once max_prepared_stmt_count is reached, new connection.prepare() calls reject
+          with ER_MAX_PREPARED_STMT_COUNT_REACHED (MySQL errno 1461):
+          "Can't create more than max_prepared_stmt_count statements (current value: 16382)"
+        required_handling: >
+          Always call statement.close() after finishing with a manually-prepared statement.
+          Use try-finally to ensure close() is called even when execute() throws:
+
+            const stmt = await connection.prepare('INSERT INTO events (type, payload) VALUES (?, ?)');
+            try {
+              await stmt.execute([eventType, JSON.stringify(payload)]);
+            } finally {
+              await stmt.close(); // Always close — fire-and-forget, always resolves
+            }
+
+          Prefer connection.execute() (auto-cached LRU, auto-closes evicted statements)
+          over connection.prepare() unless you need explicit statement lifecycle control.
+          The auto-cache manages closing evicted statements transparently.
+
+          For batch operations where a statement is reused many times, prepare() +
+          close() is more efficient than execute() (which re-parses the statement cache
+          on each call). In these cases, always close in finally.
+        sources:
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/promise/prepared_statement_info.js"
+          - "https://github.com/sidorares/node-mysql2/blob/master/lib/commands/close_statement.js"
+          - "https://sidorares.github.io/node-mysql2/docs/documentation/prepared-statements"
+          - "https://dev.mysql.com/doc/refman/8.0/en/server-system-variables.html#sysvar_max_prepared_stmt_count"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Failing to call close() on manually-prepared statements is a resource leak.
+          Each unclosed PreparedStatementInfo occupies a slot on the MySQL server
+          until the connection closes (pool connections persist for a long time).
+          When max_prepared_stmt_count (default 16,382) is reached across all connections,
+          new prepare() calls fail with ER_MAX_PREPARED_STMT_COUNT_REACHED.
+          This causes a gradual service degradation rather than an immediate crash —
+          symptoms appear hours or days after the leak begins.
         evidence_quality: confirmed
