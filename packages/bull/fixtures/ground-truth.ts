@@ -352,3 +352,84 @@ async function moveToFailedWithErrorHandling(job: Job) {
 
 // Stub for compilation
 async function processWork(data: any) { return data; }
+
+// ============================================================
+// Job.extendLock — VIOLATION CASES (deepen-stream-1 pass 3)
+// ============================================================
+
+// @expect-violation: extend-lock-zero-return-unchecked
+// @expect-violation: extend-lock-no-try-catch
+async function extendLockWithoutAnyHandling(job: Job) {
+  // ❌ No try-catch and no return value check
+  // If Redis is down: unhandled rejection crashes the function
+  // If lock was taken by another worker (returns 0): processing continues as duplicate
+  await job.extendLock(30000);
+  // ... continues processing job (potential duplicate\!)
+}
+
+// @expect-violation: extend-lock-zero-return-unchecked
+async function extendLockWithTryCatchButNoReturnCheck(job: Job) {
+  try {
+    // ❌ Has try-catch but doesn't check return value
+    // If extendLock returns 0 (lock taken), processing continues as duplicate
+    await job.extendLock(30000);
+    // ... continues processing job (potential duplicate if lock was taken\!)
+  } catch (err) {
+    console.error('Lock renewal error:', err);
+  }
+}
+
+// @expect-clean
+async function extendLockWithFullHandling(job: Job) {
+  try {
+    // ✅ Check return value AND wrap in try-catch
+    const extended = await job.extendLock(30000);
+    if (\!extended) {
+      // Another worker took the job — stop processing immediately
+      throw new Error('Lock lost: job taken by another worker');
+    }
+    // Safe to continue processing — lock still held
+  } catch (err: any) {
+    console.error('Lock renewal failed — aborting job:', err.message);
+    throw err; // Re-throw to abort job processing
+  }
+}
+
+// ============================================================
+// Queue.getMetrics — VIOLATION CASES (deepen-stream-1 pass 3)
+// ============================================================
+
+// @expect-violation: get-metrics-no-try-catch
+async function getMetricsWithoutErrorHandling() {
+  const queue = new Queue('metrics-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — Redis pipeline errors crash the metrics endpoint
+  const metrics = await queue.getMetrics('completed');
+  console.log('Metrics:', metrics.data);
+}
+
+// @expect-clean
+async function getMetricsWithErrorHandling() {
+  const queue = new Queue('metrics-queue', {
+    redis: { host: 'localhost', port: 6379 },
+    metrics: { maxDataPoints: 1440 }, // ✅ Metrics enabled
+  });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    // ✅ try-catch handles Redis pipeline errors
+    const metrics = await queue.getMetrics('completed');
+    if (metrics.count === 0) {
+      console.warn('No metrics data yet — ensure metrics is enabled in QueueOptions');
+    }
+    return metrics.data;
+  } catch (err) {
+    console.error('Failed to fetch queue metrics:', err);
+    return [];
+  }
+}
