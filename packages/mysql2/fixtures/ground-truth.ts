@@ -59,3 +59,65 @@ export async function poolQueryWithCatch() {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. connection.reset() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: reset-connection-dead
+export async function resetNoCatch() {
+  const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
+  // SHOULD_FIRE: reset-connection-dead — connection.reset() can reject (PROTOCOL_CONNECTION_LOST, ECONNRESET)
+  // if the connection is no longer alive. No try-catch.
+  await connection.reset();
+  await connection.end();
+}
+
+// @expect-clean
+export async function resetWithCatch() {
+  const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
+  try {
+    // SHOULD_NOT_FIRE: connection.reset() inside try-catch satisfies error handling
+    await connection.reset();
+    await connection.query('SELECT 1');
+  } catch (err) {
+    // Connection is unusable after failed reset — destroy, not release
+    connection.destroy();
+    throw err;
+  } finally {
+    await connection.end().catch(() => {}); // Ignore end errors after reset
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. PreparedStatementInfo.close() — resource leak pattern
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: prepared-statement-close-missing
+export async function prepareWithoutClose() {
+  const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
+  try {
+    const stmt = await connection.prepare('SELECT * FROM users WHERE id = ?');
+    // SHOULD_FIRE: prepared-statement-close-missing — stmt.close() never called.
+    // Each unclosed statement occupies a server-side slot until connection closes.
+    // Long-running apps exhaust max_prepared_stmt_count (default: 16,382).
+    await stmt.execute([1]);
+    // Missing: await stmt.close();
+  } finally {
+    await connection.end();
+  }
+}
+
+// @expect-clean
+export async function prepareWithClose() {
+  const connection = await mysql.createConnection({ host: 'localhost', database: 'testdb' });
+  const stmt = await connection.prepare('SELECT * FROM users WHERE id = ?');
+  try {
+    // SHOULD_NOT_FIRE: stmt.execute() inside try with stmt.close() in finally
+    const [rows] = await stmt.execute([1]);
+    return rows;
+  } finally {
+    await stmt.close(); // Always close — fire-and-forget, always resolves
+    await connection.end();
+  }
+}
