@@ -47,3 +47,24 @@ export function validateConfigWithoutHandling(config: { host: string; port: numb
   expect(config.port).to.be.a('number').within(1, 65535);
   expect(config.ssl).to.be.a('boolean');
 }
+
+// @expect-violation: assert-iferror-rethrows-value
+// VIOLATION: Using assert.ifError in a try-catch that only catches AssertionError.
+// assert.ifError rethrows the value itself (NOT AssertionError), so this catch
+// block will MISS errors thrown by assert.ifError(err) if err is not an AssertionError.
+export function processCallbackResultWithTypedCatch(err: Error | null, data: unknown) {
+  try {
+    // ❌ assert.ifError rethrows err directly — NOT AssertionError
+    // If err is an Error, the catch block below will NOT handle it
+    // because AssertionError !== err.constructor
+    assert.ifError(err);
+    return data;
+  } catch (error) {
+    // ❌ This only catches AssertionError, but assert.ifError rethrows err itself
+    // so a non-AssertionError will pass through this catch block uncaught
+    if (error instanceof Error && error.constructor.name === 'AssertionError') {
+      console.error('Assertion failed:', error.message);
+    }
+    // Bug: non-AssertionError errors from assert.ifError(err) propagate uncaught
+  }
+}

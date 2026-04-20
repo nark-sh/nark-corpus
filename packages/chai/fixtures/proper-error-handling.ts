@@ -75,3 +75,18 @@ export function validateWithShould(value: string): boolean {
     return false;
   }
 }
+
+// @expect-clean
+// CORRECT: Using assert.ifError with a catch that handles any error (not just AssertionError).
+// Because assert.ifError rethrows the value itself, the catch must handle any error type.
+export function processCallbackResultClean(err: Error | null, data: unknown) {
+  try {
+    // assert.ifError rethrows err directly — the catch handles any error, not just AssertionError
+    assert.ifError(err);
+    return data;
+  } catch (error) {
+    // Correctly catches the rethrown err (or any other Error) from assert.ifError
+    console.error('Callback error:', error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
