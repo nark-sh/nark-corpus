@@ -1,19 +1,48 @@
 package: request-promise
 semver: ">=4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-20"
 status: deprecated
 evidence_quality: confirmed
 deprecated: true
 deprecated_reason: "The request package is unmaintained since February 2020. Use axios, node-fetch, or undici instead."
 deprecated_date: "2020-02-11"
+# Depth pass 2026-04-20 (deepen-stream-1 pass 3):
+# API surface: 11 callable exports (default, get, post, put, patch, del/delete, head,
+#              defaults [factory], forever [agent factory], jar [sync], cookie [sync])
+# Contracted before: 3 (default, get, post) — missing put, patch, del/delete, head
+# Contracted after: 8 (+5: put, patch, del, head, and added TransformError postcondition to default)
+# Intentionally omitted: 3 (defaults — sync factory; jar — sync; cookie — sync)
+# Coverage: 8/11 total = 0.73; effective (contracted/non-omitted) = 8/8 = 1.0
+# Key new finding: TransformError is a THIRD distinct error type never documented in
+#   previous contract — thrown when options.transform() throws inside the callback.
+#   Source confirmed: request-promise-core/lib/plumbing.js lines 100, 117.
+# Evidence confirmed from:
+#   node_modules/request-promise-core/lib/plumbing.js (error dispatch logic, lines 85-127)
+#   node_modules/request-promise-core/lib/errors.js (error class definitions)
+#   node_modules/@types/request/index.d.ts (RequestAPI interface — put/patch/del/head/head)
+#   https://github.com/request/request-promise (official README — method shortcuts, error types)
+coverage_score: 0.73
+
+detection:
+  type_names: []
+  import_names:
+    - request-promise
 
 functions:
   - name: default
     import_path: "request-promise"
-    description: "See postconditions for behavioral contract details."
+    description: >
+      The main callable export. Accepts a URL string or options object and returns a
+      Bluebird promise that resolves with the response body (or full response if
+      resolveWithFullResponse: true). By default, any non-2xx HTTP status code causes
+      rejection with StatusCodeError. Network-level failures reject with RequestError.
+      If a transform function is configured and throws, rejects with TransformError.
     postconditions:
+      # Evidence: request-promise-core/lib/plumbing.js lines 85-127 (callback dispatch)
+      # Evidence: request-promise-core/lib/errors.js (error class definitions)
+      # Evidence: https://github.com/request/request-promise (README)
       - id: http-error-4xx-5xx
         condition: "response status is 4xx or 5xx and options.simple is true (default)"
         throws: "StatusCodeError with statusCode, error (response body), options, and response properties"
@@ -22,6 +51,7 @@ functions:
           Default behavior (simple: true) throws on non-2xx status codes.
         sources:
           - "https://github.com/request/request-promise"
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L104"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -38,6 +68,7 @@ functions:
           Check err.cause for underlying error details (ECONNREFUSED, ENOTFOUND, ETIMEDOUT, etc.).
         sources:
           - "https://github.com/request/request-promise"
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L87"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -46,12 +77,64 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      - id: transform-function-error
+        condition: "options.transform() function is configured and throws an error during execution"
+        throws: >
+          TransformError with cause (the error thrown by the transform function), error,
+          options, and response properties. TransformError.name === 'TransformError'.
+        required_handling: >
+          Callers using options.transform MUST also handle TransformError in addition to
+          StatusCodeError and RequestError. A catch block catching only StatusCodeError
+          will silently swallow transform failures, causing the promise to never settle.
+          TransformError.cause contains the original error from the transform function.
+        sources:
+          - "https://github.com/request/request-promise#migration-from-v2-to-v3"
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L100"
+          - "https://github.com/request/request-promise-core/blob/master/lib/errors.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
     edge_cases:
       - id: simple-false-disables-statuscodeerror
-        description: "Setting options.simple = false disables StatusCodeError. Non-2xx responses resolve normally."
+        description: >
+          Setting options.simple = false disables StatusCodeError. Non-2xx responses
+          resolve normally — the promise resolves with the body (or full response if
+          resolveWithFullResponse: true) even for 4xx/5xx status codes.
+          Usually combined with resolveWithFullResponse: true to check response.statusCode manually.
         sources:
           - "https://github.com/request/request-promise"
         severity: info
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: get
+    import_path: "request-promise"
+    description: >
+      HTTP GET shortcut. Equivalent to calling rp({ method: 'GET', uri: ... }).
+      Returns a Bluebird promise. Rejects with StatusCodeError on non-2xx responses
+      (when simple: true, the default), RequestError on network failures, and
+      TransformError if a transform function throws.
+    postconditions:
+      # Evidence: https://github.com/request/request-promise (README confirms same error behavior for all shortcuts)
+      # Evidence: request-promise-core/lib/plumbing.js — shared callback handles all methods identically
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.get(). Same behavior as calling
+          rp() directly — non-2xx responses reject unless simple: false is set.
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -59,15 +142,12 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
-  - name: get
-    import_path: "request-promise"
-    description: "See postconditions for behavioral contract details."
-    postconditions:
-      - id: http-error-4xx-5xx
-        condition: "response status is 4xx or 5xx and options.simple is true (default)"
-        throws: "StatusCodeError with statusCode, error, options, and response properties"
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
         required_handling: >
-          Caller MUST catch StatusCodeError when using rp.get().
+          Caller MUST catch RequestError for network-level failures.
+          Check err.cause for the underlying error (ECONNREFUSED, ENOTFOUND, etc.).
         sources:
           - "https://github.com/request/request-promise"
         severity: error
@@ -80,8 +160,12 @@ functions:
 
   - name: post
     import_path: "request-promise"
-    description: "See postconditions for behavioral contract details."
+    description: >
+      HTTP POST shortcut. Equivalent to calling rp({ method: 'POST', uri: ..., body: ... }).
+      Returns a Bluebird promise. Same error profile as rp.get().
     postconditions:
+      # Evidence: https://github.com/request/request-promise (README)
+      # Evidence: request-promise-core/lib/plumbing.js — same callback for all methods
       - id: http-error-4xx-5xx
         condition: "response status is 4xx or 5xx and options.simple is true (default)"
         throws: "StatusCodeError with statusCode, error, options, and response properties"
@@ -96,3 +180,211 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.post().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: put
+    import_path: "request-promise"
+    description: >
+      HTTP PUT shortcut. Used for creating or replacing a resource at a known URL.
+      Returns a Bluebird promise with the same error profile as rp.get() and rp.post().
+      Rejects with StatusCodeError on non-2xx responses (default simple: true),
+      RequestError on network failures.
+    postconditions:
+      # Evidence: https://github.com/request/request-promise (README: "the same is available for all http method shortcuts")
+      # Evidence: @types/request index.d.ts — put() in RequestAPI interface (line 32-34)
+      # Evidence: request-promise-core/lib/plumbing.js — shared callback, identical behavior for all methods
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.put(). PUT requests to
+          missing or unauthorized resources (404, 403) will reject by default.
+        sources:
+          - "https://github.com/request/request-promise"
+          - "https://github.com/DefinitelyTyped/DefinitelyTyped/blob/master/types/request/index.d.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.put().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: patch
+    import_path: "request-promise"
+    description: >
+      HTTP PATCH shortcut. Used for partial resource updates. Returns a Bluebird promise
+      with the same error profile as rp.put(). Rejects with StatusCodeError on non-2xx
+      responses, RequestError on network failures.
+    postconditions:
+      # Evidence: https://github.com/request/request-promise (README confirms all shortcuts share error behavior)
+      # Evidence: @types/request index.d.ts — patch() in RequestAPI interface (line 40-42)
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.patch(). PATCH requests to
+          resources that don't exist (404) or where the user lacks permission (403)
+          will reject by default.
+        sources:
+          - "https://github.com/request/request-promise"
+          - "https://github.com/DefinitelyTyped/DefinitelyTyped/blob/master/types/request/index.d.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.patch().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: del
+    import_path: "request-promise"
+    description: >
+      HTTP DELETE shortcut (alias: rp.delete()). Used for deleting resources. Returns a
+      Bluebird promise with the same error profile as other HTTP method shortcuts. Note:
+      the method is named 'del' (not 'delete') in older code since 'delete' was a reserved
+      keyword; both names are available in request-promise v4.
+    postconditions:
+      # Evidence: https://github.com/request/request-promise (README: del/delete both listed)
+      # Evidence: @types/request index.d.ts — del() and delete() both in RequestAPI interface (lines 44-50)
+      # Evidence: request-promise-core/lib/plumbing.js — shared callback for all methods
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.del() or rp.delete().
+          DELETE on a resource that doesn't exist (404) or lacks permission (403) will
+          reject. A 404 on a repeated DELETE is common — check statusCode before retrying.
+        sources:
+          - "https://github.com/request/request-promise"
+          - "https://github.com/DefinitelyTyped/DefinitelyTyped/blob/master/types/request/index.d.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.del().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: head
+    import_path: "request-promise"
+    description: >
+      HTTP HEAD shortcut. Used for checking resource existence or headers without
+      downloading the body. Unlike other methods, resolves with the response HEADERS
+      object by default (not the body) because HEAD responses have no body.
+      The error profile is the same as other HTTP method shortcuts.
+    postconditions:
+      # Evidence: https://github.com/request/request-promise (README confirms all shortcuts)
+      # Evidence: request-promise-core/lib/plumbing.js lines 62-66 — HEAD has a special
+      #   defaultTransformation that returns headers (or full response) instead of body
+      # Evidence: @types/request index.d.ts — head() in RequestAPI interface (lines 36-38)
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.head(). A 404 HEAD check for
+          resource existence will reject by default — this is a common gotcha when using
+          HEAD to probe whether a resource exists.
+        sources:
+          - "https://github.com/request/request-promise"
+          - "https://github.com/DefinitelyTyped/DefinitelyTyped/blob/master/types/request/index.d.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.head().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: head-resolves-with-headers-not-body
+        condition: "request succeeds (2xx)"
+        returns: >
+          Response headers object (not body) by default, because HTTP HEAD responses have no body.
+          Set resolveWithFullResponse: true to get the full response object instead.
+        required_handling: >
+          Callers MUST NOT expect a body from rp.head(). The resolved value is the
+          response.headers object by default. This differs from all other HTTP method
+          shortcuts which resolve with the body.
+        sources:
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L62"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
