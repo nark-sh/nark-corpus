@@ -22,6 +22,8 @@
  *   whitelist:       whitelist-regex-injection (2026-04-20, stream-1 pass 4)
  *   toBoolean:       to-boolean-loose-mode-truthy-surprise (2026-04-20, stream-1 pass 4)
  *   trim:            trim-non-string-throws (2026-04-20, stream-1 pass 4)
+ *   isByteLength:    isbytelength-byte-vs-char-confusion, isbytelength-non-string-throws (2026-04-20, stream-2 pass 5)
+ *   isWhitelisted:   iswhitelisted-null-chars-throws, iswhitelisted-unchecked-return (2026-04-20, stream-2 pass 5)
  *
  * Annotation format:
  *   @expect-violation: <postcondition-id>  — scanner SHOULD flag this
@@ -698,6 +700,101 @@ function sanitizeOptionalFieldSafe(value: string | null | undefined): string {
 }
 
 // =============================================================================
+// isByteLength — deepen pass 2026-04-20 (stream-2 pass 5)
+// =============================================================================
+
+// @expect-violation: isbytelength-byte-vs-char-confusion
+function validateDisplayNameForDb(name: string): boolean {
+  // ❌ Using isByteLength with a character-count limit (100 chars) as if it were bytes.
+  // CJK names: '大切なユーザー' (7 chars) = 21 bytes — will fail {max:100} byte check
+  // even though only 7 characters are used. Silently rejects valid international names.
+  // Conversely, if the DB column is VARCHAR(100) bytes, isLength() should NOT be used here.
+  if (!validator.isByteLength(name, { max: 100 })) {
+    throw new Error('Name too long');
+  }
+  return true;
+}
+
+// @expect-violation: isbytelength-non-string-throws
+function validateBioField(bio: string | null): boolean {
+  // ❌ Optional bio field may be null — throws TypeError before byte count
+  return validator.isByteLength(bio as string, { min: 0, max: 255 });
+}
+
+// @expect-violation: isbytelength-non-string-throws
+function validatePayloadSize(payload: unknown): boolean {
+  // ❌ payload from JSON body may not be a string — isByteLength throws immediately
+  return validator.isByteLength(payload as string, { max: 1024 });
+}
+
+// @expect-clean
+function validateRedisKeyByteLength(key: string): boolean {
+  // ✅ Redis has a 512MB key limit but common practice is to cap at 1KB.
+  // Key bytes (not chars) is the correct measure here — isByteLength is appropriate.
+  if (typeof key !== 'string') return false;
+  return validator.isByteLength(key, { min: 1, max: 1024 });
+}
+
+// @expect-clean
+function validateDisplayNameForUiLimit(name: string): boolean {
+  // ✅ UI character limit (max 50 visible chars) — isLength is correct here, not isByteLength
+  // Comment documents why isLength is used over isByteLength for character-count constraints
+  return validator.isLength(name, { min: 1, max: 50 });
+}
+
+// =============================================================================
+// isWhitelisted — deepen pass 2026-04-20 (stream-2 pass 5)
+// =============================================================================
+
+// @expect-violation: iswhitelisted-null-chars-throws
+function validateInputAgainstConfig(input: string, config: { allowedChars?: string }): boolean {
+  // ❌ config.allowedChars may be undefined — throws TypeError on chars.indexOf()
+  // Unlike most is* validators where only the first arg can throw, here the SECOND arg
+  // (chars) throws if null/undefined. TypeError: "Cannot read properties of undefined"
+  return validator.isWhitelisted(input, config.allowedChars as string);
+}
+
+// @expect-violation: iswhitelisted-null-chars-throws
+function checkInputCharset(input: string, allowedCharset: string | null): boolean {
+  // ❌ allowedCharset null from optional DB column — throws inside isWhitelisted loop
+  // assertString(str) passes but chars.indexOf() fails with null
+  return validator.isWhitelisted(input, allowedCharset as string);
+}
+
+// @expect-violation: iswhitelisted-unchecked-return
+function storeTagWithoutValidation(input: string): void {
+  // ❌ isWhitelisted returns boolean but result not checked before storing input
+  // The ORIGINAL unmodified input is used — validator is bypassed
+  validator.isWhitelisted(input, 'abcdefghijklmnopqrstuvwxyz0123456789-');
+  storeTagInDb(input); // input unchanged — isWhitelisted is not a sanitizer!
+}
+
+// @expect-violation: iswhitelisted-unchecked-return
+function processTagInput(tag: string): string {
+  // ❌ isWhitelisted is confused with whitelist() (sanitizer).
+  // isWhitelisted returns boolean, does NOT return a filtered string.
+  const safe = validator.isWhitelisted(tag, 'abcdefghijklmnopqrstuvwxyz');
+  return safe as any; // safe is boolean 'true'/'false', not a sanitized string
+}
+
+// @expect-clean
+function validateTagWithCheck(input: string): void {
+  // ✅ Check the return value and reject invalid input
+  const allowedChars = 'abcdefghijklmnopqrstuvwxyz0123456789-';
+  if (!validator.isWhitelisted(input, allowedChars)) {
+    throw new Error('Tag contains invalid characters');
+  }
+  storeTagInDb(input); // Only reached if all chars are in allowed set
+}
+
+// @expect-clean
+function validateInputWithFallback(input: string, config: { allowedChars?: string }): boolean {
+  // ✅ Default chars if config value is absent — no null/undefined for chars
+  const allowed = config.allowedChars ?? 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return validator.isWhitelisted(input, allowed);
+}
+
+// =============================================================================
 // Helper stubs (not under test)
 // =============================================================================
 
@@ -705,3 +802,4 @@ async function fetchUserById(id: number): Promise<any> { return null; }
 function chargeCard(card: string, amount: number): void { }
 function saveCard(card: string, meta: any): void { }
 function storeDate(date: string): void { }
+function storeTagInDb(tag: string): void { }

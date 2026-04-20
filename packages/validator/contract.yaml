@@ -5,7 +5,19 @@ maintainer: "corpus-team"
 last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.281
+coverage_score: 0.301
+# deepen-stream-2 pass 5: +2 functions (isByteLength, isWhitelisted)
+# Depth pass 2026-04-20 (deepen-stream-2 pass 5):
+# +2 functions: isByteLength, isWhitelisted
+# isByteLength: bytes vs chars confusion — CJK '你好' (2 chars) = 6 bytes; fails {max:4}
+# isWhitelisted: unique TypeError on null CHARS arg (not just str); all other is* only throw on null str
+# Total contracted: 31 / 103 raw = 0.301
+#   CONTRACTED: isByteLength (byte-vs-char confusion + non-string TypeError)
+#               isWhitelisted (null-chars TypeError + unchecked-return-value)
+#   INTENTIONALLY OMITTED (this pass): isSemVer (boolean only, assertString TypeError redundant),
+#     isTime (returns false for non-string — no throw at all), isHash (returns false for invalid
+#     algorithm — no throw; assertString TypeError only), toString (Object.prototype, not validator)
+#
 # Depth pass 2026-04-20 (deepen-stream-2 pass 1):
 # +2 functions: isLicensePlate, isBase32
 # isLicensePlate: throws Error (not TypeError) for invalid locale — unique in validator API
@@ -1595,6 +1607,176 @@ functions:
           incident_cost_range: low
         evidence_quality: confirmed
 
+  - name: isByteLength
+    import_path: "validator"
+    description: >
+      Validates that a string's length in UTF-8 bytes falls within a given range.
+      Measures BYTES not JavaScript characters. For ASCII text, bytes == chars.
+      For multi-byte characters (CJK, emoji, accented chars), byte count > char count.
+      Throws TypeError on non-string input (assertString pattern). Returns boolean.
+      Common use: validating inputs against database column byte limits.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js#validators (isByteLength docs)
+      # Source confirmed: lib/isByteLength.js — uses encodeURI(str).split(/%..|./).length - 1
+      # encodeURI() encodes non-ASCII chars as %XX%XX sequences; split counts them as 2-3 bytes each.
+      - id: isbytelength-byte-vs-char-confusion
+        condition: >
+          isByteLength() used to validate string length against a limit derived from a
+          database column size or API constraint, where the column stores multibyte
+          characters (CJK, Arabic, emoji, accented Latin). The max option reflects the
+          column's byte capacity, not its character capacity.
+          Example: VARCHAR(100) means 100 bytes in some databases (MySQL latin1), or
+          100 chars in others (MySQL utf8mb4 stores 1-4 bytes per char). Code that
+          passes isByteLength({max: 100}) for a utf8mb4 VARCHAR(100) column will REJECT
+          valid CJK strings that fit the column because it conflates bytes and chars.
+          Conversely, code that uses isLength({max: 100}) for a VARCHAR(100) byte-limited
+          column will ALLOW overlong multibyte strings that EXCEED the DB column's capacity.
+        returns: >
+          false when the byte length exceeds max — but this can falsely reject valid input
+          if the limit was meant as a character limit, or falsely accept overlong input if
+          isLength() was used instead for a byte-limited column.
+        required_handling: >
+          Use isByteLength() only when the constraint is a BYTE limit (e.g. Redis
+          key/value byte caps, fixed-width binary fields, HTTP header length limits).
+          Use isLength() when the constraint is a CHARACTER limit (e.g. display name
+          max characters, tweet length, most UI character counters).
+          For database columns: check whether the column type stores length in bytes or
+          characters. MySQL utf8mb4 CHAR(n) = n characters; VARCHAR(n) = n bytes.
+          PostgreSQL TEXT/VARCHAR(n) = n characters.
+
+            // Wrong: Assumes column limit is characters, not bytes
+            if (!validator.isByteLength(name, { max: 100 })) reject('name too long');
+            // May reject valid CJK name 'が大切' (3 chars = 9 bytes)
+
+            // Right for byte-limited storage:
+            if (!validator.isByteLength(value, { max: 256 })) reject('value too large');
+
+            // Right for character-limited display (most UI use cases):
+            if (!validator.isLength(name, { max: 100 })) reject('name too long');
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isByteLength.js"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: isbytelength-non-string-throws
+        condition: >
+          isByteLength() called with a non-string first argument. Common when processing
+          JSON payload fields that may be null (optional fields), numbers, or objects
+          before string validation.
+        throws: >
+          TypeError with message "Expected a string but received a <type>".
+          Thrown by assertString() before the byte count is computed.
+        required_handling: >
+          Guard or coerce to string before calling:
+
+            // Wrong: may receive null from optional JSON field
+            const valid = validator.isByteLength(req.body.description, { max: 255 });
+
+            // Right: guard first
+            const desc = req.body.description;
+            if (typeof desc !== 'string') return reject('description required');
+            const valid = validator.isByteLength(desc, { max: 255 });
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isWhitelisted
+    import_path: "validator"
+    description: >
+      Returns true if every character in `str` is present in the `chars` whitelist string.
+      Returns false if any character in `str` is NOT in `chars`. Returns true for empty `str`.
+      Throws TypeError if `str` is non-string (assertString pattern). Throws TypeError if
+      `chars` is null or undefined (unique: most is* validators only throw for non-string str,
+      not for the second parameter). Used as a character-allowlist validator in form processing.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js#validators (isWhitelisted)
+      # Source confirmed: lib/isWhitelisted.js — chars.indexOf(str[i]) throws if chars is null
+      # assertString(str) called first; then chars.indexOf() called without null-check on chars.
+      - id: iswhitelisted-null-chars-throws
+        condition: >
+          isWhitelisted() called where the `chars` parameter is null, undefined, or a value
+          that does not have an indexOf() method. This differs from all other is* validators
+          whose only TypeError comes from a null/non-string FIRST argument. Here the SECOND
+          argument (chars) can also throw. Occurs when chars is loaded from a config file or
+          environment variable that may be absent, or when it's derived from user input
+          without validation.
+        throws: >
+          TypeError: "Cannot read properties of null (reading 'indexOf')" when chars is null.
+          TypeError: "Cannot read properties of undefined (reading 'indexOf')" when chars is undefined.
+          This is NOT an assertString() error — it originates from the chars.indexOf() call
+          inside the loop after assertString(str) has already succeeded.
+        required_handling: >
+          Always ensure chars is a non-null string before calling isWhitelisted():
+
+            // Wrong: chars from config may be undefined
+            const allowed = config.allowedChars;  // may be undefined
+            if (!validator.isWhitelisted(input, allowed)) throw new Error('invalid chars');
+            // => TypeError: Cannot read properties of undefined (reading 'indexOf')
+
+            // Right: validate or default chars
+            const allowed = config.allowedChars ?? 'abcdefghijklmnopqrstuvwxyz0123456789';
+            if (!validator.isWhitelisted(input, allowed)) throw new Error('invalid chars');
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isWhitelisted.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: iswhitelisted-unchecked-return
+        condition: >
+          isWhitelisted() return value not checked, or checked but the application
+          proceeds with the unvalidated input when it returns false. Unlike blacklist()
+          which REMOVES disallowed chars from the string, isWhitelisted() only REPORTS
+          whether disallowed chars are present — it does not sanitize. Callers who
+          mistake it for a sanitizer instead of a validator pass through invalid input.
+        returns: >
+          false when any character in str is not in chars. The string is NOT modified.
+          Returning false means the input is INVALID — the caller must reject it.
+        required_handling: >
+          Always act on the boolean return value. Do not pass the original string
+          through after isWhitelisted returns — the string is unchanged:
+
+            // Wrong: confuses validator with sanitizer
+            const safe = validator.isWhitelisted(userInput, 'a-z0-9');
+            // safe is boolean, NOT a sanitized string — but name implies it "whitelisted" the value
+            db.query('INSERT INTO tags VALUES (' + userInput + ')');  // userInput unchanged!
+
+            // Right: check and reject
+            if (!validator.isWhitelisted(userInput, 'abcdefghijklmnopqrstuvwxyz0123456789-')) {
+              return res.status(400).json({ error: 'Invalid characters in tag name' });
+            }
+            db.query('INSERT INTO tags VALUES (?)', [userInput]);
+        sources:
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
 # SOURCES.md has comprehensive documentation of all error conditions
 # See: corpus/packages/validator/SOURCES.md (111 lines)
 #
@@ -1608,6 +1790,7 @@ functions:
 # - Deepen pass 2026-04-20 (stream-2 pass 1): +2 (isLicensePlate, isBase32), 19 total contracted
 # - Deepen pass 2026-04-20 (stream-1 pass 4): +10 (isMobilePhone, isPostalCode, isTaxID, isVAT,
 #     isIdentityCard, unescape, blacklist, whitelist, toBoolean, trim), 29 total contracted
+# - Deepen pass 2026-04-20 (stream-2 pass 5): +2 (isByteLength, isWhitelisted), 31 total contracted
 #
 # Key findings (updated 2026-04-20):
 # - CORRECTION: validator.js DOES throw TypeError on non-string input (assertString() pattern)
@@ -1621,6 +1804,8 @@ functions:
 # - toBoolean non-strict mode: 'no', 'off', 'null', '0.0' all return TRUE — use strict mode
 #   for config/feature flag parsing
 # - unescape() is an XSS vector: unescaping before HTML render defeats escape() protection
+# - isByteLength() counts bytes not chars — CJK/emoji inputs may fail or pass unexpectedly
+# - isWhitelisted() throws on null CHARS (second arg), unlike all other is* validators
 # - Most common mistake: Not checking return values (boolean/null/NaN)
 # - #1 security issue: Not escaping user input (XSS)
 # - #2 security issue: Not whitelisting URL protocols (open redirects, XSS)
@@ -1631,13 +1816,15 @@ functions:
 #
 # API surface (2026-04-20 update):
 #   Total exported functions: 103 (full README enumeration: 90 validators + 13 sanitizers)
-#   Contracted: 29 (escape, normalizeEmail, isEmail, isURL, isJSON, isStrongPassword, isJWT,
+#   Contracted: 31 (escape, normalizeEmail, isEmail, isURL, isJSON, isStrongPassword, isJWT,
 #               stripLow, toDate, toFloat, toInt, isCreditCard, matches, isCurrency, isBase64,
 #               isLength, isISO8601, isLicensePlate, isBase32, isMobilePhone, isPostalCode,
-#               isTaxID, isVAT, isIdentityCard, unescape, blacklist, whitelist, toBoolean, trim)
-#   Omitted: ~74 pure-format validators (isAlpha, isAlphanumeric, isAscii, isBIC, isIBAN,
+#               isTaxID, isVAT, isIdentityCard, unescape, blacklist, whitelist, toBoolean, trim,
+#               isByteLength, isWhitelisted)
+#   Omitted: ~72 pure-format validators (isAlpha, isAlphanumeric, isAscii, isBIC, isIBAN,
 #            isISO*, isLatLong, isMACAddress, isIP, isUUID, isFQDN, isBoolean, isInt, isFloat,
-#            isAlpha*, isHexColor, isBtcAddress, isEthereumAddress, and similar)
+#            isAlpha*, isHexColor, isBtcAddress, isEthereumAddress, isSemVer, isTime, isHash,
+#            toString (Object.prototype), isByteLength, isWhitelisted now contracted, and similar)
 #   Omission reason: Omitted functions return boolean only, throw TypeError only on non-string
 #                    (same profile as contracted validators), and have no unique security
 #                    contracts beyond the assertString pattern. isPassportNumber specifically
