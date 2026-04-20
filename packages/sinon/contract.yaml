@@ -1,11 +1,21 @@
 package: sinon
 semver: ">=1.0.0"
-contract_version: "2.0.0"
+contract_version: "2.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
-
+coverage_score: 0.73
+# Depth pass 2026-04-20 (deepen-stream-2 pass 3):
+# +2 functions: fake, replace (sandbox.replace with 4 postconditions)
+# API surface: 11 callable-with-error-contract functions total
+#   Previously contracted (6): stub, spy, mock, useFakeTimers, createSandbox, createStubInstance
+#   New (2): fake (2 postconditions), replace (4 postconditions)
+#   Intentionally omitted (3): promise (only throws if resolved twice — testing utility),
+#     replaceGetter (narrow accessor use case, same pattern as replace),
+#     replaceSetter (narrow accessor use case)
+# Coverage: 8 contracted / 11 total = 0.73
+#
 # Scan: scan-sinon-2026-04-03.json — 4 repos scanned, 0 violations found
 # sinon is a testing library; most violations (improper restore patterns) occur in
 # test files not analyzed by the scanner. 0/20 FP repos, evidence_quality: confirmed.
@@ -230,6 +240,219 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: fake
+    import_path: "sinon"
+    description: >
+      Creates a fake that records all calls, arguments, and return values. The modern
+      sinon API (since v5) for creating test doubles. When called with a function argument,
+      wraps that function and records interactions. When called with no arguments, creates
+      a blank fake. Sub-methods (fake.returns, fake.throws, fake.resolves, fake.rejects,
+      fake.yields, fake.yieldsAsync) are factories that create fakes with preset behaviors.
+    postconditions:
+      # Evidence: sinon/lib/sinon/fake.js line 30-32 (source inspection sinon@21.1.2):
+      #   if (arguments.length > 0 && typeof f !== "function") {
+      #     throw new TypeError("Expected f argument to be a Function");
+      # Documentation: https://sinonjs.org/releases/latest/fakes/
+      - id: fake-non-function-arg-throws
+        condition: >
+          sinon.fake(value) is called where value is not a function (e.g. a string,
+          number, plain object, or undefined passed explicitly as first argument).
+          sinon.fake() with zero arguments is valid; sinon.fake(someString) throws.
+        throws: "TypeError: Expected f argument to be a Function"
+        required_handling: >
+          MUST pass either no argument (blank fake) or a Function when calling sinon.fake().
+          Sub-methods (fake.returns, fake.resolves, fake.rejects, etc.) accept non-function
+          values and are the correct API when you want a preset return value.
+
+            // Correct: blank fake
+            const f = sinon.fake();
+
+            // Correct: wrap an existing function
+            const f2 = sinon.fake(myImpl);
+
+            // Correct: preset return value via factory
+            const f3 = sinon.fake.returns(42);
+
+            // WRONG: passing a non-function
+            const f4 = sinon.fake("not a function"); // TypeError!
+        sources:
+          - "https://sinonjs.org/releases/latest/fakes/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/fake.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: sinon/lib/sinon/fake.js fake.yields/yieldsAsync:
+      #   throw new TypeError("Expected last argument to be a function");
+      # Both fake.yields() and fake.yieldsAsync() throw this when the fake is invoked
+      # without a function as the last argument.
+      - id: fake-yields-missing-callback
+        condition: >
+          A fake created with sinon.fake.yields(...values) or sinon.fake.yieldsAsync(...values)
+          is invoked at call time without a function as its last argument. The TypeError is
+          thrown when the fake is called, not when it is created.
+        throws: "TypeError: Expected last argument to be a function"
+        required_handling: >
+          MUST ensure the last argument passed to a yields/yieldsAsync fake is a function.
+          This is the callback convention: the fake expects to invoke its last argument.
+
+            // Correct: caller always passes a callback last
+            const fake = sinon.fake.yields("result");
+            fake("arg1", (result) => console.log(result)); // ok
+
+            // WRONG: no callback
+            fake("arg1"); // TypeError at invocation time!
+        sources:
+          - "https://sinonjs.org/releases/latest/fakes/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/fake.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: replace
+    import_path: "sinon"
+    description: >
+      Sandbox method (sandbox.replace) that replaces a non-accessor property on an object
+      with a replacement value. The replacement is tracked and restored when sandbox.restore()
+      is called. Distinct from stub (which wraps functions) — replace works on any property type
+      (values, functions, modules) as long as the type matches. Accessor properties (getters/setters)
+      must use replaceGetter/replaceSetter instead.
+    postconditions:
+      # Evidence: sinon/lib/sinon/sandbox.js (source inspection sinon@21.1.2):
+      #   checkForValidArguments: throw TypeError for undefined descriptor (non-existent)
+      #   verifyNotReplaced: throw TypeError "Attempted to replace X which is already replaced"
+      #   throwOnAccessors: throw Error "Use sandbox.replaceGetter for replacing getters"
+      #   verifySameType: throw TypeError "Cannot replace <type> with <type>"
+      # Documentation: https://sinonjs.org/releases/latest/sandbox/
+      - id: replace-non-existent-property
+        condition: >
+          sandbox.replace(object, property, replacement) is called where `property` does
+          not exist on `object` or its prototype chain. A common mistake when refactoring
+          code that removes or renames properties while tests still reference old names.
+        throws: "TypeError: Cannot replace non-existent property '<property>'. Perhaps you meant sandbox.define()?"
+        required_handling: >
+          MUST verify the property exists on the object before calling sandbox.replace().
+          If the goal is to add a new property (not replace an existing one), use
+          sandbox.define(object, property, value) instead.
+
+            // Correct: property exists
+            const obj = { method: () => 'original' };
+            sandbox.replace(obj, 'method', sandbox.stub()); // ok
+
+            // WRONG: property doesn't exist
+            sandbox.replace(obj, 'nonExistent', sandbox.stub()); // TypeError!
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: replace-already-replaced-throws
+        condition: >
+          sandbox.replace(object, property, replacement) is called on a property that
+          has already been replaced via sandbox.replace() in the same sandbox without
+          an intervening sandbox.restore(). Happens when the same setup code is called
+          twice, or two beforeEach hooks both replace the same property.
+        throws: "TypeError: Attempted to replace '<property>' which is already replaced"
+        required_handling: >
+          MUST call sandbox.restore() between replace calls on the same property.
+          Use a single sandbox per test scope and restore in afterEach.
+
+            // Correct: one replace per sandbox lifecycle
+            beforeEach(() => {
+              sandbox.replace(obj, 'method', replacement);
+            });
+            afterEach(() => {
+              sandbox.restore(); // clears the replacement
+            });
+
+            // WRONG: replacing twice without restore
+            sandbox.replace(obj, 'method', stub1); // ok
+            sandbox.replace(obj, 'method', stub2); // TypeError: already replaced!
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: replace-accessor-property-throws
+        condition: >
+          sandbox.replace(object, property, replacement) is called on a property that
+          is defined as a getter or setter (accessor property). sandbox.replace() only
+          works on value properties (data descriptors). Attempting to replace a getter
+          or setter throws an Error directing to use replaceGetter/replaceSetter.
+        throws: "Error: Use sandbox.replaceGetter for replacing getters"
+        required_handling: >
+          Use sandbox.replaceGetter() for getter properties, sandbox.replaceSetter() for
+          setter properties, or sandbox.replace.usingAccessor() when you need to replace
+          the underlying value of an accessor property.
+
+            // Correct: use replaceGetter for getters
+            sandbox.replaceGetter(obj, 'computedProp', () => 'test-value');
+
+            // WRONG: using replace() on a getter
+            // if 'computedProp' is a getter:
+            sandbox.replace(obj, 'computedProp', 'test-value'); // Error!
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: replace-type-mismatch-throws
+        condition: >
+          sandbox.replace(object, property, replacement) is called where the replacement
+          is a different JavaScript type than the original property value. For example,
+          replacing a function property with a plain object, or replacing a string
+          property with a number. sinon enforces type consistency to prevent accidental
+          misuse.
+        throws: "TypeError: Cannot replace <originalType> with <replacementType>"
+        required_handling: >
+          MUST pass a replacement of the same type as the original property.
+          When replacing a function, use a stub/spy/fake (which are functions).
+          When replacing a primitive, use the same primitive type.
+
+            const obj = { value: 'original-string' };
+
+            // Correct: same type
+            sandbox.replace(obj, 'value', 'replacement-string'); // ok
+
+            // WRONG: different type
+            sandbox.replace(obj, 'value', 42); // TypeError: Cannot replace string with number!
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 # Category: testing
 # npm: https://www.npmjs.com/package/sinon
