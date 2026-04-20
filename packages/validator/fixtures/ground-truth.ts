@@ -24,6 +24,11 @@
  *   trim:            trim-non-string-throws (2026-04-20, stream-1 pass 4)
  *   isByteLength:    isbytelength-byte-vs-char-confusion, isbytelength-non-string-throws (2026-04-20, stream-2 pass 5)
  *   isWhitelisted:   iswhitelisted-null-chars-throws, iswhitelisted-unchecked-return (2026-04-20, stream-2 pass 5)
+ *   isAlpha:         alpha-invalid-locale-throws, alpha-ignore-type-throws (2026-04-20, stream-1 pass 7)
+ *   isAlphanumeric:  alphanumeric-invalid-locale-throws, alphanumeric-ignore-type-throws (2026-04-20, stream-1 pass 7)
+ *   isDecimal:       decimal-invalid-locale-throws, decimal-force-decimal-not-set (2026-04-20, stream-1 pass 7)
+ *   isDate:          isdate-non-strict-accepts-date-objects, isdate-strict-format-mismatch (2026-04-20, stream-1 pass 7)
+ *   isIBAN:          iban-format-only-not-account-verified, iban-whitespace-stripping-silent (2026-04-20, stream-1 pass 7)
  *
  * Annotation format:
  *   @expect-violation: <postcondition-id>  — scanner SHOULD flag this
@@ -795,6 +800,162 @@ function validateInputWithFallback(input: string, config: { allowedChars?: strin
 }
 
 // =============================================================================
+// isAlpha — should fire
+// =============================================================================
+
+// @expect-violation: alpha-invalid-locale-throws
+function validateNameForLocale(name: string, userLocale: string): boolean {
+  // ❌ userLocale from user settings passed directly — may be 'zh-CN-Simplified' or 'POSIX'
+  // throws Error("Invalid locale '...'") for unrecognized locales
+  return validator.isAlpha(name, userLocale as any);
+}
+
+// @expect-violation: alpha-ignore-type-throws
+function validateNameIgnoringChars(name: string, charsToIgnore: string[]): boolean {
+  // ❌ charsToIgnore is an array, not string or RegExp — throws Error
+  return validator.isAlpha(name, 'en-US', { ignore: charsToIgnore as any });
+}
+
+// =============================================================================
+// isAlpha — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateNameSafeLocale(name: string, userLocale: string): boolean {
+  // ✅ Pre-validate locale against supported set
+  const { isAlpha } = validator;
+  const SUPPORTED_LOCALES = new Set(['en-US', 'de-DE', 'fr-FR', 'es-ES', 'ja-JP', 'zh-TW', 'ar']);
+  const safeLocale = SUPPORTED_LOCALES.has(userLocale) ? userLocale : 'en-US';
+  return validator.isAlpha(name, safeLocale as any);
+}
+
+// @expect-clean
+function validateNameIgnoringHyphenSpace(name: string): boolean {
+  // ✅ ignore is a string — valid
+  return validator.isAlpha(name, 'en-US', { ignore: ' -' });
+}
+
+// =============================================================================
+// isAlphanumeric — should fire
+// =============================================================================
+
+// @expect-violation: alphanumeric-invalid-locale-throws
+function validateUsernameForLocale(username: string, locale: string): boolean {
+  // ❌ locale from Accept-Language header passed without validation
+  return validator.isAlphanumeric(username, locale as any);
+}
+
+// =============================================================================
+// isAlphanumeric — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateUsernameSafe(username: string, locale: string): boolean {
+  // ✅ Fallback to en-US for unrecognized locales
+  const safeLocale = ['en-US', 'de-DE', 'fr-FR', 'zh-TW'].includes(locale) ? locale : 'en-US';
+  return validator.isAlphanumeric(username, safeLocale as any);
+}
+
+// =============================================================================
+// isDecimal — should fire
+// =============================================================================
+
+// @expect-violation: decimal-invalid-locale-throws
+function validateDecimalForLocale(price: string, locale: string): boolean {
+  // ❌ locale from user profile passed directly — may be unsupported
+  return validator.isDecimal(price, { locale: locale as any });
+}
+
+// @expect-violation: decimal-force-decimal-not-set
+function validatePriceRequiresDecimal(price: string): boolean {
+  // ❌ No force_decimal — '100' (integer) passes as valid price
+  // Financial form expects '100.00' format but accepts bare '100'
+  return validator.isDecimal(price);
+}
+
+// =============================================================================
+// isDecimal — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validatePriceSafe(price: string): boolean {
+  // ✅ force_decimal: true requires decimal point, locale validated
+  return validator.isDecimal(price, { force_decimal: true, locale: 'en-US' });
+}
+
+// =============================================================================
+// isDate — should fire
+// =============================================================================
+
+// @expect-violation: isdate-non-strict-accepts-date-objects
+function validateDateInput(input: any): boolean {
+  // ❌ Non-strict mode: if input is a Date object, isDate() returns true
+  // but caller may then try to call string methods on it
+  if (!validator.isDate(input)) {
+    throw new Error('Invalid date');
+  }
+  // Subsequent string operation will throw if input was a Date object
+  const trimmed = (input as string).trim();
+  return true;
+}
+
+// @expect-violation: isdate-strict-format-mismatch
+function validateISODateStrict(dateStr: string): boolean {
+  // ❌ Strict mode with default format ('YYYY/MM/DD') — rejects '2024-01-15' (ISO format)
+  // Returns false for valid ISO dates because format doesn't match
+  return validator.isDate(dateStr, { strictMode: true });
+}
+
+// =============================================================================
+// isDate — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateISODateCorrect(dateStr: string): boolean {
+  // ✅ Strict mode with explicit format matching expected input
+  return validator.isDate(dateStr, { strictMode: true, format: 'YYYY-MM-DD' });
+}
+
+// =============================================================================
+// isIBAN — should fire
+// =============================================================================
+
+// @expect-violation: iban-format-only-not-account-verified
+async function initiateBankTransfer(iban: string, amount: number): Promise<void> {
+  // ❌ isIBAN() used as sole validation before payment — only checks format+checksum,
+  // not account existence, activity, or ownership
+  if (!validator.isIBAN(iban)) {
+    throw new Error('Invalid IBAN');
+  }
+  // Proceeds directly to transfer without payment provider account verification
+  await processTransfer(iban, amount);
+}
+
+// @expect-violation: iban-whitespace-stripping-silent
+async function storeBankAccount(rawIban: string): Promise<void> {
+  // ❌ isIBAN validates space-formatted IBANs silently, stores with inconsistent spacing
+  if (!validator.isIBAN(rawIban)) {
+    throw new Error('Invalid IBAN');
+  }
+  // rawIban may contain spaces ('DE89 3704 0044...')  — not normalized before storage
+  await saveBankAccountToDb(rawIban);
+}
+
+// =============================================================================
+// isIBAN — should NOT fire
+// =============================================================================
+
+// @expect-clean
+async function storeBankAccountNormalized(rawIban: string): Promise<void> {
+  // ✅ Validate then normalize before storage
+  if (!validator.isIBAN(rawIban)) {
+    throw new Error('Invalid IBAN format');
+  }
+  const normalizedIban = rawIban.replace(/\s+/g, '').toUpperCase();
+  await saveBankAccountToDb(normalizedIban);
+}
+
+// =============================================================================
 // Helper stubs (not under test)
 // =============================================================================
 
@@ -803,3 +964,5 @@ function chargeCard(card: string, amount: number): void { }
 function saveCard(card: string, meta: any): void { }
 function storeDate(date: string): void { }
 function storeTagInDb(tag: string): void { }
+async function processTransfer(iban: string, amount: number): Promise<void> { }
+async function saveBankAccountToDb(iban: string): Promise<void> { }

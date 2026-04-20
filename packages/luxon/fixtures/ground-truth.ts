@@ -14,6 +14,9 @@
  *   - endof-invalid-unit
  *   - min-non-datetime-throws
  *   - max-non-datetime-throws
+ *   - set-conflicting-specification (added 2026-04-20)
+ *   - diff-invalid-unit (added 2026-04-20)
+ *   - duration-fromobject-non-object-throws (added 2026-04-20)
  */
 
 import { DateTime, Duration } from 'luxon';
@@ -245,5 +248,113 @@ function findLatestOfDateTimes(dt1: DateTime, dt2: DateTime): DateTime {
     return DateTime.max(dt1, dt2);
   } catch (error) {
     throw new Error(`Failed to find max DateTime: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DateTime.set — throws ConflictingSpecificationError for mixed calendar systems
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: set-conflicting-specification
+// ❌ SHOULD_FIRE — mixing weekYear with month; set() throws ConflictingSpecificationError
+function setMixedCalendarFieldsWeek(dt: DateTime, weekYear: number, month: number): DateTime {
+  return dt.set({ weekYear, month }); // throws! can't mix ISO week year with Gregorian month
+}
+
+// @expect-violation: set-conflicting-specification
+// ❌ SHOULD_FIRE — mixing ordinal with month/day; set() throws ConflictingSpecificationError
+function setMixedCalendarFieldsOrdinal(dt: DateTime, ordinal: number, month: number): DateTime {
+  return dt.set({ ordinal, month }); // throws! can't mix ordinal with Gregorian month/day
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — set only Gregorian fields, wrapped in try-catch
+function setGregorianFieldsSafe(dt: DateTime, hour: number, minute: number): DateTime {
+  try {
+    return dt.set({ hour, minute });
+  } catch (error) {
+    throw new Error(`Failed to set DateTime fields: ${error}`);
+  }
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — set only week-based fields, wrapped in try-catch
+function setWeekFieldsSafe(dt: DateTime, weekNumber: number): DateTime {
+  try {
+    return dt.set({ weekNumber });
+  } catch (error) {
+    throw new Error(`Failed to set week number: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DateTime.diff — throws InvalidUnitError for unrecognized unit strings
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: diff-invalid-unit
+// ❌ SHOULD_FIRE — unit from user input without validation; throws for 'date', 'min', etc.
+function diffWithDynamicUnit(start: DateTime, end: DateTime, unit: string): number {
+  const duration = start.diff(end, unit as 'days'); // throws if unit is 'date' or 'min'
+  return duration.valueOf();
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — validate unit before use, wrapped in try-catch
+function diffWithValidatedUnit(start: DateTime, end: DateTime, unit: string): number {
+  const VALID_UNITS = ['years', 'months', 'weeks', 'days', 'hours', 'minutes', 'seconds', 'milliseconds'];
+  if (!VALID_UNITS.includes(unit)) {
+    throw new Error(`Invalid diff unit: ${unit}. Valid: ${VALID_UNITS.join(', ')}`);
+  }
+  try {
+    const duration = start.diff(end, unit as 'days');
+    return duration.valueOf();
+  } catch (error) {
+    throw new Error(`Failed to diff DateTimes: ${error}`);
+  }
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — hardcoded valid units array, wrapped in try-catch
+function getSubscriptionDaysRemaining(startDate: DateTime, endDate: DateTime): number {
+  try {
+    const duration = startDate.diff(endDate, ['months', 'days']);
+    return duration.days;
+  } catch (error) {
+    throw new Error(`Failed to compute subscription period: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Duration.fromObject — throws InvalidArgumentError for null/non-object input
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: duration-fromobject-non-object-throws
+// ❌ SHOULD_FIRE — Duration.fromObject called with potentially null/undefined; throws
+function createDurationFromConfig(config: Record<string, unknown>): Duration {
+  return Duration.fromObject(config.retryDelay as object); // throws if config.retryDelay is null/undefined
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — validate before calling Duration.fromObject, with try-catch
+function createDurationFromConfigSafe(config: Record<string, unknown>): Duration {
+  const delay = config.retryDelay;
+  if (!delay || typeof delay !== 'object' || Array.isArray(delay)) {
+    return Duration.fromMillis(1000); // default 1 second
+  }
+  try {
+    return Duration.fromObject(delay as Record<string, number>);
+  } catch (error) {
+    throw new Error(`Invalid duration configuration: ${error}`);
+  }
+}
+
+// @expect-clean
+// ✅ SHOULD_NOT_FIRE — nullish coalescing to provide safe default, with try-catch
+function parseDurationOrDefault(input: unknown): Duration {
+  const durationObj = (typeof input === 'object' && input !== null) ? input : { milliseconds: 0 };
+  try {
+    return Duration.fromObject(durationObj as Record<string, number>);
+  } catch (error) {
+    throw new Error(`Failed to create Duration: ${error}`);
   }
 }
