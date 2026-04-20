@@ -18,11 +18,22 @@
 
 package: mocha
 semver: ">=8.0.0 <12.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
+coverage_score: 0.89  # 8 contracted / (10 total - 1 intentionally omitted) = 8/9
+# Depth pass 2026-04-20 (deepen-stream-1 pass 5):
+# API surface: 10 callable-with-error-contract (BDD + TDD hooks, programmatic API)
+# Contracted before: 6 (it, before, after, beforeEach, afterEach, describe)
+# Contracted after: 8 (+2: Mocha.loadFilesAsync, Mocha.run)
+# Intentionally omitted: 1 (TDD aliases: suiteSetup/suiteTeardown/setup/teardown — identical contracts to before/after/beforeEach/afterEach)
+# Also omitted: context/specify/xdescribe/xit (aliases for describe/it and pending markers — no unique error contracts)
+# Evidence confirmed from:
+#   node_modules/mocha/lib/nodejs/esm-utils.js — throw sites lines 11-30, 48-86
+#   node_modules/mocha/lib/mocha.js — run() callback pattern lines 217, 608-612
+#   https://legacy.mochajs.org/api/mocha (loadFilesAsync documented with .catch() example)
 
 # Mocha hook functions (it, before, after, etc.) are called synchronously — the async
 # callback they receive is run later by the Mocha runtime, not at the call site.
@@ -356,6 +367,212 @@ edge_cases:
       visibility: visible
       user_experience: service_unavailable
       incident_cost_range: medium
+
+  - name: Mocha.loadFilesAsync
+    import_path: "mocha"
+    description: >
+      Programmatic API method on the Mocha class. Asynchronously loads test files (both CJS and
+      ESM modules) prior to calling mocha.run(). Supports ESM modules via dynamic import(). The
+      method iterates over all registered files (added via mocha.addFile()) and requires or imports
+      each one. If any file fails to load, the returned Promise rejects. Commonly used in custom
+      CI runners and programmatic test orchestration.
+    postconditions:
+      # Evidence: node_modules/mocha/lib/nodejs/esm-utils.js lines 7-34
+      # SyntaxError is caught and rethrown with filename annotation at lines 17-29
+      # Original error rethrown at line 30
+      - id: load-files-async-syntax-error
+        condition: >
+          A test file contains a JavaScript or TypeScript syntax error. loadFilesAsync()
+          catches SyntaxError during import and rethrows it with the filename prepended to
+          the stack trace for better diagnostics.
+        throws: >
+          SyntaxError annotated with filename: "SyntaxError[ @/path/to/test.js ] <original message>".
+          The Promise rejects — no test files after the failing file are loaded.
+        required_handling: >
+          Caller MUST attach a .catch() or use try/catch with await on loadFilesAsync():
+
+            // CORRECT: handle rejection before run()
+            mocha.loadFilesAsync()
+              .then(() => mocha.run(failures => process.exitCode = failures ? 1 : 0))
+              .catch(err => {
+                console.error('Failed to load test files:', err);
+                process.exitCode = 1;
+              });
+
+            // CORRECT: async/await style
+            try {
+              await mocha.loadFilesAsync();
+              mocha.run(failures => process.exitCode = failures ? 1 : 0);
+            } catch (err) {
+              console.error('Test file load failed:', err);
+              process.exitCode = 1;
+            }
+
+          Without a .catch() or try/catch, a syntax error in any test file causes an
+          UnhandledPromiseRejection that crashes the Node.js process.
+        sources:
+          - "https://legacy.mochajs.org/api/mocha"
+          - "https://github.com/mochajs/mocha/blob/main/lib/nodejs/esm-utils.js#L11-L30"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/mocha/lib/nodejs/esm-utils.js lines 48-86
+      # err.code === 'ERR_MODULE_NOT_FOUND' triggers fallback require; if both fail, original error thrown
+      - id: load-files-async-module-not-found
+        condition: >
+          A test file imports a module that does not exist (e.g., a typo in an import path,
+          a package that was not installed, or a relative import to a file that was deleted or
+          renamed). Node.js throws an ERR_MODULE_NOT_FOUND error during import.
+        throws: >
+          Error with .code === 'ERR_MODULE_NOT_FOUND' and message like
+          "Cannot find module './missing-module'" or "Cannot find package 'not-installed'".
+          The Promise rejects immediately — remaining test files are not loaded.
+        required_handling: >
+          Catch the rejection from loadFilesAsync(). The error message identifies which
+          module was not found. Fix the import path or install the missing package.
+
+            mocha.loadFilesAsync()
+              .then(() => mocha.run(failures => process.exitCode = failures ? 1 : 0))
+              .catch(err => {
+                if (err.code === 'ERR_MODULE_NOT_FOUND') {
+                  console.error('Missing dependency:', err.message);
+                }
+                process.exitCode = 1;
+              });
+        sources:
+          - "https://legacy.mochajs.org/api/mocha"
+          - "https://github.com/mochajs/mocha/blob/main/lib/nodejs/esm-utils.js#L48-L86"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/mocha/lib/nodejs/esm-utils.js line 51
+      # err.code === 'ERR_UNKNOWN_FILE_EXTENSION' — .ts files without a TypeScript loader
+      - id: load-files-async-unknown-extension
+        condition: >
+          A test file has an unrecognized file extension (e.g., .ts without ts-node or
+          @swc-node/register registered, .tsx, .vue) and Node.js cannot load it via
+          either require() or import(). Throws ERR_UNKNOWN_FILE_EXTENSION.
+        throws: >
+          Error with .code === 'ERR_UNKNOWN_FILE_EXTENSION'. Common when running .ts test
+          files without a TypeScript transpiler registered. The error message is
+          "Unknown file extension '.<ext>' for /path/to/test.ts".
+        required_handling: >
+          Register a TypeScript loader before calling loadFilesAsync():
+
+            // Option 1: ts-node/esm loader
+            // node --loader ts-node/esm mocha.mjs
+
+            // Option 2: @swc-node/register
+            import '@swc-node/register';
+            await mocha.loadFilesAsync();
+
+            // Option 3: Set esmDecorator to transform the path
+            await mocha.loadFilesAsync({ esmDecorator: (file) => /* transform */ });
+
+          Catch and provide a clear diagnostic message about the missing loader.
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/nodejs/esm-utils.js#L48-L86"
+          - "https://mochajs.org/#typescript"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: Mocha.run
+    import_path: "mocha"
+    description: >
+      Programmatic API method on the Mocha class. Runs loaded tests synchronously, invoking
+      an optional callback with the number of test failures when the run completes. The callback
+      receives an integer failure count (0 = all tests passed, N = N tests failed). The runner
+      itself does not throw or return a Promise — all errors are reported via the failure count
+      and test events. Must be called AFTER mocha.loadFilesAsync() resolves. Cannot be called
+      if mocha is already running or has been disposed.
+    postconditions:
+      # Evidence: node_modules/mocha/lib/mocha.js lines 608-612, 903-912
+      # createMochaInstanceAlreadyRunningError thrown at line 608 (run while running)
+      # createMochaInstanceAlreadyDisposedError thrown at line 912 (run after dispose)
+      - id: run-already-running-throws
+        condition: >
+          mocha.run() is called while a previous test run is still in progress. The Mocha
+          instance tracks a running flag and throws synchronously if run() is called twice.
+          This can happen in programmatic orchestration that doesn't await the callback.
+        throws: >
+          Error: "Mocha instance is currently running. Cannot run while running." (synchronous throw)
+        required_handling: >
+          Only call run() once per Mocha instance per run cycle. Use a new Mocha() instance
+          per test run if running tests multiple times (e.g., in watch mode).
+
+            // CORRECT: wait for run to finish before running again
+            mocha.run(failures => {
+              if (failures) process.exitCode = 1;
+              // Don't call run() again here — use a fresh instance
+            });
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js#L608"
+          - "https://legacy.mochajs.org/api/mocha#run"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: node_modules/mocha/lib/mocha.js run() callback pattern
+      # The failures count is passed to callback; if no callback or callback doesn't check it,
+      # test failures are silently swallowed — process exits with code 0 even if tests fail
+      - id: run-silent-failure-no-callback
+        condition: >
+          mocha.run() is called without a callback function, or with a callback that does not
+          set process.exitCode based on the failures count. In CI environments, the process
+          will exit with code 0 even when tests fail, making the build green when it should be red.
+        throws: >
+          Does not throw. Failures are silently discarded. Process exits with code 0
+          (success) even when N tests failed — CI/CD pipelines report false success.
+        required_handling: >
+          Always provide a callback that checks the failures count and sets process.exitCode:
+
+            // CORRECT: set exit code based on failures
+            mocha.run(failures => {
+              process.exitCode = failures ? 1 : 0;
+            });
+
+            // ALSO CORRECT: explicit exit
+            mocha.run(failures => {
+              if (failures > 0) {
+                console.error(`${failures} test(s) failed`);
+                process.exit(1);
+              }
+            });
+
+            // WRONG: no callback — failures silently swallowed
+            mocha.run();
+
+            // WRONG: callback ignores failures
+            mocha.run(() => { /* no check */ });
+        sources:
+          - "https://legacy.mochajs.org/api/mocha"
+          - "https://mochajs.org/#programmatic-usage"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: hidden
+          user_experience: silent_data_loss
+          incident_cost_range: low
 
 # Category: testing
 # npm: https://www.npmjs.com/package/mocha
