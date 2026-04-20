@@ -5,7 +5,7 @@ maintainer: "corpus-team"
 last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.200
+coverage_score: 0.281
 # Depth pass 2026-04-20 (deepen-stream-2 pass 1):
 # +2 functions: isLicensePlate, isBase32
 # isLicensePlate: throws Error (not TypeError) for invalid locale — unique in validator API
@@ -15,6 +15,26 @@ coverage_score: 0.200
 #   INTENTIONALLY OMITTED: isMD5 (pure hex regex, no security contract), isBase58 (returns boolean),
 #     isMagnetURI (niche BitTorrent format, returns boolean), isMailtoURI (delegates to isEmail,
 #     returns boolean, no unique contract), isFreightContainerID/isISO6346 (niche shipping domain)
+#
+# Depth pass 2026-04-20 (deepen-stream-1 pass 4):
+# +10 functions: isMobilePhone, isPostalCode, isTaxID, isVAT, isIdentityCard, unescape,
+#                blacklist, whitelist, toBoolean, trim
+# Total contracted: 29 / 103 raw = 0.281
+# Key findings this pass:
+#   - 5 locale/country-throwing functions identified: isMobilePhone, isPostalCode, isTaxID,
+#     isVAT (Error "Invalid country code:"), isIdentityCard — all throw Error (not TypeError)
+#     for invalid locale/country params, making them harder to catch than assertString's TypeError
+#   - unescape(): critical XSS reintroduction risk — unescaping before HTML render negates
+#     the protection that escape() provided
+#   - blacklist/whitelist: regex injection risk — chars param interpolated directly into
+#     RegExp without escaping; '[' + chars + ']' in blacklist, '[^' + chars + ']' in whitelist
+#   - toBoolean(): strict vs non-strict mode: non-strict mode treats 'no', 'off', 'disabled',
+#     'null' as TRUE — critical for feature flags and auth systems
+#   - trim/ltrim/rtrim: unlike blacklist/whitelist, DOES escape chars before RegExp — safe;
+#     contracted for TypeError on non-string input (null from optional form fields)
+#   INTENTIONALLY OMITTED this pass: isPassportNumber (silently returns false for invalid
+#     country code — no throw), isIP/isIPRange/isUUID/isFQDN (return boolean only, no unique
+#     error contracts beyond assertString TypeError already covered)
 # Scan note: scan-validator-2026-04-03.json — 0 repos successfully scanned (2 skipped, 20 errored)
 # FP check: 0/15 FPs in repos without validator (0% rate) — no false positives detected
 #
@@ -1064,6 +1084,517 @@ functions:
           incident_cost_range: low
         evidence_quality: confirmed
 
+  - name: isMobilePhone
+    import_path: "validator"
+    description: >
+      Validates whether a string is a valid mobile phone number for a given locale.
+      Accepts a locale string, array of locales, or 'any'. Returns boolean. Throws
+      Error (not TypeError) when an unrecognized locale string is passed — the same
+      locale-throws pattern as isLicensePlate, isTaxID, isPostalCode, and isIdentityCard.
+      Supports 200+ locales. strictMode option requires a country code prefix (e.g. '+1').
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isMobilePhone.js
+      # Source confirmed: throw new Error(`Invalid locale '${locale}'`) in final else clause
+      # Fires when locale is not an array, not a key in `phones` object, and not 'any' or falsey.
+      - id: mobile-phone-invalid-locale-throws
+        condition: >
+          isMobilePhone() called with a locale string not in the supported set and not 'any'.
+          Common causes: (1) locale derived from user input or Accept-Language header passed
+          directly without normalization, (2) using 'en-US' when the library expects 'en-US'
+          but with a subtle variation, (3) using a locale like 'en' (must be 'en-US', 'en-GB',
+          etc.), (4) configuration file lists an unsupported locale added for a new market.
+        throws: >
+          Error with message "Invalid locale '<locale>'".
+          This is a plain Error, not TypeError. Callers that catch TypeError only will
+          NOT catch this. Unlike assertString's TypeError (which fires on non-string
+          first argument), this error fires on valid string input with bad locale name.
+        required_handling: >
+          Validate the locale before passing to isMobilePhone():
+
+            // Safe: use 'any' when locale is unknown or user-provided
+            isMobilePhone(phone, 'any')  // tries all 200+ locale patterns
+
+            // Better: validate locale against supported set first
+            const SUPPORTED_LOCALES = new Set(require('validator').isMobilePhone.locales);
+            const safeLocale = SUPPORTED_LOCALES.has(locale) ? locale : 'any';
+            isMobilePhone(phone, safeLocale)
+
+          For international apps: never pass Accept-Language header values directly
+          as the locale parameter without normalization.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isMobilePhone.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isPostalCode
+    import_path: "validator"
+    description: >
+      Validates whether a string is a valid postal code for a given locale.
+      Requires a locale argument (country code like 'US', 'GB', 'DE') or 'any'.
+      Returns boolean. Throws Error (not TypeError) when an unrecognized locale
+      string is passed. Supports ~32 country locales.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isPostalCode.js
+      # Source confirmed: throw new Error(`Invalid locale '${locale}'`) in else clause
+      # Fires when locale not in `patterns` object and not 'any'.
+      - id: postal-code-invalid-locale-throws
+        condition: >
+          isPostalCode() called with a locale string not in the supported set and not 'any'.
+          Common causes: (1) using ISO 3166-1 alpha-3 ('USA') instead of alpha-2 ('US'),
+          (2) using a locale code not yet in validator.js (e.g., newly supported country),
+          (3) deriving locale from user-submitted country form field without validation,
+          (4) using lowercase ('us') when the library expects uppercase ('US').
+        throws: >
+          Error with message "Invalid locale '<locale>'".
+          Plain Error, not TypeError. Callers catching only TypeError will miss this.
+          The locale string itself is valid — it is just unrecognized by validator.js.
+        required_handling: >
+          Always use 'any' when locale is user-provided or not guaranteed to be in
+          the supported set, or pre-validate against the supported list:
+
+            // Safe fallback: 'any' accepts any valid postal code format from ~32 countries
+            isPostalCode(code, 'any')
+
+            // Explicit locale: valid for 'AD', 'AT', 'AU', 'BE', 'BG', 'CA', 'CH',
+            // 'CZ', 'DE', 'DK', 'DZ', 'EE', 'ES', 'FI', 'FR', 'GB', 'GR', 'HR',
+            // 'HU', 'ID', 'IL', 'IN', 'IR', 'IS', 'IT', 'JP', 'KE', 'LI', 'LT',
+            // 'LU', 'LV', 'MT', 'MX', 'MY', 'NL', 'NO', 'NZ', 'PL', 'PR', 'PT',
+            // 'RO', 'RU', 'SA', 'SE', 'SI', 'SK', 'TH', 'TN', 'TW', 'UA', 'US',
+            // 'ZA', 'ZM'
+            isPostalCode(code, 'US')
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isPostalCode.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isTaxID
+    import_path: "validator"
+    description: >
+      Validates whether a string is a valid Tax Identification Number (TIN/EIN/SSN)
+      for a given locale. Defaults to 'en-US' (US SSN/EIN format). Returns boolean.
+      Throws Error (not TypeError) when an unrecognized locale string is passed.
+      Supports ~25 locales including EU countries and US. Tax ID formats are highly
+      locale-specific: US SSN is 9 digits, German TIN is 11 digits, etc.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isTaxID.js
+      # Source confirmed: throw new Error(`Invalid locale '${locale}'`) in final else clause
+      # Supported locales include: 'bg-BG', 'cs-CZ', 'de-AT', 'de-DE', 'dk-DK', 'el-CY',
+      # 'el-GR', 'en-CA', 'en-GB', 'en-IE', 'en-US', 'es-AR', 'es-ES', 'et-EE', 'fi-FI',
+      # 'fr-BE', 'fr-FR', 'fr-LU', 'hr-HR', 'hu-HU', 'it-IT', 'lb-LU', 'lt-LT', 'lv-LV',
+      # 'mt-MT', 'nl-BE', 'nl-NL', 'pl-PL', 'pt-BR', 'pt-PT', 'ro-RO', 'sk-SK', 'sl-SI',
+      # 'sv-SE', 'uk-UA'
+      - id: tax-id-invalid-locale-throws
+        condition: >
+          isTaxID() called with a locale string not in the supported set. Common causes:
+          (1) using 'en-AU' (Australia not supported — returns false, no throw... unless
+          locale is completely unrecognized), (2) passing a country ISO code ('US') instead
+          of full locale ('en-US'), (3) deriving locale from i18n configuration that uses
+          different locale naming conventions, (4) using 'en' or 'de' instead of 'en-US'
+          or 'de-DE'.
+        throws: >
+          Error with message "Invalid locale '<locale>'".
+          Plain Error (not TypeError). Thrown when locale string is not found in the
+          taxIdFormat object. Callers that use typeof checks or catch TypeError only
+          will not catch this runtime exception.
+        required_handling: >
+          Always validate locale before calling isTaxID(), or use a try-catch:
+
+            try {
+              const isValid = isTaxID(str, locale);
+            } catch (e) {
+              if (e.message.startsWith('Invalid locale')) {
+                // locale not supported, handle gracefully
+                return false;
+              }
+              throw e;
+            }
+
+          For financial applications: verify the exact locale strings supported
+          by your installed validator.js version before adding a new country market.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isTaxID.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: isVAT
+    import_path: "validator"
+    description: >
+      Validates whether a string is a valid VAT (Value Added Tax) number for a
+      given country code. Requires a countryCode argument (ISO 3166-1 alpha-2 like
+      'GB', 'DE', 'FR'). Returns boolean. Throws Error (not TypeError) when an
+      unrecognized country code is passed — UNLIKE isPassportNumber which silently
+      returns false. Supports ~25 EU and UK country codes.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isVAT.js
+      # Source confirmed: throw new Error(`Invalid country code: '${countryCode}'`)
+      # Fires when countryCode not in `vatMatchers` object.
+      # IMPORTANT: error message is "Invalid country code: '${countryCode}'" (with colon),
+      # NOT "Invalid locale '${locale}'" (which is the pattern for phone/postal/tax/identity)
+      - id: vat-invalid-country-code-throws
+        condition: >
+          isVAT() called with a country code not in the supported EU/UK set. Common causes:
+          (1) using an EU candidate country code not yet in validator.js, (2) passing
+          a 3-letter code ('GBR') instead of 2-letter ('GB'), (3) using lowercase ('gb')
+          when uppercase ('GB') is required, (4) using 'EU' as a generic EU VAT prefix
+          instead of the member country code.
+        throws: >
+          Error with message "Invalid country code: '<countryCode>'".
+          Note: error message format differs from other locale-throwing functions
+          (uses "Invalid country code:" not "Invalid locale"). Callers must handle
+          this specific message format when catching expected locale/country errors.
+        required_handling: >
+          Validate the country code before calling isVAT(), or wrap in try-catch:
+
+            const SUPPORTED_VAT_COUNTRIES = new Set([
+              'AL', 'AT', 'BE', 'BG', 'CH', 'CY', 'CZ', 'DE', 'DK', 'EE',
+              'EL', 'ES', 'EU', 'FI', 'FR', 'GB', 'HR', 'HU', 'IE', 'IT',
+              'LT', 'LU', 'LV', 'MT', 'NL', 'NO', 'PL', 'PT', 'RO', 'SE',
+              'SI', 'SK'
+            ]);
+            if (!SUPPORTED_VAT_COUNTRIES.has(countryCode.toUpperCase())) {
+              return false; // unsupported country, skip VAT check
+            }
+            return isVAT(vatNumber, countryCode.toUpperCase());
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isVAT.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: isIdentityCard
+    import_path: "validator"
+    description: >
+      Validates whether a string is a valid identity card number for a given locale.
+      Accepts a locale string or 'any'. Returns boolean. Throws Error (not TypeError)
+      when an unrecognized locale string is passed. Supports ~13 locales including
+      various Asian and European ID card formats.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isIdentityCard.js
+      # Source confirmed: throw new Error(`Invalid locale '${locale}'`) in final condition
+      # Fires when locale not found in validators object and not 'any'.
+      - id: identity-card-invalid-locale-throws
+        condition: >
+          isIdentityCard() called with a locale string not in the supported set and
+          not 'any'. Common causes in KYC/identity verification systems: (1) using a
+          country code ('CN') instead of locale ('zh-CN'), (2) adding support for a
+          new country whose locale is not yet in validator.js, (3) user-submitted
+          country dropdown value passed directly as locale parameter.
+        throws: >
+          Error with message "Invalid locale '<locale>'".
+          Plain Error (not TypeError). Identity verification flows that catch only
+          TypeError or only check for falsy return values will surface this as an
+          unhandled exception in production.
+        required_handling: >
+          Use 'any' when the identity card type is unknown or user-provided, or
+          pre-validate the locale:
+
+            // Safe: 'any' tries all supported patterns
+            isIdentityCard(idNumber, 'any')
+
+            // Validated explicit locale
+            const SUPPORTED = ['ar-LY', 'ar-TN', 'es-EC', 'fr-TN', 'he-IL', 'hr-HR',
+                               'hu-HU', 'id-ID', 'it-IT', 'LK', 'MS', 'nl-NL',
+                               'sk-SK', 'sr-RS', 'zh-CN', 'zh-HK', 'zh-TW'];
+            const locale = SUPPORTED.includes(userLocale) ? userLocale : 'any';
+            isIdentityCard(idNumber, locale)
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isIdentityCard.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: unescape
+    import_path: "validator"
+    description: >
+      Reverses HTML entity escaping: converts &amp; → &, &lt; → <, &gt; → >,
+      &quot; → ", &#x27; → ', &#x2F; → /, &#x5C; → \, &#96; → `.
+      Returns string. Throws TypeError on non-string input (assertString pattern).
+      This function is the INVERSE of escape() — calling it restores raw characters
+      that would be dangerous in HTML contexts.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/unescape.js
+      # Source confirmed: sequential string replacements using .replace() chains.
+      # assertString() throws TypeError for non-string input.
+      # Security risk: unescaping before HTML rendering reintroduces XSS vectors.
+      - id: unescape-xss-reintroduction
+        condition: >
+          unescape() output rendered directly in HTML without re-escaping. Occurs when:
+          (1) data is stored escaped in database, retrieved, unescaped, then rendered
+          in a template — the unescape call negates the original protection, (2) an
+          "unescape for display" step is added to a data pipeline that also renders
+          to HTML, (3) using unescape() to "clean up" data before passing to another
+          validator that doesn't need HTML-encoded input.
+        returns: >
+          String with all HTML entities converted back to literal characters.
+          The returned string contains raw <, >, &, ", ', / characters that
+          are DANGEROUS in HTML rendering contexts.
+        required_handling: >
+          Never render unescape() output directly in HTML without calling escape() again.
+          The canonical safe pattern is to store raw strings (not HTML-encoded) and
+          escape only at render time:
+
+            // WRONG: store encoded, unescape for comparison, render without re-escaping
+            const stored = validator.escape(userInput);   // stored in DB
+            const raw = validator.unescape(stored);       // retrieved later
+            template.innerHTML = raw;                      // ← XSS vulnerability!
+
+            // RIGHT: store raw, escape only when rendering HTML
+            const stored = userInput;                      // store raw
+            template.innerHTML = validator.escape(stored); // escape at render time
+
+          Use unescape() only when the unescaped output will NOT be rendered in HTML
+          (e.g., logging, plaintext email body, API response body in JSON).
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/unescape.js"
+          - "https://owasp.org/www-community/attacks/xss/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: blacklist
+    import_path: "validator"
+    description: >
+      Removes all occurrences of characters in the `chars` string from `str`.
+      Returns string. Throws TypeError on non-string first argument (assertString pattern).
+      Internally constructs a RegExp as `new RegExp('[' + chars + ']+', 'g')` — the
+      chars parameter is NOT escaped. If chars contains regex metacharacters, they are
+      interpreted as regex syntax rather than literal characters, causing unexpected
+      behavior or RegExp errors.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/blacklist.js
+      # Source confirmed: str.replace(new RegExp('[' + chars + ']+', 'g'), '')
+      # chars is directly interpolated without escaping — regex injection risk.
+      - id: blacklist-regex-injection
+        condition: >
+          blacklist() called where the `chars` argument derives from user input, a
+          configuration value, or a database field that may contain regex metacharacters
+          (], [, ^, -, \, ., *, +, ?, (, ), {, }, |).
+          For example: blacklist(input, userSuppliedCharsToRemove) where the chars value
+          contains '-' would be interpreted as a range operator in the character class,
+          potentially making the regex match unintended characters or throw a SyntaxError.
+        throws: >
+          SyntaxError when chars contains invalid regex syntax (e.g., unbalanced brackets,
+          invalid character class ranges like 'z-a'). May silently match unintended
+          characters when chars contains range operators like '-' or '^'.
+        required_handling: >
+          Never pass user-controlled values as the `chars` argument. If chars must be
+          dynamic, escape regex special characters before passing:
+
+            function safeBlacklist(str, chars) {
+              // Escape special regex chars in the character class
+              const escapedChars = chars.replace(/[-[\]^\\]/g, '\\$&');
+              return validator.blacklist(str, escapedChars);
+            }
+
+          For static char lists (hardcoded strings), verify the string contains no
+          regex metacharacters. Use whitelist() (or trim/replace) when you know exactly
+          which characters to KEEP rather than remove.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/blacklist.js"
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: whitelist
+    import_path: "validator"
+    description: >
+      Removes all characters from `str` EXCEPT those in the `chars` string (inverse
+      of blacklist). Returns string. Throws TypeError on non-string first argument.
+      Internally constructs RegExp as `new RegExp('[^' + chars + ']+', 'g')` — the
+      chars parameter is NOT escaped. Same regex injection vulnerability as blacklist().
+      Commonly used as a "allow only alphanumeric" sanitizer in form processing.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/whitelist.js
+      # Source confirmed: str.replace(new RegExp('[^' + chars + ']+', 'g'), '')
+      # chars interpolated without escaping — same regex injection risk as blacklist.
+      - id: whitelist-regex-injection
+        condition: >
+          whitelist() called where the `chars` argument derives from user input,
+          a config file, or a variable that may contain regex metacharacters.
+          Same attack surface as blacklist(): '-', '^', ']', '\' in chars cause
+          unintended regex behavior. Additionally, '^' at the start of chars
+          inverts the logic (already negated in the pattern), potentially passing
+          all characters through.
+        throws: >
+          SyntaxError when chars produces invalid regex syntax. May silently pass
+          through characters that should have been removed when chars contains
+          range or negation metacharacters.
+        required_handling: >
+          Always use hardcoded chars strings. For dynamic whitelist characters,
+          escape before passing:
+
+            // Wrong: dynamic chars from config
+            whitelist(input, allowedCharsFromConfig)
+
+            // Right: hardcoded explicit character set
+            whitelist(input, 'a-zA-Z0-9')  // letters and digits only
+            whitelist(input, '0-9')          // digits only
+
+            // If dynamic is unavoidable:
+            const escaped = chars.replace(/[-[\]^\\]/g, '\\$&');
+            whitelist(input, escaped)
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/whitelist.js"
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: toBoolean
+    import_path: "validator"
+    description: >
+      Converts a string to boolean. Throws TypeError on non-string input (assertString).
+      Non-strict mode (default): returns false for '0', 'false', '' — everything else
+      returns true, including 'no', 'off', 'null', 'undefined'. Strict mode: returns
+      true ONLY for '1' and 'true' (case-insensitive) — everything else returns false.
+      The distinction between strict and non-strict is critical for authentication
+      and feature-flag systems where users control the string value.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/toBoolean.js
+      # Non-strict: returns false for '0', 'false', ''; true for everything else.
+      # Strict (strict=true): returns true for '1', 'true'; false for everything else.
+      # assertString() throws TypeError for non-string input.
+      - id: to-boolean-loose-mode-truthy-surprise
+        condition: >
+          toBoolean() called without strict=true in a security-sensitive context where
+          the string value comes from user input, environment variables, or query
+          parameters. In non-strict mode, 'no', 'off', 'disabled', 'false' (wrong case
+          would still be 'false'), 'null', '0.0', 'FALSE' — all return true because
+          only the exact strings '0', 'false', and '' return false.
+          Examples: toBoolean('no') → true, toBoolean('off') → true,
+          toBoolean('null') → true, toBoolean('0.0') → true.
+        returns: >
+          true for any string that is not exactly '0', 'false' (case-sensitive), or ''
+          in non-strict mode. This is counterintuitive — many strings that humans read
+          as "falsy" (like 'no', 'off', 'disabled') return true.
+        required_handling: >
+          Use strict mode (toBoolean(str, true)) when parsing boolean config values,
+          feature flags, or any string that may be 'yes'/'no', 'on'/'off', or
+          natural language booleans:
+
+            // Non-strict (default) — only use when you trust the source to be '0'/'false'/''
+            toBoolean('no')       // → true (SURPRISE: 'no' is truthy!)
+            toBoolean('off')      // → true (SURPRISE: 'off' is truthy!)
+            toBoolean('0.0')      // → true (SURPRISE: '0.0' is truthy!)
+
+            // Strict mode — only '1' and 'true' return true
+            toBoolean('yes', true)  // → false (as expected)
+            toBoolean('1', true)    // → true  (as expected)
+            toBoolean('true', true) // → true  (as expected)
+            toBoolean('on', true)   // → false
+
+          For environment variables and feature flags, always use strict mode:
+            const isFeatureEnabled = toBoolean(process.env.FEATURE_FLAG, true);
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/toBoolean.js"
+          - "https://github.com/validatorjs/validator.js#sanitizers"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: trim
+    import_path: "validator"
+    description: >
+      Removes specified characters from both ends of a string. When chars is omitted,
+      removes whitespace. Returns string. Throws TypeError on non-string input.
+      Internally calls ltrim() then rtrim(). Unlike blacklist/whitelist, trim() uses
+      an escaped regex — special characters in chars are safely handled by ltrim/rtrim.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/trim.js
+      # ltrim.js escapes chars: chars.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')
+      # Therefore trim/ltrim/rtrim do NOT have the regex injection issue of blacklist/whitelist.
+      # assertString() throws TypeError for non-string input.
+      - id: trim-non-string-throws
+        condition: >
+          trim(), ltrim(), or rtrim() called with a non-string first argument. Common
+          in form processing pipelines where fields may be null (optional fields not
+          submitted), undefined (object property not set), or numbers (age, price
+          parsed from JSON before being passed to trim for "just in case" sanitization).
+          Contrast with JavaScript's native String.prototype.trim() which doesn't exist
+          on null/undefined.
+        throws: >
+          TypeError with message "Expected a string but received a <type>".
+          Thrown by assertString() before any trimming occurs. Non-string values like
+          null, undefined, 0, or objects cause immediate TypeError.
+        required_handling: >
+          Always ensure the input is a string before calling trim():
+
+            // Wrong: may receive null from optional form field
+            const cleanName = validator.trim(req.body.name);
+
+            // Right: coerce or guard first
+            const cleanName = validator.trim(String(req.body.name ?? ''));
+
+            // Or use optional chaining with fallback
+            const cleanName = req.body.name
+              ? validator.trim(req.body.name)
+              : '';
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/trim.js"
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/ltrim.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
 # SOURCES.md has comprehensive documentation of all error conditions
 # See: corpus/packages/validator/SOURCES.md (111 lines)
 #
@@ -1074,10 +1605,22 @@ functions:
 # - Phase 4: Production usage analysis (5 patterns, 80% use express-validator middleware)
 # - Deepen pass 2026-04-17: Full API surface enumeration, assertString() discovery,
 #     6 new functions added (isStrongPassword, isJWT, stripLow, toDate, toFloat, toInt, isCreditCard)
+# - Deepen pass 2026-04-20 (stream-2 pass 1): +2 (isLicensePlate, isBase32), 19 total contracted
+# - Deepen pass 2026-04-20 (stream-1 pass 4): +10 (isMobilePhone, isPostalCode, isTaxID, isVAT,
+#     isIdentityCard, unescape, blacklist, whitelist, toBoolean, trim), 29 total contracted
 #
-# Key findings (corrected 2026-04-17):
+# Key findings (updated 2026-04-20):
 # - CORRECTION: validator.js DOES throw TypeError on non-string input (assertString() pattern)
 #   affects ~94 of ~95 functions — previous contract incorrectly stated "does NOT throw"
+# - Locale-throwing functions (throw Error, NOT TypeError): isMobilePhone, isPostalCode,
+#   isTaxID, isIdentityCard, isLicensePlate throw Error("Invalid locale '${locale}'");
+#   isVAT throws Error("Invalid country code: '${countryCode}'") — different message format!
+# - Regex injection in sanitizers: blacklist() and whitelist() do NOT escape chars param —
+#   dynamic chars from user input can cause RegExp SyntaxError or match unintended chars
+# - trim/ltrim/rtrim DO escape chars param safely — no regex injection risk
+# - toBoolean non-strict mode: 'no', 'off', 'null', '0.0' all return TRUE — use strict mode
+#   for config/feature flag parsing
+# - unescape() is an XSS vector: unescaping before HTML render defeats escape() protection
 # - Most common mistake: Not checking return values (boolean/null/NaN)
 # - #1 security issue: Not escaping user input (XSS)
 # - #2 security issue: Not whitelisting URL protocols (open redirects, XSS)
@@ -1086,13 +1629,16 @@ functions:
 # - Minimum safe version: 13.15.20 (CVE patches)
 # - Detection focus: Missing validation on user input before dangerous operations
 #
-# API surface (2026-04-17):
-#   Total exported functions: ~95
-#   Contracted: 11 (escape, normalizeEmail, isEmail, isURL, isJSON,
-#               isStrongPassword, isJWT, stripLow, toDate, toFloat, toInt, isCreditCard)
-#   Omitted: ~84 pure-format validators (isAlpha, isAlphanumeric, isAscii,
-#            isAbaRouting, isBIC, isIBAN, isISO*, isLatLong, isMACAddress, etc.)
-#   Omission reason: All omitted functions return boolean only, throw TypeError only
-#                    on non-string (same profile as contracted validators), and have
-#                    no unique security contracts beyond the assertString pattern
-#                    documented in contracted functions above.
+# API surface (2026-04-20 update):
+#   Total exported functions: 103 (full README enumeration: 90 validators + 13 sanitizers)
+#   Contracted: 29 (escape, normalizeEmail, isEmail, isURL, isJSON, isStrongPassword, isJWT,
+#               stripLow, toDate, toFloat, toInt, isCreditCard, matches, isCurrency, isBase64,
+#               isLength, isISO8601, isLicensePlate, isBase32, isMobilePhone, isPostalCode,
+#               isTaxID, isVAT, isIdentityCard, unescape, blacklist, whitelist, toBoolean, trim)
+#   Omitted: ~74 pure-format validators (isAlpha, isAlphanumeric, isAscii, isBIC, isIBAN,
+#            isISO*, isLatLong, isMACAddress, isIP, isUUID, isFQDN, isBoolean, isInt, isFloat,
+#            isAlpha*, isHexColor, isBtcAddress, isEthereumAddress, and similar)
+#   Omission reason: Omitted functions return boolean only, throw TypeError only on non-string
+#                    (same profile as contracted validators), and have no unique security
+#                    contracts beyond the assertString pattern. isPassportNumber specifically
+#                    silently returns false for invalid country code (no throw) — no contract needed.

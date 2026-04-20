@@ -12,6 +12,16 @@
  *   isCreditCard:    credit-card-format-only, credit-card-non-string-throws
  *   isLicensePlate:  license-plate-invalid-locale-throws, license-plate-any-locale-perf (2026-04-20)
  *   isBase32:        base32-crockford-confusion (2026-04-20)
+ *   isMobilePhone:   mobile-phone-invalid-locale-throws (2026-04-20, stream-1 pass 4)
+ *   isPostalCode:    postal-code-invalid-locale-throws (2026-04-20, stream-1 pass 4)
+ *   isTaxID:         tax-id-invalid-locale-throws (2026-04-20, stream-1 pass 4)
+ *   isVAT:           vat-invalid-country-code-throws (2026-04-20, stream-1 pass 4)
+ *   isIdentityCard:  identity-card-invalid-locale-throws (2026-04-20, stream-1 pass 4)
+ *   unescape:        unescape-xss-reintroduction (2026-04-20, stream-1 pass 4)
+ *   blacklist:       blacklist-regex-injection (2026-04-20, stream-1 pass 4)
+ *   whitelist:       whitelist-regex-injection (2026-04-20, stream-1 pass 4)
+ *   toBoolean:       to-boolean-loose-mode-truthy-surprise (2026-04-20, stream-1 pass 4)
+ *   trim:            trim-non-string-throws (2026-04-20, stream-1 pass 4)
  *
  * Annotation format:
  *   @expect-violation: <postcondition-id>  — scanner SHOULD flag this
@@ -445,6 +455,246 @@ function validateULIDTokenCorrect(token: string): boolean {
 function validateTOTPSecret(secret: string): boolean {
   // ✅ Standard Base32 (RFC 4648) for TOTP secrets — default options correct here
   return validator.isBase32(secret);
+}
+
+// =============================================================================
+// isMobilePhone — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: mobile-phone-invalid-locale-throws
+function validateMobileFromAcceptLanguage(phone: string, acceptLang: string): boolean {
+  // ❌ Accept-Language header value used directly as locale — 'en', 'fr-FR;q=0.9' throw Error
+  // Error("Invalid locale 'en'") — not caught by TypeError handlers
+  return validator.isMobilePhone(phone, acceptLang as any);
+}
+
+// @expect-violation: mobile-phone-invalid-locale-throws
+function validatePhoneForCountry(phone: string, countryIsoCode: string): boolean {
+  // ❌ ISO 3166-1 alpha-2 code ('US', 'GB') not valid — needs full locale ('en-US', 'en-GB')
+  return validator.isMobilePhone(phone, countryIsoCode as any);
+}
+
+// @expect-clean
+function validateMobilePhoneSafe(phone: string, locale: string): boolean {
+  // ✅ Fallback to 'any' when locale not validated
+  const availableLocales: string[] = (validator.isMobilePhone as any).locales || [];
+  const safeLocale = availableLocales.includes(locale) ? locale : 'any';
+  return validator.isMobilePhone(phone, safeLocale as any);
+}
+
+// =============================================================================
+// isPostalCode — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: postal-code-invalid-locale-throws
+function validatePostalCodeFromForm(code: string, countryAlpha3: string): boolean {
+  // ❌ ISO alpha-3 codes ('USA', 'GBR') not valid — isPostalCode uses alpha-2 ('US', 'GB')
+  // Error("Invalid locale 'USA'") — plain Error, not TypeError
+  return validator.isPostalCode(code, countryAlpha3 as any);
+}
+
+// @expect-violation: postal-code-invalid-locale-throws
+function validatePostalCodeUnsafe(code: string, locale: string): boolean {
+  // ❌ locale from external config — if unsupported locale added, throws in production
+  return validator.isPostalCode(code, locale as any);
+}
+
+// @expect-clean
+function validatePostalCodeSafe(code: string): boolean {
+  // ✅ Use 'any' to accept any recognized postal code format
+  return validator.isPostalCode(code, 'any');
+}
+
+// =============================================================================
+// isTaxID — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: tax-id-invalid-locale-throws
+function validateTaxIdFromUserCountry(taxId: string, countryCode: string): boolean {
+  // ❌ Short country code 'US' passed instead of full locale 'en-US' — throws Error
+  // isTaxID('123-45-6789', 'US') → Error("Invalid locale 'US'")
+  return validator.isTaxID(taxId, countryCode as any);
+}
+
+// @expect-violation: tax-id-invalid-locale-throws
+function validateEuTaxId(taxId: string, locale: string): boolean {
+  // ❌ locale from i18n config that uses different naming (e.g., 'de' instead of 'de-DE')
+  return validator.isTaxID(taxId, locale as any);
+}
+
+// @expect-clean
+function validateTaxIdWithFallback(taxId: string, locale: string): boolean {
+  // ✅ try-catch to handle unsupported locale gracefully
+  try {
+    return validator.isTaxID(taxId, locale as any);
+  } catch (e: any) {
+    if (e.message && e.message.startsWith('Invalid locale')) {
+      return false; // unsupported locale, treat as invalid
+    }
+    throw e;
+  }
+}
+
+// =============================================================================
+// isVAT — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: vat-invalid-country-code-throws
+function validateVatNumberFromForm(vatNumber: string, countryAlpha3: string): boolean {
+  // ❌ 3-letter country code ('DEU', 'GBR') — isVAT expects 2-letter ('DE', 'GB')
+  // Error("Invalid country code: 'DEU'") — different message format from locale errors!
+  return validator.isVAT(vatNumber, countryAlpha3 as any);
+}
+
+// @expect-violation: vat-invalid-country-code-throws
+function validateVatLowercase(vatNumber: string, cc: string): boolean {
+  // ❌ lowercase country code ('gb', 'de') — isVAT requires uppercase
+  return validator.isVAT(vatNumber, cc as any);
+}
+
+// @expect-clean
+function validateVatNumberSafe(vatNumber: string, countryCode: string): boolean {
+  // ✅ normalize to uppercase and validate before calling
+  const cc = countryCode.toUpperCase();
+  const SUPPORTED = new Set(['AL','AT','BE','BG','CH','CY','CZ','DE','DK','EE',
+    'EL','ES','EU','FI','FR','GB','HR','HU','IE','IT','LT','LU','LV','MT',
+    'NL','NO','PL','PT','RO','SE','SI','SK']);
+  if (!SUPPORTED.has(cc)) return false;
+  return validator.isVAT(vatNumber, cc as any);
+}
+
+// =============================================================================
+// isIdentityCard — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: identity-card-invalid-locale-throws
+function validateIdCardFromUserCountry(idNumber: string, locale: string): boolean {
+  // ❌ locale from country dropdown — user may select unsupported country
+  // Error("Invalid locale '<locale>'") — plain Error, not TypeError
+  return validator.isIdentityCard(idNumber, locale as any);
+}
+
+// @expect-clean
+function validateIdCardSafe(idNumber: string, locale: string): boolean {
+  // ✅ Fall back to 'any' for unsupported locales
+  return validator.isIdentityCard(idNumber, (locale || 'any') as any);
+}
+
+// =============================================================================
+// unescape — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: unescape-xss-reintroduction
+function renderUserComment(escapedContent: string): string {
+  // ❌ Unescaping HTML-encoded content before rendering in HTML — reintroduces XSS!
+  const rawContent = validator.unescape(escapedContent);
+  return `<div class="comment">${rawContent}</div>`; // XSS via <script> in rawContent
+}
+
+// @expect-violation: unescape-xss-reintroduction
+function displayProductDescription(encodedDesc: string): string {
+  // ❌ "Cleaning up" encoded description before putting in template
+  const unescaped = validator.unescape(encodedDesc);
+  return `<p>${unescaped}</p>`; // Direct HTML injection
+}
+
+// @expect-clean
+function renderUserCommentSafe(rawContent: string): string {
+  // ✅ Store raw, escape at render time — no unescape needed
+  return `<div class="comment">${validator.escape(rawContent)}</div>`;
+}
+
+// @expect-clean
+function logUserInput(escapedContent: string): void {
+  // ✅ unescape for non-HTML output (logging to console) — safe context
+  const rawContent = validator.unescape(escapedContent);
+  console.log('User input:', rawContent); // Plaintext log — not HTML
+}
+
+// =============================================================================
+// blacklist — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: blacklist-regex-injection
+function sanitizeInputWithUserChars(input: string, charsToRemove: string): string {
+  // ❌ charsToRemove from user input — regex injection if it contains ], -, ^, \
+  // 'a-z' in charsToRemove becomes range [a-z] not literal characters a, -, z
+  return validator.blacklist(input, charsToRemove);
+}
+
+// @expect-violation: blacklist-regex-injection
+function removeCharsFromConfig(input: string, configChars: string): string {
+  // ❌ chars from external config file — if config contains regex metacharacters, breaks
+  return validator.blacklist(input, configChars);
+}
+
+// @expect-clean
+function removeSpecialCharsHardcoded(input: string): string {
+  // ✅ Hardcoded chars string — no regex injection risk
+  return validator.blacklist(input, '<>"\'/');
+}
+
+// =============================================================================
+// whitelist — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: whitelist-regex-injection
+function filterToAllowedChars(input: string, allowedChars: string): string {
+  // ❌ allowedChars from user input — regex injection in [^${chars}]+ pattern
+  // '^' in allowedChars inverts the negation; '-' creates character ranges
+  return validator.whitelist(input, allowedChars);
+}
+
+// @expect-clean
+function keepOnlyAlphanumeric(input: string): string {
+  // ✅ Hardcoded character set — safe
+  return validator.whitelist(input, 'a-zA-Z0-9');
+}
+
+// =============================================================================
+// toBoolean — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: to-boolean-loose-mode-truthy-surprise
+function parseFeatureFlag(flagValue: string): boolean {
+  // ❌ Non-strict mode — 'no', 'off', 'disabled' all return TRUE
+  // Environment variable FEATURE_X=no → toBoolean('no') = TRUE!
+  return validator.toBoolean(flagValue);
+}
+
+// @expect-violation: to-boolean-loose-mode-truthy-surprise
+function isFeatureEnabled(configValue: string): boolean {
+  // ❌ 'disabled', 'null', '0.0', 'NO' all return true in non-strict mode
+  const enabled = validator.toBoolean(configValue);
+  return enabled; // Always true for 'disabled' — silently enables feature
+}
+
+// @expect-clean
+function parseFeatureFlagStrict(flagValue: string): boolean {
+  // ✅ strict=true: only '1' and 'true' return true — everything else false
+  return validator.toBoolean(flagValue, true);
+}
+
+// =============================================================================
+// trim — deepen pass 2026-04-20 (stream-1 pass 4)
+// =============================================================================
+
+// @expect-violation: trim-non-string-throws
+function sanitizeOptionalField(value: string | null | undefined): string {
+  // ❌ null/undefined input throws TypeError("Expected a string but received a null")
+  return validator.trim(value as string);
+}
+
+// @expect-violation: trim-non-string-throws
+function cleanRequestField(req: { body: { name?: string } }): string {
+  // ❌ Optional field may be undefined when not submitted in the form
+  return validator.trim(req.body.name as string);
+}
+
+// @expect-clean
+function sanitizeOptionalFieldSafe(value: string | null | undefined): string {
+  // ✅ Guard with nullish coalescing before passing to trim
+  return validator.trim(value ?? '');
 }
 
 // =============================================================================
