@@ -2,10 +2,19 @@ package: validator
 semver: ">=13.15.20"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-18"
+last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.18
+coverage_score: 0.198
+# Depth pass 2026-04-20 (deepen-stream-2 pass 1):
+# +2 functions: isLicensePlate, isBase32
+# isLicensePlate: throws Error (not TypeError) for invalid locale — unique in validator API
+# isBase32: Crockford vs standard Base32 confusion (parallel to isBase64 urlSafe issue)
+# Total contracted: 19 / 95 raw = 0.200; 7 newly identified functions analyzed:
+#   CONTRACTED: isLicensePlate (throws Error on invalid locale), isBase32 (crockford confusion)
+#   INTENTIONALLY OMITTED: isMD5 (pure hex regex, no security contract), isBase58 (returns boolean),
+#     isMagnetURI (niche BitTorrent format, returns boolean), isMailtoURI (delegates to isEmail,
+#     returns boolean, no unique contract), isFreightContainerID/isISO6346 (niche shipping domain)
 # Scan note: scan-validator-2026-04-03.json — 0 repos successfully scanned (2 skipped, 20 errored)
 # FP check: 0/15 FPs in repos without validator (0% rate) — no false positives detected
 #
@@ -913,6 +922,139 @@ functions:
         sources:
           - "https://github.com/validatorjs/validator.js#validators"
           - "https://datatracker.ietf.org/doc/html/rfc3339"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isLicensePlate
+    import_path: "validator"
+    description: >
+      Validates whether a string matches the license plate format for a given locale.
+      Requires an explicit locale argument (e.g. 'en-IN', 'de-DE', 'pt-BR'). Returns
+      boolean. Throws Error (not TypeError) when an unrecognized locale is passed —
+      this is the only validator function (besides assertString's TypeError) that throws
+      a non-TypeError exception. Supports 13 locales plus 'any' (tries all).
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isLicensePlate.js
+      # Source confirmed: throw new Error(`Invalid locale '${locale}'`) at line ~150
+      # Throws Error (not TypeError, not RangeError) for unrecognized locale string.
+      # assertString() throws TypeError for non-string first argument (same as all validator functions).
+      - id: license-plate-invalid-locale-throws
+        condition: >
+          isLicensePlate() called with a locale string not in the supported set
+          ('cs-CZ', 'de-DE', 'de-LI', 'en-IN', 'en-SG', 'en-PK', 'es-AR', 'fi-FI',
+          'hu-HU', 'pt-BR', 'pt-PT', 'sq-AL', 'sv-SE') and not 'any'.
+          This happens when: (1) a locale derived from user input or environment
+          variable is passed directly without validation, (2) a newly-added locale from
+          the frontend doesn't match validator.js supported set, (3) using 'en-US' (not
+          supported — no US state-level logic in validator.js).
+        throws: >
+          Error with message "Invalid locale '<locale>'".
+          Note: This is a plain Error, not TypeError. Unlike the ubiquitous assertString()
+          TypeError (which fires on non-string input), this error fires on VALID string
+          input with an unrecognized locale name. Callers that catch TypeError only will
+          NOT catch this error.
+        required_handling: >
+          Always validate the locale before calling isLicensePlate():
+
+            const SUPPORTED_LOCALES = new Set([
+              'cs-CZ', 'de-DE', 'de-LI', 'en-IN', 'en-SG', 'en-PK', 'es-AR',
+              'fi-FI', 'hu-HU', 'pt-BR', 'pt-PT', 'sq-AL', 'sv-SE', 'any'
+            ]);
+            if (!SUPPORTED_LOCALES.has(locale)) {
+              // fall back to 'any' or return false
+              locale = 'any';
+            }
+            const isValid = isLicensePlate(plateStr, locale);
+
+          For international apps that add new locales: upgrade validator.js version or
+          use 'any' locale as fallback to avoid hard crashes on unrecognized country codes.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isLicensePlate.js"
+          - "https://github.com/validatorjs/validator.js#validators"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: license-plate-any-locale-perf
+        condition: >
+          isLicensePlate(str, 'any') used in hot paths (request handlers, batch validation loops)
+          without awareness that 'any' iterates through ALL supported locales sequentially.
+          When str doesn't match any locale, isLicensePlate() tries each of the 13 locale
+          validators in turn — each with complex regex — before returning false.
+        returns: "true if any locale's regex matches; false after exhausting all 13 validators"
+        required_handling: >
+          When validation performance matters, pass the specific locale if known:
+            isLicensePlate(plateStr, 'en-IN')  // O(1) — single regex check
+          instead of:
+            isLicensePlate(plateStr, 'any')    // O(n) — iterates all 13 locales
+
+          For user-submitted forms where the locale is unknown, consider adding a
+          dropdown or country selector to collect the locale rather than using 'any'.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isLicensePlate.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: isBase32
+    import_path: "validator"
+    description: >
+      Validates whether a string is valid Base32-encoded data. Returns boolean.
+      Throws TypeError on non-string input (assertString pattern). The crockford
+      option switches between standard RFC 4648 Base32 (A-Z, 2-7, = padding, length
+      must be multiple of 8) and Crockford Base32 (A-Z minus ILOU, 0-9, no padding,
+      no length constraint). These are incompatible encodings — standard Base32 and
+      Crockford Base32 strings with the same content are different character sequences.
+    postconditions:
+      # Evidence: https://github.com/validatorjs/validator.js/blob/master/src/lib/isBase32.js
+      # Standard regex: /^[A-Z2-7]+=*$/ with str.length % 8 === 0 check
+      # Crockford regex: /^[A-HJKMNP-TV-Z0-9]+$/ with no length constraint
+      # Confirmed: default is crockford: false (standard Base32)
+      - id: base32-crockford-confusion
+        condition: >
+          Crockford Base32-encoded data (used by ULID, NanoID, some blockchain identifiers)
+          validated without { crockford: true } option. Crockford Base32 excludes
+          ambiguous characters (I, L, O, U) and uses digits 0-9 alongside letters.
+          Standard Base32 uses only A-Z and 2-7. A valid Crockford Base32 string
+          WILL fail isBase32() with default options because:
+          (1) Crockford allows digits 0, 1, 3-9 which aren't in [A-Z2-7]
+          (2) Crockford strings have no padding (= chars)
+          (3) Crockford strings may not be length % 8
+        returns: "false for valid Crockford Base32 strings when crockford option is not set"
+        required_handling: >
+          Determine which encoding standard your data uses before calling isBase32():
+
+          // Standard RFC 4648 Base32 (e.g., TOTP secrets, many crypto keys):
+          isBase32(str)  // or { crockford: false }
+          // Example valid: 'MFRA====', length must be multiple of 8
+
+          // Crockford Base32 (used by ULID, NanoID, Hashids):
+          isBase32(str, { crockford: true })
+          // Example valid: '01ARYZ6S41', no padding required
+
+          The two are not interchangeable. A ULID (always Crockford Base32) will
+          always fail standard isBase32() — returning false, not throwing, causing
+          silent validation failures that reject valid data.
+        sources:
+          - "https://github.com/validatorjs/validator.js/blob/master/src/lib/isBase32.js"
+          - "https://www.crockford.com/base32.html"
+          - "https://github.com/ulid/spec"
         severity: warning
         business_impact:
           incident_label: SILENT_FAILURE
