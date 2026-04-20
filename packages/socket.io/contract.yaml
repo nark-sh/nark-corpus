@@ -2,10 +2,10 @@ package: socket.io
 semver: ^4.0.0
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-04-20"
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.80  # 8 contracted / 10 async-callable (2 omitted: socket.leave, Namespace.serverSideEmitWithAck)
+coverage_score: 0.83  # 10 contracted / 12 async-callable (2 omitted: socket.leave, Namespace.serverSideEmitWithAck)
 
 detection:
   class_names:
@@ -398,3 +398,161 @@ functions:
           incident_cost_range: medium
         sources:
           - "https://socket.io/docs/v4/server-api/#serverserversideemitwithack"
+
+  - name: socket.use
+    import_path: "socket.io"
+    description: >
+      Registers per-socket middleware that executes for every incoming packet on a specific socket.
+      Unlike Server.use() which gates the connection itself, socket.use() gates individual packets
+      after the socket is connected. Middleware receives ([eventName, ...args], next) and MUST call
+      next() in every code path. Errors passed to next(err) are emitted as 'error' events on the
+      socket via socket._onerror(err) — confirmed from socket.js source. If no 'error' listener
+      is registered on the socket, Node.js emits an uncaughtException or the socket silently breaks.
+    postconditions:
+      # Evidence: socket.js source lines 520-526, 691-703, 739-752
+      # socket.run() calls fn(err) which calls this._onerror(err) which calls this.emitReserved("error", err)
+      # Documentation: https://socket.io/docs/v4/middlewares/
+      - id: socket-use-middleware-error-no-listener
+        condition: >
+          socket.use() middleware calls next(err) with an Error, but no 'error' event listener
+          is registered on the socket instance. This is distinct from Server.use() — per-socket
+          middleware errors emit on the socket, not as a process-level unhandled rejection.
+        throws: >
+          socket._onerror(err) calls this.emitReserved("error", err). If no 'error' listener exists
+          on the socket, EventEmitter throws the error synchronously, crashing the connection handler.
+          In Node.js, an EventEmitter 'error' event with no listener throws the error — confirmed
+          from Node.js EventEmitter docs. The process may crash or the unhandledRejection fires.
+        required_handling: >
+          MUST register an 'error' listener on every socket that uses socket.use() middleware:
+            io.on("connection", (socket) => {
+              socket.use(([event, ...args], next) => {
+                if (isUnauthorized(event)) {
+                  return next(new Error("unauthorized event"));
+                }
+                next();
+              });
+
+              // REQUIRED: handle middleware errors
+              socket.on("error", (err) => {
+                console.error("Socket middleware error:", err.message);
+                socket.disconnect(); // or other remediation
+              });
+            });
+          Without the 'error' listener, any next(err) call crashes the socket handler and
+          potentially the server process.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        sources:
+          - "https://socket.io/docs/v4/middlewares/"
+
+      - id: socket-use-middleware-async-unhandled
+        condition: >
+          Async middleware registered via socket.use() throws or rejects without a try-catch,
+          causing next() to never be called and the error to propagate as an unhandled rejection.
+        throws: >
+          Unhandled promise rejection — Node.js emits an 'unhandledRejection' event.
+          In Node.js >= 15, process exits. The packet that triggered the middleware is silently
+          dropped, causing the client to miss the expected response.
+        required_handling: >
+          Async socket.use() middleware MUST use try-catch:
+            socket.use(async ([event, ...args], next) => {
+              try {
+                await validateEvent(event, args);
+                next();
+              } catch (err) {
+                next(new Error("event validation failed"));
+              }
+            });
+            socket.on("error", (err) => {
+              socket.disconnect();
+            });
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/middlewares/"
+
+  - name: BroadcastOperator.emitWithAck
+    import_path: "socket.io"
+    description: >
+      Emits an event to all matching clients and waits for acknowledgements from all of them.
+      Accessed via io.timeout(ms).emitWithAck() or io.to(room).timeout(ms).emitWithAck().
+      This is the broadcast version — it waits for ALL targeted clients to acknowledge.
+      Unlike socket.emitWithAck() (contracted separately), this targets multiple clients and
+      accumulates all responses. REQUIRES .timeout(ms) to be chained — without a timeout the
+      Promise hangs indefinitely if any single client does not acknowledge.
+    postconditions:
+      # Evidence: broadcast-operator.js lines 177-185, 233-245
+      #   timer = setTimeout(() => { ack(new Error("operation has timed out"), responses) }, timeout)
+      #   emitWithAck: return new Promise((resolve, reject) => { args.push((err, responses) => {
+      #     if (err) { err.responses = responses; return reject(err); } ...
+      # Documentation: https://socket.io/docs/v4/server-api/#broadcastoperatoremitwithacheck
+      - id: broadcast-emit-with-ack-timeout-unhandled
+        condition: >
+          io.timeout(ms).emitWithAck() called but the returned Promise is not wrapped in try-catch,
+          and one or more targeted clients fail to acknowledge within the timeout window.
+        throws: >
+          Error with message "operation has timed out" — confirmed from broadcast-operator.js source.
+          The error object has an additional .responses property containing all acknowledgements
+          received before the timeout expired:
+            err.responses = [...responses from clients that did ack in time...]
+          This Promise rejects — unhandled rejection crashes the server in Node.js >= 15.
+        required_handling: >
+          MUST wrap in try-catch. Also check .responses for partial acknowledgements:
+            try {
+              const responses = await io.timeout(5000).emitWithAck("confirm", payload);
+              // all targeted clients acknowledged
+            } catch (err) {
+              // err.message === "operation has timed out"
+              // err.responses contains partial responses from clients that did ack
+              console.error(`${err.responses.length} clients acked before timeout`);
+              // decide: retry, proceed with partial, or fail the operation
+            }
+          Partial responses (err.responses) are critical for idempotency — some clients may
+          have already processed the event before the timeout. Do NOT retry blindly.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          - "https://socket.io/docs/v4/server-api/#broadcastoperatoremitwithacheck"
+          - "https://socket.io/docs/v4/emitting-events/#acknowledgements"
+
+      - id: broadcast-emit-with-ack-no-timeout
+        condition: >
+          io.to(room).emitWithAck() called WITHOUT first chaining .timeout(ms), and one or more
+          targeted clients never send an acknowledgement (disconnect, ignore, or crash).
+        throws: >
+          The Promise NEVER resolves or rejects — it hangs indefinitely. There is no built-in
+          deadline for BroadcastOperator.emitWithAck() when .timeout() is not chained.
+          Each disconnected or unresponsive client holds the Promise open permanently.
+          In high-traffic servers handling many rooms, this causes Promise accumulation,
+          memory leak, and eventual OOM crash.
+        required_handling: >
+          ALWAYS chain .timeout(ms) before .emitWithAck() in broadcast contexts:
+            // WRONG - hangs forever if any client disconnects:
+            const responses = await io.to("room-101").emitWithAck("sync", data);
+
+            // RIGHT - rejects with "operation has timed out" after 5s:
+            const responses = await io.to("room-101").timeout(5000).emitWithAck("sync", data);
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+        sources:
+          - "https://socket.io/docs/v4/server-api/#broadcastoperatoremitwithacheck"

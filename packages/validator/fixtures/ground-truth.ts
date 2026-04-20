@@ -1,5 +1,5 @@
 /**
- * Ground-truth fixtures for validator package — deepen pass 2026-04-17
+ * Ground-truth fixtures for validator package — deepen pass 2026-04-17, updated 2026-04-20
  *
  * New postconditions covered:
  *   isStrongPassword: strong-password-weak-defaults, strong-password-non-string-throws,
@@ -10,6 +10,8 @@
  *   toFloat:         to-float-nan-unchecked
  *   toInt:           to-int-nan-unchecked, to-int-radix-default
  *   isCreditCard:    credit-card-format-only, credit-card-non-string-throws
+ *   isLicensePlate:  license-plate-invalid-locale-throws, license-plate-any-locale-perf (2026-04-20)
+ *   isBase32:        base32-crockford-confusion (2026-04-20)
  *
  * Annotation format:
  *   @expect-violation: <postcondition-id>  — scanner SHOULD flag this
@@ -381,6 +383,68 @@ function storeEventDate(dateStr: string): void {
 function validateAppointmentDateStrict(dateStr: string): boolean {
   // ✅ strict: true rejects calendar-invalid dates like 2009-02-29
   return validator.isISO8601(dateStr, { strict: true, strictSeparator: true });
+}
+
+// =============================================================================
+// isLicensePlate — deepen pass 2026-04-20
+// =============================================================================
+
+// @expect-violation: license-plate-invalid-locale-throws
+function validateLicensePlateNoLocaleCheck(plate: string, userLocale: string): boolean {
+  // ❌ locale from user input passed directly — 'en-US' and many others throw Error
+  // Error: "Invalid locale 'en-US'" — NOT caught by TypeError handlers
+  return validator.isLicensePlate(plate, userLocale);
+}
+
+// @expect-violation: license-plate-invalid-locale-throws
+async function processVehicleRegistration(plateStr: string, countryCode: string): Promise<boolean> {
+  // ❌ countryCode from external API (e.g. 'US', 'GB') not mapped to validator locales
+  // 'US' is not 'en-US', and 'en-US' itself is not in the supported set
+  return validator.isLicensePlate(plateStr, countryCode);
+}
+
+// @expect-clean
+function validateLicensePlateWithFallback(plate: string, locale: string): boolean {
+  // ✅ Validate locale before passing — fall back to 'any' for unsupported locales
+  const SUPPORTED = new Set([
+    'cs-CZ', 'de-DE', 'de-LI', 'en-IN', 'en-SG', 'en-PK', 'es-AR',
+    'fi-FI', 'hu-HU', 'pt-BR', 'pt-PT', 'sq-AL', 'sv-SE', 'any'
+  ]);
+  const safeLocale = SUPPORTED.has(locale) ? locale : 'any';
+  return validator.isLicensePlate(plate, safeLocale);
+}
+
+// =============================================================================
+// isBase32 — deepen pass 2026-04-20
+// =============================================================================
+
+// @expect-violation: base32-crockford-confusion
+function validateULIDToken(token: string): boolean {
+  // ❌ ULIDs use Crockford Base32 but default isBase32 uses standard RFC 4648 Base32
+  // ULID "01ARYZ6S41" will fail — returns false, silently rejecting valid ULIDs
+  return validator.isBase32(token);
+}
+
+// @expect-violation: base32-crockford-confusion
+function validateFileIdentifier(id: string): boolean {
+  // ❌ NanoID and similar tools use Crockford Base32 encoding
+  // Default isBase32() will reject valid identifiers containing '0', '1', etc.
+  if (!validator.isBase32(id)) {
+    throw new Error('Invalid file identifier');
+  }
+  return true;
+}
+
+// @expect-clean
+function validateULIDTokenCorrect(token: string): boolean {
+  // ✅ { crockford: true } for Crockford Base32 (ULID, NanoID)
+  return validator.isBase32(token, { crockford: true });
+}
+
+// @expect-clean
+function validateTOTPSecret(secret: string): boolean {
+  // ✅ Standard Base32 (RFC 4648) for TOTP secrets — default options correct here
+  return validator.isBase32(secret);
 }
 
 // =============================================================================
