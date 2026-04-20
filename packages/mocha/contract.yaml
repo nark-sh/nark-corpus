@@ -23,17 +23,19 @@ maintainer: "corpus-team"
 last_verified: "2026-04-20"
 status: production
 evidence_quality: confirmed
-coverage_score: 0.89  # 8 contracted / (10 total - 1 intentionally omitted) = 8/9
-# Depth pass 2026-04-20 (deepen-stream-1 pass 5):
+coverage_score: 1.0  # 9 contracted / (10 total - 1 intentionally omitted) = 9/9
+# Depth pass 2026-04-20 (deepen-stream-1 pass 6):
 # API surface: 10 callable-with-error-contract (BDD + TDD hooks, programmatic API)
-# Contracted before: 6 (it, before, after, beforeEach, afterEach, describe)
-# Contracted after: 8 (+2: Mocha.loadFilesAsync, Mocha.run)
+# Contracted before: 8 (it, before, after, beforeEach, afterEach, describe, Mocha.loadFilesAsync, Mocha.run)
+# Contracted after: 9 (+1: Mocha.parallelMode; +1 new postcondition on Mocha.run: run-already-disposed-throws)
 # Intentionally omitted: 1 (TDD aliases: suiteSetup/suiteTeardown/setup/teardown — identical contracts to before/after/beforeEach/afterEach)
-# Also omitted: context/specify/xdescribe/xit (aliases for describe/it and pending markers — no unique error contracts)
+# Also omitted (not in omitted_count): context/specify/xdescribe/xit/xcontext/xspecify (aliases & pending markers — no unique error contracts)
 # Evidence confirmed from:
-#   node_modules/mocha/lib/nodejs/esm-utils.js — throw sites lines 11-30, 48-86
-#   node_modules/mocha/lib/mocha.js — run() callback pattern lines 217, 608-612
-#   https://legacy.mochajs.org/api/mocha (loadFilesAsync documented with .catch() example)
+#   node_modules/mocha/lib/mocha.js — parallelMode() lines 1074-1101, _guardRunningStateTransition() lines 901-918
+#   node_modules/mocha/lib/errors.js — createMochaInstanceAlreadyDisposedError() line 260, createUnsupportedError() line 125
+#   node_modules/mocha/lib/error-constants.js — ERR_MOCHA_UNSUPPORTED, ERR_MOCHA_INSTANCE_ALREADY_DISPOSED
+#   https://legacy.mochajs.org/api/mocha — "@throws If Mocha not in INIT state", "@throws If run in browser"
+#   https://mochajs.org/features/parallel-mode/
 
 # Mocha hook functions (it, before, after, etc.) are called synchronously — the async
 # callback they receive is run later by the Mocha runtime, not at the call site.
@@ -42,6 +44,8 @@ coverage_score: 0.89  # 8 contracted / (10 total - 1 intentionally omitted) = 8/
 # from normal Mocha usage where hooks are called without await.
 detection:
   require_await_detection: true
+  class_names:
+    - Mocha
 
 functions:
   - name: it
@@ -531,6 +535,54 @@ edge_cases:
           user_experience: service_unavailable
           incident_cost_range: low
 
+      # Evidence: node_modules/mocha/lib/mocha.js _guardRunningStateTransition() lines 908-917
+      # createMochaInstanceAlreadyDisposedError thrown when state is DISPOSED or REFERENCES_CLEANED
+      # code: ERR_MOCHA_INSTANCE_ALREADY_DISPOSED
+      # This happens when cleanReferencesAfterRun is true (default) and run() is called again
+      # on the same Mocha instance after a test run completes.
+      - id: run-already-disposed-throws
+        condition: >
+          mocha.run() is called on a Mocha instance that has already been disposed. By default,
+          Mocha disposes itself (cleans function references) after each test run when
+          cleanReferencesAfterRun is true (the default). Calling run() again on a disposed
+          instance throws synchronously. This is a common mistake in programmatic usage
+          where developers reuse the same Mocha instance across multiple test runs.
+        throws: >
+          Error with code ERR_MOCHA_INSTANCE_ALREADY_DISPOSED:
+          "Mocha instance is already disposed, cannot start a new test run. Please create
+          a new mocha instance. Be sure to set disable `cleanReferencesAfterRun` when you
+          want to reuse the same mocha instance for multiple test runs."
+        required_handling: >
+          For multiple test runs, either:
+          (a) Create a new Mocha() instance per run (simplest), or
+          (b) Disable auto-dispose and call dispose() manually:
+
+            // OPTION A: new instance per run (recommended)
+            function runTests() {
+              const mocha = new Mocha({ timeout: 5000 });
+              mocha.addFile('./test/suite.spec.js');
+              mocha.run(failures => process.exitCode = failures ? 1 : 0);
+            }
+
+            // OPTION B: reuse instance — disable auto-dispose
+            const mocha = new Mocha({ cleanReferencesAfterRun: false });
+            mocha.addFile('./test/suite.spec.js');
+            mocha.run(failures => {
+              // can call mocha.run() again safely
+              mocha.unloadFiles();
+              mocha.run(failures2 => process.exitCode = failures2 ? 1 : 0);
+            });
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js"
+          - "https://legacy.mochajs.org/api/mocha#run"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
       # Evidence: node_modules/mocha/lib/mocha.js run() callback pattern
       # The failures count is passed to callback; if no callback or callback doesn't check it,
       # test failures are silently swallowed — process exits with code 0 even if tests fail
@@ -572,6 +624,93 @@ edge_cases:
           production_behavior: silent_failure
           visibility: hidden
           user_experience: silent_data_loss
+          incident_cost_range: low
+
+  - name: Mocha.parallelMode
+    import_path: "mocha"
+    description: >
+      Toggles parallel mode on a Mocha instance. When enabled, Mocha uses a
+      ParallelBufferedRunner that distributes test files across worker processes. Must be
+      called BEFORE mocha.run() — calling it after run() has been invoked throws synchronously.
+      Also throws if called in a browser environment (parallel mode is Node.js only).
+      Commonly used in programmatic test orchestration to speed up large test suites.
+    postconditions:
+      # Evidence: node_modules/mocha/lib/mocha.js lines 1076-1090
+      # parallelMode() throws createUnsupportedError() in two branches:
+      #   1. Line 1076: utils.isBrowser() check → throws "parallel mode is only supported in Node.js"
+      #   2. Line 1087: this._state !== mochaStates.INIT → throws "cannot change parallel mode after having called run()"
+      # Error code: ERR_MOCHA_UNSUPPORTED (from constants.UNSUPPORTED)
+      # Documentation: https://legacy.mochajs.org/api/mocha#parallelMode
+      #   "@throws If run in browser"
+      #   "@throws If Mocha not in `INIT` state"
+      - id: parallel-mode-after-run-throws
+        condition: >
+          Mocha.parallelMode() is called after mocha.run() has already been invoked. Once run()
+          is called, the Mocha instance transitions out of the INIT state and parallelMode()
+          can no longer be toggled. This is a setup-ordering mistake in programmatic usage —
+          parallelMode must be configured before run() begins executing test files.
+        throws: >
+          Error with code ERR_MOCHA_UNSUPPORTED:
+          "cannot change parallel mode after having called run()"
+        required_handling: >
+          Always call parallelMode() before run():
+
+            // CORRECT: configure parallel mode before running
+            const mocha = new Mocha({ timeout: 10000 });
+            mocha.addFile('./test/**/*.spec.js');
+            mocha.parallelMode(true);   // BEFORE run()
+            mocha.run(failures => process.exitCode = failures ? 1 : 0);
+
+            // WRONG: parallel mode after run() — throws ERR_MOCHA_UNSUPPORTED
+            mocha.run(failures => {
+              mocha.parallelMode(true);  // too late — throws
+            });
+
+          Note: parallelMode can also be set via the Mocha constructor options:
+            new Mocha({ parallel: true })
+          This avoids the ordering issue entirely.
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js#L1074"
+          - "https://legacy.mochajs.org/api/mocha#parallelMode"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: parallel-mode-in-browser-throws
+        condition: >
+          Mocha.parallelMode() is called in a browser environment. Mocha detects the browser
+          via a utils.isBrowser() check. Parallel mode spawns Node.js worker threads/child
+          processes which are unavailable in browsers. Uncommon in typical usage but affects
+          projects that use mocha programmatically in both Node.js and browser contexts (e.g.,
+          universal test harnesses or karma integration with the Mocha class directly).
+        throws: >
+          Error with code ERR_MOCHA_UNSUPPORTED:
+          "parallel mode is only supported in Node.js"
+        required_handling: >
+          Check the environment before enabling parallel mode:
+
+            if (typeof process !== 'undefined' && process.versions?.node) {
+              mocha.parallelMode(true);
+            }
+            // Or just never call parallelMode() in browser-targeted test code.
+
+          Alternatively, pass parallel: true in MochaOptions constructor only in
+          Node-targeted builds:
+            new Mocha({ parallel: isNode })
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js#L1076"
+          - "https://legacy.mochajs.org/api/mocha#parallelMode"
+          - "https://mochajs.org/features/parallel-mode/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: low
 
 # Category: testing
