@@ -212,3 +212,41 @@ export async function getTrialExpiryDateHardcoded(): Promise<string> {
   const dur = dayjs.duration('P14D'); // 14 days in ISO 8601
   return dayjs().add(dur).toISOString();
 }
+
+// ============================================================
+// dayjs() zero-argument — SHOULD NOT fire dayjs-invalid-date
+// ============================================================
+// dayjs() with NO arguments always returns the current time and is always valid.
+// There is no user-supplied input, so requiring .isValid() is a false positive.
+// Evidence: concern-20260421-dayjs-no-args-fp (195 FPs across ant-design, mantine, notesnook)
+
+// @expect-clean
+// dayjs() with no args — current time, always valid. Must NOT trigger dayjs-invalid-date.
+export function getCurrentTime(): string {
+  const now = dayjs();
+  return now.format('YYYY-MM-DD');
+}
+
+// @expect-clean
+// dayjs() no-args chained with .format() — still no-args, still always valid.
+export function getCurrentTimeFormatted(): string {
+  return dayjs().format('YYYY-MM-DD HH:mm:ss');
+}
+
+// @expect-clean
+// dayjs() no-args used in a diff calculation (common pattern in age/duration calcs).
+export function daysSinceDate(dateStr: string): number {
+  const past = dayjs(dateStr);
+  if (!past.isValid()) {
+    throw new Error('Invalid date');
+  }
+  const now = dayjs(); // no-args: always valid, must NOT trigger dayjs-invalid-date
+  return now.diff(past, 'day');
+}
+
+// @expect-violation: dayjs-invalid-date
+// dayjs() WITH a string argument — user input may be invalid, should still fire.
+export function formatUserDate(input: string): string {
+  const d = dayjs(input); // has arg — may be invalid
+  return d.format('YYYY-MM-DD');
+}

@@ -31,7 +31,7 @@ import fastify from 'fastify';
 async function startServerMissingRouteErrorHandling() {
   const app = fastify();
 
-  // SHOULD_FIRE: route-handler-async-error — async route handler with no try-catch
+  // SHOULD_NOT_FIRE: route-handler-async-error — removed from contract (Fastify 5 always catches async handler errors internally)
   app.get('/user', async (request, reply) => {
     const data = await fetchUserData();
     return { data };
@@ -47,7 +47,7 @@ async function startServerMissingRouteErrorHandling() {
 async function startServerWithRouteErrorHandling() {
   const app = fastify();
 
-  // SHOULD_NOT_FIRE: route-handler-async-error — has try-catch
+  // SHOULD_NOT_FIRE: route-handler-async-error — postcondition removed from contract
   app.get('/user', async (request, reply) => {
     try {
       const data = await fetchUserData();
@@ -220,7 +220,7 @@ async function setupWithCustomParserNoErrorHandling() {
     return body;
   });
 
-  // also triggers route-handler-async-error since route body has no try-catch
+  // route-handler-async-error postcondition removed from contract — Fastify 5 always catches async errors
   app.post('/upload', async (request, reply) => {
     const data = await processUpload(request.body);
     return { processed: data };
