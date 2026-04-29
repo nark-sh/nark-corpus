@@ -1,4 +1,4 @@
-# Sources: @sendgrid/mail Behavioral Contract
+# Sources: @sendgrid/mail Nark profile
 
 **Package:** @sendgrid/mail
 **Version:** ^7.0.0 || ^8.0.0

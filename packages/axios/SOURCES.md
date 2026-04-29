@@ -1,6 +1,6 @@
-# Axios Behavioral Contract Sources
+# Axios Nark profile Sources
 
-This document lists all authoritative sources consulted when creating the axios behavioral contract.
+This document lists all authoritative sources consulted when creating the axios Nark profile.
 
 **Package:** axios
 **Versions Covered:** 1.0.0 - 1.x.x
@@ -84,7 +84,7 @@ The following open-source TypeScript projects were examined to validate this con
 ## Known CVEs and Security Issues
 
 ### None Currently Documented
-As of 2026-02-23, there are no open CVEs related to behavioral contracts.
+As of 2026-02-23, there are no open CVEs related to Nark profiles.
 
 If security issues are discovered that relate to behavioral misuse (e.g., algorithm confusion), they will be documented here.
 

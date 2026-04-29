@@ -1,4 +1,4 @@
-# ioredis Behavioral Contract - Sources
+# ioredis Nark profile - Sources
 
 **Package:** ioredis (Redis client for Node.js)
 **Version Range:** >=4.27.8 (minimum for prototype pollution fix)

@@ -1,4 +1,4 @@
-# CORS Package - Behavioral Contract Sources
+# CORS Package - Nark profile Sources
 
 **Package:** cors
 **Version:** 2.8.5
@@ -921,7 +921,7 @@ app.get('/api/sensitive', requireAuth, (req, res) => {
 
 ## Contract Relevance
 
-This package should have behavioral contracts for:
+This package should have Nark profiles for:
 
 1. **Configuration Validation**
    - Detecting wildcard origin in production (`origin: '*'`)

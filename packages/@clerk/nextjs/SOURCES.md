@@ -1,4 +1,4 @@
-# @clerk/nextjs Behavioral Contract - Sources
+# @clerk/nextjs Nark profile - Sources
 
 **Package:** @clerk/nextjs (Clerk authentication SDK for Next.js)
 **Version Range:** >=5.0.0 <7.0.0

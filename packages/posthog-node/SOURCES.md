@@ -80,5 +80,5 @@ To upgrade `evidence_quality` from `partial` to `confirmed`, find repos that use
 
 ### Shai-Hulud 2.0 Supply Chain Attack (November 2025)
 **URL:** https://posthog.com/blog/nov-24-shai-hulud-attack-post-mortem
-**Relevance:** Package integrity (supply chain), not behavioral contracts.
+**Relevance:** Package integrity (supply chain), not Nark profiles.
 **Action:** Use posthog-node >=5.25.0 or verify package integrity.

@@ -1,4 +1,4 @@
-# Behavioral Contract Sources: nock
+# Nark profile Sources: nock
 
 **Package:** nock
 **Version Range:** >=9.0.0
@@ -9,7 +9,7 @@
 
 ## Overview
 
-nock is a widely-used HTTP request mocking library for Node.js testing. It intercepts outgoing HTTP/HTTPS requests and allows developers to define expected requests and responses without making actual network calls. This behavioral contract focuses on **throw-based error patterns** that occur when mocks are misconfigured, requests don't match expectations, or proper cleanup is not performed.
+nock is a widely-used HTTP request mocking library for Node.js testing. It intercepts outgoing HTTP/HTTPS requests and allows developers to define expected requests and responses without making actual network calls. This Nark profile focuses on **throw-based error patterns** that occur when mocks are misconfigured, requests don't match expectations, or proper cleanup is not performed.
 
 **Primary Repository:** https://github.com/nock/nock
 **NPM Package:** https://www.npmjs.com/package/nock

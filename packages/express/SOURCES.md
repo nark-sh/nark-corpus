@@ -123,7 +123,7 @@ The analyzer may require enhancements to fully detect callback function patterns
 2. **CVE Analysis**: Reviewed Express CVE databases and GitHub security issues
 3. **Best Practices Research**: Community articles, blog posts, and npm packages
 4. **Real-World Usage**: Analyzed test repositories (Express not heavily used in available repos)
-5. **Pattern Analysis**: Identified async error handling as the most critical behavioral contract
+5. **Pattern Analysis**: Identified async error handling as the most critical Nark profile
 
 ## Confidence Level
 

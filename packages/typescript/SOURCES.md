@@ -1,4 +1,4 @@
-# TypeScript Behavioral Contract - Sources
+# TypeScript Nark profile - Sources
 
 **Package:** typescript
 **Contract Version:** 1.0.0
@@ -166,7 +166,7 @@
 - No try-catch blocks around file operations
 - Assumption that files/directories exist
 
-**Implication:** This behavioral contract addresses a common real-world vulnerability.
+**Implication:** This Nark profile addresses a common real-world vulnerability.
 
 ---
 

@@ -1,4 +1,4 @@
-# Sources for helmet Behavioral Contract
+# Sources for helmet Nark profile
 
 **Package:** helmet
 **Version Range:** 7.x - 8.x
@@ -784,7 +784,7 @@ app.use(helmet({
 
 ---
 
-## Detection Strategy for Behavioral Contract
+## Detection Strategy for Nark profile
 
 ### Functions to Monitor
 

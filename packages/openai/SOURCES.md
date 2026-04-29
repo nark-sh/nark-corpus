@@ -1,4 +1,4 @@
-# OpenAI Behavioral Contract - Sources
+# OpenAI Nark profile - Sources
 
 ## Official Documentation
 

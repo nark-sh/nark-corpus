@@ -43,7 +43,7 @@
 
 ---
 
-## Behavioral Contract Rationale
+## Nark profile Rationale
 
 ### Why fetch() Requires Error Handling
 

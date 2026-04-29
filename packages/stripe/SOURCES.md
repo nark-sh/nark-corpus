@@ -1,4 +1,4 @@
-# Stripe Behavioral Contract - Sources
+# Stripe Nark profile - Sources
 
 ## Official Documentation
 

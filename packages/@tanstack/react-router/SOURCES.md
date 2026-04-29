@@ -1,6 +1,6 @@
-# @tanstack/react-router Behavioral Contract Sources
+# @tanstack/react-router Nark profile Sources
 
-This document lists all authoritative sources consulted when creating the @tanstack/react-router behavioral contract.
+This document lists all authoritative sources consulted when creating the @tanstack/react-router Nark profile.
 
 **Package:** @tanstack/react-router
 **Versions Covered:** 1.0.0 - 1.x.x
@@ -74,7 +74,7 @@ The following patterns were examined to validate this contract:
 
 ### None Currently Documented
 
-As of 2026-03-12, there are no open CVEs related to @tanstack/react-router behavioral contracts.
+As of 2026-03-12, there are no open CVEs related to @tanstack/react-router Nark profiles.
 
 ---
 

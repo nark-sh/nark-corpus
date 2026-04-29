@@ -1,4 +1,4 @@
-# Sources for @slack/web-api Behavioral Contract
+# Sources for @slack/web-api Nark profile
 
 **Package:** @slack/web-api
 **Version:** 7.x (latest as of 2026-02-25)

@@ -1,4 +1,4 @@
-# Got - Behavioral Contract Sources
+# Got - Nark profile Sources
 
 ## Package Information
 - **Package Name:** got

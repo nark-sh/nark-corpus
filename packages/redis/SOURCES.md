@@ -1,6 +1,6 @@
 # Sources: redis
 
-This document tracks all research sources used to create the behavioral contract for the `redis` npm package (node-redis v5).
+This document tracks all research sources used to create the Nark profile for the `redis` npm package (node-redis v5).
 
 ---
 
@@ -184,7 +184,7 @@ try {
 
 ---
 
-## Behavioral Contract Rationale
+## Nark profile Rationale
 
 ### Why These Functions?
 

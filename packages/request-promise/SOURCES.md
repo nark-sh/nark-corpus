@@ -1,4 +1,4 @@
-# Sources for request-promise Behavioral Contract
+# Sources for request-promise Nark profile
 
 **Last Updated:** 2026-02-27
 **Package Version:** 4.x

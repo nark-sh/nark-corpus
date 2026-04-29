@@ -1,6 +1,6 @@
 # Sources: axios-retry
 
-This document lists all sources used to create the behavioral contract for `axios-retry`.
+This document lists all sources used to create the Nark profile for `axios-retry`.
 
 **Last Updated:** 2026-02-27
 
@@ -153,7 +153,7 @@ retryDelay: (retryCount, error) =>
 
 ---
 
-## Behavioral Contract Implications
+## Nark profile Implications
 
 ### What Errors Occur
 1. **After retries exhausted:** axios-retry re-throws the final error
@@ -194,7 +194,7 @@ axios-retry is a **configuration library** that modifies axios behavior but **do
 - ✅ **try-catch still required** around axios HTTP methods
 - ✅ **Error handling covered by axios contract**
 
-**Recommendation:** This package does not require a separate behavioral contract. Users should refer to the axios contract for error handling requirements. The axios-retry library only adds retry logic before the final error is thrown.
+**Recommendation:** This package does not require a separate Nark profile. Users should refer to the axios contract for error handling requirements. The axios-retry library only adds retry logic before the final error is thrown.
 
 ---
 

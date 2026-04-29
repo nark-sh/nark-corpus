@@ -1,4 +1,4 @@
-# Sources: @anthropic-ai/sdk Behavioral Contract
+# Sources: @anthropic-ai/sdk Nark profile
 
 **Package:** @anthropic-ai/sdk
 **Version:** >=0.18.0 <1.0.0

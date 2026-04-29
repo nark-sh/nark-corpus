@@ -1,4 +1,4 @@
-# Prisma Behavioral Contract - Sources
+# Prisma Nark profile - Sources
 
 ## Official Documentation
 

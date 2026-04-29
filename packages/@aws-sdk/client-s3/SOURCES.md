@@ -1,4 +1,4 @@
-# Sources for @aws-sdk/client-s3 Behavioral Contract
+# Sources for @aws-sdk/client-s3 Nark profile
 
 ## Official Documentation
 

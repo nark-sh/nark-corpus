@@ -638,7 +638,7 @@ Common issue: "dotenv won't load parsed env variables into process.env"
 
 ---
 
-## Summary of Behavioral Contracts
+## Summary of Nark profiles
 
 ### High-Priority Postconditions
 

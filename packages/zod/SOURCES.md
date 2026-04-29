@@ -187,7 +187,7 @@ const form = useForm({
 
 ---
 
-## Behavioral Contract Rationale
+## Nark profile Rationale
 
 ### Why parse() and parseAsync() are contracted:
 

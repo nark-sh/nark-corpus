@@ -1,4 +1,4 @@
-# PostgreSQL (pg) Behavioral Contract - Sources
+# PostgreSQL (pg) Nark profile - Sources
 
 ## Official Documentation
 

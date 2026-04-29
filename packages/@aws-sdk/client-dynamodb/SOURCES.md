@@ -22,7 +22,7 @@
 | https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/dynamodb/command/BatchWriteItemCommand/ | BatchWriteItemCommand — UnprocessedItems (partial failure) |
 | https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/dynamodb/command/TransactWriteItemsCommand/ | TransactWriteItemsCommand — TransactionCanceledException |
 
-## Evidence of Behavioral Contract
+## Evidence of Nark profile
 
 The AWS DynamoDB error handling guide documents:
 

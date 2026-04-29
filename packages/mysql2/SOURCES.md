@@ -1,4 +1,4 @@
-# mysql2 - Behavioral Contract Sources
+# mysql2 - Nark profile Sources
 
 ## Package Overview
 

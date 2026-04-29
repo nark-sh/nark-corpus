@@ -1,6 +1,6 @@
-# ai (Vercel AI SDK) Behavioral Contract Sources
+# ai (Vercel AI SDK) Nark profile Sources
 
-This document lists all authoritative sources consulted when creating the ai (Vercel AI SDK) behavioral contract.
+This document lists all authoritative sources consulted when creating the ai (Vercel AI SDK) Nark profile.
 
 **Package:** ai
 **Versions Covered:** 2.0.0 - 6.x.x
@@ -79,7 +79,7 @@ The following patterns were validated:
 
 ### None Currently Documented
 
-As of 2026-03-12, there are no open CVEs related to Vercel AI SDK behavioral contracts.
+As of 2026-03-12, there are no open CVEs related to Vercel AI SDK Nark profiles.
 
 ---
 

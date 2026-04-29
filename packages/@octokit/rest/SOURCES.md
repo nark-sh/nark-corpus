@@ -1,6 +1,6 @@
 # Sources for @octokit/rest Contract
 
-This document lists all sources used to create the behavioral contract for `@octokit/rest`.
+This document lists all sources used to create the Nark profile for `@octokit/rest`.
 
 ## Official Documentation
 

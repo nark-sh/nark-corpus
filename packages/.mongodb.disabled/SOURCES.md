@@ -1,4 +1,4 @@
-# MongoDB Behavioral Contract - Sources
+# MongoDB Nark profile - Sources
 
 **Package:** mongodb
 **Contract Version:** 1.0.0

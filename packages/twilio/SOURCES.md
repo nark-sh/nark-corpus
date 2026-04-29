@@ -1,6 +1,6 @@
 # Sources: twilio
 
-This document tracks the research sources used to create the behavioral contract for the `twilio` package.
+This document tracks the research sources used to create the Nark profile for the `twilio` package.
 
 ---
 
@@ -199,7 +199,7 @@ client.messages.create({...})
 
 ---
 
-## Behavioral Contract Rationale
+## Nark profile Rationale
 
 ### Why These Functions?
 

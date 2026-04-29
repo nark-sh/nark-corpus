@@ -473,7 +473,7 @@ try {
 
 ---
 
-## Behavioral Contract Rationale
+## Nark profile Rationale
 
 ### Why These Functions Need Error Handling
 

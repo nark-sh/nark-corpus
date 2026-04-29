@@ -55,5 +55,5 @@ Documentation sources for behavioral claims in `contract.yaml`.
 ## Notes
 
 - All CVEs affect the dev server or build output, not the programmatic API's error handling contract.
-- The behavioral contracts focus on async error handling obligations, not security version constraints.
+- The Nark profiles focus on async error handling obligations, not security version constraints.
 - vite error messages are enhanced by `enhanceRollupError()` before being re-thrown — the RollupError shape applies.

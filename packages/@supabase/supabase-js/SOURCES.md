@@ -1,4 +1,4 @@
-# Supabase Behavioral Contract - Sources
+# Supabase Nark profile - Sources
 
 ## Official Documentation
 

@@ -1,4 +1,4 @@
-# Sources for cloudinary Behavioral Contract
+# Sources for cloudinary Nark profile
 
 **Package:** cloudinary  
 **Contract Version:** 1.0.0  
