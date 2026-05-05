@@ -27,7 +27,7 @@ import nodemailer from 'nodemailer';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const sendEmailNoCatch = async (event: any) => {
-  // SHOULD_FIRE: configuration-error — createTransport() throws on invalid config. No try-catch.
+  // SHOULD_NOT_FIRE: createTransport() is sync object construction, downgraded to info severity.
   const transporter = nodemailer.createTransport({
     host: 'smtp.example.com',
     port: 587,

@@ -34,7 +34,7 @@ import * as dotenv from 'dotenv';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function configNoCatch() {
-  // SHOULD_FIRE: missing-env-file — config() result not checked. Silent failure if .env missing.
+  // SHOULD_NOT_FIRE: config() returns { error } instead of throwing. Suppress missing-env-file.
   dotenv.config();
   console.log('running');
 }
@@ -74,16 +74,14 @@ export function configFollowedByEnvCheckOnNextLine() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. config() in vault mode — no try-catch → SHOULD_FIRE (vault-invalid-dotenv-key)
-//    When DOTENV_KEY is set, config() throws (does not return {error}).
-//    Missing try-catch lets process crash on malformed/wrong key.
+// 4. config() in vault mode — vault postconditions require DOTENV_KEY in file.
+//    Since this fixture mixes vault and non-vault tests, vault postconditions
+//    are suppressed (no file-level vault indicator). See separate vault fixture
+//    for vault-specific tests.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// @expect-violation: vault-invalid-dotenv-key
-// @expect-violation: vault-decryption-failed
 export function configVaultModeNoCatch() {
-  // SHOULD_FIRE: vault-invalid-dotenv-key / vault-decryption-failed
-  // No try-catch. When DOTENV_KEY is present, config() throws on bad key or decryption failure.
+  // SHOULD_NOT_FIRE: no vault indicator in file, vault postconditions suppressed.
   dotenv.config();
   console.log('loaded via vault');
 }
