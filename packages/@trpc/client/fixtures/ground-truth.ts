@@ -24,6 +24,7 @@
  */
 
 import { TRPCClientError, createTRPCClient, createTRPCProxyClient, httpLink, isTRPCClientError } from '@trpc/client';
+import { PromiseCall, PromiseState, safeAsync } from './wrapper-stubs';
 
 type AppRouter = any;
 
@@ -177,4 +178,55 @@ export function subscribeWithMinimalOnError(roomId: string) {
       console.error('chat subscription error:', err.message);
     },
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8 callback-wrapper shells — wrapper class/function catches errors one frame up.
+// Concern: concern-20260515-section8-promisecall-promisestate-wrapper-shells
+// Concern: concern-20260515-section8-trpc-query-wrapper-shells
+// Wrapper helpers (PromiseCall, PromiseState, safeAsync) are imported at file
+// level above. The suppression heuristic walks the import declarations — not
+// the bodies — to confirm the wrapper names are imported, not locally shadowed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export function blinkoPromiseCallWrap(noteId: string) {
+  // SHOULD_NOT_FIRE: PromiseCall wraps the promise — PromiseCall's body holds the try-catch.
+  return PromiseCall(trpc.note.detail.query({ id: noteId }));
+}
+
+// @expect-clean
+export function blinkoPromiseStateWrap() {
+  // Wrapper-class shape: callback is the `function:` property of an object literal
+  // that is a `new PromiseState({...})` argument. The class's .call() method holds
+  // the try-catch; flagging the inner await would FP.
+  return new PromiseState({
+    // SHOULD_NOT_FIRE: function: property of new PromiseState({...}) — wrapper.call() holds try-catch.
+    function: async (params: { id: string }) => trpc.note.detail.query(params),
+  });
+}
+
+// @expect-clean
+export function safeAsyncWrap(title: string) {
+  // SHOULD_NOT_FIRE: safeAsync wraps the lambda — safeAsync body holds the try-catch.
+  return safeAsync(async () => trpc.post.create.mutate({ title }));
+}
+
+// Name-collision defense: a LOCALLY-declared function named `PromiseCall` that
+// is NOT imported at file level must NOT trigger suppression. This guards
+// against over-suppression when a project happens to define an identifier that
+// collides with a built-in wrapper name but does not actually wrap try-catch.
+function PromiseCall_localShadow<T>(p: T): T {
+  // Note: NO try-catch here — local shadow does not actually handle errors.
+  return p;
+}
+
+// @expect-violation: trpc-mutate-missing-try-catch
+export async function nameCollisionLocalShadow(title: string) {
+  // The await is the bare TRPC call — the surrounding helper does not catch.
+  // Even though the outer identifier name matches `PromiseCall`, it is NOT in
+  // the file's imported-identifier set, so the heuristic must NOT suppress.
+  // SHOULD_FIRE: trpc-mutate-missing-try-catch — local shadow does not provide try-catch, wrapper-shell heuristic must not over-suppress
+  const result = await PromiseCall_localShadow(trpc.post.create.mutate({ title }));
+  return result;
 }
