@@ -1,0 +1,115 @@
+package: "svix"
+semver: ">=1.0.0"
+contract_version: "1.0.0"
+maintainer: "nark-sh"
+last_verified: "2026-06-10"
+coverage_status: covered
+status: production
+evidence_quality: partial
+
+# Initial svix profile. v0.1 — covers the two highest-frequency caller-side
+# error contracts: message.create() (outbound webhook delivery API) and
+# Webhook.verify() (inbound webhook signature verification). Future
+# bc-deepen-contract pass will enumerate the Application/Endpoint/Event-type
+# CRUD surfaces and add postconditions for the full svix-server REST API.
+#
+# Why this matters: webhooks are order-sensitive and at-least-once delivery.
+# A swallowed svix error means either (a) a webhook that was supposed to fire
+# never did (lost integration), or (b) a webhook signature verification that
+# silently passed when it should have failed (auth bypass). Both are
+# production-critical.
+
+functions:
+  - name: create
+    namespace: "message"
+    import_path: "svix"
+    description: "Enqueues an outbound webhook event for delivery to all endpoints subscribed to that event type."
+
+    postconditions:
+      - id: api-error
+        condition: "svix-server rejected the message — invalid app ID, malformed payload, unauthorized API key, or rate-limited"
+        throws: "ApiException (svix.ApiException) with statusCode and body"
+        required_handling: >
+          Caller MUST catch ApiException around message.create(). 4xx errors
+          (400 validation, 401 auth, 404 unknown app, 429 rate limit) require
+          distinct handling — DO NOT blindly retry on auth or validation
+          errors. For rate-limit (429), respect Retry-After if present and
+          back off. The webhook is NOT delivered when create() throws — so a
+          swallowed exception equals a silently-lost integration message.
+        sources:
+          - "https://docs.svix.com/api-reference/message/message-create-message"
+          - "https://docs.svix.com/error-handling-and-retry-schedule"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: network-error
+        condition: "Network failure reaching api.svix.com — DNS, TLS, timeout"
+        throws: "Error (Node.js network error) or ApiException with no body"
+        required_handling: >
+          Caller MUST catch and either retry with exponential backoff or
+          enqueue locally for later replay. svix-server does NOT see the
+          message at all when network errors hit before request lands — your
+          system is the only one that knows it was supposed to fire. For
+          critical integrations (billing, compliance), pair create() with a
+          local outbox table so failed sends can be replayed.
+        sources:
+          - "https://docs.svix.com/quickstart#sending-your-first-event"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: verify
+    namespace: "Webhook"
+    import_path: "svix"
+    description: "Verifies the signature of an inbound webhook payload. Returns the parsed payload on success, throws on signature mismatch or expired timestamp."
+
+    postconditions:
+      - id: signature-mismatch
+        condition: "Webhook signature did not validate against the provided secret"
+        throws: "WebhookVerificationError"
+        required_handling: >
+          Caller MUST catch WebhookVerificationError and respond with HTTP
+          401 (or 400) WITHOUT processing the payload body. A swallowed
+          signature error is an authentication bypass — the caller would
+          then process attacker-controlled webhook events as if they came
+          from a trusted sender. NEVER fall back to "trust the body anyway."
+          Constant-time signature comparison is handled by svix internally;
+          the caller's only job is to not ignore the throw.
+        sources:
+          - "https://docs.svix.com/receiving/verifying-payloads/how"
+          - "https://docs.svix.com/receiving/verifying-payloads/how-manual"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: timestamp-expired
+        condition: "Webhook timestamp is outside the tolerance window (default 5 minutes) — likely a replay attack"
+        throws: "WebhookVerificationError"
+        required_handling: >
+          Caller MUST catch and reject with HTTP 401. svix's verify() rejects
+          messages older than the tolerance window to prevent replay attacks
+          against the webhook endpoint. Do NOT extend the tolerance window
+          to "be lenient" — that defeats the protection. If clock skew is a
+          real concern, sync NTP rather than widening the window.
+        sources:
+          - "https://docs.svix.com/receiving/verifying-payloads/how"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical

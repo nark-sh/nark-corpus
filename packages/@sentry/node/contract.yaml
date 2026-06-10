@@ -1,0 +1,146 @@
+package: "@sentry/node"
+semver: ">=7.0.0"
+contract_version: "1.0.0"
+maintainer: "nark-sh"
+last_verified: "2026-06-10"
+coverage_status: covered
+status: production
+evidence_quality: partial
+
+# Initial @sentry/node profile. v0.1 — covers the four highest-frequency caller-
+# side error contracts (init validation, flush/close shutdown contracts,
+# wrapper-callback propagation). Future bc-deepen-contract pass will enumerate
+# the full Transport / Hub / Scope API surface and add postconditions for the
+# remaining edge cases (transport-specific errors, breadcrumb encoding,
+# tunnel relay failures).
+#
+# Why this matters: Sentry's transport layer absorbs HTTP failures silently by
+# design (the goal of observability tooling is "never crash the app"), so the
+# caller-facing error contracts are not "throws ABC" but rather "MUST check
+# return value" and "MUST await before process exit." Most production Sentry
+# bugs come from missing one of these contracts.
+
+functions:
+  - name: init
+    import_path: "@sentry/node"
+    description: "Initializes the Sentry SDK. Validates DSN and configures the global client."
+
+    postconditions:
+      - id: invalid-dsn
+        condition: "DSN is missing, malformed, or contains an invalid public key"
+        throws: "Error or DSN validation failure routed through onFatalError"
+        required_handling: >
+          Caller MUST validate that the DSN env var (typically SENTRY_DSN) is
+          present and non-empty before calling Sentry.init(). For optional
+          telemetry — e.g. local dev — wrap in a try/catch and degrade
+          gracefully (log a warning, continue without Sentry). DO NOT let an
+          invalid DSN throw at module-load time during process boot — it will
+          take down the whole app for a non-essential observability
+          dependency.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/configuration/options/#dsn"
+          - "https://docs.sentry.io/platforms/javascript/guides/node/best-practices/empty-dsn/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: flush
+    import_path: "@sentry/node"
+    description: "Awaits delivery of all queued events. Returns Promise<boolean> — false means timeout (events may be lost)."
+
+    postconditions:
+      - id: flush-return-ignored
+        condition: "flush() return value is ignored — caller proceeds assuming success"
+        returns: "Promise<boolean> where false = timeout, events lost"
+        required_handling: >
+          Caller MUST check the return value of await Sentry.flush(timeout).
+          If false, events did not deliver within the timeout — log this fact
+          (to stdout, not Sentry — Sentry is the thing that failed). Common
+          mistake: writing `await Sentry.flush(2000); process.exit(0)` and
+          assuming events landed. They didn't if flush returned false. For
+          worker / serverless shutdown paths this is the difference between
+          "lost the smoking-gun error log" and "captured the crash."
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/configuration/draining/"
+          - "https://docs.sentry.io/platforms/javascript/guides/node/best-practices/sdk-initialization/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: flush-not-awaited
+        condition: "Process exits before queued Sentry events are sent"
+        returns: "Promise<boolean>"
+        required_handling: >
+          Caller MUST await Sentry.flush() (or Sentry.close()) before any
+          deliberate process.exit() in worker / cron / serverless handlers.
+          Fire-and-forget Sentry.captureException() does NOT block; events
+          live in an in-memory queue that drains asynchronously. Exiting the
+          process before drain completes drops the events.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/configuration/draining/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: close
+    import_path: "@sentry/node"
+    description: "Closes the Sentry client. Flushes remaining events and disables further capture. Returns Promise<boolean> — false means timeout."
+
+    postconditions:
+      - id: close-not-awaited
+        condition: "Process exits before close() resolves — same shape as flush-not-awaited but harder to retry because close() is one-shot"
+        returns: "Promise<boolean>"
+        required_handling: >
+          Caller MUST await Sentry.close(timeout) before deliberate
+          process.exit() in shutdown handlers. Unlike flush(), close()
+          disables future capture — calling captureException() after close()
+          succeeds is a no-op (silent loss). Prefer flush() in long-running
+          processes that just need to drain; reserve close() for true
+          shutdown paths.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/configuration/draining/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: startSpan
+    import_path: "@sentry/node"
+    description: "Wraps a callback in a performance span. Synchronous or async per callback signature. Errors thrown by the callback are CAPTURED and re-thrown by Sentry."
+
+    postconditions:
+      - id: span-callback-rethrows
+        condition: "Errors thrown inside the span callback are captured (good) AND re-thrown to the caller (caller must still handle)"
+        throws: "Whatever the callback threw"
+        required_handling: >
+          Caller MUST treat Sentry.startSpan() as transparent for error
+          propagation. The span captures the error for observability, but
+          the error still escapes the span call and reaches the caller. If
+          you want Sentry to "swallow" the error, wrap explicitly in
+          try/catch — do not assume startSpan absorbs it. Common misuse:
+          "I put it in a span so it's tracked" while the unhandled rejection
+          crashes the process.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
