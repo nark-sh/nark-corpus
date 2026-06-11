@@ -2,10 +2,11 @@ package: "@sentry/node"
 semver: ">=7.0.0"
 contract_version: "1.0.0"
 maintainer: "nark-sh"
-last_verified: "2026-06-10"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.73  # 8 contracted / 11 total async-callable (3 intentionally omitted)
 
 # Initial @sentry/node profile. v0.1 — covers the four highest-frequency caller-
 # side error contracts (init validation, flush/close shutdown contracts,
@@ -143,4 +144,224 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/
+  # Source confirmed from @sentry/core/build/cjs/tracing/trace.js — startSpanManual callback
+  # does NOT auto-finish the span; finish() is passed as the second callback arg.
+  # Unlike startSpan, the span remains open until the caller explicitly calls finish() or span.end().
+  - name: startSpanManual
+    import_path: "@sentry/node"
+    description: >
+      Like startSpan() but the span is NOT automatically ended when the callback returns.
+      A finish() function is passed as the second argument to the callback — the caller
+      MUST invoke it (or call span.end() directly) to close the span. The span remains
+      open and recording until explicitly ended; if never ended, it becomes a zombie span
+      that holds memory and is never sent to Sentry.
+
+    postconditions:
+      # Evidence: @sentry/core source — startSpanManual does not auto-call span.end()
+      # https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/
+      - id: span-manual-finish-never-called
+        condition: "finish() or span.end() is never called — callback returns without ending the span"
+        returns: "Span remains open indefinitely — never sent to Sentry, never recorded"
+        required_handling: >
+          Caller MUST call finish() (the second callback argument) or span.end() in
+          ALL code paths including error paths. The most dangerous pattern is a
+          try/catch that calls finish() only in the happy path — a thrown error
+          exits the callback without finishing the span. Use try/finally:
+            startSpanManual(options, (span, finish) => {
+              try {
+                doWork();
+              } finally {
+                finish();
+              }
+            });
+          Unfinished spans silently vanish: no performance data in Sentry, no error
+          recorded, no alert fired. Debugging "why are my spans missing" is
+          extremely difficult because no error is thrown.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: span-manual-callback-rethrows
+        condition: "Errors thrown inside the startSpanManual callback are re-thrown to the caller (same as startSpan)"
+        throws: "Whatever the callback threw"
+        required_handling: >
+          Caller MUST treat Sentry.startSpanManual() as transparent for error
+          propagation. Errors are not swallowed. If the callback throws before
+          calling finish(), the span is never ended AND the error propagates.
+          Always use try/finally to guarantee finish() is called.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/
+  # Source confirmed from @sentry/core/build/cjs/tracing/trace.js — startInactiveSpan returns
+  # a Span object directly. No callback wrapper. Caller owns 100% of lifecycle.
+  - name: startInactiveSpan
+    import_path: "@sentry/node"
+    description: >
+      Creates a span that is NOT active in the current async context and is NOT
+      automatically ended. Unlike startSpan/startSpanManual, there is no callback
+      wrapper — the span is returned directly to the caller. The caller MUST call
+      span.end() to close the span. The span does NOT become the active parent for
+      child spans (use startSpan for that). Useful for manually instrumenting parallel
+      work where you control the span lifecycle explicitly.
+
+    postconditions:
+      # Evidence: @sentry/core/build/cjs/tracing/trace.js — startInactiveSpan returns
+      # SentrySpan or SentryNonRecordingSpan; neither auto-ends.
+      # https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/
+      - id: inactive-span-end-never-called
+        condition: "span.end() is never called — span was created but never finished"
+        returns: "Span remains open indefinitely — never sent to Sentry"
+        required_handling: >
+          Caller MUST call span.end() in ALL code paths. Wrap the work in
+          try/finally to guarantee the span is ended even when errors are thrown:
+            const span = Sentry.startInactiveSpan({ name: 'my-op' });
+            try {
+              await doWork();
+            } finally {
+              span.end();
+            }
+          Because the span is inactive (not in async context), no automatic cleanup
+          mechanism exists. An unended inactive span is permanently lost data — no
+          error is thrown, no warning is logged.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/custom-instrumentation/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/crons/
+  # Source confirmed from @sentry/core/build/cjs/exports.js — withMonitor implementation:
+  # catches sync/async callback errors, sends finishCheckIn("error") THEN re-throws.
+  # The monitor check-in is fire-and-forget (no await on captureCheckIn).
+  - name: withMonitor
+    import_path: "@sentry/node"
+    description: >
+      Wraps a callback (sync or async) in a Sentry Crons check-in. Sends an
+      in_progress check-in before the callback runs, then sends ok/error on
+      completion. Used to monitor cron jobs and scheduled tasks. Requires the
+      Sentry Crons feature to be enabled. The callback's errors are CAPTURED
+      (sent to Sentry as error check-in) and RE-THROWN to the caller — withMonitor
+      does not swallow errors.
+
+    postconditions:
+      # Evidence: @sentry/core/build/cjs/exports.js — withMonitor implementation
+      # explicitly calls finishCheckIn("error") then `throw e` in both sync catch
+      # and async rejection handler.
+      # https://docs.sentry.io/platforms/javascript/guides/node/crons/
+      - id: monitor-callback-rethrows
+        condition: "Errors thrown (or rejected Promises returned) by the withMonitor callback propagate to the caller after Sentry records the error check-in"
+        throws: "Whatever the callback threw or rejected with"
+        required_handling: >
+          Caller MUST handle errors from Sentry.withMonitor() — the function does
+          NOT swallow errors. The Sentry check-in (status="error") is sent before
+          re-throwing, so the error IS captured by Sentry. But the cron handler
+          code still needs its own try/catch to prevent unhandled rejections from
+          crashing the worker/scheduler.
+
+          Common mistake: wrapping the entire cron job in withMonitor and assuming
+          that "Sentry handles it." Sentry records the failure; it does not recover
+          from it. The scheduler will see the job as failed.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/crons/"
+          - "https://github.com/getsentry/sentry-javascript/blob/develop/packages/core/src/exports.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/crons/
+      # The upsertMonitorConfig is optional — if omitted AND the monitor slug does
+      # not exist in the Sentry project, the check-in is silently discarded.
+      - id: monitor-slug-not-configured
+        condition: "monitorSlug does not match an existing monitor in the Sentry project, and upsertMonitorConfig is not provided to auto-create it"
+        returns: "Check-ins are sent but silently ignored by Sentry — no monitor data recorded, no alerts fired"
+        required_handling: >
+          Always provide upsertMonitorConfig as the third argument to withMonitor()
+          in production environments. The config creates the monitor if it does not
+          exist, ensuring check-ins are recorded. Without it, a typo in the slug
+          or a missing monitor setup causes complete silent loss of cron monitoring
+          with no error thrown.
+
+          Minimum config:
+            Sentry.withMonitor('my-cron', callback, {
+              schedule: { type: 'crontab', value: '0 * * * *' }
+            });
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/crons/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/crons/
+  # Source confirmed from @sentry/core/build/cjs/exports.js — captureCheckIn() calls
+  # prepareCheckInEnvelope and sends via client transport. Returns a checkInId string.
+  # The returned checkInId is REQUIRED for the completion check-in; losing it means
+  # the completion check-in cannot be correlated and the monitor shows the run as "missed."
+  - name: captureCheckIn
+    import_path: "@sentry/node"
+    description: >
+      Sends a single check-in event to Sentry Crons. Used for the two-step manual
+      pattern: send in_progress at job start (returns checkInId), then send ok/error
+      at job completion using the same checkInId. Unlike withMonitor(), the caller
+      manages both check-ins manually. If only one check-in is sent (no completion),
+      the monitor marks the run as timed out once maxRuntime is exceeded.
+
+    postconditions:
+      # Evidence: https://docs.sentry.io/platforms/javascript/guides/node/crons/
+      # Source: @sentry/core/build/cjs/exports.js — captureCheckIn returns checkInId string
+      - id: checkin-completion-missing
+        condition: "captureCheckIn({ status: 'in_progress' }) is called at job start but the completion check-in (status: 'ok' or 'error') is never sent — e.g., job crashes before the second captureCheckIn call"
+        returns: "checkInId (string) — but without the completion check-in, monitor marks run as timed out after maxRuntime"
+        required_handling: >
+          Caller MUST ensure the completion check-in is always sent, even when the
+          job throws. Store the checkInId and wrap the job body in try/catch/finally:
+            const checkInId = Sentry.captureCheckIn({
+              monitorSlug: 'my-cron',
+              status: 'in_progress'
+            });
+            try {
+              await runJob();
+              Sentry.captureCheckIn({ monitorSlug: 'my-cron', status: 'ok', checkInId });
+            } catch (err) {
+              Sentry.captureCheckIn({ monitorSlug: 'my-cron', status: 'error', checkInId });
+              throw err;
+            }
+          A missed completion check-in results in a "timed out" alert rather than
+          an "error" alert — making root cause analysis harder.
+        sources:
+          - "https://docs.sentry.io/platforms/javascript/guides/node/crons/"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
           incident_cost_range: low
