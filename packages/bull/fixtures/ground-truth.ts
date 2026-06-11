@@ -433,3 +433,163 @@ async function getMetricsWithErrorHandling() {
     return [];
   }
 }
+
+// ============================================================
+// Job.moveToCompleted — VIOLATION CASES (deepen-stream-1 pass 4)
+// ============================================================
+
+// @expect-violation: move-to-completed-return-value-not-serializable
+// @expect-violation: move-to-completed-no-try-catch
+async function moveToCompletedWithoutErrorHandling(job: Job) {
+  const processResult = { data: 'result', timestamp: Date.now() };
+  // ❌ No try-catch — throws TypeError if processResult has circular refs or BigInt
+  // ❌ No try-catch — throws finishedErrors if lock expired or job not active
+  await job.moveToCompleted(processResult);
+}
+
+// @expect-violation: move-to-completed-no-try-catch
+async function moveToCompletedWithBadReturnValue(job: Job) {
+  try {
+    // Has try-catch but still passes potentially non-serializable value
+    // ❌ No pre-validation of returnValue — will throw TypeError for circular refs
+    const circular: any = {};
+    circular.self = circular; // circular reference
+    await job.moveToCompleted(circular);
+  } catch (err) {
+    console.error('moveToCompleted error:', err);
+  }
+}
+
+// @expect-clean
+async function moveToCompletedWithFullHandling(job: Job) {
+  const processResult = { status: 'done', count: 42 };
+
+  // ✅ Validate serialization before completing
+  let serializedResult: string;
+  try {
+    serializedResult = JSON.stringify(processResult);
+  } catch (err) {
+    await job.moveToCompleted({ status: 'completed', error: 'result-not-serializable' }).catch(() => {});
+    return;
+  }
+
+  try {
+    // ✅ Wrapped in try-catch for Redis/lock errors
+    await job.moveToCompleted(processResult);
+  } catch (err: any) {
+    if (err.message.includes('Missing lock') || err.message.includes('Lock mismatch')) {
+      console.warn('Lock lost before completion, aborting', { jobId: job.id });
+      return;
+    }
+    if (err.message.includes('Missing key')) {
+      console.warn('Job cleaned up before completion', { jobId: job.id });
+      return;
+    }
+    throw err;
+  }
+}
+
+// ============================================================
+// Job.takeLock — VIOLATION CASES (deepen-stream-1 pass 4)
+// ============================================================
+
+// @expect-violation: take-lock-false-return-unchecked
+// @expect-violation: take-lock-no-try-catch
+async function takeLockWithoutAnyHandling(job: Job) {
+  // ❌ No try-catch — Redis errors propagate as unhandled rejections
+  // ❌ No return value check — proceeds even if lock was not acquired (returns false)
+  await job.takeLock();
+  await doExclusiveWork(job.data); // potential duplicate processing!
+}
+
+// @expect-violation: take-lock-false-return-unchecked
+async function takeLockWithTryCatchButNoReturnCheck(job: Job) {
+  try {
+    // ❌ Has try-catch but does not check the return value
+    // If takeLock() returns false (lock held by another worker), proceeds anyway
+    await job.takeLock();
+    await doExclusiveWork(job.data); // potential duplicate if lock not acquired!
+  } catch (err) {
+    console.error('Error taking lock:', err);
+  }
+}
+
+// @expect-clean
+async function takeLockWithFullHandling(job: Job) {
+  let lock: number | false;
+  try {
+    // ✅ try-catch for Redis errors
+    lock = await job.takeLock();
+  } catch (err) {
+    console.error('Redis error acquiring job lock', { jobId: job.id });
+    return;
+  }
+
+  // ✅ Return value check — abort if lock not acquired
+  if (!lock) {
+    console.warn('Could not acquire lock for job, another worker owns it', { jobId: job.id });
+    return;
+  }
+
+  try {
+    await doExclusiveWork(job.data);
+  } finally {
+    // ✅ Always release lock in finally block
+    await job.releaseLock().catch(err => console.error('Lock release error:', err));
+  }
+}
+
+// ============================================================
+// Queue.pause — VIOLATION CASES (deepen-stream-1 pass 4)
+// ============================================================
+
+// @expect-violation: pause-no-try-catch
+async function pauseQueueWithoutErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  // ❌ No try-catch — Redis errors propagate if pause Lua script fails
+  // If this throws, global pause was NOT persisted — workers continue processing
+  await queue.pause();
+  console.log('Queue paused'); // ← may never reach here if Redis is down
+}
+
+// @expect-clean
+async function pauseQueueWithErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    // ✅ Wrapped in try-catch — handles Redis errors during pause
+    await queue.pause();
+    console.log('Queue paused globally');
+  } catch (err) {
+    console.error('Failed to pause queue — workers may still be processing', err);
+    // Alert ops team — jobs are still processing despite pause attempt
+    throw err;
+  }
+}
+
+// @expect-clean
+async function pauseQueueLocallyWithTimeout() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+
+  try {
+    // ✅ Local pause with doNotWaitActive=true — avoids hanging on stuck jobs
+    await queue.pause(true, true);
+    console.log('Worker paused locally (immediate)');
+  } catch (err) {
+    console.error('Failed to pause worker locally', err);
+    throw err;
+  }
+}
+
+// Stub for compilation
+async function doExclusiveWork(data: any) { return data; }

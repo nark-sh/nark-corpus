@@ -1,15 +1,15 @@
 package: bull
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"  # deepen-stream-1 pass 3: expanded from 21→23 contracted functions (Job.extendLock, Queue.getMetrics)
+last_verified: "2026-06-11"  # deepen-stream-1 pass 4: expanded from 23→26 contracted functions (+3: Job.moveToCompleted, Job.takeLock, Queue.pause)
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.74  # 23 contracted / 31 total async-callable (13 omitted read-only/monitoring, +2 this pass: Job.extendLock + Queue.getMetrics)
-# effective_coverage: 1.0 — 23/23 non-omitted functions contracted
-# functions_added_this_pass (deepen-stream-1 pass 3): Job.extendLock, Queue.getMetrics
-# functions_added_previous_pass: Queue.whenCurrentJobsFinished, Queue.removeJobs, Job.releaseLock, Job.moveToFailed
+coverage_score: 0.84  # 26 contracted / 31 total async-callable (13 omitted read-only/monitoring; +3 this pass)
+# effective_coverage: 1.0 — 26/26 non-omitted functions contracted (Job.discard synchronous-only omitted)
+# functions_added_this_pass (deepen-stream-1 pass 4): Job.moveToCompleted, Job.takeLock, Queue.pause
+# functions_added_previous_pass (pass 3): Job.extendLock, Queue.getMetrics
 # Queue.getCountsPerPriority intentionally omitted — read-only diagnostic (see omission note below)
 
 # Event handler detection NOW SUPPORTED (as of 2026-02-27):
@@ -1478,8 +1478,283 @@ functions:
           incident_cost_range: low
         evidence_quality: confirmed
 
+  # Evidence: bull/lib/job.js Job.prototype.moveToCompleted() lines 250-269
+  # utils.tryCatch(JSON.stringify, JSON, [returnValue]) — returns utils.errorObject on JSON error
+  # then Promise.reject(err) with the original TypeError
+  # scripts.moveToCompleted → scripts.moveToFinished → finishedErrors codes -1/-2/-3/-6
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/job.js
+  - name: Job.moveToCompleted
+    import_path: "bull"
+    description: >
+      Manually moves a job to the completed state. Typically called by Bull's internal
+      processor on success, but available for custom completion flows (e.g. jobs that
+      complete in a spawned subprocess and signal completion back to the parent process).
+      Returns a tuple of [nextJobData, nextJobId] for the next waiting job, or null.
+      Requires the calling worker to hold the job's lock (unless ignoreLock=true). Can
+      reject with the same finishedErrors codes as moveToFailed, plus a TypeError when
+      the returnValue cannot be JSON-serialized.
+    postconditions:
+      # Evidence: bull/lib/job.js lines 254-260:
+      # returnValue = utils.tryCatch(JSON.stringify, JSON, [returnValue]);
+      # if (returnValue === utils.errorObject) {
+      #   const err = utils.errorObject.value;
+      #   return Promise.reject(err);
+      # }
+      - id: move-to-completed-return-value-not-serializable
+        condition: "job.moveToCompleted(returnValue) called with a non-JSON-serializable returnValue"
+        throws: "TypeError: Converting circular structure to JSON / TypeError: Do not know how to serialize a BigInt"
+        required_handling: >
+          Caller MUST ensure the returnValue is JSON-serializable before calling moveToCompleted().
+          Use try-catch and validate the return value:
+
+            // WRONG — throws if result contains circular references or BigInt
+            await job.moveToCompleted(processResult);
+
+            // CORRECT — validate before completing
+            try {
+              JSON.stringify(processResult);  // test serialization
+            } catch (err) {
+              // Return a safe summary instead of the full object
+              await job.moveToCompleted({ status: 'completed', error: 'result-not-serializable' });
+              return;
+            }
+            await job.moveToCompleted(processResult);
+
+          Common causes: circular references in database ORM objects (Prisma result objects
+          may have circular prototype chains), BigInt fields from PostgreSQL, or custom
+          class instances with non-serializable properties.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: bull/lib/scripts.js moveToFinished → finishedErrors:
+      # code -1: "Missing key for job <id> finished"
+      # code -2: "Missing lock for job <id> finished"
+      # code -3: "Job <id> is not in the active state. finished"
+      # code -6: "Lock mismatch for job <id>. Cmd finished from active"
+      - id: move-to-completed-no-try-catch
+        condition: >
+          await job.moveToCompleted() called without try-catch, and the job is no longer
+          in the active state, the lock has expired, or the lock is owned by another worker.
+        throws: >
+          Error('Missing key for job <id> finished') — job deleted from Redis (removeOnComplete, eviction);
+          Error('Missing lock for job <id> finished') — lock expired before completion;
+          Error('Job <id> is not in the active state. finished') — job completed/failed via another path;
+          Error('Lock mismatch for job <id>...') — another worker took the lock.
+        required_handling: >
+          Caller MUST wrap await job.moveToCompleted() in try-catch. Handle each error type:
+          - Missing key: log and skip (job was cleaned up by another mechanism)
+          - Missing lock / Lock mismatch: another worker owns the job — abort immediately
+            to prevent duplicate completion; do not re-attempt moveToCompleted.
+          - Wrong state: job already completed or failed — check getState() before retrying.
+
+            try {
+              await job.moveToCompleted(returnValue);
+            } catch (err) {
+              if (err.message.includes('Missing lock') || err.message.includes('Lock mismatch')) {
+                logger.warn('Lock lost before completion, aborting', { jobId: job.id });
+                return;  // Stop processing — another worker will handle this job
+              }
+              if (err.message.includes('Missing key')) {
+                logger.warn('Job cleaned up before completion', { jobId: job.id });
+                return;  // Job was removed (removeOnComplete with short TTL)
+              }
+              throw err;  // Unexpected error — re-throw
+            }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/scripts.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/job.js Job.prototype.takeLock() lines 216-220
+  # Returns scripts.takeLock result (lock token as number) or false
+  # scripts.takeLock → SETNX equivalent Lua: returns lock token or 0 if lock held
+  # No explicit throw on lock-unavailable — silently returns false
+  # Redis connection errors propagate from queue.client.takeLock() as ioredis Error
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/job.js
+  - name: Job.takeLock
+    import_path: "bull"
+    description: >
+      Acquires the Redis lock for a job. Returns a numeric lock token on success, or false
+      if the lock is currently held by another worker. Used in advanced multi-worker scenarios
+      where a worker needs to explicitly take ownership of a job (e.g. after stall detection
+      or when implementing custom load-balancing). CRITICAL: returns false silently when lock
+      unavailable — callers that treat all truthy/falsy returns incorrectly will race for the
+      same job. Redis errors propagate as rejected promises without explicit handling.
+    postconditions:
+      # Evidence: bull/lib/job.js lines 216-220:
+      # Job.prototype.takeLock = function() {
+      #   return scripts.takeLock(this.queue, this).then(lock => {
+      #     return lock || false;
+      #   });
+      # };
+      # Scripts.takeLock → SETNX-equivalent Lua script returns 0 when already locked
+      # lock || false: 0 (not acquired) → false; token (number) → number (truthy)
+      - id: take-lock-false-return-unchecked
+        condition: >
+          await job.takeLock() is called without checking the return value, and returns
+          false (lock held by another worker or lock already acquired by this worker).
+        throws: "Does not throw — returns false silently when lock cannot be acquired"
+        required_handling: >
+          Caller MUST check the return value. false means the lock could not be acquired:
+
+            // WRONG — proceeds even if lock was not acquired
+            await job.takeLock();
+            await doExclusiveWork();  // NOT safe — another worker may also be doing this!
+
+            // CORRECT — check return value before proceeding
+            const lock = await job.takeLock();
+            if (!lock) {
+              logger.warn('Could not acquire lock for job, another worker owns it', { jobId: job.id });
+              return;  // Abort — do not proceed with exclusive work
+            }
+            await doExclusiveWork();
+            await job.releaseLock();  // Always release in finally block
+
+          Failing to check the return value leads to duplicate processing when multiple
+          workers attempt to take the same lock — the same critical race condition as
+          extendLock returning 0 without being checked.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: ioredis errors from queue.client.takeLock() Lua call propagate directly
+      # Redis connection failure during lock acquisition rejects the Promise
+      - id: take-lock-no-try-catch
+        condition: "await job.takeLock() called without try-catch and Redis connection is unavailable"
+        throws: "Error (ioredis connection error or NOSCRIPT error if Lua script not cached)"
+        required_handling: >
+          Wrap await job.takeLock() in try-catch. On Redis error, do not proceed with
+          exclusive work — treat it as a lock acquisition failure and abort:
+
+            let lock;
+            try {
+              lock = await job.takeLock();
+            } catch (err) {
+              logger.error('Redis error acquiring job lock', { jobId: job.id, err });
+              return;  // Cannot determine lock state — abort
+            }
+            if (!lock) { return; }  // Lock held by another worker
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.pause() lines 887-918
+  # isReady() can reject on Redis connection failure
+  # Global pause: scripts.pause(this, true) — Redis Lua script, can fail with connection error
+  # Local pause: creates a Promise for whenCurrentJobsFinished() — can fail if Redis disconnects
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/queue.js
+  - name: Queue.pause
+    import_path: "bull"
+    description: >
+      Pauses queue processing. If global (default), all workers for the queue stop accepting
+      new jobs from Redis. If local (isLocal=true), only this worker pauses. Global pause
+      uses a Redis Lua script and persists across restarts. Local pause waits for active
+      jobs to finish (unless doNotWaitActive=true). Pausing an already-paused queue is a
+      no-op. Returns a Promise that resolves after the 'paused' event is emitted.
+      Used in graceful shutdown sequences and queue maintenance flows.
+    postconditions:
+      # Evidence: queue.prototype.pause → this.isReady() → scripts.pause(this, true) for global
+      # scripts.pause() is a Redis Lua command that can fail with ioredis connection errors
+      # Local pause: this.whenCurrentJobsFinished() — can hang indefinitely if jobs are stuck
+      - id: pause-no-try-catch
+        condition: "await queue.pause() called without try-catch and Redis connection is unavailable"
+        throws: "Error (ioredis connection error from isReady() or scripts.pause() Lua execution)"
+        required_handling: >
+          Wrap await queue.pause() in try-catch in shutdown handlers and maintenance scripts.
+          A Redis error during global pause means the pause state was NOT persisted — other
+          workers will continue processing jobs. Retry or alert on failure:
+
+            try {
+              await queue.pause();
+              logger.info('Queue paused globally');
+            } catch (err) {
+              logger.error('Failed to pause queue — workers may still be processing', err);
+              // Alert ops team — jobs are still processing despite shutdown attempt
+            }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: local pause path: this.whenCurrentJobsFinished() waits for active jobs
+      # If a job hangs indefinitely, whenCurrentJobsFinished() never resolves
+      # No timeout built into pause() — can block shutdown handler forever
+      - id: pause-local-hangs-on-stuck-job
+        condition: >
+          queue.pause(true) called with isLocal=true (without doNotWaitActive=true), and
+          there is a job currently in the active state that never completes (stuck/hung processor).
+        throws: "Does not throw — hangs indefinitely awaiting whenCurrentJobsFinished()"
+        required_handling: >
+          When using local pause in shutdown handlers, always set a timeout and use
+          doNotWaitActive=true for immediate termination, or race with a timeout:
+
+            // RISKY — hangs forever if a job is stuck
+            await queue.pause(true);
+
+            // SAFE — use doNotWaitActive for immediate local pause
+            await queue.pause(true, true);  // Returns immediately without waiting
+
+            // SAFE — with timeout for graceful-but-bounded shutdown
+            await Promise.race([
+              queue.pause(true),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Pause timeout')), 30000))
+            ]).catch(() => queue.pause(true, true));  // Force pause if timeout
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
 # Intentionally omitted from deepen-stream-1 pass 3:
 # Queue.getCountsPerPriority() — read-only diagnostic returning counts per priority level.
 #   Pure Redis ZCOUNT/LLEN queries. No distinct error behavior beyond generic Redis connection
 #   errors (identical to count() which is already omitted). Added in bull 4.x. Low adoption.
 #   Omission reason: same category as count(), getCompletedCount(), etc. already omitted.
+# Intentionally omitted from deepen-stream-1 pass 4 (2026-06-11):
+# Job.discard() — synchronous (sets this._discarded = true only); no async error contract.
+# Job.getState() — read-only Redis query; returns JobStatus string; same error profile as other read-only getters.
+# Job.isCompleted/isFailed/isDelayed/isActive/isWaiting/isPaused/isStuck() — all are read-only
+#   state checks that return Promise<boolean>; no distinct error contracts beyond generic Redis connection errors.
+# Job.takeLock return-value contract is now contracted above (take-lock-false-return-unchecked).
+# Queue.resume() — mirrors pause() but has no additional error contracts; re-resuming a non-paused queue
+#   is a no-op. Same Redis connection error profile as pause() which is now contracted.
