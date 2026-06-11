@@ -636,3 +636,80 @@ export async function verifyMicrodepositsWithCatch(piId: string, amounts: number
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. Helper-function-returned instance (scanner-upgrade regression case)
+//     The Stripe instance is created inside a helper function whose return value
+//     is not directly recognized as a known factory. Mirrors FullAgent/fulling
+//     github-app.ts getAppInstance() pattern. Resolved via TypeScript return-type
+//     inference in InstanceTrackerPlugin (Case 2 typeChecker fallback).
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _lazyStripe: Stripe | null = null;
+
+function getLazyStripe(): Stripe {
+  if (!_lazyStripe) {
+    _lazyStripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+      apiVersion: '2024-12-18.acacia',
+    });
+  }
+  return _lazyStripe;
+}
+
+function makeStripe(): Stripe {
+  return new Stripe(process.env.STRIPE_SECRET_KEY!, {
+    apiVersion: '2024-12-18.acacia',
+  });
+}
+
+// Use distinct variable names (lazyClient / madeClient) so they don't collide
+// with the module-level `stripe` already in InstanceTrackerPlugin.instanceMap.
+// Names like `stripe` would shadow-resolve to the module-level binding and
+// the test would pass for the wrong reason.
+
+export async function createChargeViaLazyHelper() {
+  const lazyClient = getLazyStripe();
+  // SHOULD_FIRE: card-error — helper-fn-returned instance, charges.create without try-catch
+  const charge = await lazyClient.charges.create({
+    amount: 2000,
+    currency: 'usd',
+    source: 'tok_visa',
+  });
+  return charge;
+}
+
+export async function createChargeViaSimpleHelper() {
+  const madeClient = makeStripe();
+  // SHOULD_FIRE: card-error — direct-return helper, charges.create without try-catch
+  const charge = await madeClient.charges.create({
+    amount: 2000,
+    currency: 'usd',
+    source: 'tok_visa',
+  });
+  return charge;
+}
+
+export async function createChargeViaLazyHelperWithCatch() {
+  const lazyClient = getLazyStripe();
+  try {
+    // SHOULD_NOT_FIRE: helper-fn-returned instance inside try-catch is safe
+    const charge = await lazyClient.charges.create({
+      amount: 2000,
+      currency: 'usd',
+      source: 'tok_visa',
+    });
+    return charge;
+  } catch (err: any) {
+    if (err.type === 'StripeCardError') {
+      throw new Error(`Card declined: ${err.decline_code}`);
+    }
+    throw err;
+  }
+}
+
+export async function constructEventViaHelper(payload: string, sig: string, secret: string) {
+  const lazyClient = getLazyStripe();
+  // SHOULD_FIRE: signature-verification-failed — helper-fn instance, webhooks.constructEvent without try-catch
+  const event = lazyClient.webhooks.constructEvent(payload, sig, secret);
+  return event;
+}
