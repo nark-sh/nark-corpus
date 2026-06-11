@@ -2,6 +2,32 @@
 
 Created by bc-deepen-contract Phase 6.4 — pre-CHANGELOG history not preserved.
 
+## 2026-06-11 — deepen pass — coverage 75% → 92%
+
+- **Profile:** `packages/svix/contract.yaml`
+- **Functions added:** authentication.expireAll, endpoint.replayMissing, endpoint.sendExample (3 total)
+- **Postconditions added:** 6 (authentication-expire-all-api-error, authentication-expire-all-network-error, endpoint-replay-missing-api-error, endpoint-replay-missing-async-not-polled, endpoint-send-example-api-error, endpoint-send-example-delivery-not-confirmed)
+- **Functions intentionally omitted this pass:** operationalWebhookEndpoint.create (svix→YOUR system webhooks, enterprise-only pattern, narrow SaaS adoption), authentication.dashboardAccess (legacy, superseded by appPortalAccess), authentication.logout (void session mgmt, no domain contract), authentication.streamPortalAccess/getStreamPollerToken/rotateStreamPollerToken (streaming enterprise feature), all list/read-only/admin CRUD, backgroundTask.*/health.*/statistics.*/environment.*/eventType.*/integration.*/connector.*/ingest.*/streaming.*
+- **Scanner concerns queued:** 3 (`concern-20260611-svix-deepen-5` — authentication.expireAll detection, `concern-20260611-svix-deepen-6` — endpoint.replayMissing async-not-polled pattern, `concern-20260611-svix-deepen-7` — endpoint.sendExample delivery-not-confirmed pattern)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:**
+  - `svix@1.84.1/dist/api/authentication.js` — expireAll() implementation (POST /api/v1/auth/app/{app_id}/expire-all, sendNoResponseBody)
+  - `svix@1.84.1/dist/api/endpoint.js` — replayMissing() and sendExample() implementations
+  - `svix@1.84.1/dist/models/replayOut.d.ts` — ReplayOut: { id: string, status: BackgroundTaskStatus, task: BackgroundTaskType }
+  - `svix@1.84.1/dist/models/backgroundTaskStatus.d.ts` — BackgroundTaskStatus enum: "running" | "finished" | "failed"
+  - `svix@1.84.1/dist/models/eventExampleIn.d.ts` — EventExampleIn: { eventType: string, exampleIndex?: number }
+  - `svix@1.84.1/dist/models/applicationTokenExpireIn.d.ts` — ApplicationTokenExpireIn: { expiry?: number | null, sessionIds?: string[] }
+  - `svix@1.84.1/dist/request.js` — filterResponseForErrors() and sendWithRetry() confirmed (2 retries on 5xx/network)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-11T20:16:21Z)
+
+### Key insights from this pass
+
+1. **authentication.expireAll() is security-critical, not administrative:** Called in incident response to immediately revoke all outstanding portal magic links. A missing try-catch means outstanding sessions remain valid after a security event — the portal is still accessible to unauthorized parties. Must catch both ApiException AND Error (network failures skip retry on auth endpoints).
+
+2. **endpoint.replayMissing() has the same async pitfall as endpoint.recover():** Both return a background task reference (ReplayOut vs RecoverOut — both have `id` and `status` fields). Callers who discard the return value assume the replay is complete when it is only queued. The BackgroundTaskStatus enum ("running" / "finished" / "failed") must be polled.
+
+3. **endpoint.sendExample() creates a queued message, NOT a delivery receipt:** MessageOut confirms the test message was enqueued — it does NOT confirm the endpoint's HTTP server received and acknowledged the payload. "Send Test Event" UIs that use sendExample() without calling messageAttempt.listByMsg() to verify delivery will give false assurance to customers with misconfigured endpoints.
+
 ## 2026-06-11 — deepen pass — coverage 17% → 75%
 
 - **Profile:** `packages/svix/contract.yaml`
