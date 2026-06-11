@@ -38,6 +38,10 @@ import {
   UpdateSecretCommand,
   DeleteSecretCommand,
   RotateSecretCommand,
+  UpdateSecretVersionStageCommand,
+  CancelRotateSecretCommand,
+  PutResourcePolicyCommand,
+  RestoreSecretCommand,
   SecretsManagerServiceException,
 } from '@aws-sdk/client-secrets-manager';
 
@@ -261,6 +265,165 @@ async function gt_rotateSecret_safe() {
     if (error instanceof SecretsManagerServiceException) {
       if (error.name === 'InvalidRequestException') {
         console.error('Rotation config error (Lambda not set, or rotation in progress):', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+
+// ──────────────────────────────────────────────────
+// 8. UpdateSecretVersionStageCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: update-secret-version-stage-no-try-catch
+async function gt_updateVersionStage_missing(newVersionId: string, oldVersionId: string) {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, update-secret-version-stage-no-try-catch
+  await smClient.send(new UpdateSecretVersionStageCommand({
+    SecretId: SECRET_ID,
+    VersionStage: 'AWSCURRENT',
+    MoveToVersionId: newVersionId,
+    RemoveFromVersionId: oldVersionId,
+  }));
+}
+
+// @expect-clean
+async function gt_updateVersionStage_safe(newVersionId: string, oldVersionId: string) {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    await smClient.send(new UpdateSecretVersionStageCommand({
+      SecretId: SECRET_ID,
+      VersionStage: 'AWSCURRENT',
+      MoveToVersionId: newVersionId,
+      RemoveFromVersionId: oldVersionId,
+    }));
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'LimitExceededException') {
+        console.error('Too many staging labels — clean up old labels first');
+      } else if (error.name === 'InvalidRequestException') {
+        console.error('Version stage update failed — check version IDs and secret state:', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 9. CancelRotateSecretCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: cancel-rotate-secret-no-try-catch
+async function gt_cancelRotateSecret_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, cancel-rotate-secret-no-try-catch
+  await smClient.send(new CancelRotateSecretCommand({
+    SecretId: SECRET_ID,
+  }));
+}
+
+// @expect-violation: cancel-rotate-secret-orphaned-pending-version
+async function gt_cancelRotateSecret_pendingNotCleaned() {
+  try {
+    // SHOULD_FIRE: cancel-rotate-secret-orphaned-pending-version
+    // response.VersionId checked but AWSPENDING label not removed from orphaned version
+    const result = await smClient.send(new CancelRotateSecretCommand({
+      SecretId: SECRET_ID,
+    }));
+    // ❌ VersionId logged but AWSPENDING label not cleaned up — blocks future rotations
+    if (result.VersionId) {
+      console.log(`Cancelled rotation, orphaned version: ${result.VersionId}`);
+      // Missing: UpdateSecretVersionStageCommand to remove AWSPENDING label
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+// @expect-clean
+async function gt_cancelRotateSecret_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch and response.VersionId is cleaned up
+    const result = await smClient.send(new CancelRotateSecretCommand({
+      SecretId: SECRET_ID,
+    }));
+    if (result.VersionId) {
+      // ✅ Clean up orphaned AWSPENDING label to unblock future rotations
+      await smClient.send(new UpdateSecretVersionStageCommand({
+        SecretId: SECRET_ID,
+        VersionStage: 'AWSPENDING',
+        RemoveFromVersionId: result.VersionId,
+      }));
+    }
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      console.error(`Cancel rotation failed [${error.name}]: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 10. PutResourcePolicyCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: put-resource-policy-no-try-catch
+async function gt_putResourcePolicy_missing(policy: string) {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, put-resource-policy-no-try-catch
+  await smClient.send(new PutResourcePolicyCommand({
+    SecretId: SECRET_ID,
+    ResourcePolicy: policy,
+    BlockPublicPolicy: true,
+  }));
+}
+
+// @expect-clean
+async function gt_putResourcePolicy_safe(policy: string) {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    await smClient.send(new PutResourcePolicyCommand({
+      SecretId: SECRET_ID,
+      ResourcePolicy: policy,
+      BlockPublicPolicy: true,
+    }));
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'PublicPolicyException') {
+        console.error('SECURITY: Policy grants overly broad access — rejected by BlockPublicPolicy');
+        throw new Error('Policy rejected: grants public access to secret');
+      } else if (error.name === 'MalformedPolicyDocumentException') {
+        console.error('Policy JSON syntax error:', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 11. RestoreSecretCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: restore-secret-no-try-catch
+async function gt_restoreSecret_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, restore-secret-no-try-catch
+  await smClient.send(new RestoreSecretCommand({
+    SecretId: SECRET_ID,
+  }));
+}
+
+// @expect-clean
+async function gt_restoreSecret_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const result = await smClient.send(new RestoreSecretCommand({
+      SecretId: SECRET_ID,
+    }));
+    console.log(`Secret restored: ${result.ARN}`);
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'InvalidRequestException') {
+        console.error('Secret is not scheduled for deletion (or was force-deleted with no recovery window):', error.message);
+      } else if (error.name === 'ResourceNotFoundException') {
+        console.error('Secret not found:', error.message);
       }
     }
     throw error;

@@ -2,7 +2,7 @@ package: "@aws-sdk/client-secrets-manager"
 semver: ">=3.0.0 <4.0.0"
 contract_version: "1.1.1"
 maintainer: "corpus-team"
-last_verified: "2026-04-18"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -25,7 +25,7 @@ evidence_quality: confirmed
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/models/models_0.d.ts (exception class hierarchy)
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/commands/*.d.ts (@throws annotations)
 # v1.1.1: fixed schema — renamed description->condition, converted business_impact to objects, added sources
-coverage_score: 0.33
+coverage_score: 0.50
 
 detection:
   type_names:
@@ -671,6 +671,293 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: UpdateSecretVersionStageCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Modifies the staging labels attached to a version of a secret. Used in custom
+      rotation Lambda functions to promote a new secret version to AWSCURRENT
+      (zero-downtime credential rotation) and in CI/CD pipelines to track deployment
+      state via custom staging labels. Moving AWSCURRENT automatically moves the
+      AWSPREVIOUS label. Used as the final step in rotation workflows to atomically
+      flip active credentials.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecretVersionStage.html
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html
+      # Error types confirmed from dist-types/commands/UpdateSecretVersionStageCommand.d.ts @throws annotations
+      - id: update-secret-version-stage-limit-exceeded
+        severity: error
+        condition: >
+          total staging labels attached across all versions of the secret reaches
+          the hard limit of 20; each custom label added without removing old ones
+          exhausts the quota; throws LimitExceededException
+          (error.name === "LimitExceededException")
+        throws: LimitExceededException
+        required_handling: >
+          Before adding a new staging label, check existing labels via
+          ListSecretVersionIds. Clean up obsolete custom labels to stay under the
+          limit of 20 labels across all versions. Rotation Lambdas that accumulate
+          custom labels per deployment will hit this limit after 20 deployments if
+          labels are never removed.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecretVersionStage.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html"
+        business_impact:
+          incident_label: FAILED_ROTATION
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded
+          incident_cost_range: medium
+
+      - id: update-secret-version-stage-invalid-request
+        severity: error
+        condition: >
+          the secret is scheduled for deletion, the label being moved is AWSCURRENT
+          but RemoveFromVersionId is missing or mismatched, the secret is managed
+          by another AWS service (e.g., RDS managed rotation), or the label is
+          already the only label on a version (removing it would deprecate the version
+          unexpectedly); throws InvalidRequestException
+          (error.name === "InvalidRequestException")
+        throws: InvalidRequestException
+        required_handling: >
+          Handle InvalidRequestException to detect state conflicts. When using
+          UpdateSecretVersionStage to promote AWSCURRENT during rotation, always
+          provide both MoveToVersionId and RemoveFromVersionId to avoid ambiguous
+          state transitions. Check error.message for details on which constraint
+          was violated.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecretVersionStage.html"
+        business_impact:
+          incident_label: FAILED_ROTATION
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded
+          incident_cost_range: medium
+
+      - id: update-secret-version-stage-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new UpdateSecretVersionStageCommand(...))
+          without a wrapping try-catch
+        throws: >
+          LimitExceededException, InvalidRequestException, ResourceNotFoundException,
+          and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Failed UpdateSecretVersionStage in a rotation Lambda
+          means the new secret version was never promoted to AWSCURRENT — the old
+          (possibly expired/rotated) credentials remain active while the application
+          believes rotation completed. This is a silent security incident.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UpdateSecretVersionStage.html"
+        business_impact:
+          incident_label: FAILED_ROTATION
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: degraded
+          incident_cost_range: high
+
+  - name: CancelRotateSecretCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Turns off automatic rotation and cancels any rotation currently in progress.
+      Used in incident response when a rotation is stuck (Lambda failure, network
+      timeout) or when rotation needs to be rolled back. Cancelling mid-rotation
+      leaves the AWSPENDING label on an incomplete version — callers must manually
+      clean up the orphaned version to prevent future rotation failures.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CancelRotateSecret.html
+      # Error types confirmed from dist-types/commands/CancelRotateSecretCommand.d.ts @throws annotations
+      - id: cancel-rotate-secret-orphaned-pending-version
+        severity: warning
+        condition: >
+          rotation is cancelled mid-flight (AWSPENDING label attached to an incomplete
+          version); the response.VersionId field is populated with the incomplete
+          version that must be cleaned up; leaving it uncleaned can block future
+          rotations from starting (no-try-catch means the caller never sees
+          response.VersionId)
+        throws: >
+          does not throw — response.VersionId contains the orphaned version ID;
+          the risk is NOT handling the returned VersionId
+        required_handling: >
+          After calling CancelRotateSecretCommand, always check response.VersionId.
+          If present, call UpdateSecretVersionStage to remove the AWSPENDING label
+          from that version. Failing to clean up leaves a partial version that
+          blocks re-enabling rotation.
+
+          Example cleanup:
+            const result = await smClient.send(new CancelRotateSecretCommand({
+              SecretId: 'my/secret'
+            }));
+            if (result.VersionId) {
+              await smClient.send(new UpdateSecretVersionStageCommand({
+                SecretId: 'my/secret',
+                VersionStage: 'AWSPENDING',
+                RemoveFromVersionId: result.VersionId,
+              }));
+            }
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CancelRotateSecret.html"
+        business_impact:
+          incident_label: BLOCKED_ROTATION
+          production_behavior: silent_failure
+          visibility: hidden
+          user_experience: degraded
+          incident_cost_range: medium
+
+      - id: cancel-rotate-secret-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new CancelRotateSecretCommand(...))
+          without a wrapping try-catch
+        throws: >
+          InvalidRequestException (secret is managed by another service),
+          ResourceNotFoundException, and network errors propagate as unhandled
+          rejections
+        required_handling: >
+          Wrap in try-catch. Incident response scripts that call CancelRotateSecret
+          must handle errors — if the cancel fails, rotation continues running
+          and the incident response action had no effect.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CancelRotateSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: PutResourcePolicyCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Attaches a resource-based permission policy to a secret. Used to grant
+      cross-account access to secrets (e.g., allowing a different AWS account or
+      Lambda function to read a shared secret). The BlockPublicPolicy parameter
+      prevents accidentally granting public access. This is a security-critical
+      operation — policy mistakes can expose secrets to unintended principals.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutResourcePolicy.html
+      # Error types confirmed from dist-types/commands/PutResourcePolicyCommand.d.ts @throws annotations
+      - id: put-resource-policy-public-policy-exception
+        severity: error
+        condition: >
+          BlockPublicPolicy is true and the provided policy grants overly broad
+          access (e.g., principal is "*" or uses wildcards that AWS evaluates as
+          public access); throws PublicPolicyException
+          (error.name === "PublicPolicyException")
+        throws: PublicPolicyException
+        required_handling: >
+          Catch PublicPolicyException and reject the policy. This exception is
+          the guard that prevents accidental secret exposure. Never suppress it
+          silently — it means the policy as written would expose the secret to
+          the public. Always set BlockPublicPolicy: true in production environments.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutResourcePolicy.html"
+        business_impact:
+          incident_label: SECURITY_EXPOSURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: critical
+
+      - id: put-resource-policy-malformed-policy
+        severity: error
+        condition: >
+          the ResourcePolicy JSON string has syntax errors or references invalid
+          AWS principals/actions; throws MalformedPolicyDocumentException
+          (error.name === "MalformedPolicyDocumentException")
+        throws: MalformedPolicyDocumentException
+        required_handling: >
+          Validate IAM policy JSON before calling PutResourcePolicy. Catch
+          MalformedPolicyDocumentException and log error.message which contains
+          AWS policy parser details about the specific syntax issue. Use
+          ValidateResourcePolicyCommand to pre-validate before applying.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutResourcePolicy.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: put-resource-policy-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new PutResourcePolicyCommand(...))
+          without a wrapping try-catch
+        throws: >
+          PublicPolicyException, MalformedPolicyDocumentException,
+          InvalidRequestException, ResourceNotFoundException, and network errors
+          propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. A failed PutResourcePolicy in cross-account setup
+          scripts means the intended principal cannot access the secret — silent
+          failure causes access denials that are difficult to diagnose.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutResourcePolicy.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: RestoreSecretCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Cancels the scheduled deletion of a secret, restoring access. Only works
+      during the deletion recovery window (1-30 days after DeleteSecretCommand was
+      called). Used in disaster recovery scripts when a secret was accidentally
+      deleted. The secret cannot be accessed while scheduled for deletion — only
+      RestoreSecret can re-enable it.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RestoreSecret.html
+      # Error types confirmed from dist-types/commands/RestoreSecretCommand.d.ts @throws annotations
+      - id: restore-secret-invalid-request
+        severity: error
+        condition: >
+          the secret is NOT scheduled for deletion (RestoreSecret is called on
+          an active, non-deleted secret) or the secret was force-deleted with
+          ForceDeleteWithoutRecovery (no recovery window exists); throws
+          InvalidRequestException (error.name === "InvalidRequestException")
+        throws: InvalidRequestException
+        required_handling: >
+          Before calling RestoreSecret, verify the secret is in a deleted state
+          by calling DescribeSecretCommand and checking response.DeletedDate.
+          Catch InvalidRequestException and check error.message to distinguish
+          "not in deleted state" from "force-deleted with no recovery window".
+          Force-deleted secrets are permanently gone and cannot be restored.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RestoreSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: restore-secret-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new RestoreSecretCommand(...))
+          without a wrapping try-catch
+        throws: >
+          InvalidRequestException (not in deleted state or force-deleted),
+          ResourceNotFoundException (secret name not found), and network errors
+          propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Disaster recovery scripts that call RestoreSecret
+          must handle errors — an unhandled rejection means the script silently
+          failed and the secret remains inaccessible.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RestoreSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'ResourceNotFoundException', 'AccessDeniedException')"
@@ -683,4 +970,4 @@ notes:
   - "RotateSecretCommand is ASYNCHRONOUS — returns before the Lambda function completes rotation"
   - "PutSecretValue rate limit: max once per 10 minutes per secret to avoid version quota exhaustion"
   - "ResourceExistsException on CreateSecretCommand means secret already exists — use UpdateSecretCommand instead"
-  - "Intentionally omitted: DescribeSecretCommand, ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination), GetResourcePolicyCommand, PutResourcePolicyCommand, DeleteResourcePolicyCommand, ValidateResourcePolicyCommand (policy admin), GetRandomPasswordCommand (utility), CancelRotateSecretCommand (admin), TagResourceCommand, UntagResourceCommand (tagging admin), ReplicateSecretToRegionsCommand, RemoveRegionsFromReplicationCommand, StopReplicationToReplicaCommand (replication admin), UpdateSecretVersionStageCommand (version management admin), RestoreSecretCommand (recovery admin) — these are infrastructure management or read-only operations with no unique behavioral contracts beyond generic error handling"
+  - "Intentionally omitted: DescribeSecretCommand, ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination), GetResourcePolicyCommand, DeleteResourcePolicyCommand, ValidateResourcePolicyCommand (policy admin), GetRandomPasswordCommand (utility), TagResourceCommand, UntagResourceCommand (tagging admin), ReplicateSecretToRegionsCommand, RemoveRegionsFromReplicationCommand, StopReplicationToReplicaCommand (replication admin) — these are infrastructure management or read-only operations with no unique behavioral contracts beyond generic error handling. (Promoted from omitted: CancelRotateSecretCommand, PutResourcePolicyCommand, RestoreSecretCommand, UpdateSecretVersionStageCommand — added in deepen pass 2026-06-11)"
