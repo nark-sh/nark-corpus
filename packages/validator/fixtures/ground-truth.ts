@@ -1,5 +1,5 @@
 /**
- * Ground-truth fixtures for validator package — deepen pass 2026-04-17, updated 2026-04-20
+ * Ground-truth fixtures for validator package — deepen pass 2026-04-17, updated 2026-06-11
  *
  * New postconditions covered:
  *   isStrongPassword: strong-password-weak-defaults, strong-password-non-string-throws,
@@ -29,6 +29,11 @@
  *   isDecimal:       decimal-invalid-locale-throws, decimal-force-decimal-not-set (2026-04-20, stream-1 pass 7)
  *   isDate:          isdate-non-strict-accepts-date-objects, isdate-strict-format-mismatch (2026-04-20, stream-1 pass 7)
  *   isIBAN:          iban-format-only-not-account-verified, iban-whitespace-stripping-silent (2026-04-20, stream-1 pass 7)
+ *   isEmpty:         isempty-whitespace-not-empty-by-default (2026-06-11, stream-1 pass 3)
+ *   isFloat:         isfloat-invalid-locale-silent-false, isfloat-locale-comma-replace-asymmetry (2026-06-11, stream-1 pass 3)
+ *   isHash:          ishash-unknown-algorithm-silent-false (2026-06-11, stream-1 pass 3)
+ *   isIn:            isin-undefined-values-silent-false (2026-06-11, stream-1 pass 3)
+ *   isBoolean:       isboolean-strict-accepts-zero-one (2026-06-11, stream-1 pass 3)
  *
  * Annotation format:
  *   @expect-violation: <postcondition-id>  — scanner SHOULD flag this
@@ -965,4 +970,147 @@ function saveCard(card: string, meta: any): void { }
 function storeDate(date: string): void { }
 function storeTagInDb(tag: string): void { }
 async function processTransfer(iban: string, amount: number): Promise<void> { }
+
+// =============================================================================
+// isEmpty — should fire (2026-06-11, stream-1 pass 3)
+// =============================================================================
+
+// @expect-violation: isempty-whitespace-not-empty-by-default
+function validateRequiredFieldDefault(userInput: string): void {
+  // ❌ Default ignore_whitespace: false — '  ' is NOT empty and passes through
+  if (validator.isEmpty(userInput)) {
+    throw new Error('Name is required');
+  }
+  saveUserName(userInput);  // whitespace-only names saved to DB
+}
+
+// =============================================================================
+// isEmpty — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateRequiredFieldIgnoreWhitespace(userInput: string): void {
+  // ✅ ignore_whitespace: true catches whitespace-only inputs
+  if (validator.isEmpty(userInput, { ignore_whitespace: true })) {
+    throw new Error('Name is required');
+  }
+  saveUserName(userInput.trim());
+}
+
+// =============================================================================
+// isFloat — should fire (2026-06-11, stream-1 pass 3)
+// =============================================================================
+
+// @expect-violation: isfloat-invalid-locale-silent-false
+function validateEuropeanPriceUnsupportedLocale(priceStr: string): boolean {
+  // ❌ 'en-GB' is NOT in isFloatLocales — silently returns false for all input
+  return validator.isFloat(priceStr, { locale: 'en-GB' as any });
+}
+
+// @expect-violation: isfloat-locale-comma-replace-asymmetry
+function validateGermanPriceWithThousandsSep(rawInput: string): boolean {
+  // ❌ '1.234,56' (German format) needs thousands sep stripped first
+  // Without stripping, regex rejects it silently
+  return validator.isFloat(rawInput, { locale: 'de-DE' as any, min: 0 });
+}
+
+// =============================================================================
+// isFloat — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateFloatWithSafeLocale(priceStr: string, userLocale: string): boolean {
+  // ✅ Validate locale is in supported set before use
+  const safeLocale = validator.isFloatLocales.includes(userLocale as any) ? userLocale : 'en-US';
+  return validator.isFloat(priceStr, { locale: safeLocale as any, min: 0 });
+}
+
+// =============================================================================
+// isHash — should fire (2026-06-11, stream-1 pass 3)
+// =============================================================================
+
+// @expect-violation: ishash-unknown-algorithm-silent-false
+function validateHashWithDash(hashValue: string): boolean {
+  // ❌ 'sha-256' is not a valid algorithm name — silently returns false for all input
+  return validator.isHash(hashValue, 'sha-256' as any);
+}
+
+// @expect-violation: ishash-unknown-algorithm-silent-false
+function validateHashWrongCase(hashValue: string): boolean {
+  // ❌ 'SHA256' (uppercase) is not a valid algorithm name — always returns false
+  return validator.isHash(hashValue, 'SHA256' as any);
+}
+
+// =============================================================================
+// isHash — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateHashExactAlgorithmName(hashValue: string): boolean {
+  // ✅ Exact lowercase algorithm name from the supported set
+  return validator.isHash(hashValue, 'sha256');
+}
+
+// =============================================================================
+// isIn — should fire (2026-06-11, stream-1 pass 3)
+// =============================================================================
+
+// @expect-violation: isin-undefined-values-silent-false
+function checkUserRoleUnsafe(userRole: string, allowedRoles: string[] | undefined): void {
+  // ❌ If allowedRoles is undefined, isIn() returns false — all access silently denied
+  if (!validator.isIn(userRole, allowedRoles as any)) {
+    throw new Error('Access denied');
+  }
+  grantAccess(userRole);
+}
+
+// =============================================================================
+// isIn — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function checkUserRoleSafe(userRole: string, allowedRoles: string[]): void {
+  // ✅ Guard against undefined allowlist before calling isIn()
+  if (!allowedRoles || allowedRoles.length === 0) {
+    throw new Error('Permission configuration error: no roles defined');
+  }
+  if (!validator.isIn(userRole, allowedRoles)) {
+    throw new Error('Access denied');
+  }
+  grantAccess(userRole);
+}
+
+// =============================================================================
+// isBoolean — should fire (2026-06-11, stream-1 pass 3)
+// =============================================================================
+
+// @expect-violation: isboolean-strict-accepts-zero-one
+function validateConsentCheckboxMismatch(rawValue: string): boolean {
+  // ❌ isBoolean() in strict mode accepts '1', but downstream uses === 'true'
+  // A user submitting '1' passes validation but gets treated as false (consent not recorded)
+  if (!validator.isBoolean(rawValue)) {
+    return false;
+  }
+  return rawValue === 'true';  // '1' passes isBoolean() but returns false here
+}
+
+// =============================================================================
+// isBoolean — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateConsentCheckboxExplicit(rawValue: string): boolean {
+  // ✅ Explicitly check for the expected boolean string format
+  if (!['true', 'false'].includes(rawValue)) {
+    throw new Error('Consent must be "true" or "false"');
+  }
+  return rawValue === 'true';
+}
+
+// =============================================================================
+// Helper stubs for new tests (not under test)
+// =============================================================================
+
+function saveUserName(name: string): void { }
+function grantAccess(role: string): void { }
 async function saveBankAccountToDb(iban: string): Promise<void> { }
