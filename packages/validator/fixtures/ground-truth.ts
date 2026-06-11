@@ -1333,8 +1333,45 @@ function sanitizeSearchQuerySafe(query: string | undefined): string {
 }
 
 // =============================================================================
+// isBase58 — should fire: format-only checksum bypass (2026-06-11, deepen-stream-2 pass 5)
+// =============================================================================
+
+// @expect-violation: base58-format-only-not-checksummed
+// @expect-violation: base58-non-string-typeerror
+function acceptCryptoAddressUnsafe(address: string | null): void {
+  // ❌ isBase58 only checks character set — does NOT verify Base58Check checksum
+  // ❌ null address throws TypeError
+  if (validator.isBase58(address as any)) {
+    sendFundsToAddress(address as string);
+  }
+}
+
+// @expect-violation: base58-empty-string-valid
+function acceptWalletAddressEmptyCheck(address: string): void {
+  // ❌ isBase58('') returns true — empty address silently passes
+  if (validator.isBase58(address)) {
+    storeSolanaAddress(address);
+  }
+}
+
+// =============================================================================
+// isBase58 — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function acceptCryptoAddressSafe(address: string | null): void {
+  // ✅ Type guard + non-empty check + note about chain-specific library for full validation
+  if (typeof address !== 'string' || address.length === 0) return;
+  if (!validator.isBase58(address)) return;
+  // isBase58 is a lightweight pre-filter; full checksum validation done by chain library
+  sendFundsToAddress(address);
+}
+
+// =============================================================================
 // Additional helper stubs for new tests
 // =============================================================================
 
 function saveAge(age: string): void { }
 function processPayload(payload: string): void { }
+function sendFundsToAddress(address: string): void { }
+function storeSolanaAddress(address: string): void { }
