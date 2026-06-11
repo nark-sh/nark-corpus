@@ -149,8 +149,7 @@ export async function deleteRequestWithCatch(url: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function headRequestNoCatch(url: string) {
-  // SHOULD_FIRE: http-error-4xx-5xx — rp.head() rejects with StatusCodeError on 404. No try-catch.
-  // Note: rp.head() is commonly used to check resource existence; a 404 will still throw.
+  // SHOULD_FIRE: http-error-4xx-5xx — rp.head() rejects with StatusCodeError on 404 (a common gotcha for existence-check probes). No try-catch.
   const headers = await rp.head(url);
   return headers;
 }
