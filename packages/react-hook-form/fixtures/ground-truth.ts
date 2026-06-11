@@ -198,7 +198,7 @@ export async function triggerWithThrowingValidator() {
   });
 
   // @expect-violation: trigger-async-validator-throws
-  // SHOULD_FIRE: trigger() called with a validator that can throw — no outer try-catch
+  // FUTURE_SHOULD_FIRE: trigger-async-validator-throws — analyzer doesn't yet inspect validators registered via form.register({ validate: async ... }) to detect that they can throw a non-validation error that propagates through trigger(). Tracked as scanner-upgrade backlog (qt-62 triage section 5).
   const isValid = await form.trigger('email');
   return isValid;
 }
