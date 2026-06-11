@@ -2,6 +2,35 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-11 — deepen pass — coverage 40% → 49% (deepen-stream-2 pass 4)
+
+- **Profile:** `packages/validator/contract.yaml`
+- **Functions added:** isNumeric, isInt, equals, contains, isAfter, isBefore, ltrim, rtrim (8 total)
+- **Postconditions added:** 10
+  - isNumeric: isnumeric-non-string-typeerror, isnumeric-invalid-locale-silent-mismatch
+  - isInt: isint-non-string-typeerror, isint-range-returns-false-not-throw
+  - equals: equals-non-string-typeerror
+  - contains: contains-non-string-typeerror, contains-unchecked-return-security-bypass
+  - isAfter: isafter-unparseable-date-returns-false
+  - isBefore: isbefore-unparseable-date-returns-false
+  - ltrim: ltrim-non-string-typeerror
+  - rtrim: rtrim-non-string-typeerror
+- **Functions intentionally omitted this pass:** isAbaRouting, isBIC, isBtcAddress, isDataURI, isDivisibleBy, isEAN, isEthereumAddress, isFQDN, isFullWidth, isHalfWidth, isHexadecimal, isHexColor, isHSL, isIMEI, isISBN, isISIN, isISO15924, isISO31661Alpha2, isISO31661Alpha3, isISO31661Numeric, isISO4217, isISO6346, isISO6391, isISRC, isISSN, isLatLong, isLocale, isLowercase, isLuhnNumber, isMACAddress, isMD5, isMagnetURI, isMailtoURI, isMimeType, isMongoId, isMultibyte, isOctal, isPassportNumber, isPort, isRFC3339, isRgbColor, isSemVer, isSlug, isSurrogatePair, isTime, isULID, isUppercase, isUUID, isVariableWidth, isIP, isIPRange, alpha — all pure boolean validators with no unique contracts beyond assertString TypeError
+- **Scanner concerns queued:** 7 (`concern-20260611-validator-deepen-11` through `concern-20260611-validator-deepen-17`)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:**
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/isNumeric.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/isInt.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/equals.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/contains.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/isAfter.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/isBefore.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/ltrim.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/rtrim.js
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/alpha.js (decimal locale map)
+  - https://github.com/validatorjs/validator.js/blob/master/src/lib/util/assertString.js
+- **Verified by:** bc-deepen-contract (pass on 2026-06-11T21:15:00Z)
+
 ## 2026-06-11 — deepen pass — coverage 35% → 40%
 
 - **Profile:** `packages/validator/contract.yaml`

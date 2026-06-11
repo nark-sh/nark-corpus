@@ -1114,3 +1114,227 @@ function validateConsentCheckboxExplicit(rawValue: string): boolean {
 function saveUserName(name: string): void { }
 function grantAccess(role: string): void { }
 async function saveBankAccountToDb(iban: string): Promise<void> { }
+
+// =============================================================================
+// isNumeric — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: isnumeric-non-string-typeerror
+function validateQuantityUnsafe(qty: string | null): boolean {
+  // ❌ qty may be null from optional query param — throws TypeError
+  return validator.isNumeric(qty as any);
+}
+
+// @expect-violation: isnumeric-invalid-locale-silent-mismatch
+function validateAmountWithBadLocale(amount: string): boolean {
+  // ❌ 'xx-XX' is not a supported locale — alpha.decimal['xx-XX'] is undefined;
+  // regex becomes "[+-]?([0-9]*[undefined]..." which silently matches incorrectly
+  return validator.isNumeric(amount, { locale: 'xx-XX' as any });
+}
+
+// =============================================================================
+// isNumeric — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateQuantitySafe(qty: unknown): boolean {
+  // ✅ Guard against non-string before calling isNumeric()
+  if (typeof qty !== 'string') return false;
+  return validator.isNumeric(qty);
+}
+
+// @expect-clean
+function validateAmountWithKnownLocale(amount: string): boolean {
+  // ✅ Known supported locale from validator's list
+  return validator.isNumeric(amount, { locale: 'de-DE' });
+}
+
+// =============================================================================
+// isInt — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: isint-non-string-typeerror
+function validatePageNumberUnsafe(page: number | string): boolean {
+  // ❌ page arrives as actual number from JSON body — throws TypeError
+  return validator.isInt(page as any, { min: 1, max: 100 });
+}
+
+// @expect-violation: isint-range-returns-false-not-throw
+function validateAgeUnchecked(rawAge: string): void {
+  // ❌ isInt() returns false for out-of-range values but doesn't throw;
+  // code doesn't check the return value so invalid ages silently pass
+  validator.isInt(rawAge, { min: 0, max: 150 });
+  saveAge(rawAge); // proceeds with unvalidated age
+}
+
+// =============================================================================
+// isInt — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateAgeSafe(rawAge: string): string {
+  // ✅ Check return value and reject
+  if (!validator.isInt(rawAge, { min: 0, max: 150 })) {
+    throw new Error('Age must be an integer between 0 and 150');
+  }
+  return rawAge;
+}
+
+// =============================================================================
+// equals — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: equals-non-string-typeerror
+function verifyTokenUnsafe(providedToken: string | null, expectedToken: string): boolean {
+  // ❌ providedToken may be null when Authorization header is missing — throws TypeError
+  return validator.equals(providedToken as any, expectedToken);
+}
+
+// =============================================================================
+// equals — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function verifyTokenSafe(providedToken: string | null, expectedToken: string): boolean {
+  // ✅ Guard against null before calling equals()
+  if (typeof providedToken !== 'string') return false;
+  return validator.equals(providedToken, expectedToken);
+}
+
+// =============================================================================
+// contains — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: contains-non-string-typeerror
+function checkProfanityUnsafe(input: string | null): boolean {
+  // ❌ input may be null from optional form field — throws TypeError
+  return validator.contains(input as any, 'badword');
+}
+
+// @expect-violation: contains-unchecked-return-security-bypass
+function enforceNoncePresenceUnsafe(payload: string, nonce: string): void {
+  // ❌ contains() returns false when nonce is absent — result not checked;
+  // missing nonce silently passes the guard
+  validator.contains(payload, nonce);
+  processPayload(payload);
+}
+
+// =============================================================================
+// contains — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function checkProfanitySafe(input: string | null): boolean {
+  // ✅ Guard against null, check return value
+  if (typeof input !== 'string') return false;
+  return validator.contains(input, 'badword');
+}
+
+// @expect-clean
+function enforceNoncePresenceSafe(payload: string, nonce: string): void {
+  // ✅ Check the return value and throw if nonce is absent
+  if (!validator.contains(payload, nonce)) {
+    throw new Error('Invalid payload: nonce missing');
+  }
+  processPayload(payload);
+}
+
+// =============================================================================
+// isAfter — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: isafter-unparseable-date-returns-false
+function validateFutureDateUnsafe(userDate: string): boolean {
+  // ❌ isAfter() returns false for BOTH "date is in the past" AND "date is invalid";
+  // garbage strings like 'not-a-date' silently return false — same as a past date
+  return validator.isAfter(userDate);
+}
+
+// =============================================================================
+// isAfter — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function validateFutureDateSafe(userDate: string): boolean {
+  // ✅ Validate format first, then check range
+  if (!validator.isISO8601(userDate)) {
+    throw new Error('Invalid date format');
+  }
+  if (!validator.isAfter(userDate)) {
+    throw new Error('Date must be in the future');
+  }
+  return true;
+}
+
+// =============================================================================
+// isBefore — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: isbefore-unparseable-date-returns-false
+function checkSubscriptionExpiryUnsafe(expiryDate: string): boolean {
+  // ❌ isBefore() returns false for BOTH "not expired yet" AND "invalid date string";
+  // a corrupt expiry date is treated as "subscription not yet expired" — perpetual access
+  return !validator.isBefore(expiryDate);
+}
+
+// =============================================================================
+// isBefore — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function checkSubscriptionExpirySafe(expiryDate: string): boolean {
+  // ✅ Validate format first to distinguish parse failure from valid not-expired
+  if (!validator.isISO8601(expiryDate)) {
+    throw new Error('Invalid expiry date format');
+  }
+  return !validator.isBefore(expiryDate); // true = not yet expired
+}
+
+// =============================================================================
+// ltrim — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: ltrim-non-string-typeerror
+function normalizeUsernameUnsafe(username: string | null): string {
+  // ❌ username may be null from optional header — throws TypeError
+  return validator.ltrim(username as any);
+}
+
+// =============================================================================
+// ltrim — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function normalizeUsernameSafe(username: string | null): string {
+  // ✅ Guard against null before calling ltrim()
+  if (typeof username !== 'string') return '';
+  return validator.ltrim(username);
+}
+
+// =============================================================================
+// rtrim — should fire (2026-06-11, deepen-stream-2 pass 4)
+// =============================================================================
+
+// @expect-violation: rtrim-non-string-typeerror
+function sanitizeSearchQueryUnsafe(query: string | undefined): string {
+  // ❌ query may be undefined from missing query param — throws TypeError
+  return validator.rtrim(query as any);
+}
+
+// =============================================================================
+// rtrim — should NOT fire
+// =============================================================================
+
+// @expect-clean
+function sanitizeSearchQuerySafe(query: string | undefined): string {
+  // ✅ Guard against undefined before calling rtrim()
+  if (typeof query !== 'string') return '';
+  return validator.rtrim(query);
+}
+
+// =============================================================================
+// Additional helper stubs for new tests
+// =============================================================================
+
+function saveAge(age: string): void { }
+function processPayload(payload: string): void { }
