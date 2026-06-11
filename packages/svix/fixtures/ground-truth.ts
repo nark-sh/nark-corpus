@@ -316,3 +316,138 @@ async function resendMessageAttemptWithErrorHandling(
     throw error;
   }
 }
+
+// ============================================================
+// authentication.expireAll() — VIOLATIONS (missing try-catch)
+// ============================================================
+
+// @expect-violation: authentication-expire-all-api-error
+// @expect-violation: authentication-expire-all-network-error
+async function expireAllTokensMissingErrorHandling(svix: Svix, appId: string) {
+  // No try-catch — failure during security incident leaves all portal tokens valid
+  await svix.authentication.expireAll(appId, {});
+}
+
+// @expect-clean
+async function expireAllTokensWithErrorHandling(svix: Svix, appId: string) {
+  try {
+    await svix.authentication.expireAll(appId, {});
+  } catch (error) {
+    if (error instanceof ApiException) {
+      // Must not swallow: outstanding sessions remain valid if this fails
+      throw new Error(`Failed to expire all tokens for app ${appId}: HTTP ${error.code}`);
+    }
+    // Re-throw network errors too — token revocation was NOT applied
+    throw error;
+  }
+}
+
+// ============================================================
+// endpoint.replayMissing() — VIOLATIONS (missing try-catch + async not polled)
+// ============================================================
+
+// @expect-violation: endpoint-replay-missing-api-error
+async function replayMissingMessagesMissingErrorHandling(
+  svix: Svix,
+  appId: string,
+  endpointId: string
+) {
+  // No try-catch — 404/422 swallowed, endpoint never catches up on missed messages
+  await svix.endpoint.replayMissing(appId, endpointId, {
+    since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+  });
+}
+
+// @expect-violation: endpoint-replay-missing-async-not-polled
+async function replayMissingWithoutPollingStatus(svix: Svix, appId: string, endpointId: string) {
+  try {
+    // replayMissing() returns ReplayOut with a taskId — caller discards it
+    // The replay job is still running (or may fail) while caller assumes it's done
+    await svix.endpoint.replayMissing(appId, endpointId, {
+      since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+    });
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw error;
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function replayMissingWithPollingStatus(svix: Svix, appId: string, endpointId: string) {
+  try {
+    const result = await svix.endpoint.replayMissing(appId, endpointId, {
+      since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+    });
+    // Properly track the async background task
+    if (result?.id) {
+      let task = await svix.backgroundTask.get(result.id);
+      while (task.status === "running") {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        task = await svix.backgroundTask.get(result.id);
+      }
+      if (task.status !== "finished") {
+        throw new Error(`Replay task ${result.id} did not finish: ${task.status}`);
+      }
+    }
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`Failed to replay missing messages: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// endpoint.sendExample() — VIOLATIONS (missing try-catch + delivery not confirmed)
+// ============================================================
+
+// @expect-violation: endpoint-send-example-api-error
+async function sendTestEventMissingErrorHandling(svix: Svix, appId: string, endpointId: string) {
+  // No try-catch — 422 (unknown event type) or 404 swallowed
+  // User sees "test sent" but no error was surfaced to confirm it worked
+  await svix.endpoint.sendExample(appId, endpointId, {
+    eventType: "user.signup",
+  });
+}
+
+// @expect-violation: endpoint-send-example-delivery-not-confirmed
+async function sendTestEventWithoutConfirmingDelivery(svix: Svix, appId: string, endpointId: string) {
+  try {
+    // sendExample() queues the message — does NOT confirm delivery to customer URL
+    // Treating MessageOut as delivery confirmation is incorrect
+    const msg = await svix.endpoint.sendExample(appId, endpointId, {
+      eventType: "user.signup",
+    });
+    // msg is MessageOut (queued), not a delivery receipt
+    // Caller returns here assuming endpoint received the event
+    return msg.id;
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`Failed to send test event: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function sendTestEventWithDeliveryConfirmation(svix: Svix, appId: string, endpointId: string) {
+  try {
+    const msg = await svix.endpoint.sendExample(appId, endpointId, {
+      eventType: "user.signup",
+    });
+    // Verify actual delivery by checking message attempts
+    const attempts = await svix.messageAttempt.listByMsg(appId, msg.id);
+    const successfulAttempt = attempts.data.find((a) => a.response?.statusCode === 200);
+    if (!successfulAttempt) {
+      throw new Error(`Test event ${msg.id} was queued but endpoint has not received it yet`);
+    }
+    return msg.id;
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`Failed to send/confirm test event: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}

@@ -6,29 +6,35 @@ last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75
-# Depth pass 2026-06-11 (deepen-stream-1 pass 1):
-# API surface: 12 distinct async-callable runtime-critical function groups
+coverage_score: 0.92
+# Depth pass 2026-06-11 (deepen-stream-2 pass 2):
+# API surface: 13 distinct async-callable runtime-critical function groups (svix@1.84.1)
 #   Core send path: message.create — CONTRACTED (prior pass)
 #   Inbound verification: Webhook.verify — CONTRACTED (prior pass)
-#   Customer onboarding: application.create, application.getOrCreate — CONTRACTED (this pass)
-#   Endpoint management: endpoint.create, endpoint.recover, endpoint.rotateSecret — CONTRACTED (this pass)
-#   Portal access: authentication.appPortalAccess — CONTRACTED (this pass)
-#   Retry/resend: messageAttempt.resend — CONTRACTED (this pass)
-#   Intentionally omitted (3 runtime-adjacent): eventType.create (niche schema mgmt),
-#     integration.rotateKey (admin op), environment.import (one-time migration op)
+#   Customer onboarding: application.create, application.getOrCreate — CONTRACTED (pass 1)
+#   Endpoint management: endpoint.create, endpoint.recover, endpoint.rotateSecret — CONTRACTED (pass 1)
+#   Portal access: authentication.appPortalAccess — CONTRACTED (pass 1)
+#   Retry/resend: messageAttempt.resend — CONTRACTED (pass 1)
+#   Token revocation: authentication.expireAll — CONTRACTED (this pass)
+#   Missed message replay: endpoint.replayMissing — CONTRACTED (this pass)
+#   Test delivery: endpoint.sendExample — CONTRACTED (this pass)
+#   Intentionally omitted (1): operationalWebhookEndpoint.create — svix→YOUR system webhooks,
+#     enterprise use only, narrow adoption in standard SaaS integrations
 #   Intentionally omitted (bulk): application.list/get/update/delete/patch,
-#     endpoint.list/get/update/delete/patch, backgroundTask.*, health.*, statistics.*,
-#     connector.*, ingest.*, streaming.*, operationalWebhookEndpoint.*,
+#     endpoint.list/get/update/delete/patch/getHeaders/updateHeaders/etc,
+#     authentication.dashboardAccess (legacy), authentication.logout, authentication.streamPortalAccess,
+#     backgroundTask.*, health.*, statistics.*, connector.*, ingest.*, streaming.*,
+#     operationalWebhookEndpoint.list/get/update/delete/etc,
 #     message.list/get/expunge*, messageAttempt.list*/get/expunge*
-# Coverage: 9/12 runtime-critical distinct contracts = 0.75 (effective contracted/non-omitted = 9/9 = 1.0)
+# Coverage: 12/13 runtime-critical distinct contracts = 0.92
 # Evidence confirmed from:
-#   $TMPDIR/svix/node_modules/svix@1.95.2/dist/request.js — filterResponseForErrors() throw sites
-#   $TMPDIR/svix/node_modules/svix@1.95.2/dist/util.js — ApiException class definition
-#   $TMPDIR/svix/node_modules/standardwebhooks@*/dist/index.js — WebhookVerificationError throw sites
-#   https://docs.svix.com/idempotency — idempotency key behavior
-#   https://docs.svix.com/app-portal — appPortalAccess usage
-#   https://docs.svix.com/receiving/verifying-payloads/how — verify() documentation
+#   svix@1.84.1/dist/api/authentication.js — expireAll() implementation
+#   svix@1.84.1/dist/api/endpoint.js — replayMissing(), sendExample() implementations
+#   svix@1.84.1/dist/models/replayOut.d.ts — ReplayOut structure
+#   svix@1.84.1/dist/models/backgroundTaskStatus.d.ts — BackgroundTaskStatus enum
+#   svix@1.84.1/dist/models/eventExampleIn.d.ts — EventExampleIn structure
+#   svix@1.84.1/dist/models/applicationTokenExpireIn.d.ts — ApplicationTokenExpireIn structure
+#   svix@1.84.1/dist/request.js — filterResponseForErrors() and sendWithRetry() retry logic
 
 detection:
   type_names:
@@ -434,12 +440,208 @@ functions:
           believes the message was resent when it was not — the customer's
           integration remains broken without any indication.
         sources:
-          - https://docs.svix.com/api-reference
-          - https://docs.svix.com/api-reference
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/messageAttempt.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
         severity: error
         business_impact:
           incident_label: DATA_LOSS
           production_behavior: immediate_exception
           visibility: visible
           user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: expireAll
+    namespace: "authentication"
+    import_path: "svix"
+    description: >
+      Revokes all active portal access tokens for a specific application. Used
+      during security incidents to immediately invalidate all outstanding magic
+      links and sessions for a customer's svix app. Can optionally target
+      specific sessionIds to revoke individual sessions. Returns void.
+      Critical security response path — callers rely on this to prevent
+      unauthorized portal access after a security event.
+
+    postconditions:
+      # Evidence: svix@1.84.1/dist/api/authentication.js — expireAll() confirmed
+      #   POST /api/v1/auth/app/{app_id}/expire-all
+      #   Uses sendNoResponseBody() — returns void on success
+      # svix@1.84.1/dist/request.js — filterResponseForErrors():
+      #   4xx → ApiException(status, JSON.parse(body), headers)
+      #   5xx → ApiException(status, rawBody, headers) after 2 retries
+      #   Network failure → Error (native fetch) after 2 retries
+      # svix@1.84.1/dist/models/applicationTokenExpireIn.d.ts — expiry?: number | null, sessionIds?: string[]
+      - id: authentication-expire-all-api-error
+        condition: "svix API rejected the expireAll request — app not found, auth failure, or invalid parameters"
+        throws: "ApiException (svix.ApiException) with code (HTTP status) and body"
+        required_handling: >
+          Caller MUST catch ApiException around expireAll(). Critical cases:
+          404 = appId not found (customer's svix application was never created
+          or was already deleted); 401/403 = bad SVIX_AUTH_TOKEN (expired or
+          revoked server token). A swallowed exception during a security
+          incident means ALL outstanding portal magic links remain valid —
+          the customer's webhook management portal is still accessible to
+          unauthorized parties. This is a security regression. Never treat
+          a void return from this method as success without a surrounding try-catch.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/authentication.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: authentication-expire-all-network-error
+        condition: "Network failure reaching api.svix.com after 2 automatic retries"
+        throws: "Error (native fetch network error after retry exhaustion)"
+        required_handling: >
+          Caller MUST catch Error (not just ApiException). svix retries 5xx
+          and network failures twice before propagating the error. If still
+          failing after retries, the token revocation was NOT applied — all
+          outstanding portal sessions remain valid. Security incident handlers
+          MUST treat this as a blocking failure, not a best-effort call.
+          Retry with backoff, or notify the security team that revocation
+          failed so they can revoke the SVIX_AUTH_TOKEN itself as a last resort.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+  - name: replayMissing
+    namespace: "endpoint"
+    import_path: "svix"
+    description: >
+      Replays all messages that were missed by an endpoint within a given time
+      window. Unlike endpoint.recover() (which replays FAILED deliveries),
+      replayMissing replays messages where the endpoint did not even receive
+      a delivery attempt — e.g. when the endpoint was created after messages
+      were published, or when the endpoint's filter event types were updated.
+      Returns ReplayOut immediately — the actual replay is asynchronous in the
+      background. Callers must poll backgroundTask.get(id) to confirm completion.
+
+    postconditions:
+      # Evidence: svix@1.84.1/dist/api/endpoint.js — replayMissing() confirmed
+      #   POST /api/v1/app/{app_id}/endpoint/{endpoint_id}/replay-missing
+      #   Uses ReplayIn model (same structure as RecoverIn — since: Date)
+      #   Returns ReplayOut via ReplayOutSerializer
+      # svix@1.84.1/dist/models/replayOut.d.ts — ReplayOut: { id: string, status: BackgroundTaskStatus, task: BackgroundTaskType }
+      # svix@1.84.1/dist/models/backgroundTaskStatus.d.ts — BackgroundTaskStatus: "running" | "finished" | "failed"
+      # Error path: same filterResponseForErrors() as all other endpoints
+      - id: endpoint-replay-missing-api-error
+        condition: "svix API rejected the replayMissing request — endpoint not found, auth failure, or invalid time range"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. 404 = endpointId or appId not found;
+          422 = invalid ReplayIn (e.g. invalid date range, since > until, or
+          since too far in the past beyond svix's retention window). 401/403 =
+          auth failure. A swallowed exception means the endpoint backfill was
+          silently skipped — new endpoints onboarded into an existing event
+          stream will never receive historical messages they missed, and the
+          customer sees incomplete webhook history.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/endpoint.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: endpoint-replay-missing-async-not-polled
+        condition: "replayMissing() returns ReplayOut with a background task ID, but caller does not poll task status"
+        throws: "No throw — ReplayOut.id is silently discarded"
+        required_handling: >
+          replayMissing() is ASYNCHRONOUS. A 200 response means the replay job
+          was queued (ReplayOut.status will initially be "running"), NOT that
+          messages were delivered. Callers MUST use the returned ReplayOut.id
+          to poll backgroundTask.get(taskId) until status is "finished" or
+          "failed". Treating a successful replayMissing() response as
+          confirmation that the endpoint is caught up is incorrect. This is
+          the same async pitfall as endpoint.recover() — both return a
+          background task reference that must be tracked, not discarded.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/endpoint.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/models/replayOut.ts
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: sendExample
+    namespace: "endpoint"
+    import_path: "svix"
+    description: >
+      Sends a synthesized test event of a specific event type to an endpoint.
+      Used to verify webhook delivery is working during endpoint setup or
+      troubleshooting. Requires an EventExampleIn with eventType (and optional
+      exampleIndex). Returns MessageOut — the created test message record.
+      Commonly called in onboarding flows or webhook management UIs where the
+      customer can click "Send Test Event" to verify their endpoint responds
+      correctly.
+
+    postconditions:
+      # Evidence: svix@1.84.1/dist/api/endpoint.js — sendExample() confirmed
+      #   POST /api/v1/app/{app_id}/endpoint/{endpoint_id}/send-example
+      #   EventExampleIn: { eventType: string, exampleIndex?: number }
+      #   Returns MessageOut via MessageOutSerializer
+      # svix@1.84.1/dist/request.js — same filterResponseForErrors() path
+      # Note: Returns MessageOut (test message queued) — does NOT confirm the
+      # endpoint received it. Delivery is asynchronous.
+      - id: endpoint-send-example-api-error
+        condition: "svix API rejected the sendExample request — unknown event type, endpoint not found, or auth failure"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. 404 = endpointId or appId not found;
+          422 = eventType does not exist in svix's registered event types for
+          this app (the event schema must be pre-registered before examples can
+          be sent); 401/403 = auth failure. A swallowed exception in a
+          "Send Test Event" UI means the user receives no feedback that the
+          test failed — they believe their endpoint is configured correctly
+          when it is not, leading to missed production events.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/endpoint.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: endpoint-send-example-delivery-not-confirmed
+        condition: "sendExample() returns MessageOut successfully but the endpoint URL did not receive the payload"
+        throws: "No throw — MessageOut is returned but delivery is asynchronous"
+        required_handling: >
+          sendExample() returns MessageOut when the TEST MESSAGE WAS QUEUED —
+          NOT when the endpoint received it. The actual HTTP delivery to the
+          customer's URL is asynchronous and happens after this call returns.
+          Callers that treat a successful MessageOut response as confirmation
+          that the endpoint is working are incorrect. To confirm delivery,
+          check messageAttempt.listByMsg(appId, msg.id) and verify that at
+          least one attempt has status "success". A "Send Test Event" UI that
+          only checks the sendExample() return without checking delivery
+          attempts will give false assurance to customers with misconfigured
+          endpoints.
+        sources:
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/endpoint.ts
+          - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/messageAttempt.ts
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
           incident_cost_range: medium
