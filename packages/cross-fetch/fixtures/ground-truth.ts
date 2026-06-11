@@ -4,13 +4,16 @@
  * Each call site annotated // SHOULD_FIRE or // SHOULD_NOT_FIRE.
  * Contract postcondition IDs: network-error, http-error-unchecked, abort-error,
  *   json-parse-error, json-body-consumed-twice, text-abort-mid-stream,
- *   text-body-consumed-twice
+ *   text-body-consumed-twice, text-converted-missing-encoding-package,
+ *   text-converted-body-consumed-twice
  *
  * Key rules:
  *   - await fetch() without try-catch → SHOULD_FIRE (network-error)
  *   - await fetch() inside try-catch → SHOULD_NOT_FIRE
  *   - response.text() without try-catch after body already read → SHOULD_FIRE (text-body-consumed-twice)
  *   - response.text() with response.clone() before reading → SHOULD_NOT_FIRE
+ *   - (response as any).textConverted() without try-catch → SHOULD_FIRE (text-converted-missing-encoding-package)
+ *   - (response as any).textConverted() inside try-catch → SHOULD_NOT_FIRE
  */
 
 import fetch from 'cross-fetch';
@@ -109,6 +112,81 @@ export async function textWithClone(url: string) {
     const textFromClone = await responseClone.text();
     return textFromClone;
   } catch (error) {
+    throw error;
+  }
+}
+
+// ─── 8. textConverted() without try-catch — missing encoding package ───────────
+// @expect-violation: text-converted-missing-encoding-package
+
+export async function textConvertedWithoutCatch(url: string) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+  // SHOULD_FIRE: text-converted-missing-encoding-package — textConverted() without try-catch;
+  // if optional 'encoding' package is not installed, throws Error at runtime.
+  // TODO(scanner): text-converted-missing-encoding-package — no scanner detection rule yet.
+  const text = await (response as any).textConverted();
+  return text;
+}
+
+// ─── 9. textConverted() inside try-catch — correct pattern ────────────────────
+// @expect-clean
+
+export async function textConvertedWithCatch(url: string) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    // SHOULD_NOT_FIRE: textConverted() inside try-catch — encoding Error handled
+    const text = await (response as any).textConverted();
+    return text;
+  } catch (error) {
+    const err = error as Error;
+    if (err.message && err.message.includes('encoding must be installed')) {
+      throw new Error('Install the "encoding" package: npm install encoding');
+    }
+    throw error;
+  }
+}
+
+// ─── 10. textConverted() after body already consumed ──────────────────────────
+// @expect-violation: text-converted-body-consumed-twice
+
+export async function textConvertedAfterBodyConsumed(url: string) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    // First read consumes the body stream
+    const rawText = await response.text();
+    console.log('Raw response length:', rawText.length);
+    // SHOULD_FIRE: text-converted-body-consumed-twice — calling textConverted() on
+    // an already-consumed body throws TypeError "body used already".
+    // TODO(scanner): text-converted-body-consumed-twice — no scanner detection rule yet.
+    const decoded = await (response as any).textConverted();
+    return decoded;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ─── 11. textConverted() with clone() — correct pattern ───────────────────────
+// @expect-clean
+
+export async function textConvertedWithClone(url: string) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    // SHOULD_NOT_FIRE: clone before reading body to support textConverted() call
+    const responseClone = response.clone();
+    const rawText = await response.text();
+    console.log('Raw response length:', rawText.length);
+    // Use textConverted() on the clone — body not yet consumed
+    const decoded = await (responseClone as any).textConverted();
+    return decoded;
+  } catch (error) {
+    const err = error as Error;
+    if (err.message && err.message.includes('encoding must be installed')) {
+      throw new Error('Install the "encoding" package: npm install encoding');
+    }
     throw error;
   }
 }

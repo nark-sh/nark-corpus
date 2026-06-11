@@ -26,16 +26,31 @@
 # Added: text-body-consumed-twice postcondition to response.text()
 # Postconditions: 7 → 8 (+1 this pass)
 # Coverage: 3/6 = 0.50 (same function count, new postcondition on existing function)
+#
+# Depth pass 2026-06-11 (deepen-stream-2 pass 3):
+# Discovered 2 additional non-standard node-fetch methods not previously enumerated:
+#   response.buffer() — Node.js only, returns raw Buffer; OMITTED (same error profile as text)
+#   response.textConverted() — Node.js only, charset-detection body read; CONTRACTED (+2 postconditions)
+# New total: 8 async-callable operations (4 contracted + 4 intentionally omitted)
+# Key finding: textConverted() has a unique error: throws Error (not TypeError) when optional
+#   'encoding' npm package is not installed. This is a silent optional dependency trap.
+# Evidence sources:
+#   node-fetch/lib/index.js line 445-446: convertBody() throws Error when convert === undefined
+#   node-fetch/lib/index.js line 161-163: encoding loaded in try-catch at module init
+#   https://raw.githubusercontent.com/node-fetch/node-fetch/2.x/README.md — textConverted docs
+#   node-fetch/lib/index.js line 444-498: convertBody() charset detection logic
+# Coverage: 4/8 = 0.50 → same score, total function count updated from 6 to 8
 package: cross-fetch
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.50  # 3 contracted / 6 total async-callable (3 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 3/3 = 1.0; postconditions: 8
+coverage_score: 0.50  # 4 contracted / 8 total async-callable (4 intentionally omitted)
+# Note: total function count updated 6→8 (found buffer() and textConverted() in node-fetch source)
+# Effective coverage (contracted/non-omitted) = 4/4 = 1.0; postconditions: 10
 description: Universal WHATWG Fetch API polyfill for Node, browsers, and React Native
 
 functions:
@@ -407,6 +422,139 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: response.textConverted
+    import_path: "cross-fetch"
+    description: >
+      Node.js-specific (non-standard) response body method. Reads the response body
+      and returns it as a UTF-8 string, performing automatic charset detection rather
+      than always assuming UTF-8. Inspects the Content-Type header, then peeks at up to
+      1024 bytes of the response body for HTML meta charset declarations and XML encoding
+      declarations. Falls back to gb18030 for gb2312/gbk to prevent decode issues on
+      Chinese content. REQUIRES the optional 'encoding' npm package to be installed — if
+      absent, throws Error at call time. Node.js only; not available in browsers or
+      React Native (which use the DOM fetch API). Only use when the remote server may
+      return non-UTF-8 encoded responses (legacy systems, some government APIs, older CMS).
+    postconditions:
+      # Evidence: node-fetch/lib/index.js line 161-163:
+      #   let convert;
+      #   try { convert = require('encoding').convert; } catch (e) {}
+      # node-fetch/lib/index.js line 444-446:
+      #   function convertBody(buffer, headers) {
+      #     if (typeof convert !== 'function') {
+      #       throw new Error('The package `encoding` must be installed to use the textConverted() function');
+      # Source: https://raw.githubusercontent.com/node-fetch/node-fetch/2.x/README.md confirms:
+      #   "This API requires an optional dependency of the npm package encoding,
+      #    which you need to install manually"
+      - id: text-converted-missing-encoding-package
+        condition: >
+          response.textConverted() is called in a Node.js environment where the optional
+          'encoding' npm package is NOT installed. This is the most common failure mode:
+          developers call textConverted() expecting charset detection to work, but the
+          'encoding' package is not in their dependencies. The failure happens silently
+          until runtime — no build-time or import-time warning is given, because node-fetch
+          loads 'encoding' in a try-catch at module initialization that swallows the module
+          not found error. The call site is where the Error is thrown.
+          Note: if running in a browser or React Native environment, textConverted() is not
+          available (not in DOM fetch spec) — calling it would throw TypeError 'not a function'.
+        throws: >
+          Error (not TypeError) with message:
+          "The package `encoding` must be installed to use the textConverted() function"
+          Source: node-fetch/lib/index.js convertBody() line 446.
+          This is a plain Error, not a subclass — catch with: error instanceof Error
+          and check error.message includes 'encoding must be installed'.
+        required_handling: >
+          Option A — Install the encoding package as a production dependency:
+
+            npm install encoding
+
+          Then wrap in try-catch to handle body stream errors:
+
+            try {
+              const response = await fetch(url);
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              const text = await response.textConverted();
+              return text;
+            } catch (error) {
+              if (error.message && error.message.includes('encoding must be installed')) {
+                throw new Error('Charset detection requires the "encoding" package: npm install encoding');
+              }
+              throw error;
+            }
+
+          Option B — Use response.text() instead (always available, assumes UTF-8):
+
+            // For most modern APIs, UTF-8 is safe
+            const text = await response.text();
+
+          Option C — Manual charset detection (dependency-free):
+
+            const buffer = await response.buffer();
+            const contentType = response.headers.get('content-type') || '';
+            const charsetMatch = /charset=([^;]*)/i.exec(contentType);
+            const charset = charsetMatch ? charsetMatch[1].trim() : 'utf-8';
+            const text = buffer.toString(charset as BufferEncoding);
+
+        sources:
+          - "https://raw.githubusercontent.com/node-fetch/node-fetch/2.x/README.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: node-fetch/lib/index.js consumeBody() line 344:
+      #   return Body.Promise.reject(new TypeError(`body used already for: ${this.url}`))
+      # Same underlying consumeBody() path as json-body-consumed-twice and text-body-consumed-twice.
+      # Confirmed by node-fetch source: all body methods (json, text, blob, arrayBuffer,
+      # buffer, textConverted) route through consumeBody() which checks the disturbed flag.
+      - id: text-converted-body-consumed-twice
+        condition: >
+          response.textConverted() is called after any other body-read method (json(),
+          text(), blob(), arrayBuffer(), buffer(), or a previous textConverted() call) has
+          already consumed the response body on the same Response object. Response bodies are
+          ReadableStream objects that can only be read once. After the first call, the body
+          is "disturbed" and any subsequent read attempt throws TypeError.
+          This error is identical to json-body-consumed-twice and text-body-consumed-twice —
+          it's the same underlying consumeBody() TypeError path in node-fetch.
+        throws: >
+          TypeError with message "body used already for: <url>" (node-fetch/cross-fetch Node.js).
+          In browser: not applicable (textConverted() is Node.js only).
+        required_handling: >
+          Use response.clone() before the first body read if you need to call textConverted()
+          after another body method:
+
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+
+            // Clone before first read
+            const clone = response.clone();
+
+            // Read for logging
+            const rawText = await response.text();
+            console.debug('Raw bytes:', Buffer.byteLength(rawText), 'bytes');
+
+            // Use textConverted() on the clone
+            try {
+              const decoded = await clone.textConverted();
+              return decoded;
+            } catch (error) {
+              if (error.message && error.message.includes('encoding must be installed')) {
+                throw new Error('Install the "encoding" package: npm install encoding');
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/node-fetch/node-fetch/2.x/README.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - "fetch() is the only import from cross-fetch — Request, Response, Headers are also exported but are constructors"
   - "cross-fetch wraps node-fetch@2.x on Node.js. On browsers, it uses the native fetch."
@@ -414,6 +562,9 @@ notes:
   - "response.ok shorthand: status >= 200 && status < 300. Always check before reading body."
   - "AbortError.name === 'AbortError' is the cross-environment check (works in both Node.js node-fetch and browsers)"
   - "response.blob(), response.arrayBuffer(), response.formData() omitted — same error profile as response.text() (AbortError mid-stream, body-consumed-twice TypeError)"
+  - "response.buffer() omitted — Node.js only non-standard method, same error profile as text/arrayBuffer"
   - "cross-fetch v4+ only supports the ponyfill pattern — import fetch from 'cross-fetch'"
   - "Alternative: many projects use cross-fetch to polyfill fetch in Node.js 16 and below; Node.js 18+ has native fetch"
-  - "text-body-consumed-twice and json-body-consumed-twice are the same underlying error (consumeBody() TypeError) — affects all body methods"
+  - "text-body-consumed-twice and json-body-consumed-twice are the same underlying error (consumeBody() TypeError) — affects all body methods including buffer() and textConverted()"
+  - "textConverted() requires optional 'encoding' npm package — if not installed, throws Error at call time (not import time)"
+  - "response.bytes() (Uint8Array, new DOM spec method) is NOT in node-fetch v2 and therefore NOT in cross-fetch v4; available in Node.js 18+ native fetch only"
