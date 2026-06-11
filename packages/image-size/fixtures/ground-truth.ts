@@ -71,9 +71,7 @@ export async function getImageDimensionsFromFileWithCatch(filePath: string) {
 // @expect-violation: empty-file
 // @expect-violation: file-not-found
 export async function processUploadedImageNoCatch(uploadedPath: string) {
-  // SHOULD_FIRE: empty-file — imageSizeFromFile() without try-catch throws Error('Empty file')
-  // when the file exists but contains zero bytes. Upload pipelines checking only file existence
-  // are vulnerable to this; the file may be created before data is fully written.
+  // SHOULD_FIRE: empty-file — imageSizeFromFile() without try-catch throws Error('Empty file') when the file exists but contains zero bytes (common in upload pipelines that check only file existence before data is fully written)
   const dimensions = await imageSizeFromFile(uploadedPath);
   return { width: dimensions.width, height: dimensions.height };
 }
@@ -102,9 +100,7 @@ export async function processUploadedImageWithCatch(uploadedPath: string) {
 // @expect-violation: corrupt-image-async
 // @expect-violation: file-not-found
 export async function getCorruptImageDimensionsNoCatch(filePath: string) {
-  // SHOULD_FIRE: corrupt-image-async — imageSizeFromFile() without try-catch rejects with
-  // TypeError when file exists but contains corrupt data (e.g. truncated JPG, invalid PNG header).
-  // Callers that only handle ENOENT will miss corruption errors from user-uploaded files.
+  // SHOULD_FIRE: corrupt-image-async — imageSizeFromFile() without try-catch rejects with TypeError when file exists but contains corrupt data (e.g. truncated JPG, invalid PNG header); callers that only handle ENOENT will miss corruption errors from user-uploaded files
   return await imageSizeFromFile(filePath);
 }
 
