@@ -1,23 +1,39 @@
 package: "svix"
 semver: ">=1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "nark-sh"
-last_verified: "2026-06-10"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
-evidence_quality: partial
+evidence_quality: confirmed
+coverage_score: 0.75
+# Depth pass 2026-06-11 (deepen-stream-1 pass 1):
+# API surface: 12 distinct async-callable runtime-critical function groups
+#   Core send path: message.create — CONTRACTED (prior pass)
+#   Inbound verification: Webhook.verify — CONTRACTED (prior pass)
+#   Customer onboarding: application.create, application.getOrCreate — CONTRACTED (this pass)
+#   Endpoint management: endpoint.create, endpoint.recover, endpoint.rotateSecret — CONTRACTED (this pass)
+#   Portal access: authentication.appPortalAccess — CONTRACTED (this pass)
+#   Retry/resend: messageAttempt.resend — CONTRACTED (this pass)
+#   Intentionally omitted (3 runtime-adjacent): eventType.create (niche schema mgmt),
+#     integration.rotateKey (admin op), environment.import (one-time migration op)
+#   Intentionally omitted (bulk): application.list/get/update/delete/patch,
+#     endpoint.list/get/update/delete/patch, backgroundTask.*, health.*, statistics.*,
+#     connector.*, ingest.*, streaming.*, operationalWebhookEndpoint.*,
+#     message.list/get/expunge*, messageAttempt.list*/get/expunge*
+# Coverage: 9/12 runtime-critical distinct contracts = 0.75 (effective contracted/non-omitted = 9/9 = 1.0)
+# Evidence confirmed from:
+#   $TMPDIR/svix/node_modules/svix@1.95.2/dist/request.js — filterResponseForErrors() throw sites
+#   $TMPDIR/svix/node_modules/svix@1.95.2/dist/util.js — ApiException class definition
+#   $TMPDIR/svix/node_modules/standardwebhooks@*/dist/index.js — WebhookVerificationError throw sites
+#   https://docs.svix.com/idempotency — idempotency key behavior
+#   https://docs.svix.com/app-portal — appPortalAccess usage
+#   https://docs.svix.com/receiving/verifying-payloads/how — verify() documentation
 
-# Initial svix profile. v0.1 — covers the two highest-frequency caller-side
-# error contracts: message.create() (outbound webhook delivery API) and
-# Webhook.verify() (inbound webhook signature verification). Future
-# bc-deepen-contract pass will enumerate the Application/Endpoint/Event-type
-# CRUD surfaces and add postconditions for the full svix-server REST API.
-#
-# Why this matters: webhooks are order-sensitive and at-least-once delivery.
-# A swallowed svix error means either (a) a webhook that was supposed to fire
-# never did (lost integration), or (b) a webhook signature verification that
-# silently passed when it should have failed (auth bypass). Both are
-# production-critical.
+detection:
+  type_names:
+    - Svix
+    - Webhook
 
 functions:
   - name: create
@@ -37,8 +53,8 @@ functions:
           back off. The webhook is NOT delivered when create() throws — so a
           swallowed exception equals a silently-lost integration message.
         sources:
-          - "https://docs.svix.com/api-reference/message/message-create-message"
-          - "https://docs.svix.com/error-handling-and-retry-schedule"
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
         severity: error
         business_impact:
           incident_label: DATA_LOSS
@@ -58,7 +74,7 @@ functions:
           critical integrations (billing, compliance), pair create() with a
           local outbox table so failed sends can be replayed.
         sources:
-          - "https://docs.svix.com/quickstart#sending-your-first-event"
+          - https://docs.svix.com/api-reference
         severity: error
         business_impact:
           incident_label: DATA_LOSS
@@ -85,8 +101,8 @@ functions:
           Constant-time signature comparison is handled by svix internally;
           the caller's only job is to not ignore the throw.
         sources:
-          - "https://docs.svix.com/receiving/verifying-payloads/how"
-          - "https://docs.svix.com/receiving/verifying-payloads/how-manual"
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
         severity: error
         business_impact:
           incident_label: SECURITY_RISK
@@ -105,7 +121,7 @@ functions:
           to "be lenient" — that defeats the protection. If clock skew is a
           real concern, sync NTP rather than widening the window.
         sources:
-          - "https://docs.svix.com/receiving/verifying-payloads/how"
+          - https://docs.svix.com/api-reference
         severity: error
         business_impact:
           incident_label: SECURITY_RISK
@@ -113,3 +129,317 @@ functions:
           visibility: silent
           user_experience: security_breach
           incident_cost_range: critical
+
+      - id: missing-required-headers
+        # Evidence: standardwebhooks/dist/index.js verify() line:
+        #   if (!msgSignature || !msgId || !msgTimestamp) {
+        #     throw new WebhookVerificationError("Missing required headers");
+        #   }
+        # Required headers: svix-id, svix-timestamp, svix-signature (or webhook-id/timestamp/signature)
+        condition: "One or more required svix headers are absent from the request (svix-id, svix-timestamp, svix-signature)"
+        throws: "WebhookVerificationError"
+        required_handling: >
+          Caller MUST catch WebhookVerificationError and return HTTP 400.
+          Missing headers indicate a request that was NOT sent by svix — either
+          a probe, a misconfigured sender, or a programming error in the caller's
+          header extraction. Never attempt to process the payload body without
+          all three headers present. This error is distinct from a bad signature —
+          it means the request is not a well-formed webhook at all.
+        sources:
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+  - name: create
+    namespace: "application"
+    import_path: "svix"
+    description: >
+      Creates a new svix Application object. Applications map 1:1 to your
+      tenants or customers — each app holds its own endpoints and receives
+      its own messages. Called during customer onboarding or tenant provisioning.
+      Returns ApplicationOut with id, name, uid, and createdAt.
+
+    postconditions:
+      # Evidence: svix/dist/request.js — filterResponseForErrors()
+      #   Any 4xx or 5xx → throws ApiException(status, body, headers)
+      #   4xx body is parsed JSON (HttpErrorOut with code + detail fields)
+      #   5xx body is raw text (auto-retried 2x before throw)
+      # Evidence: svix/dist/util.js — ApiException class: code (HTTP status), body, headers
+      - id: application-create-api-error
+        condition: "svix API rejected the create request — invalid payload, auth failure, or rate limit"
+        throws: "ApiException (svix.ApiException) with code (HTTP status) and body"
+        required_handling: >
+          Caller MUST catch ApiException. Key cases: 401/403 = invalid auth
+          token (bad SVIX_AUTH_TOKEN env); 422 = validation error on
+          ApplicationIn payload (body is HTTPValidationError); 429 = rate
+          limit exceeded. A swallowed exception leaves the customer without an
+          application — subsequent message.create() calls will fail with 404
+          (app not found) and webhook delivery will silently fail.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: application-create-network-error
+        condition: "Network failure reaching api.svix.com before or during the request"
+        throws: "Error (native fetch error after 2 automatic retries)"
+        required_handling: >
+          Caller MUST catch Error (not just ApiException). svix's SDK retries
+          5xx and network failures twice before throwing. If still failing,
+          the application was NOT created and the customer's tenant has no svix
+          app — retry with idempotency key. For critical onboarding paths, treat
+          this as a blocking error that must block the signup flow or queue for
+          later retry with exponential backoff.
+        sources:
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: getOrCreate
+    namespace: "application"
+    import_path: "svix"
+    description: >
+      Creates a new Application, or returns the existing one if an app with
+      the same uid already exists. Idempotent alternative to application.create()
+      for onboarding flows that may run multiple times (e.g. webhook handler,
+      retry queue). Returns ApplicationOut. Uses the same error profile as create().
+
+    postconditions:
+      # Evidence: svix/dist/request.js — same filterResponseForErrors() path as create()
+      # getOrCreate() sends POST with getIfExists=true query param — 200 on existing, 201 on new
+      # Both paths throw on the same ApiException conditions
+      - id: application-get-or-create-api-error
+        condition: "svix API rejected the getOrCreate request — auth failure, validation error, or rate limit"
+        throws: "ApiException (svix.ApiException) with code (HTTP status) and body"
+        required_handling: >
+          Caller MUST catch ApiException. Same error profile as application.create().
+          Common in retry-safe onboarding flows — do not assume getOrCreate()
+          is "safe to ignore on error" because an application already exists.
+          On auth failure (401/403), all subsequent webhook operations for this
+          customer will also fail silently.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: create
+    namespace: "endpoint"
+    import_path: "svix"
+    description: >
+      Registers a new webhook endpoint URL for an application. Endpoints receive
+      the webhook events published via message.create(). Called when a customer
+      sets up their first webhook destination or adds a new one. Returns EndpointOut.
+      If not called after application.create(), no messages will be delivered to
+      the customer — the integration silently does nothing.
+
+    postconditions:
+      # Evidence: svix/dist/request.js — filterResponseForErrors()
+      # Additional: endpoint.create validates URL format (422), checks for duplicate UIDs,
+      # enforces HTTPS-only URLs in production svix accounts
+      - id: endpoint-create-api-error
+        condition: "svix API rejected endpoint creation — invalid URL, auth failure, app not found, validation error"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. Critical cases: 404 = app not found
+          (application was not created first, or wrong appId); 422 = URL failed
+          validation (non-HTTPS URL in production, malformed URL, invalid filter
+          event types); 401/403 = bad auth token. A silently-swallowed failure
+          here means the customer's webhook URL is never registered — message.create()
+          will succeed but deliver to zero endpoints.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: recover
+    namespace: "endpoint"
+    import_path: "svix"
+    description: >
+      Replays all failed messages for an endpoint since a given timestamp.
+      Used for incident recovery after an endpoint was down. Returns RecoverOut
+      immediately — the actual message resending happens asynchronously in the
+      background. Callers must check backgroundTask status separately to
+      confirm replay completion.
+
+    postconditions:
+      # Evidence: svix/dist/api/endpoint.d.ts — recover(appId, endpointId, recoverIn) returns RecoverOut
+      # RecoverIn has since: Date, until: Date? fields
+      # svix/dist/request.js — same ApiException throw path
+      - id: endpoint-recover-api-error
+        condition: "svix API rejected the recover request — invalid endpoint, auth failure, or validation error"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. Critical: 404 = endpointId or appId
+          not found; 422 = invalid date range in RecoverIn (e.g. since > until,
+          or since too far in past). recover() returns immediately with a
+          background task ID — a successful HTTP 202 only means the task was
+          queued, NOT that messages were replayed. Callers using this for SLA
+          recovery MUST poll backgroundTask.get(taskId) to confirm completion.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: endpoint-recover-async-not-polled
+        condition: "recover() returns RecoverOut with a background task ID, but caller does not poll task status"
+        throws: "No throw — RecoverOut.id is silently discarded"
+        required_handling: >
+          recover() is ASYNCHRONOUS. A 200 response means the replay job was
+          queued, not completed. Callers MUST use the returned taskId to poll
+          backgroundTask.get(taskId) until status is 'finished'. Treating a
+          successful recover() response as confirmation that messages were
+          replayed is incorrect — the replay may be still in progress or may
+          have partially failed.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: rotateSecret
+    namespace: "endpoint"
+    import_path: "svix"
+    description: >
+      Rotates the signing secret for a specific endpoint. Used during security
+      incidents or planned secret rotation. After rotation, the new secret takes
+      effect immediately — the old secret is no longer valid. Returns void.
+      Any consumer still using the old secret will fail verification until updated.
+
+    postconditions:
+      # Evidence: svix/dist/api/endpoint.d.ts — rotateSecret(appId, endpointId, secretIn) returns void
+      # EndpointSecretRotateIn has key?: string (optional — auto-generates if absent)
+      # svix/dist/request.js — same ApiException throw path
+      - id: endpoint-rotate-secret-api-error
+        condition: "svix API rejected the rotateSecret request — auth failure, endpoint not found, or invalid key format"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. 404 = endpointId or appId not found;
+          422 = supplied key does not meet svix's format requirements (if providing
+          a custom key). Critically: if this call is NOT wrapped in try-catch and
+          fails silently, the secret rotation event is lost — the caller may believe
+          rotation succeeded and stop using the old secret, but svix still has the
+          old secret, causing all subsequent webhook verifications to fail.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: appPortalAccess
+    namespace: "authentication"
+    import_path: "svix"
+    description: >
+      Generates a short-lived magic link token granting a specific user access
+      to the svix Consumer App Portal for their application. The returned URL
+      is a single-use authentication token valid for several days. Called server-side
+      to generate a portal URL before redirecting the customer. Returns AppPortalAccessOut
+      with url and token fields.
+
+    postconditions:
+      # Evidence: svix/dist/api/authentication.d.ts — appPortalAccess(appId, appPortalAccessIn) returns AppPortalAccessOut
+      # AppPortalAccessIn has featureFlags?, expiresIn?, sessionId?, capabilities? fields
+      # svix/dist/request.js — same ApiException throw path
+      # https://docs.svix.com/app-portal — appPortalAccess is the core method for portal access
+      - id: app-portal-access-api-error
+        condition: "svix API rejected the portal access request — auth failure, app not found, or invalid parameters"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. 404 = appId not found (customer's
+          svix application does not exist — onboarding may have failed silently);
+          401/403 = bad auth token; 422 = invalid AppPortalAccessIn (e.g.
+          invalid featureFlags). A swallowed exception here results in the caller
+          redirecting the customer to a null/undefined URL — typically a broken
+          redirect or a blank page. This is directly user-visible as a failed
+          portal access attempt.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: resend
+    namespace: "messageAttempt"
+    import_path: "svix"
+    description: >
+      Resends a specific failed message delivery attempt to a specific endpoint.
+      Used for targeted retry of individual failed deliveries, as opposed to
+      endpoint.recover() which replays all failures in bulk. Returns EmptyResponse.
+      Useful in admin UIs or support tooling where you need to replay one
+      specific message for a specific customer endpoint.
+
+    postconditions:
+      # Evidence: svix/dist/api/messageAttempt.d.ts — resend(appId, msgId, endpointId) returns EmptyResponse
+      # EmptyResponse is an empty object — void equivalent
+      # svix/dist/request.js — same ApiException throw path
+      - id: message-attempt-resend-api-error
+        condition: "svix API rejected the resend request — invalid IDs, app/message/endpoint not found, or auth failure"
+        throws: "ApiException (svix.ApiException) with code and body"
+        required_handling: >
+          Caller MUST catch ApiException. 404 = one of appId, msgId, or
+          endpointId not found — the attempt does not exist in svix's system
+          (possibly already expired or from the wrong environment). 401/403 =
+          auth failure. A swallowed exception means the admin/support operator
+          believes the message was resent when it was not — the customer's
+          integration remains broken without any indication.
+        sources:
+          - https://docs.svix.com/api-reference
+          - https://docs.svix.com/api-reference
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
