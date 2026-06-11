@@ -146,8 +146,7 @@ export async function startDevServerWithCatch() {
 
 export async function listenNoCatch() {
   const server = await createServer({ server: { port: 3001, strictPort: true } });
-  // SHOULD_FIRE: server-listen-port-conflict — server.listen() without try-catch
-  // If port 3001 is in use, throws Error("Port 3001 is already in use")
+  // SHOULD_FIRE: server-listen-port-conflict — server.listen() without try-catch; if port 3001 is in use, throws Error("Port 3001 is already in use")
   await server.listen();
 }
 
@@ -169,8 +168,7 @@ export async function listenWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function restartNoCatch(server: Awaited<ReturnType<typeof createServer>>) {
-  // SHOULD_FIRE: server-restart-port-conflict — server.restart() without try-catch
-  // If restart fails due to port conflict, throws and server is left in closed state
+  // SHOULD_FIRE: server-restart-port-conflict — server.restart() without try-catch; if restart fails due to port conflict, throws and server is left in closed state
   await server.restart();
 }
 
@@ -190,8 +188,7 @@ export async function restartWithCatch(server: Awaited<ReturnType<typeof createS
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function resolveConfigNoCatch() {
-  // SHOULD_FIRE: resolveconfig-config-hook-throws — resolveConfig() without try-catch
-  // If a plugin config hook throws, the error propagates unhandled
+  // SHOULD_FIRE: resolveconfig-config-hook-throws — resolveConfig() without try-catch; if a plugin config hook throws, the error propagates unhandled
   const resolved = await resolveConfig({}, "build");
   return resolved;
 }
@@ -212,8 +209,7 @@ export async function resolveConfigWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function loadConfigNoCatch() {
-  // SHOULD_FIRE: loadconfig-not-an-object — loadConfigFromFile() without try-catch
-  // Throws if config file exports a non-object (e.g., a string or number)
+  // SHOULD_FIRE: loadconfig-not-an-object — loadConfigFromFile() without try-catch; throws if config file exports a non-object (e.g., a string or number)
   const result = await loadConfigFromFile({ mode: "development", command: "build", isSsrBuild: false, isPreview: false });
   return result;
 }
@@ -234,8 +230,7 @@ export async function loadConfigWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function createBuilderNoCatch() {
-  // SHOULD_FIRE: createbuilder-config-resolution-failure — createBuilder() without try-catch
-  // If config has errors or environment init fails, throws unhandled
+  // SHOULD_FIRE: createbuilder-config-resolution-failure — createBuilder() without try-catch; if config has errors or environment init fails, throws unhandled
   const builder = await createBuilder({});
   return builder;
 }
@@ -256,9 +251,7 @@ export async function createBuilderWithCatch() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function transformCodeNoCatch(code: string, filename: string) {
-  // SHOULD_FIRE: transformwithoxc-parse-error — transformWithOxc() without try-catch
-  // If code has syntax errors, throws Error("Transform failed with N error(s):...")
-  // with .errors array containing OxcTransformError objects
+  // SHOULD_FIRE: transformwithoxc-parse-error — transformWithOxc() without try-catch; if code has syntax errors, throws Error("Transform failed with N error(s):...") with .errors array containing OxcTransformError objects
   const result = await transformWithOxc(code, filename, {});
   return result;
 }
