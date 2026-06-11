@@ -5,11 +5,6 @@
  * Each SHOULD_FIRE annotation maps to a postcondition in contract.yaml.
  * Each SHOULD_NOT_FIRE annotation confirms the analyzer does not false-positive.
  *
- * Note: The yup analyzer has a known limitation — schema instances created by
- * factory functions (Yup.object(), Yup.string(), etc.) cannot currently be
- * tracked by the analyzer. Detection rate is 0% until factory-method tracking
- * is implemented. These annotations document the DESIRED behavior.
- *
  * Postcondition IDs:
  *   validate-rejects                    — validate() without try-catch
  *   validatesync-throws                 — validateSync() without try-catch
@@ -43,14 +38,14 @@ const schemaWithAsyncTest = Yup.object({
 // validate() — SHOULD_FIRE cases
 // ============================================================
 
-// SHOULD_FIRE: validate-rejects — validate() awaited without try-catch
 async function validateNoTryCatch(data: unknown) {
+  // SHOULD_FIRE: validate-rejects — validate() awaited without try-catch
   const valid = await userSchema.validate(data);
   return valid;
 }
 
-// SHOULD_FIRE: validate-rejects — validate() in async arrow without try-catch
 const validateArrowNoTryCatch = async (data: unknown) => {
+  // SHOULD_FIRE: validate-rejects — validate() in async arrow without try-catch
   return await userSchema.validate(data);
 };
 
@@ -58,8 +53,8 @@ const validateArrowNoTryCatch = async (data: unknown) => {
 // validateSync() — SHOULD_FIRE cases
 // ============================================================
 
-// SHOULD_FIRE: validatesync-throws — validateSync() without try-catch
 function validateSyncNoTryCatch(data: unknown) {
+  // SHOULD_FIRE: validatesync-throws — validateSync() without try-catch
   const valid = userSchema.validateSync(data);
   return valid;
 }
@@ -68,8 +63,8 @@ function validateSyncNoTryCatch(data: unknown) {
 // validateAt() — SHOULD_FIRE cases
 // ============================================================
 
-// SHOULD_FIRE: validateat-rejects — validateAt() awaited without try-catch
 async function validateAtNoTryCatch(data: unknown) {
+  // SHOULD_FIRE: validateat-rejects — validateAt() awaited without try-catch
   const valid = await userSchema.validateAt('email', data);
   return valid;
 }
@@ -78,8 +73,8 @@ async function validateAtNoTryCatch(data: unknown) {
 // isValid() — SHOULD_FIRE cases
 // ============================================================
 
-// SHOULD_FIRE: isvalid-non-validation-error-rethrows — isValid() without catch on schema with async test
 async function isValidWithoutCatch(data: unknown) {
+  // SHOULD_FIRE: isvalid-non-validation-error-rethrows — isValid() without catch on schema with async test
   const valid = await schemaWithAsyncTest.isValid(data);
   return valid;
 }
@@ -88,14 +83,14 @@ async function isValidWithoutCatch(data: unknown) {
 // cast() — SHOULD_FIRE cases
 // ============================================================
 
-// SHOULD_FIRE: cast-type-error — cast() called without try-catch
 function castWithoutTryCatch(rawInput: unknown) {
+  // SHOULD_FIRE: cast-type-error — cast() called without try-catch
   const num = Yup.number().cast(rawInput);
   return num;
 }
 
-// SHOULD_FIRE: cast-type-error — cast() on object schema without try-catch
 function castObjectWithoutTryCatch(rawInput: unknown) {
+  // SHOULD_FIRE: cast-type-error — cast() on object schema without try-catch
   const obj = userSchema.cast(rawInput);
   return obj;
 }
@@ -104,9 +99,9 @@ function castObjectWithoutTryCatch(rawInput: unknown) {
 // validate() — SHOULD_NOT_FIRE cases (proper error handling)
 // ============================================================
 
-// SHOULD_NOT_FIRE: validate() with try-catch — proper error handling
 async function validateWithTryCatch(data: unknown) {
   try {
+    // SHOULD_NOT_FIRE: validate() with try-catch — proper error handling
     const valid = await userSchema.validate(data);
     return valid;
   } catch (error) {
@@ -117,8 +112,8 @@ async function validateWithTryCatch(data: unknown) {
   }
 }
 
-// SHOULD_NOT_FIRE: validate() with .catch() chained
 async function validateWithCatchChain(data: unknown) {
+  // SHOULD_NOT_FIRE: validate() with .catch() chained
   return userSchema.validate(data)
     .then(valid => valid)
     .catch(error => {
@@ -130,9 +125,9 @@ async function validateWithCatchChain(data: unknown) {
 // validateSync() — SHOULD_NOT_FIRE cases
 // ============================================================
 
-// SHOULD_NOT_FIRE: validateSync() with try-catch — proper error handling
 function validateSyncWithTryCatch(data: unknown) {
   try {
+    // SHOULD_NOT_FIRE: validateSync() with try-catch — proper error handling
     const valid = userSchema.validateSync(data);
     return valid;
   } catch (error) {
@@ -147,9 +142,9 @@ function validateSyncWithTryCatch(data: unknown) {
 // isValid() — SHOULD_NOT_FIRE cases
 // ============================================================
 
-// SHOULD_NOT_FIRE: isValid() with try-catch — handles non-ValidationError from async tests
 async function isValidWithTryCatch(data: unknown) {
   try {
+    // SHOULD_NOT_FIRE: isValid() with try-catch — handles non-ValidationError from async tests
     const valid = await schemaWithAsyncTest.isValid(data);
     return valid;
   } catch (error) {
@@ -159,8 +154,8 @@ async function isValidWithTryCatch(data: unknown) {
   }
 }
 
-// SHOULD_NOT_FIRE: isValid() with .catch() chained
 async function isValidWithCatchFallback(data: unknown) {
+  // SHOULD_NOT_FIRE: isValid() with .catch() chained
   return schemaWithAsyncTest.isValid(data).catch(() => false);
 }
 
@@ -168,9 +163,9 @@ async function isValidWithCatchFallback(data: unknown) {
 // cast() — SHOULD_NOT_FIRE cases
 // ============================================================
 
-// SHOULD_NOT_FIRE: cast() with try-catch — handles TypeError
 function castWithTryCatch(rawInput: unknown) {
   try {
+    // SHOULD_NOT_FIRE: cast() with try-catch — handles TypeError
     const num = Yup.number().cast(rawInput);
     return num;
   } catch (error) {
@@ -181,8 +176,8 @@ function castWithTryCatch(rawInput: unknown) {
   }
 }
 
-// SHOULD_NOT_FIRE: cast() with assert: false — returns null instead of throwing
 function castWithAssertFalse(rawInput: unknown) {
+  // SHOULD_NOT_FIRE: cast() with assert: false — returns null instead of throwing
   const result = Yup.number().cast(rawInput, { assert: false });
   return result;
 }
