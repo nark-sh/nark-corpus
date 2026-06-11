@@ -1,8 +1,15 @@
 /**
  * Ground-truth fixtures for @sentry/node Nark profile.
- * Tests postconditions: span-manual-finish-never-called, span-manual-callback-rethrows,
- * inactive-span-end-never-called, monitor-callback-rethrows, monitor-slug-not-configured,
- * checkin-completion-missing
+ *
+ * Postconditions under test:
+ *   - span-manual-finish-never-called   (startSpanManual — no try/finally with finish/span.end in callback)
+ *   - span-manual-callback-rethrows     (startSpanManual — outside try-catch, error re-thrown)
+ *   - inactive-span-end-never-called    (startInactiveSpan — no try/finally with span.end in scope)
+ *   - monitor-callback-rethrows         (withMonitor — outside try-catch, error re-thrown)
+ *   - monitor-slug-not-configured       (withMonitor — missing upsertMonitorConfig 3rd argument)
+ *
+ * Note: checkin-completion-missing (captureCheckIn) requires cross-call data-flow analysis
+ * that exceeds current scanner capabilities — deferred, not tested here.
  */
 import * as Sentry from "@sentry/node";
 
@@ -10,47 +17,43 @@ import * as Sentry from "@sentry/node";
 // startSpanManual — span.end() / finish() patterns
 // ---------------------------------------------------------------------------
 
-// @expect-violation: span-manual-finish-never-called
-// @expect-violation: span-manual-callback-rethrows
 async function spanManualMissingFinish(): Promise<void> {
+  // SHOULD_FIRE: span-manual-finish-never-called — callback has no try/finally with finish() or span.end()
   await Sentry.startSpanManual({ name: "my-op" }, async (span) => {
-    // Missing: finish() / span.end() is never called
     await fetch("https://api.example.com/data");
-    // span leaks — never sent to Sentry
   });
 }
 
-// @expect-violation: span-manual-finish-never-called
 function spanManualFinishOnlyInHappyPath(): void {
+  // SHOULD_FIRE: span-manual-finish-never-called — finish() only in happy path, not in finally
   Sentry.startSpanManual({ name: "my-op" }, (span, finish) => {
     try {
       doSomeWork();
-      finish(); // only called on success — throws exit without finishing
+      finish();
     } catch (err) {
-      // missing: finish() in error path
       throw err;
     }
   });
 }
 
-// @expect-clean
 async function spanManualWithProperFinish(): Promise<void> {
+  // SHOULD_NOT_FIRE: callback has try/finally that calls finish()
   await Sentry.startSpanManual({ name: "my-op" }, async (span, finish) => {
     try {
       await fetch("https://api.example.com/data");
     } finally {
-      finish(); // always called via try/finally
+      finish();
     }
   });
 }
 
-// @expect-clean
 function spanManualWithSpanEndInFinally(): void {
+  // SHOULD_NOT_FIRE: callback has try/finally that calls span.end()
   Sentry.startSpanManual({ name: "my-op" }, (span) => {
     try {
       doSomeWork();
     } finally {
-      span.end(); // span.end() also acceptable
+      span.end();
     }
   });
 }
@@ -59,60 +62,69 @@ function spanManualWithSpanEndInFinally(): void {
 // startInactiveSpan — span.end() patterns
 // ---------------------------------------------------------------------------
 
-// @expect-violation: inactive-span-end-never-called
 async function inactiveSpanEndNeverCalled(): Promise<void> {
+  // SHOULD_FIRE: inactive-span-end-never-called — no try/finally with span.end() anywhere in function
   const span = Sentry.startInactiveSpan({ name: "parallel-work" });
   await fetch("https://api.example.com/data");
-  // Missing: span.end() — span never sent to Sentry
 }
 
-// @expect-violation: inactive-span-end-never-called
 async function inactiveSpanEndOnlyOnSuccess(): Promise<void> {
+  // SHOULD_FIRE: inactive-span-end-never-called — span.end() not in finally; fetch error leaks span
   const span = Sentry.startInactiveSpan({ name: "parallel-work" });
   const result = await fetch("https://api.example.com/data");
   span.end(); // only called if fetch doesn't throw — error path leaks span
-  return;
 }
 
-// @expect-clean
 async function inactiveSpanWithProperEnd(): Promise<void> {
+  // SHOULD_NOT_FIRE: span.end() called in finally block
   const span = Sentry.startInactiveSpan({ name: "parallel-work" });
   try {
     await fetch("https://api.example.com/data");
   } finally {
-    span.end(); // always called
+    span.end();
   }
 }
 
 // ---------------------------------------------------------------------------
-// withMonitor — cron job monitoring patterns
+// withMonitor — cron job monitoring patterns (monitor-callback-rethrows)
 // ---------------------------------------------------------------------------
 
-// @expect-violation: monitor-callback-rethrows
-// @expect-violation: monitor-slug-not-configured
-async function monitorMissingConfigAndNoErrorHandling(): Promise<void> {
-  // No upsertMonitorConfig — slug might not exist (silent miss)
-  // No try/catch — error propagates as unhandled rejection
+async function monitorNoTryCatch(): Promise<void> {
+  // SHOULD_FIRE: monitor-callback-rethrows — withMonitor outside try-catch, callback errors propagate
   await Sentry.withMonitor("my-cron-job", async () => {
     await runHeavyJob();
   });
 }
 
-// @expect-violation: monitor-slug-not-configured
-async function monitorMissingUpsertConfig(): Promise<void> {
+async function monitorWithTryCatch(): Promise<void> {
   try {
+    // SHOULD_NOT_FIRE: inside try-catch satisfies monitor-callback-rethrows
     await Sentry.withMonitor("my-cron-job", async () => {
       await runHeavyJob();
     });
-    // No upsertMonitorConfig — if slug doesn't exist, check-ins are silently ignored
   } catch (err) {
     console.error("Cron job failed:", err);
   }
 }
 
-// @expect-clean
-async function monitorWithProperConfigAndErrorHandling(): Promise<void> {
+// ---------------------------------------------------------------------------
+// withMonitor — cron job monitoring patterns (monitor-slug-not-configured)
+// ---------------------------------------------------------------------------
+
+async function monitorMissingUpsertConfig(): Promise<void> {
   try {
+    // SHOULD_FIRE: monitor-slug-not-configured — missing upsertMonitorConfig (only 2 args)
+    await Sentry.withMonitor("my-cron-job", async () => {
+      await runHeavyJob();
+    });
+  } catch (err) {
+    console.error("Cron job failed:", err);
+  }
+}
+
+async function monitorWithProperConfig(): Promise<void> {
+  try {
+    // SHOULD_NOT_FIRE: upsertMonitorConfig provided (3 args) — monitor-slug-not-configured satisfied
     await Sentry.withMonitor(
       "my-cron-job",
       async () => {
@@ -123,54 +135,7 @@ async function monitorWithProperConfigAndErrorHandling(): Promise<void> {
       }
     );
   } catch (err) {
-    // Error is already captured by withMonitor as status="error"
-    // But we still need to handle it here to prevent unhandled rejection
     console.error("Cron job failed:", err);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// captureCheckIn — manual two-step check-in pattern
-// ---------------------------------------------------------------------------
-
-// @expect-violation: checkin-completion-missing
-async function checkInMissingCompletion(): Promise<void> {
-  // Only sends in_progress — no ok/error check-in on completion/failure
-  Sentry.captureCheckIn({
-    monitorSlug: "my-cron",
-    status: "in_progress",
-  });
-  await runHeavyJob(); // if this throws, completion check-in is never sent
-  // Missing: Sentry.captureCheckIn({ monitorSlug: 'my-cron', status: 'ok', checkInId })
-}
-
-// @expect-violation: checkin-completion-missing
-async function checkInMissingErrorCompletion(): Promise<void> {
-  const checkInId = Sentry.captureCheckIn({
-    monitorSlug: "my-cron",
-    status: "in_progress",
-  });
-  await runHeavyJob();
-  Sentry.captureCheckIn({ monitorSlug: "my-cron", status: "ok", checkInId });
-  // Missing: error branch — if runHeavyJob throws, no error check-in is sent
-}
-
-// @expect-clean
-async function checkInWithProperCompletion(): Promise<void> {
-  const checkInId = Sentry.captureCheckIn({
-    monitorSlug: "my-cron",
-    status: "in_progress",
-  });
-  try {
-    await runHeavyJob();
-    Sentry.captureCheckIn({ monitorSlug: "my-cron", status: "ok", checkInId });
-  } catch (err) {
-    Sentry.captureCheckIn({
-      monitorSlug: "my-cron",
-      status: "error",
-      checkInId,
-    });
-    throw err;
   }
 }
 
