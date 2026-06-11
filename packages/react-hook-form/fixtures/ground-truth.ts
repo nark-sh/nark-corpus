@@ -238,7 +238,7 @@ export function triggerResultNotAwaited() {
 
   const handleNextStep = () => {
     // @expect-violation: trigger-result-not-awaited
-    // SHOULD_FIRE: trigger() not awaited — result is Promise (always truthy), validation ignored
+    // SHOULD_FIRE: trigger-result-not-awaited — trigger() not awaited; result is Promise (always truthy), validation ignored
     const isValid = form.trigger('email');
     if (isValid) {
       console.log('advancing step');
@@ -272,7 +272,7 @@ declare const fetchUserProfile: () => Promise<{ name: string; email: string }>;
 
 export function useFormWithAsyncDefaultsNoErrorHandling() {
   // @expect-violation: async-default-values-unhandled-rejection
-  // SHOULD_FIRE: async defaultValues function can throw — no try-catch inside
+  // SHOULD_FIRE: async-default-values-unhandled-rejection — async defaultValues function can throw, no try-catch inside
   const form = useForm<FormData>({
     defaultValues: async () => {
       const profile = await fetchUserProfile();
