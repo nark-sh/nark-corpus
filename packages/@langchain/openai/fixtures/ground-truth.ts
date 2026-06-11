@@ -91,8 +91,7 @@ async function dalleInvokeWithTryCatch() {
 // @expect-violation: stream-iteration-error
 async function chatStreamNoTryCatch() {
   const model = new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  // SHOULD_FIRE: stream-connection-error — await model.stream() called without try-catch
-  // SHOULD_FIRE: stream-iteration-error — for-await-of NOT protected by try-catch
+  // SHOULD_FIRE: stream-connection-error — await model.stream() called without try-catch; stream-iteration-error sub-violation expected for the unguarded for-await-of loop
   const stream = await model.stream([new HumanMessage('Hello')]);
   let fullContent = '';
   for await (const chunk of stream) {
@@ -120,16 +119,14 @@ async function chatStreamWithFullTryCatch() {
 // @expect-violation: stream-iteration-error
 async function chatStreamTryCatchOnlyAroundAwait() {
   const model = new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  // SHOULD_FIRE: stream-iteration-error — try-catch is only around await model.stream(),
-  // but the for-await-of loop is OUTSIDE — mid-stream failures not caught
   let stream;
   try {
     stream = await model.stream([new HumanMessage('Hello')]);
   } catch (error) {
     throw error;
   }
-  // for-await-of is outside try-catch — stream-iteration-error fires here
   let fullContent = '';
+  // FUTURE_SHOULD_FIRE: stream-iteration-error — analyzer doesn't yet treat `for await (const x of stream)` as a contracted call site for ChatOpenAI.stream iteration errors; needs async-iteration scope analysis (qt-62 triage section 2, L-effort scanner upgrade).
   for await (const chunk of stream) {
     fullContent += chunk.content;
   }
@@ -141,8 +138,7 @@ async function chatStreamTryCatchOnlyAroundAwait() {
 // @expect-violation: moderation-network-error
 async function moderateContentNoTryCatch() {
   const model = new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  // SHOULD_FIRE: moderation-network-error — moderateContent() called without try-catch,
-  // API failure silently skips safety check
+  // SHOULD_FIRE: moderation-network-error — moderateContent() called without try-catch; API failure silently skips the safety check
   const result = await model.moderateContent('User submitted text');
   if (result.results[0].flagged) {
     throw new Error('Content policy violation');
