@@ -17,6 +17,11 @@
  *   - set-conflicting-specification (added 2026-04-20)
  *   - diff-invalid-unit (added 2026-04-20)
  *   - duration-fromobject-non-object-throws (added 2026-04-20)
+ *   - plus-non-duration-throws (added 2026-06-12)
+ *   - minus-non-duration-throws (added 2026-06-12)
+ *   - shiftto-invalid-unit (added 2026-06-12)
+ *   - duration-as-invalid-unit (added 2026-06-12)
+ *   - duration-get-invalid-unit (added 2026-06-12)
  */
 
 import { DateTime, Duration } from 'luxon';
@@ -356,5 +361,152 @@ function parseDurationOrDefault(input: unknown): Duration {
     return Duration.fromObject(durationObj as Record<string, number>);
   } catch (error) {
     throw new Error(`Failed to create Duration: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DateTime.plus — throws InvalidArgumentError for string/null/undefined duration
+// Added 2026-06-12 (deepen-stream-1 pass 2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: plus-non-duration-throws
+// SHOULD_FIRE: plus-non-duration-throws — dt.plus(stringOrNull) throws via Duration.fromDurationLike
+function plusWithStringDuration(gracePeriod: string): DateTime {
+  return DateTime.now().plus(gracePeriod as unknown as Duration); // throws "Unknown duration argument <v> of type string"
+}
+
+// @expect-violation: plus-non-duration-throws
+// SHOULD_FIRE: plus-non-duration-throws — config value may be undefined; plus(undefined) throws
+function plusWithConfigField(config: Record<string, unknown>): DateTime {
+  return DateTime.now().plus(config.gracePeriod as Duration); // throws if config.gracePeriod is undefined/null/string
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — explicit Duration.fromISO conversion with isValid check
+function plusWithProperDurationParsing(gracePeriod: string): DateTime {
+  const dur = Duration.fromISO(gracePeriod);
+  if (!dur.isValid) {
+    throw new Error(`Invalid grace period: ${gracePeriod}`);
+  }
+  try {
+    return DateTime.now().plus(dur);
+  } catch (error) {
+    throw new Error(`Failed to compute expiry: ${error}`);
+  }
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — coerce config value to number with isFinite guard, try-catch
+function plusFromConfigSafe(config: Record<string, unknown>): DateTime {
+  const days = Number(config.termDays);
+  if (!Number.isFinite(days)) {
+    throw new Error('Missing or invalid term days');
+  }
+  try {
+    return DateTime.now().plus({ days });
+  } catch (error) {
+    throw new Error(`Failed to add term days: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DateTime.minus — same throw profile as plus; common for lookback windows
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: minus-non-duration-throws
+// SHOULD_FIRE: minus-non-duration-throws — query string param passed directly to minus()
+function minusWithQueryParam(lookbackParam: string): DateTime {
+  return DateTime.now().minus(lookbackParam as unknown as Duration); // throws on string like "7d"
+}
+
+// @expect-violation: minus-non-duration-throws
+// SHOULD_FIRE: minus-non-duration-throws — optional config field may be undefined
+function minusWithOptionalConfig(retention: unknown): DateTime {
+  return DateTime.now().minus(retention as Duration); // throws if retention is null/undefined
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — validate and coerce, with try-catch
+function minusFromQueryParamSafe(lookbackParam: string): DateTime {
+  const days = Number(lookbackParam);
+  if (!Number.isFinite(days) || days < 0) {
+    throw new Error('Invalid lookback period');
+  }
+  try {
+    return DateTime.now().minus({ days });
+  } catch (error) {
+    throw new Error(`Failed to compute since-date: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Duration.shiftTo — throws InvalidUnitError for unrecognized unit strings
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: shiftto-invalid-unit
+// SHOULD_FIRE: shiftto-invalid-unit — dynamic unit from user input may be invalid
+function shiftToUserUnit(elapsedMs: number, userUnit: string): Duration {
+  return Duration.fromMillis(elapsedMs).shiftTo(userUnit as any); // throws for 'date', 'min', etc.
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — validate against known unit allowlist, with try-catch
+function shiftToValidatedUnit(elapsedMs: number, userUnit: string): Duration {
+  const VALID_UNITS = ['years', 'months', 'weeks', 'days', 'hours', 'minutes', 'seconds', 'milliseconds'];
+  if (!VALID_UNITS.includes(userUnit)) {
+    throw new Error(`Invalid duration unit: ${userUnit}`);
+  }
+  try {
+    return Duration.fromMillis(elapsedMs).shiftTo(userUnit as any);
+  } catch (error) {
+    throw new Error(`Failed to shift duration: ${error}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Duration.as — throws InvalidUnitError via shiftTo() for unrecognized units
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: duration-as-invalid-unit
+// SHOULD_FIRE: duration-as-invalid-unit — dynamic unit string crashes when invalid
+function asUserUnit(elapsedMs: number, userUnit: string): number {
+  return Duration.fromMillis(elapsedMs).as(userUnit as any); // throws for 'min', 'secs', etc.
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — validate unit, with try-catch
+function asValidatedUnit(elapsedMs: number, userUnit: string): number {
+  const VALID_UNITS = ['years', 'months', 'weeks', 'days', 'hours', 'minutes', 'seconds', 'milliseconds'];
+  if (!VALID_UNITS.includes(userUnit)) {
+    return NaN;
+  }
+  try {
+    return Duration.fromMillis(elapsedMs).as(userUnit as any);
+  } catch (error) {
+    return NaN;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Duration.get — throws InvalidUnitError for unrecognized unit strings
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @expect-violation: duration-get-invalid-unit
+// SHOULD_FIRE: duration-get-invalid-unit — dynamic column/unit name crashes when invalid
+function getDurationComponent(duration: Duration, columnName: string): number {
+  return duration.get(columnName as any); // throws for any non-canonical luxon unit
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE — validate column name, with try-catch
+function getDurationComponentSafe(duration: Duration, columnName: string): number {
+  const VALID_UNITS = ['years', 'months', 'weeks', 'days', 'hours', 'minutes', 'seconds', 'milliseconds'];
+  if (!VALID_UNITS.includes(columnName)) {
+    return 0;
+  }
+  try {
+    return duration.get(columnName as any);
+  } catch (error) {
+    return 0;
   }
 }
