@@ -11,6 +11,8 @@
  *   - resend.emails.cancel()     postcondition: emails-cancel-no-error-check
  *   - resend.contacts.create()   postcondition: contacts-create-no-error-check
  *   - resend.broadcasts.send()   postcondition: broadcasts-send-no-error-check
+ *   - resend.events.send()       postcondition: events-send-no-error-check (added 2026-06-11 pass 7)
+ *   - resend.automations.stop()  postcondition: automations-stop-no-error-check (added 2026-06-11 pass 7)
  *
  * Detection pattern:
  *   - Resend is imported from 'resend'
@@ -354,5 +356,60 @@ export async function createWebhookWithCheck(endpoint: string) {
   }
   // CRITICAL: persist signing_secret before deploying the verifying handler
   process.env.RESEND_WEBHOOK_SECRET = data!.signing_secret;
+  return data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. events.send() — trigger a named automation event
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendAutomationEventNoCheck(contactId: string) {
+  // SHOULD_FIRE: events-send-no-error-check — silent failure drops contact out of
+  // automation funnel with no downstream signal.
+  return await resend.events.send({
+    event: 'user.signed_up',
+    contact_id: contactId,
+    payload: { plan: 'pro' },
+  });
+}
+
+export async function sendAutomationEventWithCheck(contactId: string) {
+  // SHOULD_NOT_FIRE: result.error is checked
+  const { data, error } = await resend.events.send({
+    event: 'user.signed_up',
+    contact_id: contactId,
+    payload: { plan: 'pro' },
+  });
+  if (error) {
+    console.error('Automation trigger failed', {
+      event: 'user.signed_up',
+      contactId,
+      error,
+    });
+    throw new Error(`Automation trigger failed: ${error.message}`);
+  }
+  return data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. automations.stop() — halt a running automation
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function stopAutomationNoCheck(automationId: string) {
+  // SHOULD_FIRE: automations-stop-no-error-check — silent failure means the
+  // automation continues to fire while the operator believes it is halted.
+  return await resend.automations.stop(automationId);
+}
+
+export async function stopAutomationWithCheck(automationId: string) {
+  // SHOULD_NOT_FIRE: result.error is checked AND data.status is verified
+  const { data, error } = await resend.automations.stop(automationId);
+  if (error) {
+    console.error('Automation stop failed', { automationId, error });
+    throw new Error(`Automation stop failed: ${error.message}`);
+  }
+  if (data!.status !== 'disabled') {
+    throw new Error(`Automation stop returned unexpected status: ${data!.status}`);
+  }
   return data;
 }

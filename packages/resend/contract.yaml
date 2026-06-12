@@ -10,15 +10,28 @@ package: resend
 semver: ">=3.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.86  # 12 contracted / 14 high-impact contractable (after 2026-06-12 deepen)
-# Effective coverage: 12 contracted / 14 contractable = 0.86
+coverage_score: 1.0  # 14 contracted / 14 high-impact contractable (after 2026-06-11 deepen-stream-1 pass 7)
+# Effective coverage: 14 contracted / 14 contractable = 1.0
+# Raw coverage against 70-method surface = 14/70 = 0.20 — but 56 admin/read-only
+# methods are intentionally omitted (their generic { data, error } silent-failure
+# mode is fully covered by the generic postcondition pattern).
 # API surface re-enumerated 2026-06-12 against resend@6.12.4 (was originally
 # enumerated against v3.x with ~10 methods; v6 now exposes ~70+ methods across
 # 17 sub-clients).
+#
+# Depth pass 2026-06-11 (deepen-stream-1 pass 7):
+# +2 functions: events.send, automations.stop
+# Rationale: these were the 2 high-impact functions identified but not written
+# during the 2026-06-12 pass (which left coverage at 12/14 = 0.86). Both are
+# control-plane mutations where silent failure is uniquely dangerous because
+# the downstream signal is absent (events.send: missed automation triggers
+# leave contacts silently dropped from drip funnels; automations.stop: failed
+# stop during incident response leaves the offending automation spamming
+# customers while the operator believes it is halted).
 #
 # Depth pass 2026-06-12 (deepen-stream-2 pass 3):
 # +6 functions: emails.create, emails.update, batch.create, domains.verify,
@@ -666,6 +679,152 @@ functions:
         severity: error
         business_impact:
           incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: events.send
+    import_path: "resend"
+    description: >
+      Sends a named product engagement event to Resend's automation engine to
+      trigger any matching automations. Added in Resend SDK v6.x as part of the
+      Automations product. Returns { data, error } — does NOT throw. The event
+      is the trigger that fires customer-facing drip campaigns, transactional
+      sequences, and onboarding flows. Silent failure here means the automation
+      never fires — customers stop receiving the welcome/onboarding/reactivation
+      emails that the application thinks were dispatched. Because automations
+      are asynchronous and event-driven, there is no downstream signal that the
+      trigger was lost; the only evidence is the absence of follow-up email
+      activity, which typically goes unnoticed for days.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts — declares
+      #   class Events { send(payload: SendEventOptions): Promise<SendEventResponse>; ... }
+      # SendEventResponse uses the same Response<T> envelope as every other Resend method.
+      # Source: https://resend.com/docs/api-reference/events/send-event
+      # Error vocabulary from https://resend.com/docs/api-reference/errors
+      - id: events-send-no-error-check
+        condition: >
+          events.send() called without checking result.error — silent failure
+          on contact not found (404), restricted API key (401), missing required
+          field (event name / contact_id|email) (422), validation error on
+          payload schema mismatch (400), or rate limit exceeded (429).
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='not_found' (404) — contact_id does not exist in the team's contacts
+          - name='restricted_api_key' (401) — API key is restricted to email-only and cannot trigger automations
+          - name='missing_required_field' (422) — event name, contact_id/email, or payload missing
+          - name='validation_error' (400) — payload does not match the automation's defined event schema
+          - name='rate_limit_exceeded' (429) — burst exceeded team rate limit (5 req/sec)
+          - name='application_error' (500) — backend automation engine errored
+        required_handling: >
+          Caller MUST check result.error after every events.send() call. The
+          subscribed automations downstream are stateful (they advance the
+          contact through an automation funnel), so a missed event silently
+          drops the contact out of the funnel:
+            const { data, error } = await resend.events.send({
+              event: 'user.signed_up',
+              contact_id: contactId,
+              payload: { plan: 'pro', referrer },
+            });
+            if (error) {
+              logger.error('Automation trigger failed', { event: 'user.signed_up', contactId, error });
+              if (error.name === 'rate_limit_exceeded') {
+                // Queue + retry — losing the trigger means the customer never gets
+                // onboarding emails; this is worse than a normal email send failure
+                // because we cannot observe the downstream impact.
+                await queue.enqueue({ kind: 'resend.events.send', event, contactId, payload });
+              } else if (error.name === 'not_found') {
+                // Contact not yet created — call contacts.create first, then retry.
+                throw new Error(`Cannot trigger automation: contact ${contactId} not found`);
+              } else {
+                throw new Error(`Automation trigger failed: ${error.message}`);
+              }
+            }
+          DO NOT fire-and-forget events.send(). The "no downstream evidence"
+          property of automation triggers means silent failures are invisible
+          for days/weeks — by the time the missing drip campaigns are noticed,
+          the affected contacts have already churned without receiving any
+          onboarding nurture.
+        sources:
+          - "https://resend.com/docs/api-reference/events/send-event"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: automations.stop
+    import_path: "resend"
+    description: >
+      Stops a running automation by disabling it. Once stopped, no new contacts
+      enter the automation and no further emails are dispatched from it. Used
+      for incident response (a misconfigured automation is spamming customers),
+      seasonal pause (holiday silence on marketing automations), and decommission
+      (replacing one automation with another). Returns { data, error } — does
+      NOT throw. The response includes status='disabled' on success. Silent
+      failure here is a control-plane risk: the automation continues to fire,
+      emails continue to send, and the operator believes the automation is
+      stopped — exactly the wrong outcome during an incident.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts — declares
+      #   class Automations { stop(id: string): Promise<StopAutomationResponse>; ... }
+      # StopAutomationResponse uses the standard Response<T> envelope.
+      # Source: https://resend.com/docs/api-reference/automations/stop-automation
+      # Error vocabulary from https://resend.com/docs/api-reference/errors
+      - id: automations-stop-no-error-check
+        condition: >
+          automations.stop() called without checking result.error — silent
+          failure if automation_id not found (404), API key restricted (401),
+          automation already disabled (validation_error / 400), or backend
+          error (500). Operator believes automation is stopped; it is not.
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='not_found' (404) — automation_id does not exist or belongs to another team
+          - name='restricted_api_key' (401) — API key is restricted to sending and cannot manage automations
+          - name='validation_error' (400) — automation is in a state that cannot be stopped (already disabled, archived, etc)
+          - name='application_error' (500) — backend control-plane errored
+        required_handling: >
+          Caller MUST check result.error after every automations.stop() call.
+          Because stop is a control-plane action — the caller intends to halt
+          customer-facing email dispatch — silent failure leaves the automation
+          running against the operator's intent:
+            const { data, error } = await resend.automations.stop(automationId);
+            if (error) {
+              logger.error('Automation stop failed', { automationId, error });
+              if (error.name === 'not_found') {
+                // Automation deleted under us — confirm via automations.get() and treat as no-op
+                throw new Error(`Automation ${automationId} not found — cannot stop`);
+              } else if (error.name === 'validation_error') {
+                // Already disabled — log and treat as no-op (idempotent intent)
+                logger.warn('Automation already in stopped state', { automationId });
+              } else {
+                // Backend error during incident response — page on-call immediately
+                throw new Error(`Automation stop failed: ${error.message}`);
+              }
+            } else {
+              // CRITICAL: verify data.status === 'disabled' — successful HTTP does not guarantee state change
+              if (data!.status !== 'disabled') {
+                throw new Error(`Automation stop returned unexpected status: ${data!.status}`);
+              }
+            }
+          DO NOT call automations.stop() and assume success without inspecting
+          both result.error AND result.data.status. During incident response,
+          a silently-failed stop call means the offending automation continues
+          spamming customers while the operator's runbook claims it is halted.
+        sources:
+          - "https://resend.com/docs/api-reference/automations/stop-automation"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
           production_behavior: silent_failure
           visibility: silent
           user_experience: service_unavailable

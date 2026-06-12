@@ -2,6 +2,26 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-11 — deepen pass — coverage 86% → 100%
+
+- **Profile:** `packages/resend/contract.yaml`
+- **Functions added:** events.send, automations.stop (2 total)
+- **Postconditions added:** 2 (`events-send-no-error-check`, `automations-stop-no-error-check`)
+- **Functions intentionally omitted this pass:** None new. The 56 admin/read-only methods omitted in the 2026-06-12 pass remain omitted for the same reasons (generic `{ data, error }` silent-failure mode already covered).
+- **Scanner concerns queued:** 2 (`concern-20260611-resend-deepen-7`, `concern-20260611-resend-deepen-8`)
+- **Scanner version used:** nark@3.0.0 (read from nark-dev/nark/package.json)
+- **Sources fetched:**
+  - https://resend.com/docs/api-reference/events/send-event
+  - https://resend.com/docs/api-reference/automations/stop-automation
+  - https://resend.com/docs/api-reference/errors (re-verified error vocabulary)
+  - `node_modules/resend/dist/index.d.mts` (resend@6.12.2 in papermark test-repo — declares `class Events { send(...): Promise<SendEventResponse>; ... }` and `class Automations { stop(id: string): Promise<StopAutomationResponse>; ... }`)
+- **Key insights:**
+  - These were the 2 functions the 2026-06-12 pass identified as "high-impact contractable" in the 12/14 effective-coverage denominator but did not write postconditions for. Closing the gap to 14/14.
+  - `events.send()` is the Resend v6 Automations product trigger API. Silent failure here is uniquely dangerous because the downstream signal is *absent* — missed drip campaigns leave contacts silently dropped out of automation funnels with no error, no log, no downstream artifact. Often invisible for days/weeks until someone notices customers stopped getting onboarding emails.
+  - `automations.stop()` is the control-plane halt operation. The required handling must check *both* `result.error` AND `result.data.status === 'disabled'` — a successful HTTP response can still carry a non-disabled state on the validation_error path. During incident response, a silently-failed stop call leaves the offending automation spamming customers while the operator's runbook claims it is halted.
+- **Effective coverage:** 14/14 high-impact contractable methods = 1.0. Raw score against the 70-method surface = 0.20, but the 56 admin/read-only omissions are the correct call (their generic `{ data, error }` silent-failure mode is already covered by the standing postcondition pattern).
+- **Verified by:** bc-deepen-contract (deepen-stream-1 pass 7 on 2026-06-11)
+
 ## 2026-06-12 — deepen pass — coverage 60% → 86%
 
 - **Profile:** `packages/resend/contract.yaml`
