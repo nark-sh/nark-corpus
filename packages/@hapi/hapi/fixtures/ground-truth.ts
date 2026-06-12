@@ -193,6 +193,87 @@ export async function authVerifyWithCatch(server: Hapi.Server, request: Hapi.Req
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. server.inject() — SHOULD_FIRE (deepen-pass 2026-06-12)
+// ─────────────────────────────────────────────────────────────────────────────
+// New postconditions added 2026-06-12; no scanner detection rule yet — tests are
+// spec documentation until bc-scanner-upgrade implements the rules.
+
+export async function injectNoCatch(server: Hapi.Server) {
+  // SHOULD_FIRE: inject-handler-throws-boom-error — inject() rethrows handler errors
+  // (Boom or arbitrary thrown values) as part of the request lifecycle. Unhandled
+  // rejections crash test runners and serverless function invocations.
+  const res = await server.inject({ method: 'GET', url: '/users/123' });
+  return res.result;
+}
+
+export async function injectWithDeprecatedCredentialsNoCatch(server: Hapi.Server) {
+  // SHOULD_FIRE: inject-deprecated-credentials-option — options.credentials was removed in
+  // hapi 17+; passing it throws AssertionError synchronously inside the async body.
+  // Common when migrating legacy hapi 16 test code.
+  const res = await server.inject({
+    method: 'GET',
+    url: '/private',
+    // @ts-expect-error — exercising the deprecated option path on purpose
+    credentials: { user: 'alice' },
+  });
+  return res;
+}
+
+export async function injectWithMalformedAuthNoCatch(server: Hapi.Server, mockAuth: any) {
+  // SHOULD_FIRE: inject-auth-options-malformed — if mockAuth is missing .strategy or
+  // .credentials, or is a primitive, Hoek.assert fires before any request runs.
+  const res = await server.inject({
+    method: 'POST',
+    url: '/admin/users',
+    auth: mockAuth,
+  });
+  return res;
+}
+
+export async function injectInServerlessAdapterNoCatch(
+  server: Hapi.Server,
+  event: { method: string; url: string; payload?: unknown }
+) {
+  // SHOULD_FIRE: inject-handler-throws-boom-error — serverless adapters frequently translate
+  // cloud-event payloads through inject() with no try-catch, causing Lambda retry storms.
+  return server.inject({
+    method: event.method as Hapi.Util.HTTP_METHODS,
+    url: event.url,
+    payload: event.payload,
+  });
+}
+
+// SHOULD_NOT_FIRE: inject wrapped in try-catch
+export async function injectWithCatch(server: Hapi.Server) {
+  try {
+    const res = await server.inject({ method: 'GET', url: '/users/123' });
+    return res.result;
+  } catch (error) {
+    // error.data carries the partial response per official docs
+    console.error('inject failed:', error);
+    throw error;
+  }
+}
+
+// SHOULD_NOT_FIRE: serverless adapter with try-catch and Boom-aware error translation
+export async function injectInServerlessAdapterWithCatch(
+  server: Hapi.Server,
+  event: { method: string; url: string; payload?: unknown }
+) {
+  try {
+    return await server.inject({
+      method: event.method as Hapi.Util.HTTP_METHODS,
+      url: event.url,
+      payload: event.payload,
+    });
+  } catch (err) {
+    // Translate handler-thrown errors into a 500-equivalent cloud response instead
+    // of letting the function invocation crash and trigger retries.
+    return { statusCode: 500, headers: {}, payload: JSON.stringify({ error: 'handler-failed' }) };
+  }
+}
+
 // SHOULD_NOT_FIRE: full lifecycle with proper error handling
 export async function fullLifecycleWithCatch() {
   const server = Hapi.server({ port: 3000, host: 'localhost' });

@@ -2,11 +2,11 @@ package: "@hapi/hapi"
 semver: ">=21.0.0 <22.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83
+coverage_score: 1.0  # 8/8 contracted/non-omitted (12 total async-callable, 4 intentionally omitted: cache.provision, states.format, states.parse, events.once — all near-zero corpus usage)
 
 detection:
   type_names:
@@ -318,6 +318,86 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: inject
+    import_path: "@hapi/hapi"
+    description: >
+      Programmatically dispatches a simulated request through the full hapi request lifecycle without
+      opening a real HTTP listener. Returns a ServerInjectResponse with the rendered response (statusCode,
+      headers, payload). Used pervasively in hapi unit/integration tests to exercise routes, in
+      serverless adapters that translate cloud-event payloads into hapi requests, and in admin tooling
+      that needs to invoke an authenticated handler internally. Errors surface in two distinct ways:
+      synchronously via Hoek.assert option validation, and asynchronously via the handler's own throw
+      (rethrown by inject when a route handler sets a custom error on the response symbol).
+    postconditions:
+      # Evidence: lib/server.js inject() lines 306-360 — explicit Hoek.assert for !options.credentials
+      #           (deprecation guard), and three more asserts validating options.auth shape when present
+      #           (auth must be object, must have .credentials, must have .strategy).
+      #           Custom handler errors are rethrown via `throw custom.error` at line 351-352.
+      # Source: https://github.com/hapijs/hapi/blob/master/API.md#serverinjectoptions (server.inject "Throws a Boom error if the request processing fails. The partial response object is exposed on the data property.")
+      - id: inject-deprecated-credentials-option
+        condition: "options.credentials passed to server.inject() — removed in hapi 17+, replaced by options.auth"
+        throws: "AssertionError: 'options.credentials no longer supported (use options.auth)'"
+        required_handling: >
+          Migrate to options.auth = { strategy: <name>, credentials: <obj> } before calling inject().
+          The legacy options.credentials shape throws synchronously inside inject's async body,
+          producing an unhandled rejection if the test/integration code does not await + try-catch.
+          A common failure mode is older test suites copied from hapi 16 code that never get
+          updated — every call site silently breaks at runtime, not at type-check time.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: inject-auth-options-malformed
+        condition: "options.auth provided but missing required shape (not an object, or missing .credentials, or missing .strategy)"
+        throws: "AssertionError: 'options.auth must be an object' / 'options.auth.credentials is missing' / 'options.auth.strategy is missing'"
+        required_handling: >
+          Wrap server.inject() in try-catch when options.auth is constructed dynamically
+          (e.g. from a test factory or a stored mock credentials object). All three asserts
+          fire BEFORE any request lifecycle code runs, so the failure is purely a config
+          shape issue — but it produces a synchronous throw inside the async function that
+          becomes an unhandled promise rejection if uncaught. Validate the auth object shape
+          at the call site, or normalize through a typed helper that asserts the shape before
+          passing to inject().
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: inject-handler-throws-boom-error
+        condition: "route handler throws (or returns a rejected promise) during the simulated request, OR request processing fails inside hapi internals (validation, auth, pre-handlers)"
+        throws: "Boom error (the partial ServerInjectResponse is exposed on .data per official docs). Custom handler errors are rethrown via `throw custom.error` in lib/server.js line 351-352."
+        required_handling: >
+          Wrap server.inject() in try-catch in test and adapter code paths. Unlike the live
+          HTTP server (which sends a 500 response to the client), inject() rethrows the
+          handler's error to the caller. Serverless adapters (Lambda, Cloud Functions) that
+          translate cloud-event payloads through inject() will crash the function invocation
+          and trigger a retry storm if the underlying handler error is not caught and
+          translated into a domain-appropriate response. Tests that don't catch this end up
+          as unhandled promise rejections that crash the test runner instead of failing the
+          specific assertion. The error.data property carries the partial response (status
+          code reached, headers set) — useful for diagnostic logging.
+        sources:
+          - "https://github.com/hapijs/hapi/blob/master/lib/server.js"
+          - "https://github.com/hapijs/hapi/blob/master/API.md#serverinjectoptions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 edge_cases:
   - id: centralized-error-handling
     description: "Configure onPreResponse extension point for centralized error handling - ensures consistent error responses across all routes and proper error formatting"
@@ -332,7 +412,8 @@ edge_cases:
       incident_cost_range: medium
 
 # Category: framework
-# Latest version: 21.4.6
+# Latest version: 21.4.9
 # Generated: 2026-02-26
 # Audited: 2026-04-11
 # Deepened: 2026-04-11 (deepen-stream-1 pass 4)
+# Deepened: 2026-06-12 (deepen-stream-1 pass 7) — +inject (3 postconditions)
