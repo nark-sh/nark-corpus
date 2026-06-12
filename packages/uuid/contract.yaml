@@ -21,16 +21,43 @@
 #   node_modules/uuid/dist/v4.js — Error('Random bytes length must be >= 16') and RangeError
 #   node_modules/uuid/dist/v7.js — same RangeError/Error as v4
 #   https://github.com/uuidjs/uuid#readme
+#
+# Depth pass 2026-06-12 (deepen-stream-2 pass 5):
+# Triggered by uuid@14.0.0 changelog discovered via bc-version-drift sweep 2026-06-11:
+# "v3/v5/v6 now throw RangeError if offset < 0 or offset + 16 > buf.length" —
+# a new error class on the v3/v5 explicit-buffer-API path that the pre-v14 profile
+# did not cover. Re-enumerated full surface against uuid@14.0.0 (installed in
+# /private/tmp/claude/bc-deepen/uuid). Export list unchanged from uuid@10+.
+# +2 postconditions on existing functions:
+#   v3: + v3-buffer-offset-out-of-bounds (new RangeError class in v14)
+#   v5: + v5-buffer-offset-out-of-bounds (new RangeError class in v14)
+# +1 new function contracted: stringify (was previously omitted as "internal utility")
+#   - stringify-invalid-bytes: TypeError('Stringified UUID is invalid') for
+#     bytes that don't encode a valid RFC 4122 UUID — fires when reading from
+#     binary DB columns, network bytes, or hand-rolled test fixtures.
+# Coverage after: 8 contracted / 10 total callable = 0.80 (3 omitted: v1, v6, v1ToV6, v6ToV1)
+# Effective coverage: 8/(8+0) = 1.0 since all error-bearing callable funcs are covered.
+# Note: v1 and v6 remain omitted with rationale "same error profile as v4/v7 plus low
+# usage in modern SaaS code" — they SHOULD inherit the new buf-offset RangeError
+# as well, but the omission stands because the v1/v6 buf-offset RangeError already
+# existed pre-v14 (v14 only newly added it for v3/v5/v6 — v1/v4/v7 already had it).
+# v1ToV6/v6ToV1 remain omitted — internal parse() call inherits parse-invalid-uuid.
+# Evidence sources for this pass:
+#   node_modules/uuid/dist/v35.js lines 27-30 (buffer offset RangeError)
+#   node_modules/uuid/dist/stringify.js lines 30-33 (TypeError on invalid bytes)
+#   https://github.com/uuidjs/uuid/blob/main/CHANGELOG.md#1400
+#   https://github.com/uuidjs/uuid#uuidstringifyarr-offset
 package: uuid
 semver: ">=9.0.0 <15.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.70  # 7 contracted / 10 total callable (4 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 7/7 = 1.0
+coverage_score: 0.67  # 8 contracted / 12 total callable (4 intentionally omitted: v1, v6, v1ToV6, v6ToV1)
+# Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
+# Depth pass 2026-06-12 added: stringify function + buf-offset postconditions on v3 and v5
 
 detection:
   type_names:
@@ -443,6 +470,60 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+      # Evidence: uuid@14.0.0 changelog — "v3/v5/v6 now throw RangeError if offset < 0
+      # or offset + 16 > buf.length" — security tightening for callers using the
+      # explicit buffer/offset API. Pre-v14 the check existed for v1/v4/v7 but not
+      # v3/v5/v6. Source: node_modules/uuid/dist/v35.js lines 27-30:
+      #   if (offset < 0 || offset + 16 > buf.length) {
+      #     throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
+      #   }
+      - id: v3-buffer-offset-out-of-bounds
+        condition: >
+          v3() is called with an explicit `buf` Uint8Array argument AND an `offset`
+          argument that is negative or would write past the buffer end. New in uuid@14.0.0
+          (v3/v5/v6 previously silently wrote past buffer end). Common in serialization
+          paths that pre-allocate a fixed-size buffer for many UUIDs (e.g., binary
+          protocols that pack multiple UUIDs into one buffer). Triggers when:
+          - offset < 0 (negative offset — common typo from offset-- underflow)
+          - offset + 16 > buf.length (insufficient room — common when buffer size
+            calculation is off-by-one or doesn't account for the 16 bytes per UUID)
+          - Writing many UUIDs in a loop where offset increments incorrectly past buf.length
+        throws: >
+          RangeError with message 'UUID byte range <offset>:<offset+15> is out of buffer bounds'.
+          NOT a TypeError — this is a RangeError, which inherits from Error but is a
+          distinct subclass. Catching only TypeError will miss this.
+        required_handling: >
+          When using the explicit buffer API, validate offset and buffer size first:
+
+            import { v3 } from 'uuid';
+
+            // Pre-allocate enough space for N UUIDs
+            const N = 100;
+            const buf = new Uint8Array(N * 16);
+
+            for (let i = 0; i < N; i++) {
+              const offset = i * 16;
+              // Defensive check (in addition to the runtime throw)
+              if (offset + 16 > buf.length) {
+                throw new Error(`Buffer too small: need ${(i + 1) * 16}, have ${buf.length}`);
+              }
+              v3(`item-${i}`, v3.URL, buf, offset);
+            }
+
+          For the common case (no explicit buffer), this postcondition does not apply —
+          v3() returns a new string and never throws RangeError.
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv3name-namespace-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v35.ts"
+          - "https://github.com/uuidjs/uuid/blob/main/CHANGELOG.md#1400"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
   - name: v5
     import_path: "uuid"
     description: >
@@ -490,6 +571,133 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+      # Evidence: uuid@14.0.0 changelog — "v3/v5/v6 now throw RangeError if offset < 0
+      # or offset + 16 > buf.length" — security tightening for callers using the
+      # explicit buffer/offset API. v5 uses the same internal v35() function as v3,
+      # so the same buffer/offset check applies. Source: node_modules/uuid/dist/v35.js
+      # lines 27-30 (same as v3).
+      - id: v5-buffer-offset-out-of-bounds
+        condition: >
+          v5() is called with an explicit `buf` Uint8Array argument AND an `offset`
+          argument that is negative or would write past the buffer end. New in uuid@14.0.0.
+          Identical mechanism to v3-buffer-offset-out-of-bounds since both v3 and v5
+          route through the same internal v35() function. Common in protocol-level code
+          that pre-allocates buffers for many stable IDs (e.g., generating IDs from a
+          batch of URLs and packing all 16-byte UUIDs into one Uint8Array).
+        throws: >
+          RangeError with message 'UUID byte range <offset>:<offset+15> is out of buffer bounds'.
+          NOT a TypeError — this is a RangeError. Code that catches only TypeError
+          (from the existing v5-invalid-namespace path) will miss this and crash.
+        required_handling: >
+          When using the explicit buffer API, validate buffer size and offset first:
+
+            import { v5 } from 'uuid';
+
+            const urls = ['https://a.com', 'https://b.com', 'https://c.com'];
+            const buf = new Uint8Array(urls.length * 16);
+
+            urls.forEach((url, i) => {
+              const offset = i * 16;
+              if (offset + 16 > buf.length) {
+                throw new Error('Buffer too small for batch');
+              }
+              v5(url, v5.URL, buf, offset);
+            });
+
+          For the common case (no explicit buffer), this postcondition does not apply.
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv5name-namespace-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v35.ts"
+          - "https://github.com/uuidjs/uuid/blob/main/CHANGELOG.md#1400"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: stringify
+    import_path: "uuid"
+    description: >
+      Converts a 16-byte Uint8Array to a UUID string. Synchronous. The reverse of
+      parse(). Validates the resulting string against the UUID regex and throws
+      TypeError('Stringified UUID is invalid') if the byte array does not produce
+      a valid UUID format. Less commonly called directly — most apps call parse()/v4()
+      and never round-trip through bytes. Used by: binary database adapters (storing
+      UUIDs as bytes in MySQL BINARY(16) / PostgreSQL bytea then converting back to
+      strings for display), protocol-level code that ships raw UUID bytes over the wire.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/stringify.js (uuid@14.0.0):
+      #   function stringify(arr, offset = 0) {
+      #     const uuid = unsafeStringify(arr, offset);
+      #     if (!validate(uuid)) {
+      #       throw TypeError('Stringified UUID is invalid');
+      #     }
+      #     return uuid;
+      #   }
+      # The throw fires for byte arrays whose version nibble (byte 6 upper 4 bits)
+      # or variant bits (byte 8 upper 2 bits) don't match the RFC 4122 spec — i.e.,
+      # raw random bytes will almost certainly fail validate() because they won't
+      # have the version=4 and variant=10 markers set.
+      - id: stringify-invalid-bytes
+        condition: >
+          stringify() is called with a Uint8Array whose contents do not encode a
+          valid RFC 4122 UUID — i.e., the version nibble (high 4 bits of byte 6)
+          or variant bits (high 2 bits of byte 8) are not set correctly. Triggers
+          on:
+          - Reading bytes from a binary DB column that may be corrupted or written
+            by a non-UUID-aware writer
+          - Receiving bytes over the wire that were not generated by v1/v3/v4/v5/v6/v7
+          - Constructing a Uint8Array manually with arbitrary values
+          - Passing an offset into a larger buffer where the 16 bytes at that offset
+            are not actually a UUID
+          - Writing tests with mock UUIDs that don't set the version/variant bits
+          Common in: binary protocol parsers, low-level DB drivers reading BINARY(16)
+          columns that may contain non-UUID data (legacy migration), test fixtures
+          that hand-roll bytes.
+        throws: >
+          TypeError with exact message 'Stringified UUID is invalid'. Distinct from
+          parse()'s 'Invalid UUID' message — when triaging logs, the wording
+          discriminates the failure path (stringify vs parse).
+        required_handling: >
+          For the common case of round-tripping a known-valid UUID, this never fires:
+
+            import { v4, parse, stringify } from 'uuid';
+            const id = v4();
+            const bytes = parse(id);
+            const back = stringify(bytes);  // safe — round-trip from a valid UUID
+            console.assert(back === id);
+
+          When reading bytes from an external source (DB column, network, mock
+          data), wrap in try-catch:
+
+            try {
+              const idStr = stringify(rowBytes);
+              return idStr;
+            } catch (error) {
+              if (error instanceof TypeError && error.message === 'Stringified UUID is invalid') {
+                // Bytes are corrupt or not a UUID — log and either skip or hard-fail
+                logger.error('Invalid UUID bytes in DB column', { rowId: row.id });
+                return null;
+              }
+              throw error;
+            }
+
+          For test fixtures: prefer parse(someUuidString) over hand-rolled byte
+          arrays. If you must hand-roll bytes, use the unsafeStringify export (also
+          available in the source but not in the public API).
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidstringifyarr-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/stringify.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: user-input-validation
     description: >
@@ -528,13 +736,15 @@ notes:
   - "v4 is most common (random), v7 is best for DB primary keys (sortable), v5 is best for deterministic IDs"
   - "parse() throws TypeError('Invalid UUID') — NOT 'Invalid UUID format' or similar variants"
   - "version() also throws TypeError('Invalid UUID') — same message as parse()"
+  - "stringify() throws TypeError('Stringified UUID is invalid') — distinct message from parse()"
   - "validate() NEVER throws — safe to call on any input including null/undefined"
   - "v3 and v5 require namespace UUID — use v3.DNS, v3.URL, v5.DNS, v5.URL constants"
-  - "stringify() omitted — internal utility rarely called directly by application code"
+  - "v3/v5/v6 added RangeError on buffer-offset bounds in uuid@14.0.0 — was silent before"
   - "v1/v6 omitted — same error profile as v4/v7, less common in modern SaaS"
   - "v1ToV6/v6ToV1 omitted — same error profile as parse(), conversion utilities only"
   - "MAX/NIL omitted — string constants, not callable functions"
 
 # Category: utility
-# Latest version: 13.0.0
+# Latest version: 14.0.0
 # Depth pass 2026-04-17 (deepen-stream-2 pass 11)
+# Depth pass 2026-06-12 (deepen-stream-2 pass 5): +1 function (stringify), +2 postconditions (v3/v5 buf-offset)

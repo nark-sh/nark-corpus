@@ -2,11 +2,16 @@
  * Ground-truth fixtures for uuid contract depth pass (2026-04-17).
  * Tests parse(), validate(), version(), v7(), v3(), v5() postconditions.
  *
+ * Depth pass 2026-06-12 (deepen-stream-2 pass 5) extends with:
+ *   - stringify-invalid-bytes (TypeError on invalid byte arrays)
+ *   - v3-buffer-offset-out-of-bounds (RangeError new in uuid@14.0.0)
+ *   - v5-buffer-offset-out-of-bounds (RangeError new in uuid@14.0.0)
+ *
  * @expect-violation annotations mark code that SHOULD trigger scanner violations.
  * @expect-clean annotations mark code that should NOT trigger violations.
  */
 
-import { parse, validate, version, v4, v7, v3, v5 } from 'uuid';
+import { parse, stringify, validate, version, v4, v7, v3, v5 } from 'uuid';
 
 // ============================================================
 // parse() — throws TypeError('Invalid UUID') on invalid input
@@ -140,4 +145,84 @@ function generateV5WithUrlNamespace(name: string): string {
 // Standard v4() call without custom rng — safe in all modern environments.
 function generateRandomId(): string {
   return v4(); // ✅ always succeeds in Node.js 14.17+ and modern browsers
+}
+
+// ============================================================
+// stringify() — throws TypeError('Stringified UUID is invalid')
+// when called on byte arrays that don't encode a valid RFC 4122 UUID.
+// Added by depth pass 2026-06-12 (deepen-stream-2 pass 5).
+// ============================================================
+
+// @expect-violation: stringify-invalid-bytes
+// Reading raw bytes from a binary DB column without try-catch — corrupted or
+// non-UUID bytes will crash the request handler.
+function readUuidFromDbColumn(rowBytes: Uint8Array): string {
+  return stringify(rowBytes); // ❌ throws if bytes don't decode to valid UUID
+}
+
+// @expect-clean
+// Round-trip from a known-valid UUID — stringify never throws here.
+function roundTripValidUuid(): boolean {
+  const id = v4();
+  const bytes = parse(id);
+  const back = stringify(bytes); // ✅ safe — bytes came from parse(valid UUID)
+  return back === id;
+}
+
+// @expect-clean
+// Safe pattern for reading bytes from external source — wraps stringify in try-catch
+// to handle corrupt or non-UUID bytes.
+function readUuidSafe(rowBytes: Uint8Array): string | null {
+  try {
+    return stringify(rowBytes);
+  } catch (error) {
+    if (error instanceof TypeError && error.message === 'Stringified UUID is invalid') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// v3() / v5() with explicit buffer/offset — throws RangeError on out-of-bounds.
+// New in uuid@14.0.0. Previous versions silently wrote past the buffer end.
+// Added by depth pass 2026-06-12 (deepen-stream-2 pass 5).
+// ============================================================
+
+// @expect-violation: v3-buffer-offset-out-of-bounds
+// Off-by-one buffer allocation — buf is only 16 bytes, but we ask for offset 8,
+// which means writing bytes 8..23 into a 16-byte buffer.
+function v3BufferOverflow(): Uint8Array {
+  const buf = new Uint8Array(16);
+  return v3('https://example.com', v3.URL, buf, 8); // ❌ throws RangeError in uuid@14+
+}
+
+// @expect-clean
+// Properly sized buffer with valid offset.
+function v3IntoBufferSafe(): Uint8Array {
+  const buf = new Uint8Array(32); // room for 2 UUIDs
+  v3('https://a.com', v3.URL, buf, 0);  // ✅ writes bytes 0..15
+  v3('https://b.com', v3.URL, buf, 16); // ✅ writes bytes 16..31
+  return buf;
+}
+
+// @expect-violation: v5-buffer-offset-out-of-bounds
+// Negative offset — common typo from offset-- underflow.
+function v5NegativeOffset(): Uint8Array {
+  const buf = new Uint8Array(16);
+  return v5('entity-name', v5.URL, buf, -1); // ❌ throws RangeError in uuid@14+
+}
+
+// @expect-clean
+// Loop pattern with bounds check.
+function v5BatchSafe(names: string[]): Uint8Array {
+  const buf = new Uint8Array(names.length * 16);
+  names.forEach((name, i) => {
+    const offset = i * 16;
+    if (offset + 16 > buf.length) {
+      throw new Error('Buffer too small');
+    }
+    v5(name, v5.URL, buf, offset); // ✅ bounded
+  });
+  return buf;
 }
