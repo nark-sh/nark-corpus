@@ -2,6 +2,26 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-12 — deepen pass — coverage 51% → 100% (deepen-stream-1 pass 6, tidy-up)
+
+- **Profile:** `packages/validator/contract.yaml`
+- **Functions added:** none (tidy-up pass — no new postconditions required)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** isAscii, isFreightContainerID, toString
+  - isAscii: pure ASCII regex match (`/^[\x00-\x7F]+$/`) — assertString TypeError only, identical to 50+ other already-omitted is* validators
+  - isFreightContainerID: alias of isISO6346 — niche ISO 6346 freight container domain, pure regex + checksum, parent isISO6346 already omitted for same reason
+  - toString: validator's own string-coercion utility, NEVER throws (coerces null/undefined to '' and objects via .toString()) — no error contract possible
+- **Index hygiene:** removed stale `alpha` from omitted list (not a real export — it's a Decimal locale map in lib/alpha.js, never callable by user code)
+- **Coverage math:** 104 raw exports / 54 intentionally omitted = 50 contractable; 50/50 contracted = 1.00 coverage
+- **Scanner concerns queued:** 0 (no new postconditions → no new detection gaps)
+- **Scanner version used:** nark@3.0.0 (per nark-dev/nark/package.json)
+- **Sources fetched:**
+  - node_modules/validator@13.15.35/lib/isAscii.js (source inspected — confirmed only assertString throw)
+  - node_modules/validator@13.15.35/lib/isISO6346.js (confirmed isFreightContainerID alias of isISO6346)
+  - node_modules/validator@13.15.35/lib/util/toString.js (confirmed never-throws coercion utility)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-12T02:13:00Z)
+- **Result:** validator now at 100% contractable coverage. Further deepening only makes sense on a major version release that adds new exported functions.
+
 ## 2026-06-11 — deepen pass — coverage 40% → 49% (deepen-stream-2 pass 4)
 
 - **Profile:** `packages/validator/contract.yaml`
