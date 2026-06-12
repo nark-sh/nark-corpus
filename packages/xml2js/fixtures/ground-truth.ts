@@ -10,6 +10,8 @@
  *   build-object-invalid-root-name
  *   build-object-invalid-xml-chars
  *   parser-instance-malformed-xml
+ *   parser-instance-parse-string-callback-error-ignored  (added 2026-06-12 deepen pass 2)
+ *   parser-instance-parse-string-no-callback             (added 2026-06-12 deepen pass 2)
  *
  * Annotation comments must be immediately above the call site (the await line).
  */
@@ -164,4 +166,41 @@ async function parseEmptyStringNoNullCheck(xml: string) {
   // SHOULD_FIRE: parse-promise-null-return — result not null-checked, crashes on empty input
   const result = await parseStringPromise(xml);
   return result.root.items;
+}
+
+// ─── Parser instance parseString (callback) — added 2026-06-12 deepen pass 2 ──
+
+function parserInstanceCallbackClean(xml: string) {
+  // SHOULD_NOT_FIRE: instance callback checks err before using result
+  const parser = new Parser({ explicitArray: false });
+  parser.parseString(xml, (err, result) => {
+    if (err) {
+      console.error('instance parse error:', err.message);
+      return;
+    }
+    console.log(result);
+  });
+}
+
+function parserInstanceCallbackIgnoresError(xml: string) {
+  const parser = new Parser({ explicitArray: false });
+  // SHOULD_FIRE: parser-instance-parse-string-callback-error-ignored — err discarded
+  parser.parseString(xml, (err, result) => {
+    console.log(result.items);
+  });
+}
+
+function parserInstanceCallbackUntypedIgnoresError(xml: string) {
+  const parser = new Parser();
+  // SHOULD_FIRE: parser-instance-parse-string-callback-error-ignored — function-expr callback ignores err
+  parser.parseString(xml, function(err: Error | null, result: any) {
+    const items = result.items;
+    return items;
+  });
+}
+
+function parserInstanceParseStringNoCallback(xml: string) {
+  const parser = new Parser({ explicitArray: false });
+  // SHOULD_FIRE: parser-instance-parse-string-no-callback — instance parseString called without cb
+  parser.parseString(xml);
 }

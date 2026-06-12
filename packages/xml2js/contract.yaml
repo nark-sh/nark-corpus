@@ -2,11 +2,11 @@ package: xml2js
 semver: ">=0.5.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.67
+coverage_score: 1.0  # 5 contracted / 5 contractable async-callable (5 sync processor utils omitted)
 # Evidence: scan-xml2js-2026-04-04.json — 2 repos scanned, 0 affected, 0 violations
 # 23 repos errored (TS compilation), 2 skipped (no tsconfig)
 # FP check: 0/50 repos false-positive-free. FP rate 0%. Confirmed evidence quality.
@@ -16,6 +16,23 @@ coverage_score: 0.67
 # v1.1.0: Added detection.class_names for Builder and Parser instance tracking.
 # Renamed parse-promise-empty-string → parse-promise-null-return so the contract-matcher
 # routes it through the null-check path (id.includes("null") condition).
+#
+# Depth pass 2026-06-12 (deepen-stream-1 pass 2):
+# +1 function: Parser.parseString (instance method, callback-based)
+# Gap identified: Parser.prototype.parseString (callback form) was uncovered while
+# Parser.prototype.parseStringPromise was covered. Both ship with the Parser class and
+# share identical sax-js error semantics, but the instance callback form has an
+# additional silent-failure failure mode (no-callback path emits an unhandled "error"
+# event on the EventEmitter that crashes Node.js — same root cause as module-level
+# parse-string-no-callback). Re-enumerated full surface against current @types/xml2js
+# declarations (still 0.7.x). After this pass: 5/5 async-callable methods contracted
+# (4 previously + Parser.parseString this pass). All 5 processors.* utilities remain
+# correctly omitted as pure sync transformers with no error contracts.
+# Evidence sources confirmed from:
+#   node_modules/@types/xml2js/index.d.ts (Parser class declaration)
+#   node_modules/xml2js/lib/parser.js (Parser.prototype.parseString impl, lines around
+#     try/catch block calling saxParser.write/close and emit("error", err))
+#   https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js
 
 detection:
   class_names:
@@ -195,6 +212,68 @@ functions:
           Same error behavior as the module-level parseStringPromise() — rejects with
           an Error from the underlying sax parser. Not wrapping leads to unhandled
           promise rejections crashing Node.js in production.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Parser.parseString
+    import_path: "xml2js"
+    import_class: "Parser"
+    description: >
+      Instance method on the Parser class equivalent to the module-level parseString().
+      Callback-based: parser.parseString(xml, function(err, result) { ... }). Used when
+      callers need to reuse a configured Parser instance (e.g. with explicitArray: false,
+      mergeAttrs: true, or custom tagNameProcessors) across many parse calls. Same error
+      semantics as the module-level callback form: sax-js errors land in cb(err) for
+      malformed XML, and a missing callback emits an unhandled "error" event on the
+      Parser EventEmitter that crashes Node.js.
+
+    postconditions:
+      # Evidence: node_modules/xml2js/lib/parser.js — Parser.prototype.parseString registers
+      # `this.on("end", ...)` and `this.on("error", ...)` against the callback only when cb
+      # is a function. The body wraps str.toString() + saxParser.write(str).close() in a
+      # try/catch; caught errors are re-emitted via this.emit("error", err) which routes
+      # to the cb(err) handler IF cb was provided, otherwise the "error" event is unhandled
+      # and Node.js crashes (EventEmitter default for unhandled "error"). The module-level
+      # exports.parseString delegates straight to this via `new exports.Parser(options); parser.parseString(...)`.
+      # Source: https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js
+      - id: parser-instance-parse-string-callback-error-ignored
+        condition: "XML is malformed and instance callback does not check first argument"
+        throws: "Error passed as first callback argument"
+        required_handling: >
+          Caller MUST check the err parameter in the callback before using result.
+          Pattern: parser.parseString(xml, function(err, result) { if (err) { /* handle */ return; } /* use result */ }).
+          Long-lived Parser instances are typically configured once and reused across
+          many parse calls in API request handlers — ignoring err here silently corrupts
+          downstream processing exactly the same way the module-level parseString does,
+          producing TypeErrors when accessing properties of undefined result objects.
+        sources:
+          - "https://github.com/Leonidas-from-XIV/node-xml2js#usage"
+          - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: parser-instance-parse-string-no-callback
+        condition: "Parser.parseString() called without a callback (using it like a synchronous function on the instance)"
+        throws: "Error event emitted on Parser EventEmitter, no caller to handle it"
+        required_handling: >
+          Parser.parseString() MUST be called with a callback. Without a callback, parse
+          errors emit an unhandled 'error' event on the Parser instance (which extends
+          EventEmitter), crashing Node.js with an uncaught error. Use parser.parseStringPromise()
+          for promise-based code instead. This is identical to the module-level
+          parseString no-callback failure mode but easier to miss because the Parser
+          instance is often constructed far from the parse call site.
         sources:
           - "https://github.com/Leonidas-from-XIV/node-xml2js/blob/master/lib/parser.js"
         severity: error
