@@ -16,6 +16,8 @@
  *   - await doc.cleanup() without try-catch → NO_DETECTOR (cleanup-during-rendering, no scanner rule yet)
  *   - await doc.getData() without try-catch → SHOULD_FIRE: getdata-no-try-catch
  *   - await textLayer.render() without try-catch → NO_DETECTOR (textlayer-render-no-try-catch, no scanner rule yet)
+ *   - const bytes = await doc.extractPages(...) without null-check → NO_DETECTOR (extractpages-null-return-unchecked, no scanner rule yet)
+ *   - doc.getOptionalContentConfig with mismatched intent → NO_DETECTOR (getoptionalcontentconfig-intent-mismatch, no scanner rule yet)
  *
  * Coverage:
  *   - Section 1: bare getDocument().promise → SHOULD_FIRE
@@ -37,8 +39,13 @@
  *   - Section 17: doc.getData() with try-catch → SHOULD_NOT_FIRE
  *   - Section 18: TextLayer.render() without try-catch → SHOULD_FIRE
  *   - Section 19: TextLayer.render() with try-catch → SHOULD_NOT_FIRE
+ *   - Section 20: doc.extractPages() without null-check → NO_DETECTOR (postcondition added, scanner upgrade needed)
+ *   - Section 21: doc.extractPages() with null-check → SHOULD_NOT_FIRE
+ *   - Section 22: doc.getOptionalContentConfig() mismatched intent → NO_DETECTOR (postcondition added, scanner upgrade needed)
+ *   - Section 23: doc.getOptionalContentConfig() with matching intent → NO_DETECTOR (scanner fires on all calls as approximation; intent-match check requires cross-call analysis)
  *
  * Updated: 2026-04-17 (deepen-stream-1 pass 9) — added sections 14-19 for cleanup, getData, TextLayer.render
+ * Updated: 2026-06-11 (deepen-stream-1 pass 1) — added sections 20-23 for extractPages, getOptionalContentConfig (v6.x)
  */
 
 import * as pdfjs from "pdfjs-dist";
@@ -402,6 +409,131 @@ export async function renderTextLayerWithCatch(buffer: ArrayBuffer, container: H
       return;
     }
     console.error('Text layer rendering failed:', error);
+    throw error;
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. doc.extractPages() — without null-check → NO_DETECTOR
+// extractPages() never rejects — resolves with null on failure.
+// Contract: extractpages-null-return-unchecked
+// Scanner upgrade needed: new pattern (v6.x), no detection rule yet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function extractPagesNullUnchecked(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  try {
+    // NO_DETECTOR: extractpages-null-return-unchecked
+    // extractPages() resolves with null when extraction fails (XFA, invalid pages, etc.)
+    // The return value is NOT checked before use — downstream crash when null is passed to Blob.
+    const bytes = await doc.extractPages([{ includePages: [[0, 2]] }]);
+    // ↑ bytes may be null if extraction failed — not checked here
+    const blob = new Blob([bytes as any], { type: 'application/pdf' });
+    return URL.createObjectURL(blob);
+  } finally {
+    await doc.destroy();
+  }
+}
+
+export async function extractPagesEmptyNotChecked(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  try {
+    // NO_DETECTOR: extractpages-empty-pageinfos
+    // Empty pageInfos → resolves with null ("nothing to extract") — not checked
+    const bytes = await doc.extractPages([]);
+    return bytes; // bytes is null — caller will crash when using it
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. doc.extractPages() — with null-check → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function extractPagesWithNullCheck(buffer: ArrayBuffer) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  try {
+    const pageInfos = [{ includePages: [[0, 2]] }];
+    if (!pageInfos.length) {
+      throw new Error('No pages selected');
+    }
+    // SHOULD_NOT_FIRE: null-checked before use
+    const bytes = await doc.extractPages(pageInfos);
+    if (!bytes) {
+      throw new Error('PDF page extraction failed (XFA not supported, or invalid page range)');
+    }
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    return URL.createObjectURL(blob);
+  } catch (error) {
+    console.error('extractPages failed:', error);
+    throw error;
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. doc.getOptionalContentConfig() — mismatched intent → NO_DETECTOR
+// Throws "Must use the same `intent`-argument" at render time (not at config time).
+// Contract: getoptionalcontentconfig-intent-mismatch
+// Scanner upgrade needed: intent-mismatch pattern, no detection rule yet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderWithMismatchedOptionalContentIntent(buffer: ArrayBuffer, canvas: any) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+
+  // NO_DETECTOR: getoptionalcontentconfig-intent-mismatch
+  // getOptionalContentConfig uses 'print' intent but render() uses 'display' intent
+  // → throws Error("Must use the same `intent`-argument...") at render time
+  const optionalContentConfigPromise = doc.getOptionalContentConfig({ intent: 'print' });
+  try {
+    const renderTask = page.render({
+      canvas,
+      viewport,
+      intent: 'display',                       // ← mismatched with 'print' above
+      optionalContentConfigPromise,
+    });
+    await renderTask.promise;
+  } catch (error: any) {
+    if (error.name === 'RenderingCancelledException') return;
+    throw error;
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. doc.getOptionalContentConfig() — matching intent → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderWithMatchingOptionalContentIntent(buffer: ArrayBuffer, canvas: any) {
+  const doc = await getDocument({ data: buffer as Uint8Array }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 1.0 });
+
+  // NO_DETECTOR: getoptionalcontentconfig-intent-mismatch
+  // NOTE: the scanner fires on this even with matching intents because intent-matching
+  // requires cross-call data flow analysis (comparing the intent arg in getOptionalContentConfig
+  // against the intent arg in render()). The scanner currently has no such rule — it fires
+  // on ALL getOptionalContentConfig() calls without try-catch as an approximation.
+  // A scanner upgrade is needed to distinguish matching vs. mismatching intent pairs.
+  const optionalContentConfigPromise = doc.getOptionalContentConfig({ intent: 'display' });
+  try {
+    const renderTask = page.render({
+      canvas,
+      viewport,
+      intent: 'display',                       // ← matches 'display' above
+      optionalContentConfigPromise,
+    });
+    await renderTask.promise;
+  } catch (error: any) {
+    if (error.name === 'RenderingCancelledException') return;
+    console.error('Render failed:', error);
     throw error;
   } finally {
     await doc.destroy();

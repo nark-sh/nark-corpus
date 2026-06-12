@@ -17,16 +17,32 @@
 #   node_modules/pdfjs-dist/build/pdf.mjs (TextLayer.cancel lines 14405-14410)
 #   https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
 #   https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/text_layer.js
+#
+# Depth pass 2026-06-11 (deepen-stream-1 pass 1):
+# API surface expanded from 16 to 18 (v6.x added extractPages, getOptionalContentConfig,
+#   getStructTree, getMarkInfo, getAnnotationsByType, hasJSActions, getCalculationOrderIds,
+#   getDownloadInfo — 8 new methods; 6 omitted as read-only, 2 contracted this pass)
+# Contracted before: 9 (getDocument, getPage, getTextContent, render, saveDocument, destroy,
+#   cleanup, getData, TextLayer.render)
+# Contracted after: 11 (+2 this pass: doc.extractPages, doc.getOptionalContentConfig)
+# Omitted this pass (6 new + 7 prior = 13 total omitted):
+#   getStructTree, getMarkInfo, getAnnotationsByType, hasJSActions, getCalculationOrderIds,
+#   getDownloadInfo — all read-only with no unique behavioral contracts
+# Coverage: 11/18 = 0.61
+# Evidence sources confirmed from:
+#   node_modules/pdfjs-dist/build/pdf.worker.mjs (ExtractPages handler lines 63522-63616)
+#   node_modules/pdfjs-dist/build/pdf.mjs (render() intent check line 15594)
+#   https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
 package: "pdfjs-dist"
 semver: ">=2.0.0"
 contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.56  # 9 contracted / 16 total async-callable (7 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
+coverage_score: 0.61  # 11 contracted / 18 total async-callable (7 previously omitted + 6 new read-only omissions = 13 omitted)
+# Note: effective coverage (contracted/non-omitted) = 11/11 = 1.0 (new read-only methods appropriately omitted)
 
 detection:
   # getDocument is the entry-point factory. Returns a PDFDocumentLoadingTask —
@@ -691,6 +707,192 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: extractPages
+    import_path: "pdfjs-dist"
+    description: >
+      Extracts specified pages from the PDF document into a new standalone PDF document.
+      Returns a Promise that resolves to a Uint8Array containing the extracted PDF bytes.
+      New in pdfjs-dist v6.x. Accepts an array of PageInfo objects specifying which pages
+      to extract, optionally including page indices, insertion order, and even pages from
+      other PDF documents. Used in SaaS apps to split PDFs, merge specific pages, or
+      generate page-range-based PDF exports. The worker serializes the extracted pages using
+      PDFEditor.extractPages(). Critically: this function NEVER rejects — it catches all
+      errors internally and returns null on failure (confirmed from source).
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.worker.mjs lines 63522-63616 (ExtractPages handler)
+      # Worker handler wraps extraction in try/catch:
+      #   } catch (reason) { warn(`extractPages: "${reason}".`); return null; }
+      # Invalid password during extraction: PasswordException caught, resolves null.
+      # Pure XFA documents: warn("extractPages does not support pure XFA documents."), resolves null.
+      # Any serialization failure: warn() + return null — promise never rejects.
+      # Source: /build/pdf.worker.mjs line 63613: } catch (reason) { warn(...); return null; }
+      - id: extractpages-null-return-unchecked
+        condition: >
+          doc.extractPages(pageInfos) is called without checking whether the resolved value
+          is null. The worker always resolves (never rejects) — when extraction fails due to:
+          (a) Invalid or out-of-range page indices in pageInfos,
+          (b) The page belongs to a pure XFA document (not supported),
+          (c) Any worker-side serialization error during PDF assembly,
+          (d) A provided external document in pageInfo.document is password-protected
+              and the password callback doesn't provide a valid password,
+          the promise resolves with null rather than a Uint8Array. Code that immediately
+          passes the result to Buffer.from() or downloads it will crash with:
+          "The first argument must be of type string or an instance of Buffer or
+          ArrayBuffer. Received null" (Node.js) or "Failed to construct 'Blob': The
+          provided value cannot be converted to a sequence." (browser).
+        throws: >
+          Does NOT throw. Resolves with null when extraction fails (confirmed from
+          build/pdf.worker.mjs: `catch (reason) { warn(...); return null; }`).
+          Crashes occur DOWNSTREAM when null is passed to Buffer.from(), new Blob([]),
+          URL.createObjectURL(), or written to file. These are plain TypeError or TypeError
+          from the consumer code, not pdfjs-dist custom exceptions.
+        required_handling: >
+          Caller MUST null-check the return value before using the Uint8Array.
+          extractPages() resolves with null on failure — it does not reject.
+
+            try {
+              const bytes = await doc.extractPages([
+                { includePages: [[1, 3]] }  // extract pages 1-3 (0-based indices)
+              ]);
+              if (!bytes) {
+                // Extraction failed — XFA document, invalid pages, or serialization error
+                console.error('Page extraction failed (XFA documents not supported, or invalid page range)');
+                throw new Error('PDF page extraction failed');
+              }
+              // Safe to use bytes as Uint8Array now
+              const blob = new Blob([bytes], { type: 'application/pdf' });
+              return URL.createObjectURL(blob);
+            } finally {
+              await doc.destroy();
+            }
+
+          Note: extractPages() is similar to saveDocument() in that it serializes PDF data,
+          but unlike saveDocument() which throws on worker errors, extractPages() always
+          resolves. Always check for null before processing the result.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/pdfjs-dist/build/pdf.worker.mjs line 63527:
+      # if (!pageInfos) { warn("extractPages: nothing to extract."); return null; }
+      # An empty array or undefined pageInfos resolves with null silently — no error thrown.
+      - id: extractpages-empty-pageinfos
+        condition: >
+          doc.extractPages(pageInfos) is called with an empty array [] or undefined pageInfos.
+          The worker resolves with null and emits a console warning:
+          "extractPages: nothing to extract." — no exception thrown.
+          SaaS apps that build the pageInfos array dynamically (e.g., from user-selected pages)
+          may pass an empty array when the user deselects all pages.
+          The null result then crashes downstream code identical to the extractpages-null-return-unchecked case.
+        throws: >
+          Does NOT throw. Resolves with null.
+          Confirmed: `if (!pageInfos) { warn("extractPages: nothing to extract."); return null; }`
+          from build/pdf.worker.mjs line 63527.
+        required_handling: >
+          Guard against empty pageInfos BEFORE calling extractPages():
+
+            if (!pageInfos || pageInfos.length === 0) {
+              throw new Error('No pages selected for extraction');
+            }
+            const bytes = await doc.extractPages(pageInfos);
+            if (!bytes) {
+              throw new Error('PDF page extraction failed');
+            }
+
+          Alternatively, check the result for null after the call (same null-check pattern
+          as extractpages-null-return-unchecked). Do not skip both guards.
+        sources:
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: getOptionalContentConfig
+    import_path: "pdfjs-dist"
+    description: >
+      Retrieves the optional content configuration from the PDF document, which controls
+      the visibility of optional content groups (OCGs — also called layers). Called on
+      PDFDocumentProxy. Returns a Promise resolving to an OptionalContentConfig object.
+      This object is passed to page.render() via the optionalContentConfigPromise parameter
+      to control which PDF layers are rendered. New in pdfjs-dist v5/v6. Used in SaaS
+      apps that implement PDF layer toggling (e.g., CAD drawings, multi-language PDFs
+      where different languages are in different layers).
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs line 15594:
+      # if (!(optionalContentConfig.renderingIntent & renderingIntent)) {
+      #   throw new Error("Must use the same `intent`-argument when calling the
+      #   `PDFPageProxy.render` and `PDFDocumentProxy.getOptionalContentConfig` methods.");
+      # }
+      # This error is thrown during render() — if getOptionalContentConfig() was called with
+      # a different intent than render(). The throw is synchronous inside the render callback,
+      # which means it's caught by render() and propagates via renderTask.promise rejection.
+      - id: getoptionalcontentconfig-intent-mismatch
+        condition: >
+          doc.getOptionalContentConfig({ intent: 'print' }) is called to get a config for
+          print rendering, but page.render({ intent: 'display', optionalContentConfigPromise: ... })
+          is called with a different intent. The render() method checks that the config's
+          renderingIntent matches the render's intent. When they don't match, it throws inside
+          the rendering callback, causing renderTask.promise to reject with an Error.
+          This is a configuration error that only manifests at render time, not at
+          getOptionalContentConfig() time.
+        throws: >
+          Error with message: "Must use the same `intent`-argument when calling the
+          `PDFPageProxy.render` and `PDFDocumentProxy.getOptionalContentConfig` methods."
+          Thrown inside render() (not from getOptionalContentConfig() directly).
+          This is a plain JavaScript Error object, not a pdfjs-dist custom exception.
+          Confirmed from build/pdf.mjs line 15594.
+        required_handling: >
+          Caller MUST use the same intent value for both getOptionalContentConfig()
+          and render(). If rendering for display, use 'display' (default) for both:
+
+            // CORRECT: matching intents
+            const optionalContentConfigPromise = doc.getOptionalContentConfig({ intent: 'display' });
+            const renderTask = page.render({
+              canvas,
+              viewport,
+              intent: 'display',               // matches getOptionalContentConfig intent
+              optionalContentConfigPromise,     // pass the promise directly
+            });
+            try {
+              await renderTask.promise;
+            } catch (error) {
+              if (error.name === 'RenderingCancelledException') return;
+              console.error('Render failed:', error);
+              throw error;
+            }
+
+            // WRONG: mismatched intents — will throw at render time
+            const config = doc.getOptionalContentConfig({ intent: 'print' });
+            page.render({ intent: 'display', optionalContentConfigPromise: config }); // THROWS!
+
+          Note: getOptionalContentConfig() itself does not throw for normal PDFs that lack
+          optional content groups — it resolves with an empty OptionalContentConfig.
+          Only the render() mismatch check throws. Use intent: 'display' for viewer apps,
+          intent: 'print' for print workflows (PDF → print dialog).
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - "getDocument() returns a PDFDocumentLoadingTask — must await .promise to get PDFDocumentProxy"
   - "Pages are 1-indexed: first page = 1, last page = doc.numPages. 0-indexing is a very common bug."
@@ -704,3 +906,7 @@ notes:
   - "Leaked workers (no destroy()) cause Node.js process to hang on exit and memory to grow unboundedly"
   - "saveDocument() warns (not errors) when annotationStorage is empty — use getData() for unmodified PDFs"
   - "cleanup() throws if called while a page is rendering — always cancel renders before calling cleanup()"
+  - "extractPages() (v6.x) NEVER rejects — resolves with null on failure. Always null-check before using the Uint8Array."
+  - "extractPages() does NOT support pure XFA documents — returns null if any source doc is XFA."
+  - "getOptionalContentConfig() intent must match the intent passed to render() — mismatches throw at render time."
+  - "v6.x new read-only omissions: getStructTree, getMarkInfo, getAnnotationsByType, hasJSActions, getCalculationOrderIds, getDownloadInfo — no unique behavioral contracts beyond generic HTTP/worker errors."
