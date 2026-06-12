@@ -1,11 +1,12 @@
 package: '@modelcontextprotocol/sdk'
 semver: ^1.0.0
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-12'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
+coverage_score: 0.79  # 34 contracted / 43 total async-callable (was 30/39 = 0.77; +4 this pass: fetchToken, discoverOAuthServerInfo, experimental.tasks.createMessageStream, experimental.tasks.elicitInputStream — all net-new in v1.20+/v1.29)
 # Pass 1 deepen-stream-2 2026-04-16: +6 functions (WebSocketClientTransport.start, SSEClientTransport.start,
 # SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode,
 # ProxyOAuthServerProvider.exchangeRefreshToken). Coverage: 0.72 → 0.74.
@@ -97,7 +98,7 @@ evidence_quality: confirmed
 # Evidence: dist/cjs/server/index.js:418-427 (sendLoggingMessage silent failure on missing capability)
 #           dist/cjs/shared/protocol.js:793-797 (notification() throws Error('Not connected'))
 #   Spec: https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/logging
-coverage_score: 0.77  # 30 contracted / 39 total async-callable (+7 this pass: WebSocketClientTransport.start, SSEClientTransport.start, SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode, ProxyOAuthServerProvider.exchangeRefreshToken, McpServer.sendLoggingMessage); 17 now omitted
+# (Pass 1 coverage 30/39=0.77 superseded by pass 4 coverage 34/43=0.79 in header above.)
 detection:
   class_names:
     - Client
@@ -2079,4 +2080,420 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Depth pass 2026-06-12 (deepen-stream-2 pass 4)
+  # API surface enumerated against @modelcontextprotocol/sdk@1.29.0 (latest).
+  # New functions identified by diff-against-previous-deepen (April 2026):
+  #   1. fetchToken (client/auth) — new unified token-fetch helper added in
+  #      v1.20+ alongside the AddClientAuthentication provider extensions.
+  #      Wraps the executeTokenRequest internal with provider-driven token
+  #      request preparation (prepareTokenRequest hook for client_credentials,
+  #      private_key_jwt, etc.) instead of exchange-auth-code-only.
+  #   2. discoverOAuthServerInfo (client/auth) — new unified discovery helper
+  #      that combines discoverOAuthProtectedResourceMetadata (RFC 9728) and
+  #      discoverAuthorizationServerMetadata into a single call. Falls back to
+  #      legacy MCP-spec behavior (server URL == auth server URL) when
+  #      RFC 9728 isn't supported.
+  #   3. experimental.tasks.createMessageStream (Server) — AsyncGenerator
+  #      streaming sampling API that yields ResponseMessage<CreateMessageResult>
+  #      items including 'taskCreated', 'taskStatus', 'result', and 'error'.
+  #      Distinct from createMessage(): callers iterate the stream and the
+  #      generator is guaranteed to terminate with result or error.
+  #   4. experimental.tasks.elicitInputStream (Server) — AsyncGenerator
+  #      streaming elicitation API for both form and URL-mode elicitations.
+  #      Same yield/termination contract as createMessageStream.
+  # Sources fetched:
+  #   node_modules/@modelcontextprotocol/sdk/dist/esm/client/auth.d.ts
+  #   node_modules/@modelcontextprotocol/sdk/dist/esm/client/auth.js (fetchToken
+  #     impl + executeTokenRequest impl + discoverOAuthServerInfo impl)
+  #   node_modules/@modelcontextprotocol/sdk/dist/esm/experimental/tasks/server.d.ts
+  #   node_modules/@modelcontextprotocol/sdk/dist/esm/experimental/tasks/server.js
+  #   node_modules/@modelcontextprotocol/sdk/dist/esm/shared/responseMessage.js
+  #     (takeResult helper — throws ResponseMessage.error on iterator consumption)
+  # ────────────────────────────────────────────────────────────────────────────
+
+  - name: fetchToken
+    import_path: "@modelcontextprotocol/sdk/client/auth.js"
+    description: >
+      Unified token-fetch helper added in v1.20+. Performs the OAuth token
+      request using either provider.prepareTokenRequest() (for client_credentials,
+      private_key_jwt, or custom grants) or the default authorization_code grant
+      flow when authorizationCode is supplied. Returns OAuthTokens. Throws on
+      missing required parameters (no provider hook AND no authorizationCode),
+      on missing redirectUrl in the authorization_code path, and on any non-2xx
+      HTTP response from the token endpoint (parsed into the appropriate
+      OAuthError subclass via parseErrorResponse()).
+    postconditions:
+      # Evidence: client/auth.js fetchToken() implementation:
+      #   if (!tokenRequestParams) {
+      #     if (!authorizationCode) {
+      #       throw new Error('Either provider.prepareTokenRequest() or
+      #         authorizationCode is required');
+      #     }
+      #     if (!provider.redirectUrl) {
+      #       throw new Error('redirectUrl is required for authorization_code flow');
+      #     }
+      #   }
+      # And executeTokenRequest():
+      #   if (!response.ok) {
+      #     throw await parseErrorResponse(response);
+      #   }
+      - id: fetch-token-missing-params
+        condition: >
+          fetchToken() is called with a provider that does NOT implement
+          prepareTokenRequest() AND no authorizationCode option is supplied.
+          The function cannot construct a token request and throws synchronously
+          before any network call.
+        throws: >
+          Error('Either provider.prepareTokenRequest() or authorizationCode
+          is required')
+        required_handling: >
+          Caller MUST wrap in try-catch and ensure exactly one of:
+          (a) provider implements prepareTokenRequest(scope) returning
+              URLSearchParams of grant-specific token request body, OR
+          (b) authorizationCode is supplied (and provider.redirectUrl is set).
+          Pattern:
+            try {
+              const tokens = await fetchToken(provider, authServerUrl, {
+                metadata,
+                authorizationCode: code,
+              });
+            } catch (err) {
+              if (err.message.includes('prepareTokenRequest')) {
+                // misconfigured provider — log + alert ops
+              }
+              throw err;
+            }
+          Without this check, misconfigured OAuth providers fail at first use
+          rather than at startup, leading to runtime auth failures only
+          surfaced when users attempt to sign in.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/auth.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: fetch-token-oauth-error-not-handled
+        condition: >
+          fetchToken() is called and the authorization server returns a non-2xx
+          response (invalid_grant, invalid_client, unauthorized_client,
+          invalid_scope, etc. per RFC 6749 section 5.2). executeTokenRequest() awaits
+          parseErrorResponse(response) and throws the parsed OAuthError
+          subclass (InvalidGrantError, InvalidClientError, etc.). Code that
+          treats fetchToken() as infallible crashes on every token refresh
+          when the refresh token has been revoked.
+        throws: >
+          OAuthError subclass: InvalidGrantError (401), InvalidClientError
+          (401), UnauthorizedClientError (400), InvalidScopeError (400),
+          ServerError (5xx), or generic OAuthError on unrecognized error
+          codes. Each subclass exposes errorCode, errorDescription, and
+          errorUri properties for actionable handling.
+        required_handling: >
+          Caller MUST catch and inspect the OAuthError subclass to distinguish
+          recoverable failures (e.g. invalid_grant on refresh → re-authenticate)
+          from terminal misconfigurations (invalid_client → check credentials):
+            try {
+              const tokens = await fetchToken(provider, authServerUrl, {
+                metadata,
+              });
+              await provider.saveTokens(tokens);
+            } catch (err) {
+              if (err instanceof InvalidGrantError) {
+                // Refresh token revoked — clear stored tokens, re-auth
+                await provider.saveTokens(null);
+                throw new SessionExpiredError();
+              }
+              if (err instanceof InvalidClientError) {
+                // Client misconfigured — alert ops, do NOT retry
+                throw new ConfigError('OAuth client credentials invalid');
+              }
+              throw err;
+            }
+          The most common bug is treating fetchToken() as "always succeeds
+          if I have valid credentials" and not handling the refresh-token
+          revocation path, causing all users to be silently logged out at
+          the next refresh.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/auth.ts"
+          - "https://datatracker.ietf.org/doc/html/rfc6749#section-5.2"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: discoverOAuthServerInfo
+    import_path: "@modelcontextprotocol/sdk/client/auth.js"
+    description: >
+      Unified OAuth server discovery helper added in v1.20+. Combines
+      RFC 9728 protected-resource-metadata discovery with RFC 8414
+      authorization-server-metadata discovery into a single call. Returns
+      { authorizationServerUrl, authorizationServerMetadata, resourceMetadata }.
+      Falls back to legacy MCP-spec behavior (the MCP server URL acts as the
+      authorization server) when RFC 9728 isn't supported. Throws if the
+      authorization-server-metadata fetch itself fails (network error or
+      malformed metadata response).
+    postconditions:
+      # Evidence: client/auth.js discoverOAuthServerInfo():
+      #   try {
+      #     resourceMetadata = await discoverOAuthProtectedResourceMetadata(...);
+      #     if (resourceMetadata.authorization_servers && ...) {
+      #       authorizationServerUrl = resourceMetadata.authorization_servers[0];
+      #     }
+      #   } catch {
+      #     // RFC 9728 not supported — fall back to legacy behavior
+      #   }
+      #   const authorizationServerMetadata = await
+      #     discoverAuthorizationServerMetadata(authorizationServerUrl, ...);
+      # The RFC-9728 catch swallows errors; the RFC-8414 fetch does NOT.
+      - id: discover-oauth-server-info-fetch-error
+        condition: >
+          discoverOAuthServerInfo() is awaited but the authorization-server
+          metadata fetch fails. This can happen when (a) the network is down,
+          (b) the auth server is misconfigured (returns 5xx or non-JSON),
+          (c) the legacy fallback URL (server URL itself) is not an OAuth
+          authorization server. The protected-resource-metadata error is
+          silently swallowed by the inner try/catch, but the
+          discoverAuthorizationServerMetadata error propagates.
+        throws: >
+          Error from discoverAuthorizationServerMetadata: network error,
+          'Failed to discover OAuth metadata' error, or fetch TypeError.
+          The thrown error does NOT distinguish between "no auth server
+          configured" and "auth server temporarily unreachable" — both
+          surface as discovery failures.
+        required_handling: >
+          Caller MUST wrap in try-catch and distinguish "discovery permanently
+          fails (legacy server, no OAuth)" from "discovery temporarily fails":
+            try {
+              const { authorizationServerUrl, authorizationServerMetadata } =
+                await discoverOAuthServerInfo(serverUrl, { fetchFn });
+              cache.set(serverUrl, { authorizationServerUrl, authorizationServerMetadata });
+            } catch (err) {
+              if (err instanceof TypeError) {
+                // Network error — retry with exponential backoff
+                throw new TransientError('OAuth discovery network error', { cause: err });
+              }
+              // Permanent failure — server doesn't expose OAuth metadata
+              throw new ConfigError('OAuth not configured at ' + serverUrl);
+            }
+          Failing to handle the transient-vs-permanent distinction either
+          causes (a) infinite retry loops on a permanently misconfigured
+          server, or (b) immediate failure on the first network glitch
+          during startup, blocking the entire client.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/auth.ts"
+          - "https://datatracker.ietf.org/doc/html/rfc9728"
+          - "https://datatracker.ietf.org/doc/html/rfc8414"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: experimental.tasks.createMessageStream
+    import_path: "@modelcontextprotocol/sdk/experimental/tasks/server.js"
+    description: >
+      Server-side experimental sampling stream. Returns an AsyncGenerator
+      that yields ResponseMessage<CreateMessageResult> items. For task-
+      augmented requests, yields 'taskCreated' and 'taskStatus' messages
+      before the final 'result' or 'error'. The generator is guaranteed
+      to terminate with either a 'result' or 'error' message. Distinct
+      from Server.createMessage() (which returns a single Promise) because
+      streaming consumers must iterate the generator and handle the 'error'
+      message type explicitly — unhandled errors in the stream surface as
+      uncaught generator errors that crash the consuming loop.
+    postconditions:
+      # Evidence: experimental/tasks/server.js createMessageStream() impl:
+      #   if ((params.tools || params.toolChoice) &&
+      #       !clientCapabilities?.sampling?.tools) {
+      #     throw new Error('Client does not support sampling tools capability.');
+      #   }
+      #   if (hasToolResults) {
+      #     if (lastContent.some(c => c.type !== 'tool_result')) {
+      #       throw new Error('The last message must contain only tool_result
+      #         content if any is present');
+      #     }
+      #     if (!hasPreviousToolUse) {
+      #       throw new Error('tool_result blocks are not matching any tool_use
+      #         from the previous message');
+      #     }
+      #   }
+      # And shared/responseMessage.js takeResult():
+      #   for await (const o of it) {
+      #     if (o.type === 'result') return o.result;
+      #     else if (o.type === 'error') throw o.error;
+      #   }
+      - id: create-message-stream-error-message-not-handled
+        condition: >
+          The AsyncGenerator returned by createMessageStream() yields a
+          ResponseMessage with type === 'error' but the consuming for-await
+          loop does not branch on message.type. The 'error' message contains
+          the actual MCP error (CapabilityMismatchError, ToolUseValidationError,
+          or upstream model provider error) but the loop continues iterating
+          and the error is silently dropped. Worse, if the consumer relies
+          only on the 'result' message, the loop exits without processing
+          a result and downstream code receives undefined.
+        throws: >
+          Does NOT throw automatically. The 'error' ResponseMessage carries
+          the actual Error in its .error field but the for-await loop must
+          explicitly throw it. Using shared/responseMessage.js takeResult()
+          helper auto-throws — without it, errors are silently lost.
+        required_handling: >
+          Caller MUST either (a) use the takeResult() helper which throws on
+          'error' messages, OR (b) explicitly branch on message.type and
+          throw on 'error':
+            // Option A — use takeResult() helper:
+            import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
+            try {
+              const result = await takeResult(
+                server.experimental.tasks.createMessageStream(params)
+              );
+            } catch (err) {
+              logger.error('Sampling failed', err);
+              throw err;
+            }
+
+            // Option B — manual handling:
+            try {
+              for await (const message of stream) {
+                switch (message.type) {
+                  case 'taskCreated': break;
+                  case 'taskStatus':  break;
+                  case 'result':      finalResult = message.result; break;
+                  case 'error':       throw message.error;  // critical
+                }
+              }
+            } catch (err) {
+              // ...
+            }
+
+            // BUG — silently drops errors:
+            for await (const message of stream) {
+              if (message.type === 'result') finalResult = message.result;
+              // 'error' messages silently ignored
+            }
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/server.ts"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: create-message-stream-tool-capability-not-checked
+        condition: >
+          createMessageStream() is called with params.tools or params.toolChoice
+          but the connected client did NOT advertise the sampling.tools
+          capability during initialization. The synchronous capability check
+          throws immediately before yielding any stream message.
+        throws: >
+          Error('Client does not support sampling tools capability.')
+          — thrown synchronously when entering the generator, before any
+          ResponseMessage is yielded.
+        required_handling: >
+          Caller MUST either (a) gate the call on
+          server.getClientCapabilities()?.sampling?.tools at call-site, OR
+          (b) wrap the iteration in try-catch and surface a UI-friendly error
+          telling the user their client is too old:
+            const caps = server.getClientCapabilities();
+            if ((params.tools || params.toolChoice) && !caps?.sampling?.tools) {
+              throw new UnsupportedClientError(
+                'Update your MCP client to use tools in sampling'
+              );
+            }
+            const stream = server.experimental.tasks.createMessageStream(params);
+            const result = await takeResult(stream);
+          Without this check, every sampling request from older clients
+          fails with a confusing generic Error.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/server.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: experimental.tasks.elicitInputStream
+    import_path: "@modelcontextprotocol/sdk/experimental/tasks/server.js"
+    description: >
+      Server-side experimental elicitation stream. Returns an AsyncGenerator
+      that yields ResponseMessage<ElicitResult> items. Supports both form-mode
+      and URL-mode elicitation. For task-augmented URL-mode requests (e.g.
+      long-running OAuth flows), yields 'taskCreated' and 'taskStatus'
+      messages before the final 'result' or 'error'. Same termination
+      guarantee as createMessageStream — generator ends with result or error.
+      Same silent-error-drop failure mode if the consuming loop doesn't
+      branch on message.type === 'error'.
+    postconditions:
+      # Evidence: experimental/tasks/server.js elicitInputStream() delegates
+      # to this._server.requestStream() with the elicitation method. Same
+      # ResponseMessage iteration contract as createMessageStream.
+      # shared/responseMessage.js takeResult() applies identically.
+      - id: elicit-input-stream-error-message-not-handled
+        condition: >
+          The AsyncGenerator returned by elicitInputStream() yields a
+          ResponseMessage with type === 'error' but the consuming for-await
+          loop does not branch on message.type. The 'error' message contains
+          the actual elicitation failure (user cancellation, timeout, or
+          client rejection) but the loop continues iterating and the error
+          is silently dropped. Downstream code receives undefined and treats
+          it as "user declined" instead of surfacing the actual error.
+        throws: >
+          Does NOT throw automatically. The 'error' ResponseMessage carries
+          the actual Error in its .error field. The for-await loop must
+          explicitly check message.type and throw, or use takeResult().
+        required_handling: >
+          Caller MUST use takeResult() OR explicitly branch on message.type.
+          For URL-mode elicitations (long-running OAuth-style flows), the
+          taskStatus messages are observability only — the actual result or
+          error arrives at terminal messages:
+            import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
+            try {
+              const result = await takeResult(
+                server.experimental.tasks.elicitInputStream({
+                  mode: 'url',
+                  message: 'Please authenticate',
+                  elicitationId: 'auth-123',
+                  url: 'https://example.com/auth',
+                }, { task: { ttl: 300000 } })
+              );
+              if (result.action === 'accept') {
+                // user completed elicitation
+              } else if (result.action === 'decline') {
+                // user explicitly declined
+              }
+            } catch (err) {
+              logger.error('Elicitation failed', err);
+              throw err;
+            }
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/server.ts"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 

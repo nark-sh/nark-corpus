@@ -35,6 +35,10 @@
  *   - SSEServerTransport.handlePostMessage() postcondition: sse-handle-post-content-type-error, sse-handle-post-dns-rebinding-blocked
  *   - StdioServerTransport.start()           postcondition: stdio-server-transport-already-started
  *   - McpServer.sendLoggingMessage()         postcondition: send-logging-message-capability-not-set, send-logging-message-not-connected
+ *   - fetchToken()                           postcondition: fetch-token-missing-params, fetch-token-oauth-error-not-handled  [added 2026-06-12]
+ *   - discoverOAuthServerInfo()              postcondition: discover-oauth-server-info-fetch-error  [added 2026-06-12]
+ *   - experimental.tasks.createMessageStream() postcondition: create-message-stream-error-message-not-handled, create-message-stream-tool-capability-not-checked  [added 2026-06-12]
+ *   - experimental.tasks.elicitInputStream()   postcondition: elicit-input-stream-error-message-not-handled  [added 2026-06-12]
  *
  * Detection path: instance tracking (new Client() → instanceMap) →
  *   ThrowingFunctionDetector fires client.connect() →
@@ -933,4 +937,201 @@ async function gt_sendLoggingMessage_notConnected() {
   // ❌ No connect() call before sendLoggingMessage — throws Error('Not connected')
   // SHOULD_FIRE: send-logging-message-not-connected — no try-catch; throws Error('Not connected') before transport is set
   await server.sendLoggingMessage({ level: 'info', data: 'starting up' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Depth pass 2026-06-12 (deepen-stream-2 pass 4) — new function fixtures
+// Functions added: fetchToken, discoverOAuthServerInfo,
+//   experimental.tasks.createMessageStream, experimental.tasks.elicitInputStream
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 59. fetchToken() — proper handling (clean)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_fetchToken_proper(
+  provider: OAuthClientProvider,
+  authServerUrl: string,
+  metadata: any,
+  authorizationCode: string
+) {
+  try {
+    // SHOULD_NOT_FIRE — wrapped in try-catch with OAuth error class handling
+    const { fetchToken } = await import('@modelcontextprotocol/sdk/client/auth.js');
+    const tokens = await fetchToken(provider, authServerUrl, {
+      metadata,
+      authorizationCode,
+    });
+    return tokens;
+  } catch (error) {
+    if ((error as any).errorCode === 'invalid_grant') {
+      throw new Error('Session expired — re-authenticate');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 60. fetchToken() — missing params (no try-catch, throws synchronously)
+// @expect-violation: fetch-token-missing-params
+// @expect-violation: fetch-token-oauth-error-not-handled
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_fetchToken_missingParams(
+  provider: OAuthClientProvider,
+  authServerUrl: string,
+  metadata: any
+) {
+  const { fetchToken } = await import('@modelcontextprotocol/sdk/client/auth.js');
+  // ❌ No try-catch; no authorizationCode supplied and provider may not implement prepareTokenRequest
+  // SHOULD_FIRE: fetch-token-missing-params — throws Error('Either provider.prepareTokenRequest() or authorizationCode is required')
+  // SHOULD_FIRE: fetch-token-oauth-error-not-handled — also unprotected against InvalidGrantError on the network path
+  const tokens = await fetchToken(provider, authServerUrl, { metadata });
+  return tokens;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 61. discoverOAuthServerInfo() — proper handling (clean)
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_discoverOAuthServerInfo_proper(serverUrl: string) {
+  try {
+    // SHOULD_NOT_FIRE — wrapped in try-catch with transient-vs-permanent classification
+    const { discoverOAuthServerInfo } = await import('@modelcontextprotocol/sdk/client/auth.js');
+    const info = await discoverOAuthServerInfo(serverUrl);
+    return info;
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(`OAuth discovery network error: ${(error as Error).message}`);
+    }
+    throw new Error(`OAuth not configured at ${serverUrl}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 62. discoverOAuthServerInfo() — fetch error not handled
+// @expect-violation: discover-oauth-server-info-fetch-error
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_discoverOAuthServerInfo_noTryCatch(serverUrl: string) {
+  const { discoverOAuthServerInfo } = await import('@modelcontextprotocol/sdk/client/auth.js');
+  // ❌ No try-catch — network failures or missing OAuth metadata crash this call
+  // SHOULD_FIRE: discover-oauth-server-info-fetch-error — no try-catch; discoverAuthorizationServerMetadata throws on network error
+  const info = await discoverOAuthServerInfo(serverUrl);
+  return info;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 63. experimental.tasks.createMessageStream() — proper handling with takeResult
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_createMessageStream_withTakeResult(
+  server: Server,
+  params: any
+) {
+  try {
+    // SHOULD_NOT_FIRE — takeResult() auto-throws on 'error' messages, wrapped in try-catch
+    const { takeResult } = await import('@modelcontextprotocol/sdk/shared/responseMessage.js');
+    const result = await takeResult(
+      (server as any).experimental.tasks.createMessageStream(params)
+    );
+    return result;
+  } catch (error) {
+    console.error('Sampling failed:', (error as Error).message);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 64. experimental.tasks.createMessageStream() — error message dropped silently
+// @expect-violation: create-message-stream-error-message-not-handled
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_createMessageStream_dropsErrors(
+  server: Server,
+  params: any
+) {
+  // ❌ Iterates without branching on message.type === 'error'
+  // SHOULD_FIRE: create-message-stream-error-message-not-handled — silently drops 'error' messages
+  let finalResult: any = undefined;
+  const stream = (server as any).experimental.tasks.createMessageStream(params);
+  for await (const message of stream) {
+    if (message.type === 'result') {
+      finalResult = message.result;
+    }
+    // 'error' messages silently ignored — caller treats failure as "no result"
+  }
+  return finalResult;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 65. experimental.tasks.createMessageStream() — tools without capability check
+// @expect-violation: create-message-stream-tool-capability-not-checked
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_createMessageStream_noCapabilityCheck(
+  server: Server,
+  params: any
+) {
+  // ❌ params.tools may be set but client may not advertise sampling.tools capability
+  // No pre-call gate on server.getClientCapabilities()?.sampling?.tools
+  // SHOULD_FIRE: create-message-stream-tool-capability-not-checked — synchronous throw on capability mismatch
+  const paramsWithTools = { ...params, tools: [{ name: 'calculator' }] };
+  const stream = (server as any).experimental.tasks.createMessageStream(paramsWithTools);
+  for await (const message of stream) {
+    if (message.type === 'result') return message.result;
+    if (message.type === 'error') throw message.error;
+  }
+  return undefined;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 66. experimental.tasks.elicitInputStream() — proper handling with takeResult
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_elicitInputStream_withTakeResult(
+  server: Server,
+  params: any
+) {
+  try {
+    // SHOULD_NOT_FIRE — takeResult() auto-throws on 'error', wrapped in try-catch
+    const { takeResult } = await import('@modelcontextprotocol/sdk/shared/responseMessage.js');
+    const result = await takeResult(
+      (server as any).experimental.tasks.elicitInputStream(params, {
+        task: { ttl: 300000 },
+      })
+    );
+    return result;
+  } catch (error) {
+    console.error('Elicitation failed:', (error as Error).message);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 67. experimental.tasks.elicitInputStream() — error message dropped silently
+// @expect-violation: elicit-input-stream-error-message-not-handled
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_elicitInputStream_dropsErrors(
+  server: Server,
+  params: any
+) {
+  // ❌ Iterates without branching on message.type === 'error'
+  // SHOULD_FIRE: elicit-input-stream-error-message-not-handled — silently drops 'error' messages
+  let action: string | undefined;
+  const stream = (server as any).experimental.tasks.elicitInputStream(params, {
+    task: { ttl: 300000 },
+  });
+  for await (const message of stream) {
+    if (message.type === 'result') {
+      action = message.result.action;
+    }
+    // 'error' messages silently ignored — caller treats network failure as "user declined"
+  }
+  return action;
 }
