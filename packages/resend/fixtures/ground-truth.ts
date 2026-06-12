@@ -364,8 +364,7 @@ export async function createWebhookWithCheck(endpoint: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendAutomationEventNoCheck(contactId: string) {
-  // SHOULD_FIRE: events-send-no-error-check — silent failure drops contact out of
-  // automation funnel with no downstream signal.
+  // SHOULD_FIRE: events-send-no-error-check — silent failure drops contact out of automation funnel with no downstream signal
   return await resend.events.send({
     event: 'user.signed_up',
     contact_id: contactId,
@@ -396,8 +395,7 @@ export async function sendAutomationEventWithCheck(contactId: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function stopAutomationNoCheck(automationId: string) {
-  // SHOULD_FIRE: automations-stop-no-error-check — silent failure means the
-  // automation continues to fire while the operator believes it is halted.
+  // SHOULD_FIRE: automations-stop-no-error-check — silent failure means the automation continues to fire while the operator believes it is halted
   return await resend.automations.stop(automationId);
 }
 
