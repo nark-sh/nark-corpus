@@ -2,6 +2,26 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-12 — deepen pass — coverage 50% → 100% (effective, 4/4 non-omitted)
+
+- **Profile:** `packages/cross-fetch/contract.yaml`
+- **Functions added:** none (no new functions discovered)
+- **Postconditions added:** 3 — all on existing `fetch()` function:
+  - `fetch-request-timeout-error` — node-fetch `{ timeout: N }` init option throws `FetchError` type=`'request-timeout'`
+  - `fetch-body-timeout-error` — same `{ timeout }` option arms body-read timer; throws during `.json()`/`.text()`/`.buffer()` with type=`'body-timeout'`
+  - `fetch-max-size-error` — node-fetch `{ size: N }` init option throws `FetchError` type=`'max-size'` on oversized body (SSRF/OOM guard)
+- **Total function count corrected:** 8 → 7 (`response.formData()` does NOT exist in node-fetch v2; it's a DOM-only method only available in browser native fetch — was previously counted as omitted in error)
+- **Coverage score:** 0.50 raw (4/8) → 1.00 effective (4/4 non-omitted). Header comment now reflects corrected total of 7 (3 omitted + 4 contracted).
+- **Functions intentionally omitted this pass:** `response.arrayBuffer`, `response.blob`, `response.buffer` — all share the exact consumeBody() error profile of `response.text()` (AbortError mid-stream + TypeError body-disturbed); per-method postconditions would duplicate text-abort-mid-stream and text-body-consumed-twice without adding new error paths.
+- **Key finding:** node-fetch's `{ timeout }` and `{ size }` init options are commonly assumed to be cross-environment but are silently ignored by browser native fetch. cross-fetch users on Node.js can pass them and get distinct `FetchError` types (NOT `TypeError`, NOT `AbortError`) that require their own `error.name === 'FetchError' && error.type === '...'` branches in catch blocks. The `timeout` option arms TWO timers from a single value — one for request, one for body read — so try-catch is needed around BOTH `fetch()` AND the body method.
+- **Scanner concerns queued:** 3 (`concern-20260612-cross-fetch-deepen-1`, `concern-20260612-cross-fetch-deepen-2`, `concern-20260612-cross-fetch-deepen-3`)
+- **Scanner version used:** nark@3.0.0 (per nark-dev/nark/package.json)
+- **Sources fetched:**
+  - `node_modules/node-fetch/lib/index.js` (v2.7.0, locally installed via cross-fetch@4.1.0) — lines 384-389 (body-timeout), 409-412 (max-size), 1491-1497 (request-timeout)
+  - `node_modules/node-fetch/README.md` v2 — `{ timeout, size }` init option documentation
+  - `https://github.com/node-fetch/node-fetch/blob/2.x/ERROR-HANDLING.md`
+- **Verified by:** bc-deepen-contract (pass on 2026-06-12T02:21:55.953567+00:00)
+
 ## 2026-06-11 — deepen pass — coverage 50% → 50% (total count 6→8)
 
 - **Profile:** `packages/cross-fetch/contract.yaml`

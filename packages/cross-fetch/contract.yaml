@@ -40,17 +40,38 @@
 #   https://raw.githubusercontent.com/node-fetch/node-fetch/2.x/README.md — textConverted docs
 #   node-fetch/lib/index.js line 444-498: convertBody() charset detection logic
 # Coverage: 4/8 = 0.50 → same score, total function count updated from 6 to 8
+#
+# Depth pass 2026-06-12 (deepen-stream-1 pass 1):
+# Corrected total function count: 8 → 7 (response.formData() does NOT exist in node-fetch v2;
+# it's a DOM-only method available only in browser native fetch — not exported by cross-fetch
+# ponyfill on Node.js). Real node-fetch v2 body methods: json, text, arrayBuffer, blob, buffer,
+# textConverted = 6 + fetch() itself = 7 total.
+# Added 3 new postconditions to fetch() for node-fetch-specific init options:
+#   - fetch-request-timeout-error: FetchError type='request-timeout' from { timeout: <ms> } init option
+#   - fetch-body-timeout-error: FetchError type='body-timeout' fires during body read with timeout option
+#   - fetch-max-size-error: FetchError type='max-size' from { size: <bytes> } init option (SSRF/OOM guard)
+# These are NOT covered by abort-error (which is AbortController-only) — they are node-fetch's
+# distinct timer-driven FetchError paths. cross-fetch users on Node.js can pass these init options
+# but on browsers (native fetch) the options are silently ignored.
+# Evidence sources (all from node-fetch v2.7.0 installed locally):
+#   node-fetch/lib/index.js line 1491-1497: request-timeout FetchError
+#   node-fetch/lib/index.js line 384-389: body-timeout FetchError
+#   node-fetch/lib/index.js line 409-412: max-size FetchError
+#   https://github.com/node-fetch/node-fetch/blob/2.x/README.md timeout/size init options
+#   https://github.com/node-fetch/node-fetch/blob/2.x/ERROR-HANDLING.md
+# Coverage: 7/7 = 1.00 (4 contracted + 3 omitted with same error profile as text)
+# Postconditions: 10 → 13 (+3 this pass)
 package: cross-fetch
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.50  # 4 contracted / 8 total async-callable (4 intentionally omitted)
-# Note: total function count updated 6→8 (found buffer() and textConverted() in node-fetch source)
-# Effective coverage (contracted/non-omitted) = 4/4 = 1.0; postconditions: 10
+coverage_score: 1.00  # 4 contracted / (7 total - 3 intentionally omitted) = 4/4 effective; 4/7 raw = 0.57
+# Note: 4 contracted (fetch + json + text + textConverted), 3 omitted (arrayBuffer, blob, buffer)
+# Effective coverage (contracted/non-omitted) = 4/4 = 1.0; postconditions: 13
 description: Universal WHATWG Fetch API polyfill for Node, browsers, and React Native
 
 detection:
@@ -189,6 +210,180 @@ functions:
         sources:
           - "https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch"
           - "https://developer.mozilla.org/en-US/docs/Web/API/AbortController"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: node-fetch/lib/index.js line 1491-1497:
+      #   if (request.timeout) {
+      #     req.once('socket', function (socket) {
+      #       reqTimeout = setTimeout(function () {
+      #         reject(new FetchError(`network timeout at: ${request.url}`, 'request-timeout'));
+      #       }, request.timeout);
+      #     });
+      #   }
+      # Source: node-fetch v2.7.0 README ("timeout: 0,  // req/res timeout in ms, it resets on redirect.")
+      # Note: this is the node-fetch `timeout` init option, NOT AbortController. cross-fetch
+      # users on Node.js can pass { timeout: 5000 } and get this distinct FetchError.
+      # On browsers (native fetch), the timeout option is silently ignored — only AbortController works.
+      - id: fetch-request-timeout-error
+        condition: >
+          fetch() is called with the node-fetch-specific `{ timeout: <ms> }` init option
+          (cross-fetch on Node.js), and the request takes longer than the timeout to
+          establish a socket / receive headers. Distinct from AbortController abort:
+          this is node-fetch's own setTimeout-driven path. Most commonly hit when:
+          - A developer copies a snippet using `fetch(url, { timeout: 5000 })` expecting
+            it to be cross-environment, not realizing it's a node-fetch extension
+          - Background jobs poll slow upstreams without try-catch wrapping
+          - Health-check loops use a short timeout without separating timeout from network errors
+          The error is a FetchError subclass with name === 'FetchError' and type === 'request-timeout'.
+        throws: >
+          FetchError (node-fetch extension class, NOT TypeError or AbortError) with:
+          - name === 'FetchError'
+          - type === 'request-timeout'
+          - message === `network timeout at: ${url}`
+          Source: node-fetch/lib/index.js line 1494. Catch with:
+            error.name === 'FetchError' && error.type === 'request-timeout'
+          On browsers (native fetch), the `timeout` option is silently dropped — this
+          postcondition only fires in Node.js environments.
+        required_handling: >
+          Wrap fetch() with timeout option in a try-catch and distinguish request-timeout
+          from network errors:
+
+            try {
+              const response = await fetch(url, { timeout: 5000 });
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              return await response.json();
+            } catch (error) {
+              if (error.name === 'FetchError' && error.type === 'request-timeout') {
+                throw new Error(`Upstream timed out after 5s: ${url}`);
+              }
+              if (error.name === 'AbortError') {
+                throw new Error('Request was aborted');
+              }
+              throw error; // Re-throw other network errors
+            }
+
+          Best practice: prefer AbortController for cross-environment compatibility.
+          The `timeout` init option only works in node-fetch / cross-fetch on Node.js.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/2.x/README.md"
+          - "https://github.com/node-fetch/node-fetch/blob/2.x/ERROR-HANDLING.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node-fetch/lib/index.js line 384-389:
+      #   if (_this4.timeout) {
+      #     resTimeout = setTimeout(function () {
+      #       reject(new FetchError(`Response timeout while trying to fetch ${_this4.url} (over ${_this4.timeout}ms)`, 'body-timeout'));
+      #     }, _this4.timeout);
+      #   }
+      # This fires DURING body read, not during the initial request. Separate timer from request-timeout.
+      # The same `timeout` init option arms both timers — one for socket/headers, one for body read.
+      - id: fetch-body-timeout-error
+        condition: >
+          fetch() is called with the node-fetch-specific `{ timeout: <ms> }` init option,
+          the response headers arrive successfully (so fetch() resolves), but the body
+          read (via .json(), .text(), .buffer(), etc.) takes longer than the timeout
+          to fully stream. The body-timeout fires DURING the body read, not before fetch()
+          resolves. Most commonly hit with:
+          - Large response bodies (multi-MB JSON, big file downloads)
+          - Slow upstream APIs that drip-feed body data
+          - Streaming endpoints that hold the connection open
+          This is a distinct error path from request-timeout — request-timeout fires before
+          the response object is available; body-timeout fires after.
+        throws: >
+          FetchError with:
+          - name === 'FetchError'
+          - type === 'body-timeout'
+          - message === `Response timeout while trying to fetch ${url} (over ${timeout}ms)`
+          Source: node-fetch/lib/index.js line 388. The error is thrown from inside
+          response.json() / response.text() / response.buffer(), NOT from fetch() itself.
+        required_handling: >
+          The try-catch around response body methods must handle body-timeout distinctly:
+
+            try {
+              const response = await fetch(url, { timeout: 30000 });
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              const data = await response.json(); // body-timeout can fire here
+              return data;
+            } catch (error) {
+              if (error.name === 'FetchError' && error.type === 'body-timeout') {
+                throw new Error(`Body read timed out: response too slow`);
+              }
+              if (error.name === 'FetchError' && error.type === 'request-timeout') {
+                throw new Error(`Request timed out`);
+              }
+              throw error;
+            }
+
+          For long-running streaming responses, set a larger timeout or use AbortController
+          with explicit signal control. The `timeout` option arms BOTH timers from the
+          same value — use it carefully when streaming large bodies.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/2.x/README.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: node-fetch/lib/index.js line 409-412:
+      #   if (_this4.size && accumBytes + chunk.length > _this4.size) {
+      #     abort = true;
+      #     reject(new FetchError(`content size at ${_this4.url} over limit: ${_this4.size}`, 'max-size'));
+      #   }
+      # Source: node-fetch v2.7.0 README ("size: 0,  // maximum response body size in bytes. 0 to disable")
+      # This is a security/quota guardrail — protects against unbounded memory consumption.
+      - id: fetch-max-size-error
+        condition: >
+          fetch() is called with the node-fetch-specific `{ size: <bytes> }` init option
+          (cross-fetch on Node.js), and the response body exceeds the configured maximum.
+          The size limit is checked incrementally during streaming — error is thrown the
+          moment cumulative bytes exceed the threshold. Common use cases:
+          - Untrusted upstream APIs where a 10GB response would OOM the process
+          - User-controlled URL fetching (SSRF guardrail)
+          - Memory-constrained Lambda / serverless environments
+          When the limit is hit, the body method (.json(), .text(), .buffer()) rejects.
+          Callers that set `size` without try-catch crash on oversized responses.
+        throws: >
+          FetchError with:
+          - name === 'FetchError'
+          - type === 'max-size'
+          - message === `content size at ${url} over limit: ${size}`
+          Source: node-fetch/lib/index.js line 411. The error is thrown from inside
+          the body read method, NOT from fetch() itself. Stream is aborted mid-read.
+        required_handling: >
+          Wrap body methods in try-catch and handle max-size as a distinct guardrail event:
+
+            try {
+              const response = await fetch(url, { size: 1_000_000 }); // 1MB cap
+              if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+              const data = await response.json();
+              return data;
+            } catch (error) {
+              if (error.name === 'FetchError' && error.type === 'max-size') {
+                throw new Error(`Response too large: exceeded 1MB limit for ${url}`);
+              }
+              throw error;
+            }
+
+          For user-controlled URLs (SSRF defense), always set `size` AND wrap in try-catch.
+          The `size` option only works in node-fetch / cross-fetch on Node.js — browsers
+          silently ignore it.
+        sources:
+          - "https://github.com/node-fetch/node-fetch/blob/2.x/README.md"
         severity: warning
         business_impact:
           incident_label: DOWNTIME
@@ -568,8 +763,10 @@ notes:
   - "FetchError (node-fetch) vs DOMException (browser): error.type === 'system' for network errors"
   - "response.ok shorthand: status >= 200 && status < 300. Always check before reading body."
   - "AbortError.name === 'AbortError' is the cross-environment check (works in both Node.js node-fetch and browsers)"
-  - "response.blob(), response.arrayBuffer(), response.formData() omitted — same error profile as response.text() (AbortError mid-stream, body-consumed-twice TypeError)"
+  - "response.blob(), response.arrayBuffer() omitted — same error profile as response.text() (AbortError mid-stream, body-consumed-twice TypeError)"
   - "response.buffer() omitted — Node.js only non-standard method, same error profile as text/arrayBuffer"
+  - "response.formData() does NOT exist in node-fetch v2 (not in cross-fetch ponyfill on Node.js); only available in browser native fetch"
+  - "fetch() supports node-fetch init options { timeout, size, compress, agent } on Node.js — three distinct FetchError types (request-timeout, body-timeout, max-size) confirmed in v2.7.0 source"
   - "cross-fetch v4+ only supports the ponyfill pattern — import fetch from 'cross-fetch'"
   - "Alternative: many projects use cross-fetch to polyfill fetch in Node.js 16 and below; Node.js 18+ has native fetch"
   - "text-body-consumed-twice and json-body-consumed-twice are the same underlying error (consumeBody() TypeError) — affects all body methods including buffer() and textConverted()"

@@ -3,6 +3,7 @@
  *
  * Each call site annotated // SHOULD_FIRE or // SHOULD_NOT_FIRE.
  * Contract postcondition IDs: network-error, http-error-unchecked, abort-error,
+ *   fetch-request-timeout-error, fetch-body-timeout-error, fetch-max-size-error,
  *   json-parse-error, json-body-consumed-twice, text-abort-mid-stream,
  *   text-body-consumed-twice, text-converted-missing-encoding-package,
  *   text-converted-body-consumed-twice
@@ -186,6 +187,84 @@ export async function textConvertedWithClone(url: string) {
     const err = error as Error;
     if (err.message && err.message.includes('encoding must be installed')) {
       throw new Error('Install the "encoding" package: npm install encoding');
+    }
+    throw error;
+  }
+}
+
+// ─── 12. fetch() with node-fetch { timeout } option, no try-catch ─────────────
+// @expect-violation: fetch-request-timeout-error
+// @expect-violation: network-error
+
+export async function fetchWithTimeoutOptionNoCatch(url: string) {
+  // SHOULD_FIRE: fetch-request-timeout-error — { timeout } option arms node-fetch's setTimeout.
+  // On slow upstream, this rejects with FetchError type='request-timeout'. Without try-catch,
+  // unhandled rejection. Also SHOULD_FIRE for network-error (same call site).
+  // TODO(scanner): fetch-request-timeout-error — no scanner detection rule yet.
+  const response = await (fetch as any)(url, { timeout: 5000 });
+  return response.json();
+}
+
+// ─── 13. fetch() with { timeout } inside try-catch — correct pattern ──────────
+// @expect-clean
+
+export async function fetchWithTimeoutOptionAndCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: { timeout } option used inside try-catch — FetchError handled
+    const response = await (fetch as any)(url, { timeout: 5000 });
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    const err = error as { name?: string; type?: string };
+    if (err.name === 'FetchError' && err.type === 'request-timeout') {
+      throw new Error(`Upstream timed out after 5s: ${url}`);
+    }
+    throw error;
+  }
+}
+
+// ─── 14. body-timeout fires during response.json() with { timeout } option ────
+// @expect-violation: fetch-body-timeout-error
+
+export async function fetchBodyTimeoutNoCatch(url: string) {
+  // SHOULD_FIRE: fetch-body-timeout-error — the { timeout } option also arms the body-read
+  // timer; if response body streams slowly, response.json() rejects with FetchError type='body-timeout'.
+  // Without try-catch on the body method, unhandled rejection.
+  // TODO(scanner): fetch-body-timeout-error — no scanner detection rule yet.
+  const response = await (fetch as any)(url, { timeout: 10000 });
+  if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+  // The body-timeout fires HERE, not on fetch() above
+  const data = await response.json();
+  return data;
+}
+
+// ─── 15. fetch() with node-fetch { size } cap, no try-catch ───────────────────
+// @expect-violation: fetch-max-size-error
+
+export async function fetchWithSizeCapNoCatch(url: string) {
+  // SHOULD_FIRE: fetch-max-size-error — { size } option enforces max body bytes.
+  // Oversized response rejects body method with FetchError type='max-size'.
+  // Without try-catch, the SSRF/OOM guardrail crashes the caller instead of being caught.
+  // TODO(scanner): fetch-max-size-error — no scanner detection rule yet.
+  const response = await (fetch as any)(url, { size: 1_000_000 });
+  if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+  // max-size fires HERE if body exceeds 1MB
+  return response.text();
+}
+
+// ─── 16. fetch() with { size } cap inside try-catch — correct pattern ─────────
+// @expect-clean
+
+export async function fetchWithSizeCapAndCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: { size } guardrail used inside try-catch — max-size handled
+    const response = await (fetch as any)(url, { size: 1_000_000 });
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return await response.text();
+  } catch (error) {
+    const err = error as { name?: string; type?: string };
+    if (err.name === 'FetchError' && err.type === 'max-size') {
+      throw new Error(`Response too large: exceeded 1MB limit for ${url}`);
     }
     throw error;
   }
