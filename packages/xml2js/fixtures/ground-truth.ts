@@ -12,6 +12,7 @@
  *   parser-instance-malformed-xml
  *   parser-instance-parse-string-callback-error-ignored  (added 2026-06-12 deepen pass 2)
  *   parser-instance-parse-string-no-callback             (added 2026-06-12 deepen pass 2)
+ *   parse-promise-validator-throws                       (added 2026-06-12 deepen pass 3)
  *
  * Annotation comments must be immediately above the call site (the await line).
  */
@@ -203,4 +204,43 @@ function parserInstanceParseStringNoCallback(xml: string) {
   const parser = new Parser({ explicitArray: false });
   // SHOULD_FIRE: parser-instance-parse-string-no-callback — instance parseString called without cb
   parser.parseString(xml);
+}
+
+// ─── parseStringPromise w/ validator option — added 2026-06-12 deepen pass 3 ──
+
+async function parseWithValidatorProtected(xml: string) {
+  const validator = (xpath: string, currentValue: any, newValue: any) => {
+    if (xpath === '/root/age' && typeof newValue !== 'number') {
+      throw new (xml2js as any).ValidationError(`age must be numeric, got ${newValue}`);
+    }
+    return newValue;
+  };
+  try {
+    // SHOULD_NOT_FIRE: parseStringPromise with validator wrapped in try-catch covers both
+    // sax-level and validator-thrown errors via the shared reject channel.
+    const result = await parseStringPromise(xml, { validator } as any);
+    return result;
+  } catch (err) {
+    if (err instanceof (xml2js as any).ValidationError) {
+      console.warn('validation failed:', (err as Error).message);
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function parseWithValidatorUnprotected(xml: string) {
+  const validator = (xpath: string, currentValue: any, newValue: any) => {
+    if (xpath === '/root/age' && typeof newValue !== 'number') {
+      throw new (xml2js as any).ValidationError(`age must be numeric`);
+    }
+    return newValue;
+  };
+  // parse-promise-validator-throws needs a scanner detector flow-analyzing
+  // options.validator presence — concern-20260612-xml2js-deepen-1.
+  // Until that detector lands, the unprotected validator-throws case falls through
+  // to the malformed-XML reject path on the same line.
+  // SHOULD_FIRE: parse-error-malformed-xml — unwrapped parse fires (validator-throws also applies)
+  const result = await parseStringPromise(xml, { validator } as any);
+  return result;
 }
