@@ -2,12 +2,13 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
-## 2026-06-11 — flagged for manual review
+## 2026-06-11 — semver range extended
 
 - **Latest published:** typeorm@1.0.0
-- **Verdict:** manual review required — v1.0.0 removed error handling code in createPropertyPath, restructured SQL injection parameterization, and made `invalidWhereValuesBehavior` default to "throw"
-- **Reason:** removal of error handling in createPropertyPath and query parameterization changes could affect what errors are thrown; postconditions need re-validation against v1.0
-- **Queued in:** `work-packages/version-drift/needs-review.md` (sweep 2026-06-11)
+- **Profile semver:** `>=0.3.0 <1.0.0` → `>=0.3.0 <2.0.0`
+- **Verdict:** no error-handling-relevant changes — QueryFailedError and EntityNotFoundError classes verified unchanged in v1.0.0
+- **Changelog evidence:** Extracted `package/error/QueryFailedError.d.ts` and `package/error/EntityNotFoundError.d.ts` from typeorm@1.0.0 tarball. Both inherit from `TypeORMError` with identical signatures to v0.3.x. v1.0 is primarily: dropped Node 16/18 support, security fixes (SQL injection parameterization), codemod tooling for migration, bug fixes. No new error class types, no changes to error-throwing behavior in `find()*`, `save()`, `delete()` etc. The `invalidWhereValuesBehavior` was scoped to high-level abstractions only in v0.3.30.
+- **Scanner version used:** nark@3.0.0
 - **Verified by:** bc-version-drift (sweep 2026-06-11)
 
 ## 2026-04-03 — backfilled

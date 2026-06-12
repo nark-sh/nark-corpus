@@ -2,12 +2,13 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
-## 2026-06-11 — flagged for manual review
+## 2026-06-11 — semver range extended
 
 - **Latest published:** firebase-admin@14.0.0
-- **Verdict:** manual review required — v14 ships "Error Handling Revamp" (PR #3140); error classes and/or patterns may have changed; also removed deprecated Instance ID service and legacy namespace support
-- **Reason:** "Error Handling Revamp" in v14 is a red flag — exact changes to thrown error types, error codes, or error-handling APIs need investigation before extending the range
-- **Queued in:** `work-packages/version-drift/needs-review.md` (sweep 2026-06-11)
+- **Profile semver:** `>=11.0.0 <14.0.0` → `>=11.0.0 <15.0.0`
+- **Verdict:** no error-handling-relevant behavioral changes between v13 and v14 — extended range
+- **Changelog evidence:** PR #3140 "Error Handling Revamp" investigated directly. Changes are: (1) new `cause` and `httpResponse` fields added to FirebaseError/ErrorInfo interfaces, (2) better exports of error classes, (3) refactored internals, (4) removed deprecated Instance ID service. Critical finding: functions still throw the same `FirebaseAuthError`, `FirebaseMessagingError`, etc. with the same error codes. Existing catch blocks checking `error.code` still work. The `cause`/`httpResponse` additions are additive non-breaking.
+- **Scanner version used:** nark@3.0.0
 - **Verified by:** bc-version-drift (sweep 2026-06-11)
 
 ## 2026-04-13 — backfilled

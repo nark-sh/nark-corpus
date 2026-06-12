@@ -2,11 +2,11 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
-## 2026-06-11 — flagged for manual review
+## 2026-06-11 — flagged for extends-fork
 
 - **Latest published:** @clerk/nextjs@7.5.2
-- **Verdict:** manual review required — v7 changes `useAuth().getToken` from returning `undefined` during SSR to throwing with `clerk_runtime_not_browser` error code; semantic error-handling change
-- **Reason:** profile postconditions may need validation against v7 SSR throw behavior; range can extend to `>=5.0.0 <8.0.0` but new postcondition may be needed
+- **Verdict:** extends-fork recommended — v7 introduces error-relevant behavioral change: `useAuth().getToken` now throws `ClerkRuntimeError` with code `clerk_runtime_not_browser` during SSR (previously returned `undefined`). Also: `clerkMiddleware()` now throws if `CLERK_ENCRYPTION_KEY` is missing when `secretKey` is set at runtime. `auth.protect()` returns 401 (not 404) for unauthenticated server actions.
+- **Reason:** at least 2 new postconditions needed for v7; parent postconditions (e.g. getAuth() auth checks) still apply in v7 — extends-fork qualifies (≥50% parent postconditions reusable)
 - **Queued in:** `work-packages/version-drift/needs-review.md` (sweep 2026-06-11)
 - **Verified by:** bc-version-drift (sweep 2026-06-11)
 
