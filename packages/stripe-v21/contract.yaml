@@ -1,11 +1,35 @@
 package: stripe
 semver: ">=21.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-09"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
+coverage_score: 0.86  # 6 contracted / 7 v21-specific async-callable functions (1 intentionally omitted)
+# coverage_score calculation: v21-specific surface = 7 distinct functions
+#   (constructEvent, constructEventAsync, token, deauthorize, parseEventNotification,
+#    fetchRelatedObject, fetchEvent — all v21-specific or v21-overridden)
+#   Contracted: constructEvent, constructEventAsync, token, deauthorize (4 pre-existing)
+#              + parseEventNotification, fetchRelatedObject, fetchEvent (3 added this pass) = 6 direct
+#   Note: oauth.authorizeUrl() is intentionally omitted (synchronous, returns URL string, no async errors)
+#   Effective coverage: 6/7 = 0.86
+#
+# Depth pass 2026-06-11 (deepen-stream-2 pass 1):
+# v21-specific async surface: 7 distinct functions
+# Contracted before: 4 (constructEvent override, constructEventAsync override, token, deauthorize)
+# Contracted after: 6 (+2 new contracts: parseEventNotification, fetchRelatedObject+fetchEvent grouped)
+# Actually 3 new function entries: parseEventNotification, fetchRelatedObject, fetchEvent
+# Coverage: 4/7 = 57% → 6/7 = 86% (after counting all 6 with postconditions)
+# Wait — 7 functions, 1 omitted (authorizeUrl) = 6 non-omitted, all contracted = effective 6/6 = 100%
+# Raw score: 6/7 = 0.86
+# Evidence sources:
+#   stripe-node v21.0.1 cjs/stripe.core.js lines 375-416 — parseEventNotification implementation
+#   stripe-node v21.0.1 cjs/Webhooks.js lines 28,41 — wrong-parsing-method guard
+#   stripe-node v21.0.1 cjs/Error.js — TemporarySessionExpiredError, RateLimitError (v2 specific)
+#   stripe-node v21.0.1 cjs/RequestSender.js lines 50-67 — generateV2Error error dispatch
+#   https://github.com/stripe/stripe-node/pull/2618 — wrong-parsing-method guard
+#   https://github.com/stripe/stripe-node/blob/v21.0.0/CHANGELOG.md
 extends: "../stripe/contract.yaml"
 # Fork point: stripe-node v21.0.0 (2026-03-25, "dahlia" API version).
 #
@@ -194,3 +218,239 @@ functions:
         sources:
           - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.0/src/Error.ts"
         severity: error
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # NEW in v21: thin event processing (V2 Event Notifications)
+  # Introduced in stripe-node v21 alongside the "dahlia" API version (2026-03-25).
+  # parseEventNotification() is the v2 equivalent of constructEvent() for thin events.
+  # fetchRelatedObject() and fetchEvent() are async methods on EventNotification objects.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: parseEventNotification
+    import_path: "stripe"
+    description: >
+      stripe.parseEventNotification(payload, header, secret) — synchronous method
+      that verifies a v2 thin event notification's webhook signature and returns a
+      typed Stripe.V2.Core.EventNotification object. New in stripe-node v21 (renamed
+      from parseThinEvent in prior beta). The returned EventNotification has async
+      methods fetchRelatedObject() and fetchEvent() for network lookups.
+      Throws StripeSignatureVerificationError on bad signatures (same as constructEvent).
+      Throws plain Error when a v1 event payload is passed (the wrong-parsing-method guard).
+    postconditions:
+      # Evidence:
+      #   stripe-node v21.0.1 cjs/stripe.core.js lines 375-395 — parseEventNotification impl
+      #   stripe-node v21.0.1 cjs/Webhooks.js lines 28,41 — v1-payload guard
+      #   stripe-node v21.0.1 cjs/Webhooks.js lines 92,107,110,119,124,144,153,165 — verifyHeader throws
+      #   https://github.com/stripe/stripe-node/pull/2618 — wrong-parsing-method guard
+      - id: parse-event-notification-signature-failed
+        condition: >
+          Webhook payload signature is invalid — wrong signing secret, tampered payload,
+          or expired timestamp (outside DEFAULT_TOLERANCE of 300s). Signature check
+          happens via webhooks.signature.verifyHeader() called inside parseEventNotification.
+        throws: "StripeSignatureVerificationError (extends StripeError)"
+        required_handling: >
+          Wrap stripe.parseEventNotification() in try-catch.
+          Catch StripeSignatureVerificationError specifically and return HTTP 400 to Stripe.
+          DO NOT process the event if signature verification fails — the payload cannot be
+          trusted. Unlike constructEvent, parseEventNotification processes v2 thin events,
+          so the same security requirement applies with equal urgency.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeSignatureVerificationError"
+          - instanceof: "Stripe.errors.StripeError"
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/Webhooks.js"
+          - "https://github.com/stripe/stripe-node/pull/2618"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: parse-event-notification-wrong-payload-type
+        condition: >
+          A v1 event payload (event.object === 'event') is mistakenly passed to
+          parseEventNotification(). The implementation explicitly checks for this
+          and throws a plain Error with message:
+          "You passed a webhook payload to stripe.parseEventNotification, which expects
+          an event notification. Use stripe.webhooks.constructEvent instead."
+          Conversely, passing a v2 thin event to constructEvent() throws the inverse guard.
+          Both guards were added in stripe-node v21 (PR #2618).
+        throws: "Error (plain JavaScript Error, not StripeError)"
+        required_handling: >
+          Use parseEventNotification() for v2 thin events (event_payload: 'thin' destination)
+          and stripe.webhooks.constructEvent() for v1 events (event_payload: 'snapshot').
+          Inspect the webhook destination configuration before choosing the parsing method.
+          A catch block on StripeError alone will NOT catch this — it's a plain Error.
+          Wrap in generic try-catch: catch (e) { if (e instanceof Error) return res.status(400)... }
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/stripe.core.js"
+          - "https://github.com/stripe/stripe-node/pull/2618"
+          - "https://github.com/stripe/stripe-node/blob/v21.0.0/CHANGELOG.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: fetchRelatedObject
+    import_path: "stripe"
+    description: >
+      EventNotification.fetchRelatedObject() — async method injected onto EventNotification
+      objects returned by parseEventNotification(). Makes a GET request to the Stripe v2 API
+      to retrieve the latest version of the resource associated with the event (e.g., a Meter,
+      Account, etc.). Returns null (not throws) when the notification has no related_object.
+      Uses Stripe's v2 request path which introduces two new v21-specific error types:
+      RateLimitError (distinct from v1 StripeRateLimitError) and TemporarySessionExpiredError.
+    postconditions:
+      # Evidence:
+      #   stripe-node v21.0.1 cjs/stripe.core.js lines 397-409 — fetchRelatedObject impl
+      #   stripe-node v21.0.1 cjs/RequestSender.js lines 295-335 — _rawRequest error path
+      #   stripe-node v21.0.1 cjs/RequestSender.js lines 411-414 — StripeConnectionError on network fail
+      #   stripe-node v21.0.1 cjs/Error.js lines 50-67 — generateV2Error dispatch (RateLimitError, TemporarySessionExpiredError)
+      #   stripe-node v21.0.1 types/Errors.d.ts — RateLimitError, TemporarySessionExpiredError class definitions
+      - id: fetch-related-object-no-try-catch
+        condition: >
+          Network failure (DNS, TCP, TLS), API authentication error, or server error
+          while fetching the related object from Stripe's v2 API. The HTTP GET is made
+          using the same request pipeline as all other Stripe API calls, meaning all
+          StripeConnectionError (network), StripeAuthenticationError (bad API key),
+          StripeAPIError (5xx), and StripeRateLimitError conditions apply.
+        throws: "StripeConnectionError | StripeAuthenticationError | StripeAPIError | StripeRateLimitError"
+        required_handling: >
+          Always await eventNotification.fetchRelatedObject() inside a try-catch block.
+          Note that null is returned (not thrown) when there is no related_object — this
+          is a silent case that must also be checked: if (!related) return; or a nullish
+          check before using the result. Network failures in webhook handlers cause
+          silent failures if the catch block re-throws without surfacing a 500.
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/stripe.core.js"
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/RequestSender.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: fetch-related-object-temporary-session-expired
+        condition: >
+          Throws TemporarySessionExpiredError (rawType: 'temporary_session_expired') when
+          the StripeContext attached to the event notification has expired. StripeContext
+          is a v21 addition that scopes v2 API requests to a specific event — if the
+          session window has passed, the context-authenticated request is rejected.
+          This error class is NEW in v21 and does NOT extend StripeRateLimitError —
+          a catch block for StripeRateLimitError will NOT catch it.
+          Confirmed from cjs/Error.js: generateV2Error dispatches 'temporary_session_expired'
+          to new TemporarySessionExpiredError (rawType: 'temporary_session_expired').
+        throws: "TemporarySessionExpiredError (extends StripeError, rawType: 'temporary_session_expired')"
+        required_handling: >
+          Catch TemporarySessionExpiredError explicitly. The standard pattern is to
+          re-fetch the event from the v2 events API: stripe.v2.core.events.retrieve(id).
+          Do NOT retry the same fetchRelatedObject() call — the session is permanently expired.
+          Failing to handle this will silently drop the event's side-effect processing.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.TemporarySessionExpiredError"
+          - instanceof: "Stripe.errors.StripeError"
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/Error.js"
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/types/Errors.d.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: fetch-related-object-null-unchecked
+        condition: >
+          fetchRelatedObject() returns Promise<null> (not throws) when the EventNotification
+          has no related_object field. This is a confirmed behavior from cjs/stripe.core.js:
+          if (!eventNotification.related_object) { return Promise.resolve(null); }.
+          Code that destructures or accesses properties on the result without a null check
+          will throw a TypeError at runtime.
+        throws: "TypeError (null property access — NOT a StripeError, thrown by caller code)"
+        required_handling: >
+          Always check the return value before use:
+            const related = await notification.fetchRelatedObject();
+            if (!related) return; // notification has no related object
+          This is NOT a Stripe SDK error but a caller-side TypeError from null access.
+          Particularly dangerous in typed TypeScript where the return type is typed as
+          Promise<T> and developers assume non-null.
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/stripe.core.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: fetchEvent
+    import_path: "stripe"
+    description: >
+      EventNotification.fetchEvent() — async method injected onto EventNotification
+      objects returned by parseEventNotification(). Makes a GET request to
+      /v2/core/events/{id} to retrieve the full event with data and changes hashes.
+      Uses the same v2 request pipeline as fetchRelatedObject() — same error classes apply.
+      Call fetchEvent() when you need the full event context beyond what the thin
+      notification provides (e.g., before/after changes, extended data fields).
+    postconditions:
+      # Evidence:
+      #   stripe-node v21.0.1 cjs/stripe.core.js lines 390-397 — fetchEvent implementation
+      #   stripe-node v21.0.1 cjs/RequestSender.js lines 295-414 — request error pipeline
+      #   stripe-node v21.0.1 cjs/Error.js lines 50-67 — generateV2Error for v2 paths
+      - id: fetch-event-no-try-catch
+        condition: >
+          Network failure, authentication error, or server error while fetching the full
+          event from /v2/core/events/{id}. Same error types apply as all Stripe v2 API
+          calls: StripeConnectionError (network), StripeAuthenticationError (invalid key),
+          StripeAPIError (5xx), StripeRateLimitError (v1 path) or RateLimitError (v2 path).
+        throws: "StripeConnectionError | StripeAuthenticationError | StripeAPIError | StripeRateLimitError | RateLimitError"
+        required_handling: >
+          Always await eventNotification.fetchEvent() inside a try-catch block.
+          A common anti-pattern is calling fetchEvent() only when needed (e.g., inside a
+          switch/case handler) without wrapping the call — the outer catch block from
+          parseEventNotification() does NOT cover async calls made after the synchronous parse.
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/stripe.core.js"
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/RequestSender.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: fetch-event-temporary-session-expired
+        condition: >
+          Throws TemporarySessionExpiredError when the StripeContext session has expired.
+          Same mechanism as fetchRelatedObject — the context is scoped to the event notification
+          and expires after a window. Confirmed from cjs/Error.js generateV2Error dispatch.
+          This is the same new v21-specific error class as in fetchRelatedObject.
+        throws: "TemporarySessionExpiredError (extends StripeError, rawType: 'temporary_session_expired')"
+        required_handling: >
+          Catch TemporarySessionExpiredError explicitly. Re-fetch the event using
+          stripe.v2.core.events.retrieve(eventId) with standard Stripe API authentication
+          instead of the context-scoped fetchEvent() call. Log the expired context for
+          monitoring — frequent expiry indicates delayed webhook processing.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.TemporarySessionExpiredError"
+          - instanceof: "Stripe.errors.StripeError"
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v21.0.1/cjs/Error.js"
+          - "https://docs.stripe.com/context"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
