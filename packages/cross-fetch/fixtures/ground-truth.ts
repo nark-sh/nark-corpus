@@ -197,11 +197,10 @@ export async function textConvertedWithClone(url: string) {
 // @expect-violation: network-error
 
 export async function fetchWithTimeoutOptionNoCatch(url: string) {
-  // SHOULD_FIRE: fetch-request-timeout-error — { timeout } option arms node-fetch's setTimeout.
-  // On slow upstream, this rejects with FetchError type='request-timeout'. Without try-catch,
-  // unhandled rejection. Also SHOULD_FIRE for network-error (same call site).
-  // TODO(scanner): fetch-request-timeout-error — no scanner detection rule yet.
-  const response = await (fetch as any)(url, { timeout: 5000 });
+  // { timeout } option arms node-fetch's setTimeout. On slow upstream, this rejects with
+  // FetchError type='request-timeout'. Without try-catch, unhandled rejection.
+  // SHOULD_FIRE: fetch-request-timeout-error — { timeout } option arms node-fetch setTimeout, throws FetchError without try-catch
+  const response = await fetch(url, { timeout: 5000 } as any);
   return response.json();
 }
 
