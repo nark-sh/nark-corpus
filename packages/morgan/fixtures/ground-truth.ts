@@ -8,10 +8,12 @@
  *   - morgan.compile(nonString) → SHOULD_FIRE: compile-non-string-throws
  *   - morgan.compile(format) with unregistered tokens → SHOULD_FIRE: compile-invalid-token-syntax-silent
  *   - morgan.token('status', fn) — overwriting built-in token → SHOULD_FIRE: token-name-overwrite-silent
+ *   - morgan.format('combined', fn) — overwriting built-in format → SHOULD_FIRE: format-name-overwrite-silent
  *   - morgan() without stream error handler → SHOULD_FIRE: stream-write-error
  *   - morgan() with stream error handler → SHOULD_NOT_FIRE
  *   - morgan.compile(validString) → SHOULD_NOT_FIRE
  *   - morgan.token('x-custom-id', fn) — namespaced custom token → SHOULD_NOT_FIRE
+ *   - morgan.format('app-access', fn) — namespaced custom format → SHOULD_NOT_FIRE
  *
  * Functions with proper error handling should SHOULD_NOT_FIRE.
  */
@@ -103,4 +105,30 @@ export function morganWithSafeStream() {
   });
   const middleware = morgan('combined', { stream: logStream });
   return middleware;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. morgan.format() — overwriting built-in formats silently changes log shape
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function overwriteBuiltInCombinedFormat() {
+  // SHOULD_FIRE: format-name-overwrite-silent — 'combined' is a built-in format; silent overwrite
+  morgan.format('combined', ':method :url :status :res[content-length]');
+}
+
+export function overwriteBuiltInDevFormat() {
+  // SHOULD_FIRE: format-name-overwrite-silent — 'dev' is a built-in format
+  morgan.format('dev', (tokens, req, res) => {
+    return [
+      tokens.method?.(req, res),
+      tokens.url?.(req, res),
+      tokens.status?.(req, res),
+    ].join(' ');
+  });
+}
+
+export function registerNamespacedCustomFormat() {
+  // SHOULD_NOT_FIRE: namespaced format name avoids collision with built-in formats
+  morgan.format('app-access', ':method :url :status :response-time ms');
+  morgan.format('audit-log', ':remote-addr :method :url :status');
 }
