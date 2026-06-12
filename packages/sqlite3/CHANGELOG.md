@@ -2,6 +2,19 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-12 — deepen pass — coverage 57% → 67% (effective 100%)
+
+- **Profile:** `packages/sqlite3/contract.yaml`
+- **Functions added:** Database (constructor open-error postconditions), Statement.get (2 total)
+- **Postconditions added:** 6 (database-open-cantopen, database-open-perm, database-open-notadb, database-open-corrupt, statement-get-callback-error-ignored, statement-get-leaves-database-locked)
+- **Functions intentionally omitted this pass:** Statement.bind (binding errors immediate, low silent-failure rate), Statement.reset (wiki documents "never fails"), Statement.all/each (same error profile as Database equivalents; usage pattern documented under Statement.run + finalize), Statement.map (covered by Database.map shortcut), Database.serialize/parallelize (mode control, scheduled queries report own errors), Database.wait (undocumented in current wiki API).
+- **Scanner concerns queued:** 3 (`concern-20260612-sqlite3-deepen-5` Database constructor open-error detection, `concern-20260612-sqlite3-deepen-6` Statement.get callback-error-ignored, `concern-20260612-sqlite3-deepen-7` Statement.get cursor-leak / database-locked tracking)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:** https://github.com/TryGhost/node-sqlite3/wiki/API (Database constructor, Statement#get), https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js (err.errno === sqlite3.CANTOPEN assertion), https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/prepare.test.js (canonical stmt.get callback pattern), https://www.sqlite.org/rescode.html (SQLITE_CANTOPEN=14, SQLITE_PERM=3, SQLITE_NOTADB=26, SQLITE_CORRUPT=11)
+- **Coverage rationale:** Raw 14/21 = 0.67. 7 intentionally omitted (was 9; removed Statement.get from omitted list and added 2 functions). Effective 14/14 = 1.0.
+- **Key insight:** The Database constructor itself was implicit in the contract — its 4 distinct open failure modes (CANTOPEN, PERM, NOTADB, CORRUPT) are the #1 cause of production silent-deploy failures with sqlite3 (missing data file, container uid/gid mismatch, wrong path pointing at non-DB file, corrupted snapshot). Promoting it to a first-class function entry creates an enforcement point at the deploy boundary. Statement.get was previously omitted under "same error profile as Database.get" — the wiki API explicitly documents a UNIQUE failure mode for Statement.get ("can leave the database locked, as the database awaits further calls to Statement#get to retrieve subsequent rows") that does not apply to Database.get because Database.get auto-finalizes its internal one-off statement. Two separate postconditions distinguish callback-err-ignored (silent failure) from cursor-leak (degraded service).
+- **Verified by:** bc-deepen-contract (deepen-stream-1 pass 6 on 2026-06-12T16:39Z)
+
 ## 2026-06-12 — deepen pass — coverage 69% → 57% (effective 100%)
 
 - **Profile:** `packages/sqlite3/contract.yaml`

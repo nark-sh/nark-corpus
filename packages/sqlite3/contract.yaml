@@ -1,19 +1,38 @@
 package: sqlite3
 semver: ">=5.0.3"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
 last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.57  # 12 contracted / 21 total async-callable
-# Effective coverage: 12 contracted / 12 contractable = 1.0
-# Intentionally omitted (9): Statement.bind (immediate binding error, rare),
-#   Statement.reset (documented "never fails"), Statement.get/all/each (same
+coverage_score: 0.67  # 14 contracted / 21 total async-callable
+# Effective coverage: 14 contracted / 14 contractable = 1.0
+# Intentionally omitted (7): Statement.bind (immediate binding error, rare),
+#   Statement.reset (documented "never fails"), Statement.all/each (same
 #   error profile as Database equivalents — usage pattern documented under
 #   Statement.run + finalize), Statement.map (covered by Database.map shortcut),
 #   Database.serialize/parallelize (mode control; scheduled query errors report
 #   via own callbacks), Database.wait (undocumented in current wiki API).
+#
+# Depth pass 2026-06-12 (deepen-stream-1 pass 6):
+# +2 functions: Database (constructor open-error postconditions), Statement.get
+# Gap identified: the Database constructor itself was implicit in the contract —
+# its 4 distinct open failure modes (CANTOPEN, PERM, NOTADB, CORRUPT) are the
+# #1 cause of production silent-deploy failures with sqlite3, yet no first-
+# class function entry surfaced them. Statement.get was previously omitted
+# under "same error profile as Database.get" — that was incorrect. The
+# documented "leaves the database locked" warning is unique to Statement.get
+# and creates a distinct slow-leak production pattern that Database.get does
+# not have (Database.get auto-finalizes; Statement.get does not).
+# Sources confirmed:
+#   https://github.com/TryGhost/node-sqlite3/wiki/API (Database constructor, Statement#get)
+#   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js
+#     (err.errno === sqlite3.CANTOPEN assertion for missing file in OPEN_READONLY)
+#   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/prepare.test.js
+#     (canonical stmt.get(function(err, row) { if (err) throw err; ... }) pattern)
+#   https://www.sqlite.org/rescode.html
+#     (SQLITE_CANTOPEN=14, SQLITE_PERM=3, SQLITE_NOTADB=26, SQLITE_CORRUPT=11)
 #
 # Depth pass 2026-06-12 (deepen-stream-2 pass 2):
 # +3 functions: Statement.finalize, Statement.run, map (Database#map / Statement#map)
@@ -877,6 +896,284 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: lost_data
+          incident_cost_range: medium
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Deepen pass 2026-06-12 (deepen-stream-1 pass 6)
+  # Added: Database (constructor open errors), Statement.get
+  # Sources: GitHub wiki API + open_close.test.js + prepare.test.js + sqlite.org rescode.html
+  # ───────────────────────────────────────────────────────────────────────────
+
+  - name: Database
+    import_path: "sqlite3"
+    description: >
+      Constructor for opening a SQLite database connection. The callback receives
+      `(err)` — the err is null on success and a populated Error on open failure.
+      Most-frequently-triggered failure modes are SQLITE_CANTOPEN (file not found
+      in OPEN_READONLY without OPEN_CREATE; directory doesn't exist; file is a
+      directory; symlink with OPEN_NOFOLLOW), SQLITE_PERM (no read/write
+      permission on the target file or its parent directory), SQLITE_NOTADB
+      (target file is not a SQLite database — common for accidentally pointed
+      at a binary, text, or truncated/corrupted file), and SQLITE_CORRUPT (the
+      file is a SQLite database but its internal structure has been damaged).
+      Critically, on failure the Database object is still returned but is
+      unusable — every subsequent run/get/all/exec/prepare on it will emit
+      another error event.
+    postconditions:
+      # Evidence:
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js
+      #     — test: "if (err && err.errno === sqlite3.CANTOPEN)" for missing file
+      #       in OPEN_READONLY mode.
+      #   https://github.com/TryGhost/node-sqlite3/wiki/API
+      #     — "If provided, this function will be called when the database was
+      #        opened successfully or when an error occurred. The first argument
+      #        is an error object. When it is null, opening succeeded."
+      #   https://www.sqlite.org/rescode.html
+      #     — SQLITE_CANTOPEN (14), SQLITE_PERM (3), SQLITE_NOTADB (26), SQLITE_CORRUPT (11)
+      - id: database-open-cantopen
+        condition: >
+          Constructor called with a filename that does not exist when mode does
+          NOT include OPEN_CREATE, OR filename points to a directory, OR filename
+          path is a broken symlink with OPEN_NOFOLLOW, OR the parent directory
+          does not exist, OR the process lacks search permission on an ancestor
+          directory.
+        throws: >
+          Error with errno === sqlite3.CANTOPEN (14) passed to the constructor
+          callback. The Database object is returned but is unusable — subsequent
+          operations will fail with the same error or emit "error" events.
+        required_handling: >
+          Caller MUST check err in the constructor callback. Pattern:
+            const db = new sqlite3.Database('/path/to/data.db', sqlite3.OPEN_READWRITE, (err) => {
+              if (err) {
+                // err.errno === sqlite3.CANTOPEN means file missing / inaccessible
+                throw new Error(`Failed to open database at /path/to/data.db: ${err.message}`);
+              }
+            });
+          Failing to check err is catastrophic: the application proceeds with
+          an unusable db handle. Every subsequent db.run/get/all silently emits
+          its own error event, and unless an 'error' listener is registered the
+          process crashes via the EventEmitter "error" default behavior. This is
+          one of the most common production silent-deploy failures with sqlite3
+          — a missing data file in production with no clear error chain.
+        sources:
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/open_close.test.js"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+          - "https://www.sqlite.org/rescode.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: database-open-perm
+        condition: >
+          Constructor called with a filename whose owning user/group lacks the
+          requested mode permissions (READONLY needs read; READWRITE needs both
+          read and write). Most common when application runs as a non-root user
+          but the data file was created by a different user or has restrictive
+          umask, or when the parent directory lacks write permission and
+          OPEN_CREATE is requested.
+        throws: >
+          Error with errno === sqlite3.PERM (3) passed to the constructor
+          callback. Message typically contains "SQLITE_PERM: access permission
+          denied".
+        required_handling: >
+          Caller MUST check err and surface a clear permission error. Pattern:
+            const db = new sqlite3.Database(file, (err) => {
+              if (err && err.errno === sqlite3.PERM) {
+                throw new Error(`No permission to open ${file} — check file ownership and process user`);
+              }
+              if (err) throw err;
+            });
+          In containerized deployments (Docker, Kubernetes), this is one of the
+          most common errors at first startup when the data volume is mounted
+          with a different uid/gid than the app container's user.
+        sources:
+          - "https://www.sqlite.org/rescode.html"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: database-open-notadb
+        condition: >
+          Constructor called with a filename that exists and is readable but is
+          not a SQLite database file. The file's first 16 bytes do not match the
+          SQLite magic header ("SQLite format 3\0"). Common when an application
+          accidentally points at a backup .tar.gz, a text file, a truncated
+          download, or a previous-format SQLite file (SQLite 2.x).
+        throws: >
+          Error with errno === sqlite3.NOTADB (26) passed to constructor
+          callback. Message contains "SQLITE_NOTADB: file is not a database".
+        required_handling: >
+          Caller MUST check err in the constructor callback. Pattern:
+            const db = new sqlite3.Database(file, (err) => {
+              if (err && err.errno === sqlite3.NOTADB) {
+                // File exists but is not a SQLite database — wrong path or corrupted download
+                throw new Error(`${file} is not a SQLite database file`);
+              }
+              if (err) throw err;
+            });
+          DO NOT retry — NOTADB is deterministic; the file content needs to
+          change before this will succeed.
+        sources:
+          - "https://www.sqlite.org/rescode.html"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: database-open-corrupt
+        condition: >
+          Constructor called with a filename that IS a SQLite database but whose
+          internal pages have been damaged. Typically caused by partial writes
+          (process killed during a write), filesystem corruption, copying a hot
+          database file without proper backup API, or running out of disk space
+          mid-write. The error may surface either at open time or on the first
+          read/write that touches the corrupted page.
+        throws: >
+          Error with errno === sqlite3.CORRUPT (11) passed to the constructor
+          callback OR to a subsequent operation's callback. Message contains
+          "SQLITE_CORRUPT: database disk image is malformed".
+        required_handling: >
+          Caller MUST check err in the constructor callback AND treat CORRUPT
+          as unrecoverable for the affected database. Pattern:
+            const db = new sqlite3.Database(file, (err) => {
+              if (err && err.errno === sqlite3.CORRUPT) {
+                // Database is damaged — restore from backup, do NOT continue writing
+                throw new Error(`Database ${file} is corrupt; restore from backup`);
+              }
+              if (err) throw err;
+            });
+          DO NOT continue writing to a CORRUPT database — subsequent writes
+          can amplify the damage. Application should fail fast and alert
+          operators to restore from a backup or rebuild the database. This is
+          why production systems should run `PRAGMA integrity_check` periodically
+          and use WAL mode + sqlite_backup() for hot backups.
+        sources:
+          - "https://www.sqlite.org/rescode.html"
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: Statement.get
+    import_path: "sqlite3"
+    import_class: "Statement"
+    description: >
+      Statement instance method (NOT Database#get). Binds parameters to a
+      prepared statement and retrieves the next row, calling the callback
+      `(err, row)`. Unlike Database#get (which auto-finalizes the underlying
+      one-off statement), a prepared Statement is REUSABLE — repeated calls to
+      stmt.get() advance the row cursor and keep the underlying sqlite3_stmt
+      open. If the callback ignores err, every iteration silently proceeds
+      with an undefined row, and the underlying database may be left locked.
+    postconditions:
+      # Evidence:
+      #   https://github.com/TryGhost/node-sqlite3/wiki/API (Statement#get)
+      #     — "The signature of the callback is function(err, row) {}"
+      #     — "Using this method can leave the database locked, as the database
+      #        awaits further calls to Statement#get to retrieve subsequent rows."
+      #   node_modules/sqlite3/lib/sqlite3.d.ts:83-85
+      #     — get<T>(callback?: (err: Error | null, row?: T) => void): this
+      #     — get<T>(params: any, callback?: ..., row?: T) => void): this
+      #   https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/prepare.test.js
+      #     — canonical pattern: stmt.get(function(err, row) { if (err) throw err; ... })
+      - id: statement-get-callback-error-ignored
+        condition: >
+          stmt.get([params,] callback) where the callback does not check its
+          err parameter. Same error profile as Database#get (SQLITE_ERROR for
+          syntax, SQLITE_BUSY for lock contention, SQLITE_RANGE for bad
+          parameter binding, SQLITE_MISMATCH for type mismatch) BUT the row
+          parameter is undefined on error — accessing properties of undefined
+          throws TypeError downstream and corrupts the loop state of a long-
+          lived prepared statement.
+        throws: >
+          Error passed to callback as first argument. On error the second
+          argument (row) is undefined. The statement is NOT automatically
+          finalized — the row cursor remains in an indeterminate state.
+        required_handling: >
+          Caller MUST check err before using row. Pattern:
+            const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+            for (const id of ids) {
+              await new Promise((resolve, reject) => {
+                stmt.get([id], (err, row) => {
+                  if (err) {
+                    stmt.finalize();
+                    return reject(err);
+                  }
+                  if (!row) {
+                    // No row matched — distinct from error
+                    return resolve(null);
+                  }
+                  resolve(row);
+                });
+              });
+            }
+            stmt.finalize();
+          Ignoring err in a lookup loop both silently swallows the actual
+          database error AND fails to distinguish "row not found" (row ===
+          undefined, err === null) from "query failed" (row === undefined,
+          err !== null) — they're indistinguishable to a caller that ignores
+          err.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+          - "https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/prepare.test.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: statement-get-leaves-database-locked
+        condition: >
+          stmt.get() is called once on a prepared statement and the underlying
+          sqlite3_stmt is left mid-cursor (not finalized, not reset, not iterated
+          to completion). The Statement#get documentation explicitly warns:
+          "Using this method can leave the database locked, as the database
+          awaits further calls to Statement#get to retrieve subsequent rows."
+        throws: >
+          Indirect: the underlying database connection holds a row cursor lock.
+          Subsequent writes from the same connection may proceed, but ANOTHER
+          process attempting to write to the same database file receives
+          SQLITE_BUSY. db.close() will fail with "SQLITE_BUSY: unable to close
+          due to unfinalised statements".
+        required_handling: >
+          Caller MUST either finalize the statement after the last get(), reset
+          it for reuse, or iterate to completion. Pattern (single lookup):
+            const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+            stmt.get([id], (err, row) => {
+              stmt.finalize();   // Release the cursor before exiting
+              if (err) throw err;
+              handleRow(row);
+            });
+          Or for reuse across many lookups, finalize once after the last call.
+          Long-lived servers that prepare-and-leak statements eventually fail
+          to write or close the database.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
           incident_cost_range: medium
 
 edge_cases:
