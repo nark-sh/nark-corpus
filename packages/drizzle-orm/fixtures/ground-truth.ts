@@ -183,27 +183,23 @@ export async function executeWithCatch() {
 
 // NOTE: these examples reference `db.query.users` as if a relational schema
 // was wired in. For ground-truth purposes the call shape is what matters —
-// the scanner detects `db.query.<table>.findFirst(...)` patterns regardless
-// of whether the schema is fully typed in the fixture.
-//
-// We use `db` directly (cast to `any`) rather than a separate `declare const`
-// so the InstanceTracker's existing `db → drizzle-orm` association is preserved.
-// A separate `declare const dbWithSchema` does not get tracked as a drizzle
-// instance because no factory call or type annotation links it back to the
-// package — the call sites on it would silently miss detection.
-const dbQuery = db as any;
+// the scanner detects `db.<chain>` patterns regardless of whether the schema
+// is fully typed in the fixture. We disable TS noImplicitAny so that
+// `db.query.users.findFirst()` parses without a `declare` shim that would
+// break instance tracking. The fixture-runner harness sets `strict: false`.
 
 export async function findFirstNoCatch(id: number) {
-  // SHOULD_FIRE: findfirst-driver-error — findFirst() can throw on connection
-  // loss or invalid relation config. No try-catch.
-  const user = await dbQuery.query.users.findFirst({ where: eq(usersTable.id, id) });
+  // @ts-ignore relational schema not wired up in this fixture
+  // SHOULD_FIRE: findfirst-undefined-on-missing-row — findFirst() resolves to T | undefined when no row matches. No try-catch and no undefined check.
+  const user = await db.query.users.findFirst({ where: eq(usersTable.id, id) });
   return user;
 }
 
 export async function findFirstWithCatch(id: number) {
   try {
+    // @ts-ignore relational schema not wired up in this fixture
     // SHOULD_NOT_FIRE: findFirst() inside try-catch — driver errors handled.
-    const user = await dbQuery.query.users.findFirst({ where: eq(usersTable.id, id) });
+    const user = await db.query.users.findFirst({ where: eq(usersTable.id, id) });
     return user;
   } catch (err) {
     console.error('findFirst failed:', err);
@@ -213,14 +209,10 @@ export async function findFirstWithCatch(id: number) {
 
 export async function findFirstUndefinedAccessAntiPattern(id: number) {
   try {
-    // SHOULD_NOT_FIRE for driver-error (try-catch covers it).
-    // The undefined-on-missing-row postcondition is a separate semantic check
-    // — the scanner does not yet detect property access on possibly-undefined
-    // findFirst results (this requires data-flow analysis of the result var).
-    // Captured here as an evidence pattern; a future scanner upgrade will
-    // implement undefined-row detection — see scanner concerns queued in this pass.
-    const user = await dbQuery.query.users.findFirst({ where: eq(usersTable.id, id) });
-    return (user as any).email; // BUG: TypeError if user is undefined
+    // @ts-ignore relational schema not wired up in this fixture
+    // SHOULD_NOT_FIRE: findFirst() inside try-catch — driver-error postcondition satisfied; undefined-row semantic check is not yet implemented.
+    const user = await db.query.users.findFirst({ where: eq(usersTable.id, id) });
+    return (user as any).email; // BUG: TypeError if user is undefined — captured here as evidence for future undefined-row detection upgrade
   } catch (err) {
     console.error('findFirst lookup failed:', err);
     throw err;
@@ -232,16 +224,17 @@ export async function findFirstUndefinedAccessAntiPattern(id: number) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function findManyNoCatch() {
-  // SHOULD_FIRE: findmany-driver-error — findMany() can throw on connection loss
-  // or invalid `with:` config. No try-catch.
-  const users = await dbQuery.query.users.findMany();
+  // @ts-ignore relational schema not wired up in this fixture
+  // SHOULD_FIRE: findmany-driver-error — findMany() throws on driver errors (connection lost, invalid relation config). No try-catch.
+  const users = await db.query.users.findMany();
   return users;
 }
 
 export async function findManyWithCatch() {
   try {
+    // @ts-ignore relational schema not wired up in this fixture
     // SHOULD_NOT_FIRE: findMany() inside try-catch — driver errors handled.
-    const users = await dbQuery.query.users.findMany();
+    const users = await db.query.users.findMany();
     return users;
   } catch (err) {
     console.error('findMany failed:', err);
@@ -253,16 +246,14 @@ export async function findManyWithCatch() {
 // 8. db.batch() — atomic batched statements (added 2026-06-12)
 //
 // batch() is only available on D1/LibSQL/Neon. For ground-truth detection,
-// we use `db` directly (cast to any) so the InstanceTracker's drizzle-orm
-// association is preserved — same reason as the relational query block above.
+// we call db.batch() directly so the InstanceTracker's drizzle-orm
+// association on `db` is preserved.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const dbBatchable = db as any;
-
 export async function batchNoCatch(name: string, email: string) {
-  // SHOULD_FIRE: batch-statement-failure-rolls-back-all — batch() throws on
-  // any statement failure; the entire sequence is rolled back. No try-catch.
-  const results = await dbBatchable.batch([
+  // @ts-ignore batch() only typed on D1/LibSQL/Neon driver wrappers
+  // SHOULD_FIRE: batch-statement-failure-rolls-back-all — batch() throws on any statement failure; the entire sequence is rolled back. No try-catch.
+  const results = await db.batch([
     db.insert(usersTable).values({ name, email }),
     db.insert(usersTable).values({ name: name + '_copy', email: email + '_copy' }),
   ]);
@@ -271,8 +262,9 @@ export async function batchNoCatch(name: string, email: string) {
 
 export async function batchWithCatch(name: string, email: string) {
   try {
+    // @ts-ignore batch() only typed on D1/LibSQL/Neon driver wrappers
     // SHOULD_NOT_FIRE: batch() inside try-catch — atomic rollback handled.
-    const results = await dbBatchable.batch([
+    const results = await db.batch([
       db.insert(usersTable).values({ name, email }),
       db.insert(usersTable).values({ name: name + '_copy', email: email + '_copy' }),
     ]);
