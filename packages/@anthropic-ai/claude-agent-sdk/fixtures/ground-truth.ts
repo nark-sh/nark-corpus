@@ -90,3 +90,87 @@ async function v2SessionWithProperCleanup(): Promise<void> {
     session.close();
   }
 }
+
+// ---- deleteSession fixtures (added 2026-06-12 deepen pass) ----
+import { deleteSession, importSessionToStore, resolveSettings } from '@anthropic-ai/claude-agent-sdk';
+
+async function deleteSessionMissingTryCatch(sessionId: string): Promise<void> {
+  // SHOULD_FIRE: delete-session-not-found — deleteSession() called without try/catch; throws if session is missing
+  await deleteSession(sessionId);
+}
+
+async function deleteSessionWithProperGuard(sessionId: string): Promise<void> {
+  try {
+    // SHOULD_NOT_FIRE: deleteSession() wrapped in try/catch that swallows "not found" as idempotent success
+    await deleteSession(sessionId);
+  } catch (err: any) {
+    if (err?.message?.includes('not found')) {
+      return; // idempotent — already gone
+    }
+    throw err;
+  }
+}
+
+async function deleteSessionInvalidUuidUnchecked(rawId: unknown): Promise<void> {
+  // SHOULD_FIRE: delete-session-invalid-uuid — caller passes through an untrusted id without UUID validation
+  await deleteSession(rawId as string);
+}
+
+// ---- importSessionToStore fixtures ----
+async function importSessionMissingTryCatch(sessionId: string, store: any): Promise<void> {
+  // NOTE: import-session-partial-failure is contracted but the scanner only fires one
+  //       postcondition per call site; the no-try-catch detector picks the source-missing
+  //       variant. Detection of the partial-failure variant requires data-flow analysis
+  //       across the batched store.append() loop — queued as concern-20260612-claude-agent-sdk-deepen-2.
+  // SHOULD_FIRE: import-session-source-missing — no try/catch around the import
+  await importSessionToStore(sessionId, store, { batchSize: 100 });
+}
+
+async function importSessionWithPartialFailureTracking(
+  sessionIds: string[],
+  store: any,
+): Promise<{ migrated: string[]; partial: string[] }> {
+  const migrated: string[] = [];
+  const partial: string[] = [];
+  for (const sessionId of sessionIds) {
+    try {
+      // SHOULD_NOT_FIRE: try/catch with partial-failure tracking
+      await importSessionToStore(sessionId, store, { batchSize: 100 });
+      migrated.push(sessionId);
+    } catch (err: any) {
+      partial.push(sessionId);
+    }
+  }
+  return { migrated, partial };
+}
+
+// ---- resolveSettings fixtures ----
+async function resolveSettingsMissingTryCatch(): Promise<unknown> {
+  // SHOULD_FIRE: resolve-settings-subprocess-failure — no try/catch; spawn failure crashes startup
+  const settings = await resolveSettings();
+  return settings;
+}
+
+async function resolveSettingsWithFallback(): Promise<unknown> {
+  try {
+    // SHOULD_NOT_FIRE: try/catch with fallback to defaults
+    return await resolveSettings();
+  } catch (err) {
+    return { permissions: {} }; // fallback defaults
+  }
+}
+
+// Demonstrates security-bypass: caller reads defaultMode without filterEscalatingDefaultMode()
+async function resolveSettingsUnfilteredDefaultMode(): Promise<string | undefined> {
+  try {
+    const resolved = await resolveSettings();
+    // NOTE: resolve-settings-default-mode-not-filtered is contracted but requires a
+    //       flow-sensitive detector that checks whether the resolved value was passed
+    //       through filterEscalatingDefaultMode() before defaultMode is read. Queued as
+    //       concern-20260612-claude-agent-sdk-deepen-4. Until that detector lands, this
+    //       fixture documents the violating pattern but does not assert a scanner hit.
+    return (resolved as any).permissions?.defaultMode;
+  } catch {
+    return undefined;
+  }
+}

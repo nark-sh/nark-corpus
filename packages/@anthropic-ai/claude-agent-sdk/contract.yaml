@@ -1,14 +1,15 @@
 package: "@anthropic-ai/claude-agent-sdk"
 semver: ">=0.1.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"  # deepen-stream-1 pass 5: added unstable_v2_prompt + SDKSession V2 API
+last_verified: "2026-06-12"  # deepen-stream-2 pass: added deleteSession + importSessionToStore + resolveSettings (v0.3.174 surface)
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.69  # 9 contracted / 13 total async-callable (5 omitted read-only) — +1 this pass (unstable_v2_prompt)
-# effective_coverage: 1.00 — 9/9 non-omitted functions contracted (unstable_v2_prompt added)
+coverage_score: 0.75  # 12 contracted / 16 total async-callable (4 omitted read-only) — +3 this pass (deleteSession, importSessionToStore, resolveSettings)
+# effective_coverage: 1.00 — 12/12 non-omitted functions contracted
 # V2 SDKSession methods (send/stream) treated as variants of SDKSession interface, subsumed by unstable_v2_prompt contract
+# Surface grew from 13 (v0.2.91) → 16 (v0.3.174) — Anthropic added deleteSession, importSessionToStore, resolveSettings, bridge module (skipped — @alpha, narrow adoption), assistant module (skipped — @alpha)
 
 description: >
   SDK for building AI agents with Claude Code's capabilities.
@@ -25,8 +26,8 @@ description: >
   the same error profile as query() (AbortError, process errors, session-ended errors).
 
 sources:
-  - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.2.91/sdk.d.ts
-  - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.2.91/README.md
+  - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+  - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/README.md
   - https://code.claude.com/docs/en/agent-sdk/overview
   - https://code.claude.com/docs/en/agent-sdk/typescript
   - https://code.claude.com/docs/en/agent-sdk/sessions
@@ -528,3 +529,284 @@ functions:
           # Evidence: sdk.mjs KW.close() — sets closed=true, calls inputStream.done(), abortController.abort() after timeout
           # Evidence: sdk.mjs KW[Symbol.asyncDispose]() — delegates to close()
           - https://code.claude.com/docs/en/agent-sdk/typescript-v2-preview
+
+  - name: deleteSession
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Deletes a session. With `sessionStore`: calls `sessionStore.delete()` if
+      implemented; no-op otherwise (per the SessionStore contract — appropriate
+      for WORM/append-only backends). Without `sessionStore`: removes
+      `{sessionId}.jsonl` and the `{sessionId}/` subagent-transcript subdirectory
+      from the local projects dir. Throws if the session is not found, if the
+      sessionId is not a valid UUID, or if the underlying SessionStore.delete()
+      implementation throws.
+    patterns:
+      - 'deleteSession('
+      - 'await deleteSession('
+    postconditions:
+      # Evidence: sdk.d.ts line 533 — deleteSession(_sessionId, _options?): Promise<void>
+      # Evidence: sdk.d.ts JSDoc (line 527) — "Throws if the session is not found"
+      # Evidence: sdk.mjs throws: `Invalid sessionId: ${e}`
+      # Evidence: sdk.mjs throws: `Session ${e} not found in project directory for ${t.dir}`
+      # Evidence: sdk.mjs throws: `Session ${e} not found in any project directory`
+      - id: delete-session-not-found
+        condition: >
+          deleteSession() is called without a try/catch and the sessionId does
+          not exist in the configured project directory. This happens routinely
+          in cleanup paths (UI delete button, retention sweeper, test teardown)
+          when the session was already deleted by another process, when the
+          caller is using a different cwd than the session creator (so the
+          encoded project key doesn't match), or when the session id was
+          stored as state but the underlying JSONL was manually purged.
+        throws: 'Error (message: "Session {sessionId} not found in project directory for {dir}" / "Session {sessionId} not found in any project directory")'
+        required_handling: >
+          Wrap deleteSession() in try/catch and treat "not found" as a benign
+          terminal state (idempotent delete), rejecting only on truly
+          unexpected errors:
+            try {
+              await deleteSession(sessionId, { dir: projectDir });
+            } catch (err) {
+              if (err.message?.includes('not found')) {
+                // Already gone — idempotent delete succeeded
+                return;
+              }
+              throw err;
+            }
+          Without this guard, a "delete" button that runs twice (double-click,
+          retry on transient error) surfaces a confusing "session not found"
+          error to the user despite the delete having actually succeeded the
+          first time.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts line 520-533 — deleteSession JSDoc + signature
+          # Evidence: sdk.mjs minified source: throw Error(`Session ${e} not found in any project directory`)
+          - https://code.claude.com/docs/en/agent-sdk/sessions
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+      - id: delete-session-invalid-uuid
+        condition: >
+          deleteSession() is called with a sessionId that is not a valid UUID.
+          The SDK validates sessionId format before touching the filesystem and
+          throws `Error("Invalid sessionId: ${e}")`. Commonly happens when a
+          truncated id, a placeholder string ("undefined", ""), or an id from a
+          different SDK (claude-code CLI vs claude-agent-sdk) is passed through.
+        throws: 'Error (message: "Invalid sessionId: {value}")'
+        required_handling: >
+          Validate the sessionId before calling deleteSession(), or treat the
+          UUID validation error as a non-retryable input error:
+            const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (!UUID_RE.test(sessionId)) {
+              throw new BadRequest(`Invalid sessionId: ${sessionId}`);
+            }
+            try {
+              await deleteSession(sessionId);
+            } catch (err) {
+              if (err.message?.startsWith('Invalid sessionId')) {
+                throw new BadRequest(err.message);
+              }
+              throw err;
+            }
+          Unhandled, this surfaces as a 500 error on a delete endpoint when it
+          should be a 400 — confusing operators who think the SDK is broken.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.mjs minified source: throw Error(`Invalid sessionId: ${e}`)
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+  - name: importSessionToStore
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Copies a local JSONL session into a SessionStore by reading the session
+      file (and optionally subagent transcripts) from disk and calling
+      `store.append()` for each entry. Entries are appended in batches of
+      `batchSize` to avoid backend payload limits — `append()` is called
+      multiple times per session. Annotated @alpha. Used for migrating
+      existing local sessions to a remote backend (e.g. Postgres-backed
+      SessionStore for multi-device session sync). Throws if the session
+      file is missing on disk, if the sessionId is invalid, or if the
+      SessionStore.append() implementation rejects.
+    patterns:
+      - 'importSessionToStore('
+      - 'await importSessionToStore('
+    postconditions:
+      # Evidence: sdk.d.ts line 843 — importSessionToStore(_sessionId, _store, _options?): Promise<void>
+      # Evidence: sdk.d.ts JSDoc (line 829-841) — describes batch-append behavior
+      # Evidence: sdk.mjs throws: `Invalid sessionId: ${e}` (shared validator)
+      # Evidence: sdk.mjs throws: `Session ${e} not found in project directory for ${t.dir}`
+      - id: import-session-partial-failure
+        condition: >
+          importSessionToStore() is called without a try/catch, and the
+          SessionStore.append() implementation throws partway through the
+          batch upload. Because entries are appended in batches (default
+          batchSize), an error on batch N leaves entries from batches 1..N-1
+          successfully written to the store while batches N..end are not.
+          The function rejects with the underlying store error, but the
+          partial state in the store is NOT rolled back.
+        throws: Error (whatever the SessionStore.append() implementation throws — network error, auth failure, quota exceeded, etc.)
+        required_handling: >
+          Wrap importSessionToStore() in try/catch AND track which sessions
+          have been fully migrated vs partially migrated. Do NOT assume a
+          retry will be idempotent unless the store's append() is
+          idempotent on duplicate entry ids:
+            const migrated: string[] = [];
+            const partial: { sessionId: string; error: string }[] = [];
+            for (const sessionId of toMigrate) {
+              try {
+                await importSessionToStore(sessionId, store, { batchSize: 100 });
+                migrated.push(sessionId);
+              } catch (err) {
+                partial.push({ sessionId, error: err.message });
+                // Mark as partial — needs cleanup before retry
+              }
+            }
+          Without this guard, a migration script that retries on failure
+          will append duplicate entries to the store, corrupting the
+          session transcript.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          # Evidence: sdk.d.ts line 829-843 — importSessionToStore JSDoc + signature
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+      - id: import-session-source-missing
+        condition: >
+          importSessionToStore() is called without a try/catch and the source
+          JSONL session file does not exist on disk in the (resolved or
+          searched) project directory. The session file may have been deleted
+          by an earlier deleteSession() call, the calling process may be
+          running with a different cwd, or the sessionId may be wrong.
+          The SDK throws the same "Session not found" error class as
+          deleteSession()/getSessionInfo().
+        throws: 'Error (message: "Session {sessionId} not found in project directory for {dir}" / "Session {sessionId} not found in any project directory")'
+        required_handling: >
+          Wrap importSessionToStore() in try/catch and either (a) skip
+          missing sessions in a migration loop, or (b) surface the missing
+          session as a data integrity warning to the operator:
+            try {
+              await importSessionToStore(sessionId, store, { dir: projectDir });
+            } catch (err) {
+              if (err.message?.includes('not found')) {
+                // Source session was deleted between listSessions() and import
+                console.warn(`Skipping missing session ${sessionId}`);
+                continue;
+              }
+              throw err;
+            }
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.mjs minified source: throw Error(`Session ${e} not found in any project directory`)
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+  - name: resolveSettings
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Resolves the effective Claude Code settings by reading and merging
+      managed policy (MDM), user (~/.claude/settings.json), project
+      (.claude/settings.json), and local (.claude/settings.local.json)
+      settings tiers. Annotated @alpha. On macOS, MDM resolution may invoke
+      `plutil` (when an MDM plist exists); on Windows/WSL, may invoke
+      `reg.exe`. This means resolveSettings() can subprocess and is subject
+      to PATH issues, permission-denied errors, and slow filesystem reads.
+      Returns ResolvedSettings, but `permissions.defaultMode` requires
+      passing through `filterEscalatingDefaultMode()` before acting on it
+      (separate trust filter for repo-committed escalating modes).
+    patterns:
+      - 'resolveSettings('
+      - 'await resolveSettings('
+    postconditions:
+      # Evidence: sdk.d.ts line 2554 — resolveSettings(_opts?): Promise<ResolvedSettings>
+      # Evidence: sdk.d.ts JSDoc (line 2540-2553) — describes plutil / reg.exe subprocess behavior
+      - id: resolve-settings-subprocess-failure
+        condition: >
+          resolveSettings() is called without a try/catch in an environment
+          where the MDM subprocess (`plutil` on macOS, `reg.exe` on Windows)
+          fails to spawn or returns an error. This happens in sandboxed
+          environments (containers, AppArmor, SELinux), in CI runners that
+          strip $PATH, on macOS with locked-down configurations, and when
+          the user lacks permission to read the MDM plist. The SDK propagates
+          the underlying spawn / non-zero-exit error.
+        throws: Error (subprocess spawn failure / non-zero exit from plutil or reg.exe)
+        required_handling: >
+          Wrap resolveSettings() in try/catch and fall back to a sensible
+          default settings object when MDM resolution fails:
+            let settings;
+            try {
+              settings = await resolveSettings({ cwd, sources: ['user', 'project', 'local'] });
+            } catch (err) {
+              console.warn('Settings resolution failed, using defaults:', err.message);
+              settings = DEFAULT_SETTINGS;
+            }
+          Or skip MDM by passing `sources: []` or an explicit subset to
+          avoid the subprocess paths entirely. Without this guard,
+          self-hosted CI pipelines running the SDK crash on
+          startup with an inscrutable spawn error.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          # Evidence: sdk.d.ts line 2540-2554 — resolveSettings JSDoc + signature
+          # JSDoc explicitly notes: "MDM resolution may invoke plutil (macOS) or reg.exe (Windows/WSL)"
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+      - id: resolve-settings-default-mode-not-filtered
+        condition: >
+          resolveSettings() succeeds and the caller reads
+          `settings.permissions.defaultMode` directly without first passing
+          it through `filterEscalatingDefaultMode()`. The SDK explicitly
+          documents that `permissions.defaultMode` is reported as-is across
+          all tiers including project — but the CLI applies a separate trust
+          filter before honoring escalating modes (`bypassPermissions`,
+          `auto`, `acceptEdits`) from repo-committed files. Acting on the
+          raw value gives a malicious .claude/settings.json in a cloned repo
+          the ability to escalate permissions silently.
+        throws: "No throw — silent security bypass. A repo-committed defaultMode of 'bypassPermissions' is honored by the caller despite the trust filter."
+        required_handling: >
+          Always pass the resolved settings through filterEscalatingDefaultMode()
+          before reading defaultMode:
+            const resolved = await resolveSettings({ cwd });
+            const safe = filterEscalatingDefaultMode(resolved);
+            const mode = safe.permissions?.defaultMode ?? 'default';
+            // Use `mode` — guaranteed not to be a repo-injected escalation
+          The CLI does this filtering internally; SDK consumers that
+          replicate the resolution path MUST replicate the filter too.
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+        sources:
+          # Evidence: sdk.d.ts JSDoc on resolveSettings (line 2546-2550):
+          # "permissions.defaultMode is reported as-is across all tiers including project.
+          #  The CLI applies a separate trust filter before honoring escalating modes
+          #  ('bypassPermissions', 'auto', 'acceptEdits') from repo-committed files;
+          #  pass the result through filterEscalatingDefaultMode before acting on defaultMode."
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts

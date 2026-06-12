@@ -2,6 +2,24 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-12 — deepen pass — coverage 69% → 75%
+
+- **Profile:** `packages/@anthropic-ai/claude-agent-sdk/contract.yaml`
+- **Functions added:** deleteSession, importSessionToStore, resolveSettings (3 total)
+- **Postconditions added:** 6 (delete-session-not-found, delete-session-invalid-uuid, import-session-partial-failure, import-session-source-missing, resolve-settings-subprocess-failure, resolve-settings-default-mode-not-filtered)
+- **Functions intentionally omitted this pass:**
+  - bridge module (attachBridgeSession, createCodeSession, fetchRemoteCredentials): @alpha, CCR-only, narrow adoption
+  - assistant module (runAssistantWorker): @alpha, claude.ai bridge daemon, narrow adoption
+  - Query interface control methods (interrupt, setMcpServers, reconnectMcpServer, toggleMcpServer, setModel, etc): subsumed by query() postconditions — only callable on a Query handle already obtained via query()
+- **Scanner concerns queued:** 4 (`concern-20260612-claude-agent-sdk-deepen-1` through `-4`)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:**
+  - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts (read directly from installed types)
+  - https://code.claude.com/docs/en/agent-sdk/sessions
+  - https://code.claude.com/docs/en/agent-sdk/typescript
+- **Notes:** Surface grew from 13 (v0.2.91) → 16 (v0.3.174) async-callable functions. The 0.3.x line introduced deleteSession, importSessionToStore, resolveSettings as top-level exports. Key security finding: resolveSettings() returns `permissions.defaultMode` as-is across all settings tiers including project — callers MUST pass the result through `filterEscalatingDefaultMode()` before honoring escalating modes (`bypassPermissions`, `auto`, `acceptEdits`), otherwise a repo-committed `.claude/settings.json` can silently elevate permissions (SECURITY_RISK). This is explicitly documented in sdk.d.ts lines 2546-2550. importSessionToStore() has a DATA_LOSS pattern: batches are appended one at a time so mid-import failure leaves partial state in the destination store; naive retry corrupts the transcript. All 189 corpus contracts validate.
+- **Verified by:** bc-deepen-contract (pass on 2026-06-12T01:38:00Z, deepen-stream-2)
+
 ## 2026-04-17 — backfilled
 
 - **Verified against:** @anthropic-ai/claude-agent-sdk@>=0.1.0
