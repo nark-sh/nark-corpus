@@ -28,6 +28,17 @@
  *   rotate-secret-lambda-not-configured            (InvalidRequestException — no Lambda)
  *   rotate-secret-in-progress                      (InvalidRequestException — rotation in progress)
  *   rotate-secret-async-completion-assumed         (async rotation, immediate read after rotate)
+ *   describe-secret-no-try-catch                   (DescribeSecretCommand without try-catch)
+ *   describe-secret-not-found                      (ResourceNotFoundException handling)
+ *   describe-secret-rotation-status-stale-read     (rotation polling stale read)
+ *   replicate-secret-no-try-catch                  (ReplicateSecretToRegionsCommand without try-catch)
+ *   replicate-secret-per-region-failure-unchecked  (response.ReplicationStatus[] not checked)
+ *   replicate-secret-async-completion-assumed      (InSync poll skipped)
+ *   validate-resource-policy-no-try-catch          (ValidateResourcePolicyCommand without try-catch)
+ *   validate-resource-policy-passed-flag-unchecked (PolicyValidationPassed not checked)
+ *   tag-resource-no-try-catch                      (TagResourceCommand without try-catch)
+ *   tag-resource-limit-exceeded                    (LimitExceededException for 50-tag quota)
+ *   get-random-password-no-try-catch               (GetRandomPasswordCommand without try-catch)
  */
 import {
   SecretsManagerClient,
@@ -42,6 +53,11 @@ import {
   CancelRotateSecretCommand,
   PutResourcePolicyCommand,
   RestoreSecretCommand,
+  DescribeSecretCommand,
+  ReplicateSecretToRegionsCommand,
+  ValidateResourcePolicyCommand,
+  TagResourceCommand,
+  GetRandomPasswordCommand,
   SecretsManagerServiceException,
 } from '@aws-sdk/client-secrets-manager';
 
@@ -429,3 +445,230 @@ async function gt_restoreSecret_safe() {
     throw error;
   }
 }
+
+// ──────────────────────────────────────────────────
+// 12. DescribeSecretCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: describe-secret-no-try-catch
+async function gt_describeSecret_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, describe-secret-no-try-catch
+  const result = await smClient.send(new DescribeSecretCommand({
+    SecretId: SECRET_ID,
+  }));
+  return result.RotationEnabled;
+}
+
+// @expect-clean
+async function gt_describeSecret_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const result = await smClient.send(new DescribeSecretCommand({
+      SecretId: SECRET_ID,
+    }));
+    return result.RotationEnabled;
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'ResourceNotFoundException') {
+        console.error('Secret not found while describing:', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 13. ReplicateSecretToRegionsCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: replicate-secret-no-try-catch
+async function gt_replicateSecret_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, replicate-secret-no-try-catch
+  const result = await smClient.send(new ReplicateSecretToRegionsCommand({
+    SecretId: SECRET_ID,
+    AddReplicaRegions: [{ Region: 'us-west-2' }, { Region: 'eu-west-1' }],
+  }));
+  return result.ARN;
+}
+
+// @expect-violation: replicate-secret-per-region-failure-unchecked
+async function gt_replicateSecret_perRegionFailureNotChecked() {
+  try {
+    // SHOULD_FIRE: replicate-secret-per-region-failure-unchecked
+    // response.ReplicationStatus not iterated to check Status === "Failed"
+    const result = await smClient.send(new ReplicateSecretToRegionsCommand({
+      SecretId: SECRET_ID,
+      AddReplicaRegions: [{ Region: 'us-west-2' }, { Region: 'eu-west-1' }],
+    }));
+    // BAD: caller returns ARN without examining ReplicationStatus per-region
+    return result.ARN;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// @expect-clean
+async function gt_replicateSecret_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch AND ReplicationStatus is examined per-region
+    const result = await smClient.send(new ReplicateSecretToRegionsCommand({
+      SecretId: SECRET_ID,
+      AddReplicaRegions: [{ Region: 'us-west-2' }, { Region: 'eu-west-1' }],
+    }));
+
+    const failures = (result.ReplicationStatus ?? []).filter(
+      (s) => s.Status === 'Failed'
+    );
+    if (failures.length > 0) {
+      const detail = failures
+        .map((f) => `${f.Region}: ${f.StatusMessage ?? 'unknown'}`)
+        .join('\n');
+      throw new Error(`Replication failed in regions:\n${detail}`);
+    }
+    return result.ARN;
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      console.error(`Replicate failed [${error.name}]: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 14. ValidateResourcePolicyCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: validate-resource-policy-no-try-catch
+async function gt_validateResourcePolicy_missing(policy: string) {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, validate-resource-policy-no-try-catch
+  const result = await smClient.send(new ValidateResourcePolicyCommand({
+    SecretId: SECRET_ID,
+    ResourcePolicy: policy,
+  }));
+  return result.PolicyValidationPassed;
+}
+
+// @expect-violation: validate-resource-policy-passed-flag-unchecked
+async function gt_validateResourcePolicy_passedFlagIgnored(policy: string) {
+  try {
+    // SHOULD_FIRE: validate-resource-policy-passed-flag-unchecked
+    // PolicyValidationPassed not checked before applying the policy
+    await smClient.send(new ValidateResourcePolicyCommand({
+      SecretId: SECRET_ID,
+      ResourcePolicy: policy,
+    }));
+    // BAD: caller applies policy without checking PolicyValidationPassed
+    await smClient.send(new PutResourcePolicyCommand({
+      SecretId: SECRET_ID,
+      ResourcePolicy: policy,
+      BlockPublicPolicy: true,
+    }));
+  } catch (error) {
+    throw error;
+  }
+}
+
+// @expect-clean
+async function gt_validateResourcePolicy_safe(policy: string) {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch AND PolicyValidationPassed is checked
+    const validation = await smClient.send(new ValidateResourcePolicyCommand({
+      SecretId: SECRET_ID,
+      ResourcePolicy: policy,
+    }));
+
+    if (!validation.PolicyValidationPassed) {
+      const detail = (validation.ValidationErrors ?? [])
+        .map((e) => `[${e.CheckName}] ${e.ErrorMessage}`)
+        .join('\n');
+      throw new Error(`Resource policy invalid:\n${detail}`);
+    }
+
+    await smClient.send(new PutResourcePolicyCommand({
+      SecretId: SECRET_ID,
+      ResourcePolicy: policy,
+      BlockPublicPolicy: true,
+    }));
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      console.error(`Validate failed [${error.name}]: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 15. TagResourceCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: tag-resource-no-try-catch
+async function gt_tagResource_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, tag-resource-no-try-catch
+  await smClient.send(new TagResourceCommand({
+    SecretId: SECRET_ID,
+    Tags: [
+      { Key: 'Environment', Value: 'production' },
+      { Key: 'CostCenter', Value: 'engineering' },
+    ],
+  }));
+}
+
+// @expect-clean
+async function gt_tagResource_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    await smClient.send(new TagResourceCommand({
+      SecretId: SECRET_ID,
+      Tags: [
+        { Key: 'Environment', Value: 'production' },
+        { Key: 'CostCenter', Value: 'engineering' },
+      ],
+    }));
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'LimitExceededException') {
+        console.error('Tag limit (50) exceeded — clean up obsolete tags first');
+      } else if (error.name === 'ResourceNotFoundException') {
+        console.error('Secret not found while tagging:', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 16. GetRandomPasswordCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: get-random-password-no-try-catch
+async function gt_getRandomPassword_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, get-random-password-no-try-catch
+  const result = await smClient.send(new GetRandomPasswordCommand({
+    PasswordLength: 32,
+    ExcludeCharacters: '"@/\\',
+    IncludeSpace: false,
+  }));
+  return result.RandomPassword;
+}
+
+// @expect-clean
+async function gt_getRandomPassword_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const result = await smClient.send(new GetRandomPasswordCommand({
+      PasswordLength: 32,
+      ExcludeCharacters: '"@/\\',
+      IncludeSpace: false,
+    }));
+    if (!result.RandomPassword) {
+      throw new Error('GetRandomPassword returned empty value — refusing to set a weak password');
+    }
+    return result.RandomPassword;
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      console.error(`GetRandomPassword failed [${error.name}]: ${error.message}`);
+    }
+    throw error;
+  }
+}
+

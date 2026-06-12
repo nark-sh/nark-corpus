@@ -1,20 +1,26 @@
 package: "@aws-sdk/client-secrets-manager"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.1"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-# Depth pass 2026-04-18 (deepen-stream-1 pass 4):
+# Depth pass 2026-06-12 (deepen-stream-2 pass 1):
 # API surface: 24 commands, all via client.send(command) pattern
-# Contracted before: 1 (generic send()) — evidence_quality: partial
-# Contracted after: 8 (added GetSecretValueCommand, BatchGetSecretValueCommand,
+# Contracted before this pass: 12 (send + 11 commands; coverage_score 0.50)
+# Contracted after this pass: 17 (added DescribeSecretCommand, ReplicateSecretToRegionsCommand,
+#   ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand)
+# Intentionally omitted: 7 commands (read-only/admin/idempotent inverses with no
+#   distinct behavioral contracts beyond generic SecretsManagerServiceException)
+# Coverage: 17/24 commands = 0.71 raw
+# Effective coverage: 17/17 runtime-critical commands = 1.0
+# Prior depth passes:
+# - 2026-04-18 (stream-1 pass 4): added GetSecretValueCommand, BatchGetSecretValueCommand,
 #   CreateSecretCommand, PutSecretValueCommand, UpdateSecretCommand,
-#   DeleteSecretCommand, RotateSecretCommand; retained generic send())
-# Intentionally omitted: 16 commands (read-only, admin/policy, and replication management)
-# Coverage: 8/24 commands = 0.33 raw
-# Effective coverage: 8/8 runtime-critical commands = 1.0
+#   DeleteSecretCommand, RotateSecretCommand
+# - 2026-06-11 (stream-2): added UpdateSecretVersionStageCommand, CancelRotateSecretCommand,
+#   PutResourcePolicyCommand, RestoreSecretCommand
 # Evidence confirmed from:
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_BatchGetSecretValue.html
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
@@ -25,7 +31,7 @@ evidence_quality: confirmed
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/models/models_0.d.ts (exception class hierarchy)
 #   @aws-sdk/client-secrets-manager@3.600.0 dist-types/commands/*.d.ts (@throws annotations)
 # v1.1.1: fixed schema — renamed description->condition, converted business_impact to objects, added sources
-coverage_score: 0.50
+coverage_score: 0.71
 
 detection:
   type_names:
@@ -957,6 +963,388 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: DescribeSecretCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Retrieves the details and metadata of a secret without returning its value.
+      Used heavily in rotation status polling (checking response.LastRotatedDate
+      and response.RotationEnabled), health-check endpoints, and replication
+      status monitoring (response.ReplicationStatus[]). Common in cron jobs and
+      observability code paths. Does NOT return the secret value — use
+      GetSecretValueCommand for that.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DescribeSecret.html
+      # Error types confirmed from dist-types/commands/DescribeSecretCommand.d.ts @throws annotations:
+      #   InternalServiceError, InvalidParameterException, ResourceNotFoundException
+      - id: describe-secret-not-found
+        severity: error
+        condition: >
+          specified SecretId does not exist, the ARN references a deleted secret,
+          or the secret was created in a different region; throws
+          ResourceNotFoundException (error.name === "ResourceNotFoundException")
+        throws: ResourceNotFoundException
+        required_handling: >
+          Catch ResourceNotFoundException explicitly. DescribeSecret is often
+          called from monitoring code paths where a missing secret should be
+          alerted rather than silently swallowed. Either return null/default
+          for optional secrets or throw a descriptive error naming the
+          environment and region.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DescribeSecret.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: describe-secret-rotation-status-stale-read
+        severity: warning
+        condition: >
+          caller invokes DescribeSecretCommand inside a polling loop (e.g.
+          waiting for RotateSecretCommand to complete) but reads response.LastRotatedDate
+          or response.NextRotationDate without checking that the rotation Lambda
+          actually completed (response.RotationEnabled === true AND
+          response.LastRotatedDate is recent); stale rotation status produces
+          false "rotation succeeded" signals
+        required_handling: >
+          When polling DescribeSecret for rotation completion:
+            const before = await smClient.send(new DescribeSecretCommand({ SecretId }));
+            await smClient.send(new RotateSecretCommand({ SecretId, RotateImmediately: true }));
+
+            // Poll until LastRotatedDate moves forward
+            let attempts = 0;
+            while (attempts++ < MAX_ATTEMPTS) {
+              await sleep(POLL_INTERVAL_MS);
+              const status = await smClient.send(new DescribeSecretCommand({ SecretId }));
+              if (status.LastRotatedDate
+                  && (!before.LastRotatedDate
+                      || status.LastRotatedDate > before.LastRotatedDate)) {
+                return; // rotation completed
+              }
+            }
+            throw new Error('Rotation polling timed out — Lambda may have failed');
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DescribeSecret.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: describe-secret-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new DescribeSecretCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceNotFoundException, InvalidParameterException, InternalServiceError,
+          and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. DescribeSecret is often called from health-check
+          endpoints and rotation status pollers — unhandled rejections crash
+          monitoring jobs and falsely signal that rotation is broken. Distinguish
+          ResourceNotFoundException (alert: secret missing) from
+          InternalServiceError (alert: AWS issue, retry with backoff).
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DescribeSecret.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: ReplicateSecretToRegionsCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Replicates an existing secret to one or more secondary AWS regions for
+      multi-region disaster recovery. Returns a response containing
+      ARN and ReplicationStatus[] — an array of per-region status entries.
+      CRITICAL BEHAVIORAL DIFFERENCE: per-region replication failures do NOT
+      throw — they appear silently in response.ReplicationStatus[] with
+      Status === "Failed" and a StatusMessage. The overall call succeeds
+      (Promise resolves with HTTP 200) even when every replica fails. This
+      pattern matches BatchGetSecretValueCommand's silent partial-failure
+      behavior. Used in cross-region failover setup and compliance pipelines.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ReplicateSecretToRegions.html
+      # Per-region status documented in ReplicationStatusType:
+      # "The status can be InProgress, Failed, or InSync" — confirmed from
+      # @aws-sdk/client-secrets-manager dist-types/models/models_0.d.ts lines 390-413
+      # @throws confirmed from ReplicateSecretToRegionsCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException, ResourceNotFoundException
+      - id: replicate-secret-per-region-failure-unchecked
+        severity: error
+        condition: >
+          ReplicateSecretToRegionsCommand returns HTTP 200 (Promise resolves) even when
+          individual region replications fail; per-region errors appear in
+          response.ReplicationStatus[] with Status === "Failed" but the caller does
+          not iterate response.ReplicationStatus to check each region's status
+        required_handling: >
+          Always check response.ReplicationStatus after the call:
+            const result = await smClient.send(new ReplicateSecretToRegionsCommand({
+              SecretId: SECRET_ID,
+              AddReplicaRegions: [{ Region: 'us-west-2' }, { Region: 'eu-west-1' }]
+            }));
+
+            const failures = (result.ReplicationStatus ?? []).filter(
+              s => s.Status === 'Failed'
+            );
+            if (failures.length > 0) {
+              const detail = failures
+                .map(f => `${f.Region}: ${f.StatusMessage ?? 'unknown'}`)
+                .join('\n');
+              throw new Error(`Replication failed in regions:\n${detail}`);
+            }
+
+            // Also track InProgress — replication is async per region
+            const pending = (result.ReplicationStatus ?? []).filter(
+              s => s.Status === 'InProgress'
+            );
+            return { replicated: result.ReplicationStatus, pending };
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ReplicateSecretToRegions.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: replicate-secret-async-completion-assumed
+        severity: warning
+        condition: >
+          ReplicateSecretToRegionsCommand resolves with Status === "InProgress"
+          for some regions; caller assumes replication completed and immediately
+          uses the replica in another region, before AWS has finished provisioning
+        required_handling: >
+          After calling ReplicateSecretToRegionsCommand, do NOT assume the secret
+          is immediately available in the target region. Poll DescribeSecretCommand
+          (with the region client switched to the replica region) and check
+          ReplicationStatus until Status === "InSync" before depending on the
+          replica. Document a wait window in disaster-recovery runbooks.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ReplicateSecretToRegions.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/create-manage-multi-region-secrets.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: replicate-secret-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new ReplicateSecretToRegionsCommand(...))
+          without a wrapping try-catch; request-level errors (the secret itself
+          does not exist, invalid parameters, internal service errors, KMS
+          permission failures in the target region) still throw, distinct from
+          per-region Failed entries
+        throws: >
+          ResourceNotFoundException, InvalidParameterException, InvalidRequestException,
+          InternalServiceError, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap the entire call in try-catch to handle request-level failures.
+          ALSO iterate response.ReplicationStatus to detect per-region Failed
+          entries. Both error channels must be handled independently — a
+          failed try-catch means no replication started; a Failed entry means
+          one specific region's replica is broken while others may have succeeded.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ReplicateSecretToRegions.html"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: catastrophic
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: ValidateResourcePolicyCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Validates a resource-based policy JSON string against IAM policy syntax
+      rules WITHOUT attaching it to a secret. Used as a pre-flight check before
+      PutResourcePolicyCommand to catch policy errors early. Like
+      BatchGetSecretValueCommand and ReplicateSecretToRegionsCommand, this command
+      has a SILENT-FAILURE response pattern — invalid policies do not throw,
+      they return response.PolicyValidationPassed === false with per-error
+      detail in response.ValidationErrors[]. A caller that ignores
+      PolicyValidationPassed believes the policy is valid when it is not.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ValidateResourcePolicy.html
+      # Silent failure shape confirmed from @aws-sdk/client-secrets-manager
+      # dist-types/models/models_0.d.ts lines 1930-1957 (ValidateResourcePolicyResponse):
+      #   PolicyValidationPassed?: boolean | undefined;
+      #   ValidationErrors?: ValidationErrorsEntry[] | undefined;
+      # @throws confirmed from ValidateResourcePolicyCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException,
+      #   MalformedPolicyDocumentException, ResourceNotFoundException
+      - id: validate-resource-policy-passed-flag-unchecked
+        severity: error
+        condition: >
+          ValidateResourcePolicyCommand returns HTTP 200 (Promise resolves) with
+          response.PolicyValidationPassed === false when the policy fails AWS-side
+          validation, but the caller does not check PolicyValidationPassed before
+          proceeding to call PutResourcePolicyCommand with the same policy;
+          a broken policy is attached and the validation pre-flight is rendered
+          useless
+        required_handling: >
+          Always check response.PolicyValidationPassed before applying the policy:
+            const validation = await smClient.send(new ValidateResourcePolicyCommand({
+              SecretId: SECRET_ID,
+              ResourcePolicy: policyJson,
+            }));
+
+            if (!validation.PolicyValidationPassed) {
+              const detail = (validation.ValidationErrors ?? [])
+                .map(e => `[${e.CheckName}] ${e.ErrorMessage}`)
+                .join('\n');
+              throw new Error(`Resource policy invalid:\n${detail}`);
+            }
+
+            // Only NOW apply the policy
+            await smClient.send(new PutResourcePolicyCommand({
+              SecretId: SECRET_ID,
+              ResourcePolicy: policyJson,
+              BlockPublicPolicy: true,
+            }));
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ValidateResourcePolicy.html"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: validate-resource-policy-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new ValidateResourcePolicyCommand(...))
+          without a wrapping try-catch; request-level errors throw distinct from
+          the PolicyValidationPassed === false silent-failure path
+        throws: >
+          MalformedPolicyDocumentException (JSON syntax error in the policy),
+          ResourceNotFoundException (secret name not found), InvalidParameterException,
+          InternalServiceError, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Catch MalformedPolicyDocumentException specifically —
+          this means the policy JSON itself is unparseable, distinct from
+          PolicyValidationPassed === false (parseable but semantically wrong).
+          Both must be handled to make policy validation reliable.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_ValidateResourcePolicy.html"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: TagResourceCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Attaches up to 50 tags (key-value pairs) to a secret. Tags are used for
+      cost allocation, IAM policy conditions (e.g. allowing access only to
+      secrets tagged with a specific Environment), and inventory management.
+      Hitting the per-secret tag limit (50 tags) throws LimitExceededException.
+      Used heavily in infrastructure-as-code provisioning and compliance
+      tagging pipelines. Tag failures in CI/CD often go unnoticed and lead to
+      cost-allocation reports missing entire categories of secrets.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_TagResource.html
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html
+      # @throws confirmed from TagResourceCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException, ResourceNotFoundException
+      # LimitExceededException additionally documented in TagResource API reference
+      - id: tag-resource-limit-exceeded
+        severity: warning
+        condition: >
+          total tags attached to the secret would exceed the per-secret limit of
+          50 tags; throws LimitExceededException
+          (error.name === "LimitExceededException")
+        throws: LimitExceededException
+        required_handling: >
+          Before adding tags, count existing tags via DescribeSecretCommand and
+          response.Tags.length. Either remove obsolete tags via UntagResourceCommand
+          or batch the tagging operation. Compliance scripts that blindly add a
+          tag-per-deployment will hit this limit after 50 deployments.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_TagResource.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_limits.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: tag-resource-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new TagResourceCommand(...)) without
+          a wrapping try-catch
+        throws: >
+          ResourceNotFoundException, LimitExceededException, InvalidParameterException,
+          InvalidRequestException, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. CI/CD tagging pipelines that fail silently produce
+          cost allocation reports missing entire categories of secrets and break
+          IAM policies that use tag conditions for access control. Treat tagging
+          failures as deployment failures, not silent warnings.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_TagResource.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: GetRandomPasswordCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Generates a cryptographically random password using AWS infrastructure.
+      Primarily used INSIDE rotation Lambda functions to generate the new
+      AWSPENDING secret value, and in provisioning scripts to seed initial
+      passwords. Returns response.RandomPassword (string). Throws on parameter
+      validation errors (negative length, conflicting character class flags) but
+      NOT on length=0 or empty exclusion strings — those silently produce
+      degenerate output. Rotation Lambdas that catch nothing here may write a
+      weak/empty password back via PutSecretValueCommand.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetRandomPassword.html
+      # @throws confirmed from GetRandomPasswordCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException
+      - id: get-random-password-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new GetRandomPasswordCommand(...)) without
+          a wrapping try-catch; failures here in rotation Lambdas mean rotation
+          stalls AND CloudWatch sees an uncaught exception in the Lambda, marking
+          rotation as failed without rolling back any partial state
+        throws: >
+          InvalidParameterException (invalid PasswordLength, conflicting
+          IncludeSpace/ExcludeCharacters), InvalidRequestException,
+          InternalServiceError, and network errors propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Inside a rotation Lambda, a GetRandomPassword failure
+          must be caught and re-thrown with rotation-specific context so the
+          AWSPENDING label is never created with a missing or partial value.
+          Outside rotation, log the failure and never fall back to a weak
+          deterministic password.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetRandomPassword.html"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
@@ -970,4 +1358,4 @@ notes:
   - "RotateSecretCommand is ASYNCHRONOUS — returns before the Lambda function completes rotation"
   - "PutSecretValue rate limit: max once per 10 minutes per secret to avoid version quota exhaustion"
   - "ResourceExistsException on CreateSecretCommand means secret already exists — use UpdateSecretCommand instead"
-  - "Intentionally omitted: DescribeSecretCommand, ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination), GetResourcePolicyCommand, DeleteResourcePolicyCommand, ValidateResourcePolicyCommand (policy admin), GetRandomPasswordCommand (utility), TagResourceCommand, UntagResourceCommand (tagging admin), ReplicateSecretToRegionsCommand, RemoveRegionsFromReplicationCommand, StopReplicationToReplicaCommand (replication admin) — these are infrastructure management or read-only operations with no unique behavioral contracts beyond generic error handling. (Promoted from omitted: CancelRotateSecretCommand, PutResourcePolicyCommand, RestoreSecretCommand, UpdateSecretVersionStageCommand — added in deepen pass 2026-06-11)"
+  - "Intentionally omitted: ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination with generic InvalidNextTokenException only), GetResourcePolicyCommand, DeleteResourcePolicyCommand (admin reads/idempotent deletes paired with PutResourcePolicy already contracted), UntagResourceCommand (idempotent inverse of TagResourceCommand - missing tags do not throw), RemoveRegionsFromReplicationCommand, StopReplicationToReplicaCommand (replication admin paired with ReplicateSecretToRegions - per-region success/failure on the same response.ReplicationStatus shape) - no unique behavioral contracts beyond generic error handling. (Promoted from omitted 2026-06-12: DescribeSecretCommand, ReplicateSecretToRegionsCommand, ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand. Promoted 2026-06-11: CancelRotateSecretCommand, PutResourcePolicyCommand, RestoreSecretCommand, UpdateSecretVersionStageCommand)"
