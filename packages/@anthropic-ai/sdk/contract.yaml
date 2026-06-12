@@ -1,12 +1,40 @@
 package: "@anthropic-ai/sdk"
 semver: ">=0.18.0 <1.0.0"
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: 2026-04-04
+last_verified: 2026-06-12
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.57
+coverage_score: 0.69  # 11 contracted / 16 total async-callable (5 admin/read-only omitted)
+# Coverage history:
+#   2026-04-02 pass 1: 7 contracted (messages.create/stream/Anthropic + countTokens,
+#     batches.create, beta.files.upload, messages.parse), score 7/16 = 0.44
+#   2026-04-04 pass 1 refinement: same 7 fns, refined; score still 0.44
+#   (index entry stored effective 1.0 after counting 9 omitted; yaml stored raw 0.57)
+#   2026-06-12 pass 5 (deepen-stream-1, this pass): +3 functions
+#     batches.cancel, batches.delete, beta.webhooks.unwrap → 10 contracted / 16 total
+#     Plus +1 batches.results promoted from omitted → contracted (streaming JSONL
+#     errors are distinct from create() errors and warrant their own postcondition).
+#     New raw score 11/16 = 0.69. Effective (contracted/non-omitted) = 11/11 = 1.0.
+# Re-evaluated omissions (5):
+#   messages.batches.retrieve — read-only GET, idempotent polling, no distinct
+#     error contract beyond standard APIError already covered by batches.create()
+#   beta.files.delete/download/list/retrieveMetadata — admin/read-only file ops
+#   models.retrieve, models.list — read-only GETs, no domain-specific errors
+#   completions.create — deprecated legacy Text Completions API
+# New beta resources NOT contracted (intentional, low real-world adoption as of
+# 2026-06-12): beta.agents.*, beta.sessions.*, beta.memoryStores.*, beta.skills.*,
+#   beta.vaults.*, beta.userProfiles.*, beta.deployments.*, beta.deploymentRuns.*,
+#   beta.environments.*. These are part of the new Managed Agents preview surface
+#   (SDK v0.90+) and have <1% production adoption. Revisit in 3-6 months.
+# Sources fetched this pass:
+#   https://platform.claude.com/docs/en/api/canceling-message-batches
+#   https://platform.claude.com/docs/en/api/deleting-message-batches
+#   https://platform.claude.com/docs/en/api/errors
+#   node_modules/@anthropic-ai/sdk@0.104.1/resources/beta/webhooks.js (unwrap source)
+#   node_modules/standardwebhooks/dist/index.d.ts (WebhookVerificationError class)
+#   node_modules/@anthropic-ai/sdk@0.104.1/resources/messages/batches.d.ts
 functions:
   - name: create
     import_path: "@anthropic-ai/sdk"
@@ -465,3 +493,447 @@ functions:
         source: https://github.com/anthropics/anthropic-sdk-typescript
         sources:
           - https://github.com/anthropics/anthropic-sdk-typescript
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Deepen pass 2026-06-12 (deepen-stream-1 pass 5)
+  # +3 functions: batches.cancel, batches.delete, beta.webhooks.unwrap
+  # +1 promoted: batches.results (was omitted as "streaming JSONL" — promoted
+  #   because the JSONLDecoder iteration can throw distinct errors that
+  #   batches.create() does not cover)
+  # Sources: platform.claude.com/docs/en/api/{canceling,deleting}-message-batches,
+  #          platform.claude.com/docs/en/api/errors,
+  #          @anthropic-ai/sdk@0.104.1 d.ts files, standardwebhooks source
+  # ───────────────────────────────────────────────────────────────────────────
+
+  - name: batches.cancel
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Cancels an in-progress Message Batch. Transitions the batch to "canceling"
+      state. Non-interruptible requests may still complete. Common cleanup path
+      for batch jobs that are no longer needed (e.g., user navigation away,
+      cost-overrun protection, deploy-time abort).
+    postconditions:
+      # Evidence:
+      #   https://platform.claude.com/docs/en/api/canceling-message-batches
+      #   — "Batches may be canceled any time before processing ends" — so cancel()
+      #     on an already-ended batch will return a 4xx (the docs do not promise
+      #     idempotency).
+      #   https://platform.claude.com/docs/en/api/errors — full APIError hierarchy
+      #     applies (401 auth, 404 not_found_error, 429 rate_limit, 500 api_error).
+      #   node_modules/@anthropic-ai/sdk@0.104.1/resources/messages/batches.d.ts:
+      #     cancel(messageBatchID: string, options?: RequestOptions): APIPromise<MessageBatch>
+      - id: batches-cancel-no-try-catch
+        condition: client.messages.batches.cancel() called without try-catch or .catch() handler
+        throws: >
+          APIError hierarchy: NotFoundError (404) if message_batch_id does not exist
+          or belongs to a different organization; AuthenticationError (401) on bad
+          API key; RateLimitError (429) on quota; InternalServerError (500/529);
+          APIConnectionError on network failure.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          batches.cancel() makes an HTTP POST to /v1/messages/batches/{id}/cancel.
+          Unhandled rejection crashes the worker that issued the cancel. Common in
+          deploy-time cleanup paths and "abort all running jobs" admin actions, where
+          a single failing cancel (404 for already-deleted batch, or a 401 from a
+          rotated API key) takes down the entire bulk-cancellation loop.
+        detector: |
+          If client.messages.batches.cancel() is called in an async context without
+          try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.batches.cancel(id) in try-catch.
+          Treat NotFoundError as non-fatal in bulk-cancel loops (the batch was
+          already gone — that's the desired end state). Propagate other errors:
+            try {
+              await client.messages.batches.cancel(batchId);
+            } catch (err) {
+              if (err instanceof Anthropic.NotFoundError) {
+                // Already gone — log and continue
+              } else if (err instanceof Anthropic.APIError) {
+                throw new Error(`Batch cancel failed: ${err.status} ${err.message}`);
+              } else {
+                throw err;
+              }
+            }
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/canceling-message-batches
+          - https://platform.claude.com/docs/en/api/errors
+
+      - id: batches-cancel-state-not-rechecked
+        condition: >
+          batches.cancel() resolves successfully but caller does not poll the
+          returned MessageBatch.processing_status to confirm the batch actually
+          finished (vs sitting in "canceling" state with non-interruptible
+          requests still completing).
+        throws: >
+          No exception. The returned MessageBatch.processing_status will be
+          "canceling" (in transit) or "ended" (fully done). Caller that
+          immediately calls batches.delete() will get a 4xx for "cannot delete
+          in-progress batch" if processing_status is not "ended".
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          Per docs: "Once cancellation is initiated, the batch enters a `canceling`
+          state, at which time the system may complete any in-progress,
+          non-interruptible requests before finalizing cancellation." Code that
+          chains cancel→delete in the same tick gets a 4xx on delete because the
+          batch is still in "canceling" status. Worse, billing continues for any
+          non-interruptible requests still running — silent cost overrun.
+        detector: |
+          If batches.cancel(id) is immediately followed by batches.delete(id) or
+          batches.retrieve(id) without checking processing_status === 'ended'
+        required_handling: |
+          After cancel, poll batches.retrieve(id) until processing_status === 'ended'
+          before deleting or treating the batch as terminal:
+            await client.messages.batches.cancel(batchId);
+            let batch;
+            do {
+              await new Promise(r => setTimeout(r, 2000));
+              batch = await client.messages.batches.retrieve(batchId);
+            } while (batch.processing_status !== 'ended');
+            // Now safe to delete or treat as final
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/canceling-message-batches
+
+  - name: batches.delete
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Deletes a Message Batch and its results. Per Anthropic docs: "Message
+      Batches can only be deleted once they've finished processing. If you'd
+      like to delete an in-progress batch, you must first cancel it." Common
+      in compliance-deletion paths (right-to-be-forgotten, retention cleanup).
+    postconditions:
+      # Evidence:
+      #   https://platform.claude.com/docs/en/api/deleting-message-batches
+      #   — explicit precondition: batch must have processing_status === 'ended'
+      #   — in-progress deletes return 4xx (most likely 400 invalid_request_error
+      #     per the standard APIError hierarchy in /api/errors)
+      #   node_modules/@anthropic-ai/sdk@0.104.1/resources/messages/batches.d.ts:
+      #     delete(messageBatchID: string, options?: RequestOptions): APIPromise<DeletedMessageBatch>
+      - id: batches-delete-no-try-catch
+        condition: client.messages.batches.delete() called without try-catch or .catch() handler
+        throws: >
+          APIError hierarchy: BadRequestError (400 invalid_request_error) if the
+          batch is still processing — Anthropic explicitly requires that the batch
+          be in "ended" state before delete will succeed; NotFoundError (404) if
+          the batch_id is invalid; AuthenticationError (401); RateLimitError (429);
+          InternalServerError (500/529); APIConnectionError on network failure.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          batches.delete() makes an HTTP DELETE to /v1/messages/batches/{id}.
+          Unhandled rejection crashes the deletion worker. The most common
+          production failure is the "cancel-then-delete in one tick" pattern that
+          hits BadRequestError because the batch is still in "canceling" state —
+          not yet "ended". This is especially dangerous in GDPR/CCPA deletion
+          workers that process many batches in a loop: one failing delete kills
+          the worker and leaves the rest of the user's data un-deleted, creating
+          a compliance gap.
+        detector: |
+          If client.messages.batches.delete() is called in an async context
+          without try-catch wrapping the await, or without .catch() in promise chain
+        required_handling: |
+          MUST wrap await client.messages.batches.delete(id) in try-catch. In
+          batch deletion loops, log-and-continue on per-batch failure to ensure
+          the worker completes:
+            for (const id of batchIds) {
+              try {
+                await client.messages.batches.delete(id);
+              } catch (err) {
+                if (err instanceof Anthropic.BadRequestError) {
+                  // Likely still processing — cancel first, then retry later
+                  logger.warn('Skipping delete of in-progress batch', { id });
+                  continue;
+                }
+                if (err instanceof Anthropic.NotFoundError) {
+                  continue; // already gone
+                }
+                logger.error('Batch delete failed', { id, err });
+              }
+            }
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/deleting-message-batches
+          - https://platform.claude.com/docs/en/api/errors
+
+      - id: batches-delete-without-prior-cancel
+        condition: >
+          batches.delete() is called on a batch whose processing_status has not
+          been verified to be "ended". The caller assumed the batch was complete
+          but it was actually still in_progress or canceling.
+        throws: >
+          BadRequestError (400 invalid_request_error). The error message will
+          indicate the batch is not in a deletable state.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          The Anthropic docs explicitly require: "Message Batches can only be
+          deleted once they've finished processing. If you'd like to delete an
+          in-progress batch, you must first cancel it." Code that calls delete()
+          without first either (a) verifying processing_status === 'ended' via
+          retrieve(), or (b) calling cancel() and polling until ended, will hit
+          a 400 every time. This is a programmer-error pattern, not a transient
+          failure — retrying does not help.
+        detector: |
+          If batches.delete(id) is called without a preceding batches.retrieve(id)
+          status check or batches.cancel(id) + poll loop in the same code path
+        required_handling: |
+          MUST verify the batch is in "ended" state before deleting:
+            const batch = await client.messages.batches.retrieve(id);
+            if (batch.processing_status !== 'ended') {
+              await client.messages.batches.cancel(id);
+              // Poll until ended (see batches.cancel post-condition)
+            }
+            await client.messages.batches.delete(id);
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/deleting-message-batches
+
+  - name: batches.results
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Streams the per-request results of a completed Message Batch as a JSONL
+      decoder. Each yielded item is a MessageBatchIndividualResponse with
+      result.type one of "succeeded" | "errored" | "canceled" | "expired".
+      Common reading path for cost-attributed bulk-inference pipelines (RAG
+      ingestion, eval suites, content moderation backfills).
+    postconditions:
+      # Evidence:
+      #   https://platform.claude.com/docs/en/api/canceling-message-batches
+      #     — request_counts shows succeeded/errored/canceled/expired tallies;
+      #       each per-request result is independent
+      #   node_modules/@anthropic-ai/sdk@0.104.1/resources/messages/batches.d.ts:
+      #     results(messageBatchID: string, options?: RequestOptions):
+      #       Promise<JSONLDecoder<MessageBatchIndividualResponse>>
+      #   The decoder is async-iterable; iteration can throw on malformed JSONL
+      #   lines, connection drops during streaming, or HTTP 5xx mid-stream.
+      - id: batches-results-no-try-catch
+        condition: client.messages.batches.results() awaited without try-catch on the await OR on the for-await iteration
+        throws: >
+          APIError on the initial fetch (404 NotFoundError if batch_id invalid,
+          400 BadRequestError if processing_status !== 'ended', 401/429/500).
+          APIConnectionError or generic Error during streaming iteration if the
+          JSONL connection drops mid-stream.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        description: |
+          batches.results() returns a JSONLDecoder. The initial await fetches the
+          .jsonl file URL; the for-await iteration parses each line. Both stages
+          can throw distinct errors. Unhandled errors at the await stage crash
+          the result-consuming worker. Unhandled errors during iteration leave
+          the batch results partially consumed — the caller silently processes
+          fewer results than the batch contains, producing inconsistent state
+          (e.g., 80% of documents indexed, 20% missing, no error logged).
+        detector: |
+          If client.messages.batches.results(id) is awaited without try-catch,
+          OR if the resulting decoder is iterated (for await ... of decoder)
+          without try-catch around the iteration body
+        required_handling: |
+          MUST wrap BOTH the await and the iteration:
+            try {
+              const decoder = await client.messages.batches.results(batchId);
+              try {
+                for await (const item of decoder) {
+                  // Each item also needs per-result handling:
+                  if (item.result.type === 'errored') {
+                    handleErrored(item.custom_id, item.result.error);
+                  } else if (item.result.type === 'expired' ||
+                             item.result.type === 'canceled') {
+                    handleNonSuccess(item.custom_id, item.result.type);
+                  } else {
+                    handleSucceeded(item.custom_id, item.result.message);
+                  }
+                }
+              } catch (streamErr) {
+                // Connection drop mid-stream — note how many results were
+                // processed and retry from that custom_id
+                logger.error('Batch results stream interrupted', { streamErr });
+              }
+            } catch (fetchErr) {
+              if (fetchErr instanceof Anthropic.BadRequestError) {
+                // Batch not in "ended" state yet
+              }
+              throw fetchErr;
+            }
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/canceling-message-batches
+          - https://github.com/anthropics/anthropic-sdk-typescript
+
+      - id: batches-results-individual-not-checked
+        condition: >
+          for-await over batches.results() iterates items without checking
+          item.result.type. Code treats every iterated item as a success and
+          accesses item.result.message, which is undefined for type === 'errored'
+          | 'canceled' | 'expired'.
+        throws: >
+          TypeError at runtime: "Cannot read properties of undefined (reading
+          'content')" when accessing item.result.message.content on a non-succeeded
+          result. The error type union for MessageBatchIndividualResponse is
+          discriminated by result.type — accessing .message on the wrong branch
+          is a TypeScript-level error that the runtime cannot distinguish without
+          a narrowing check.
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        description: |
+          A batch typically contains a mix of succeeded, errored, canceled, and
+          expired requests (per request_counts in the batch metadata). Code that
+          assumes every result.type === 'succeeded' loses errored/canceled/expired
+          requests — they're either silently skipped (when wrapped in a generic
+          catch) or crash the entire result-consumption loop. Either way, the
+          per-request failures are invisible to the operator. For RAG ingestion
+          pipelines, this means documents silently never get indexed.
+        detector: |
+          If for-await over batches.results() accesses item.result.message
+          without a prior check of item.result.type === 'succeeded'
+        required_handling: |
+          MUST narrow on item.result.type before accessing fields:
+            for await (const item of decoder) {
+              switch (item.result.type) {
+                case 'succeeded':
+                  use(item.result.message);
+                  break;
+                case 'errored':
+                  handleError(item.custom_id, item.result.error);
+                  break;
+                case 'canceled':
+                case 'expired':
+                  scheduleRetry(item.custom_id);
+                  break;
+              }
+            }
+        evidence_quality: confirmed
+        sources:
+          - https://platform.claude.com/docs/en/api/canceling-message-batches
+
+  - name: beta.webhooks.unwrap
+    import_path: "@anthropic-ai/sdk"
+    description: >
+      Verifies a webhook signature and parses the JSON payload. Used by any
+      Anthropic webhook consumer (session lifecycle events, vault events,
+      credential refresh failures). Synchronous — does NOT return a Promise.
+      Throws on any of: missing webhook key, invalid signature, or malformed
+      JSON body. Security-critical: a swallowed verification error means
+      forged webhook payloads get treated as authentic.
+    postconditions:
+      # Evidence:
+      #   node_modules/@anthropic-ai/sdk@0.104.1/resources/beta/webhooks.js:
+      #     unwrap(body, { headers, key }) {
+      #       if (headers !== undefined) {
+      #         const keyStr = key === undefined ? this._client.webhookKey : key;
+      #         if (keyStr === null)
+      #           throw new Error('Webhook key must not be null in order to unwrap');
+      #         const wh = new standardwebhooks_1.Webhook(keyStr);
+      #         wh.verify(body, headers);
+      #       }
+      #       return JSON.parse(body);
+      #     }
+      #   node_modules/standardwebhooks/dist/index.d.ts:
+      #     export declare class WebhookVerificationError extends ExtendableError
+      #     — thrown by wh.verify(body, headers) on bad signature or expired timestamp
+      - id: webhooks-unwrap-no-try-catch
+        condition: >
+          client.beta.webhooks.unwrap(body, { headers }) called without try-catch.
+          unwrap is synchronous but can throw THREE distinct error types: plain
+          Error (missing key), WebhookVerificationError (bad signature), or
+          SyntaxError (JSON.parse failure on malformed body).
+        throws: >
+          - Error('Webhook key must not be null in order to unwrap') if no
+            webhookKey is configured on the client and no `key` option is passed.
+          - WebhookVerificationError from standardwebhooks if the signature
+            doesn't verify OR the webhook-timestamp header is outside the
+            allowed clock-skew window.
+          - SyntaxError from JSON.parse(body) if the body bytes aren't valid JSON.
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: |
+          beta.webhooks.unwrap() is the canonical Anthropic webhook handler entry
+          point. Three failure modes, all security-relevant:
+          (1) Missing key: app forgot to set ANTHROPIC_WEBHOOK_SIGNING_KEY env
+              var. Every webhook crashes the request handler — DoS by typo.
+          (2) Bad signature / expired timestamp: WebhookVerificationError. If
+              this is swallowed and the parsed body is still trusted, an
+              attacker can forge "session.terminated" or "vault.credential.
+              archived" events. Worse: if the handler is "best-effort" with a
+              try/catch that returns 200 anyway, Anthropic stops retrying and
+              the legitimate event is lost.
+          (3) Malformed JSON: SyntaxError. Indicates body was rewritten by a
+              proxy (signature would have caught this first — unless step 2 was
+              skipped). Often masquerades as case 2.
+          Unhandled, any of these crash the webhook endpoint and Anthropic
+          retries with exponential backoff. Handled-but-not-distinguished is
+          worse: forged events flow through as authentic.
+        detector: |
+          If client.beta.webhooks.unwrap(body, { headers }) is called without
+          try-catch wrapping the call
+        required_handling: |
+          MUST wrap in try-catch and distinguish the three failure modes:
+            import { WebhookVerificationError } from 'standardwebhooks';
+            try {
+              const event = client.beta.webhooks.unwrap(rawBody, {
+                headers: req.headers,
+                // key: process.env.ANTHROPIC_WEBHOOK_SIGNING_KEY
+              });
+              await handleEvent(event);
+              res.status(200).end();
+            } catch (err) {
+              if (err instanceof WebhookVerificationError) {
+                // Forged or expired — log + 401, do NOT 200
+                logger.warn('webhook verify failed', { err });
+                res.status(401).end();
+                return;
+              }
+              if (err instanceof SyntaxError) {
+                // Malformed body — 400
+                res.status(400).end();
+                return;
+              }
+              // Missing key configuration — log loudly + 500
+              logger.error('webhook key not configured', { err });
+              res.status(500).end();
+            }
+          NEVER return 200 from a verification-failed branch — Anthropic uses
+          200 as the "accepted" signal and stops retrying. A 4xx tells Anthropic
+          the webhook was rejected and the next legitimate event is still
+          delivered cleanly.
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/anthropics/anthropic-sdk-typescript
+          - https://www.standardwebhooks.com/
