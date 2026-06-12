@@ -10,9 +10,13 @@
  *   createclient-missing-connection-string, createclient-pooled-connection-string,
  *   createclient-query-before-connect, pool-end-not-awaited, pool-end-queries-after-shutdown,
  *   client-end-not-called
+ *
+ * Deepened: 2026-06-12 (pass 2)
+ * New postconditions: sql-incorrect-template-call, sql-missing-connection-string-on-first-use,
+ *   postgresconnectionstring-invalid-type
  */
 
-import { createPool, createClient, sql } from '@vercel/postgres';
+import { createPool, createClient, sql, postgresConnectionString } from '@vercel/postgres';
 
 // ---------------------------------------------------------------------------
 // createPool() — missing connection string
@@ -144,6 +148,75 @@ async function poolEndAwaited() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// sql — incorrect template call (pass 2, 2026-06-12)
+// ---------------------------------------------------------------------------
+
+// @expect-violation: sql-incorrect-template-call
+async function callSqlAsFunction() {
+  // ❌ sql() called as a regular function, not a tagged template
+  // Throws VercelPostgresError('incorrect_tagged_template_call') synchronously
+  const result = await (sql as any)('SELECT * FROM users');
+  return result.rows;
+}
+
+// @expect-clean
+async function callSqlAsTaggedTemplate() {
+  // ✅ sql used as tagged template literal — correct usage
+  try {
+    const result = await sql`SELECT * FROM users`;
+    return result.rows;
+  } catch (error) {
+    console.error('Query failed:', error);
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// sql — missing connection string on first use (pass 2, 2026-06-12)
+// ---------------------------------------------------------------------------
+
+// @expect-violation: sql-missing-connection-string-on-first-use
+async function useSqlWithoutEnvVar() {
+  // ❌ global sql used without POSTGRES_URL set
+  // The Proxy calls createPool() lazily on first use; if POSTGRES_URL is not set,
+  // it throws VercelPostgresError('missing_connection_string') at query time.
+  const result = await sql`SELECT 1`;
+  return result.rows;
+}
+
+// @expect-clean
+async function useSqlWithEnvVarValidated() {
+  // ✅ POSTGRES_URL validated at startup before use
+  if (!process.env.POSTGRES_URL) {
+    throw new Error('POSTGRES_URL is required but not set');
+  }
+  try {
+    const result = await sql`SELECT 1`;
+    return result.rows;
+  } catch (error) {
+    console.error('Query failed:', error);
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// postgresConnectionString — invalid connection type (pass 2, 2026-06-12)
+// ---------------------------------------------------------------------------
+
+// @expect-violation: postgresconnectionstring-invalid-type
+function getConnectionStringWithInvalidType(userInput: string) {
+  // ❌ Dynamic value passed as type — TypeScript can't enforce at runtime
+  // If userInput is not 'pool' or 'direct', throws VercelPostgresError('invalid_connection_type')
+  return postgresConnectionString(userInput as any);
+}
+
+// @expect-clean
+function getConnectionStringWithValidType(type: 'pool' | 'direct') {
+  // ✅ Type is constrained to valid values by TypeScript
+  return postgresConnectionString(type);
+}
+
 export {
   queryWithImplicitPoolNoEnv,
   queryWithExplicitConnectionString,
@@ -154,4 +227,10 @@ export {
   properClientEndInFinally,
   poolEndNotAwaited,
   poolEndAwaited,
+  callSqlAsFunction,
+  callSqlAsTaggedTemplate,
+  useSqlWithoutEnvVar,
+  useSqlWithEnvVarValidated,
+  getConnectionStringWithInvalidType,
+  getConnectionStringWithValidType,
 };

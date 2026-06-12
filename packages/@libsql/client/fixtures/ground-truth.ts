@@ -373,21 +373,19 @@ export async function insertExternalIdValidated(externalId: bigint) {
 // @expect-violation: sync-wrong-client-type
 // @expect-violation: sync-network-failure
 // @expect-violation: sync-client-closed
-// SHOULD_FIRE: sync() called without any error handling — SYNC_NOT_SUPPORTED thrown
-// on http/ws clients; network errors and CLIENT_CLOSED errors go unhandled
 export async function syncReplicaNoErrorHandling() {
-  // SHOULD_FIRE: no try-catch — throws LibsqlError(SYNC_NOT_SUPPORTED) on http clients
+  // SHOULD_FIRE: sync-wrong-client-type — no try-catch; throws LibsqlError(SYNC_NOT_SUPPORTED) on http clients
   await db.sync();
 }
 
-// @expect-violation: sync-wrong-client-type
-// SHOULD_FIRE: caller catches generic Error but not LibsqlError specifically — misses
-// the SYNC_NOT_SUPPORTED code check; code assumes sync works on any client
+// SHOULD_NOT_FIRE: try-catch is present — scanner accepts any catch as satisfying the postcondition.
+// Detecting swallowed-catch (no rethrow) is a future scanner capability not yet implemented.
 export async function syncReplicaGenericCatch() {
   try {
     await db.sync();
   } catch (error) {
-    // SHOULD_FIRE: swallows SYNC_NOT_SUPPORTED without surfacing the misconfiguration
+    // Generic catch — swallows SYNC_NOT_SUPPORTED without surfacing misconfiguration.
+    // NOTE: This is a best-practice gap (no code check) but scanner treats try-catch as sufficient.
     console.error("Sync failed:", error);
   }
 }

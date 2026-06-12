@@ -1,12 +1,26 @@
 package: "@vercel/postgres"
 semver: ^0.10.0
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.63
+# Depth pass 2026-06-12 (deepen-stream-1 pass 2):
+# API surface: 13 async-callable operations (5 intentionally omitted)
+# Contracted before: 8 (sql, query, connect, createPool, createClient, pool.end, client.end, client.connect)
+# Contracted after: 9 (+1 this pass: postgresConnectionString)
+# New postconditions: sql-incorrect-template-call, sql-missing-connection-string-on-first-use,
+#   postgresconnectionstring-invalid-type
+# Omitted (unchanged): db, pool.sql, client.sql, client.query (same error profile as contracted counterparts)
+# Deprecated package: @vercel/postgres@0.10.0 — no new API surface expected
+# Coverage: 9/13 = 0.69
+# Evidence sources:
+#   dist/chunk-BZ4XJVIW.cjs (local source) — sqlTemplate(), createPool(), createClient()
+#   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/error.ts
+#   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/sql-template.ts
+#   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/index.ts
+coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 omitted aliases)
 
 detection:
   type_names:
@@ -36,6 +50,94 @@ functions:
         rationale: "SQL queries can fail due to syntax errors, connection issues, or constraint violations"
         sources:
           - "https://vercel.com/docs/storage/vercel-postgres"
+
+      # Evidence: dist/chunk-BZ4XJVIW.cjs — sqlTemplate() function throws VercelPostgresError
+      # when strings is not a TemplateStringsArray. Code: isTemplateStringsArray() check.
+      # Confirmed from archived source:
+      # https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/sql-template.ts
+      - id: sql-incorrect-template-call
+        condition: >
+          sql() is called as a regular function with a string argument instead of as a
+          tagged template literal. Example: sql('SELECT * FROM users') instead of
+          sql`SELECT * FROM users`.
+        throws: >
+          VercelPostgresError with code 'incorrect_tagged_template_call':
+          "It looks like you tried to call `sql` as a function. Make sure to use it as
+          a tagged template.\n\tExample: sql`SELECT * FROM users`, not sql('SELECT * FROM users')"
+        description: >
+          The sql global and pool.sql method use the sqlTemplate() helper which validates
+          that the first argument is a TemplateStringsArray. Calling with a plain string
+          throws immediately — synchronously — before any network request is made.
+        required_handling: >
+          Always use sql as a tagged template literal:
+            const result = await sql`SELECT * FROM users WHERE id = ${userId}`;
+
+          NOT as a function call:
+            const result = await sql('SELECT * FROM users WHERE id = ' + userId);  // THROWS
+
+          The eslint-plugin-sql (or eslint-plugin-no-unsafe-queries) can catch this
+          pattern at lint time. For dynamic queries, use pool.query() or client.query().
+        sources:
+          - "https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/sql-template.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/chunk-BZ4XJVIW.cjs — sql is a Proxy that calls createPool() lazily.
+      # createPool() throws VercelPostgresError('missing_connection_string') when POSTGRES_URL is not set.
+      # Source: https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/index.ts
+      - id: sql-missing-connection-string-on-first-use
+        condition: >
+          The global sql template (or db alias) is used for the first time and the
+          POSTGRES_URL environment variable is not set. The sql global lazily calls
+          createPool() on first use — the error is deferred from initialization time
+          to first query time, making it easy to miss in development.
+        throws: >
+          VercelPostgresError with code 'missing_connection_string':
+          "You did not supply a 'connectionString' and no 'POSTGRES_URL' env var was found."
+        description: >
+          Unlike createPool(), which throws synchronously when called explicitly, the
+          global sql object defers pool creation to the first access. Code that "works"
+          in development (where POSTGRES_URL is in .env.local) silently breaks in
+          environments where the variable is not injected. The error only surfaces
+          when the first query executes, not at module load time.
+        required_handling: >
+          Validate POSTGRES_URL at app startup before relying on the global sql tag:
+
+          if (!process.env.POSTGRES_URL) {
+            throw new Error('POSTGRES_URL is required but not set');
+          }
+
+          Or use createPool() explicitly with error handling:
+
+          const pool = createPool();  // throws if POSTGRES_URL is missing
+          try {
+            const { rows } = await pool.sql`SELECT * FROM users`;
+          } catch (error) {
+            if (error instanceof VercelPostgresError && error.code === 'missing_connection_string') {
+              console.error('Database not configured:', error.message);
+            }
+            throw error;
+          }
+
+          In Vercel deployments, POSTGRES_URL is injected automatically. In local
+          development, add it to .env.local. In CI, add it to environment secrets.
+        sources:
+          - "https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/index.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
   - name: query
     import_path: "@vercel/postgres"
     description: "Executes a SQL query on database connection"
@@ -339,6 +441,54 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: postgresConnectionString
+    import_path: "@vercel/postgres"
+    description: >
+      Utility function that reads the POSTGRES_URL (pooled) or POSTGRES_URL_NON_POOLING
+      (direct) environment variable and returns the connection string, or undefined if
+      the variable is not set. Accepts 'pool' (default) or 'direct' as the type argument.
+      Throws VercelPostgresError synchronously if an invalid type is passed. Primarily
+      used for manual connection string construction or debugging — rarely called in
+      application code since createPool/createClient handle this automatically.
+    postconditions:
+      # Evidence: dist/chunk-BZ4XJVIW.cjs — postgresConnectionString() switch statement
+      # throws VercelPostgresError('invalid_connection_type') for unknown types.
+      # Confirmed from archived source:
+      # https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/postgres-connection-string.ts
+      - id: postgresconnectionstring-invalid-type
+        condition: >
+          An invalid type string (anything other than 'pool' or 'direct') is passed to
+          postgresConnectionString(). This is a programming error — the TypeScript type
+          system prevents it at compile time, but JavaScript callers or poorly typed code
+          can still trigger it.
+        throws: >
+          VercelPostgresError with code 'invalid_connection_type':
+          "Unhandled type: <type>"
+        description: >
+          The function uses a switch statement with an exhaustive check. Passing an invalid
+          type value (e.g., postgresConnectionString('readonly' as any)) throws immediately.
+          At compile time, TypeScript prevents this for typed callers, but the runtime
+          guard still exists.
+        required_handling: >
+          Always pass 'pool' or 'direct'. For type-safe callers this is enforced at compile
+          time. For JavaScript or dynamically-typed code, validate the type argument first:
+
+          const type = getUserInput(); // 'pool' | 'direct' | unknown
+          if (type !== 'pool' && type !== 'direct') {
+            throw new Error(`Invalid connection type: ${type}`);
+          }
+          const connectionString = postgresConnectionString(type);
+        sources:
+          - "https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/postgres-connection-string.ts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 # DEPRECATION NOTE (2026-04-17):
 # @vercel/postgres@0.10.0 is deprecated. Vercel Postgres databases were migrated
 # to Neon in December 2024. New projects should use @neondatabase/serverless directly.
@@ -351,3 +501,4 @@ functions:
 # Latest version: 0.10.0 (DEPRECATED)
 # Generated: 2026-02-26
 # Deepened: 2026-04-17 — pass 1 (+5 functions: createPool, createClient, pool.end, client.end, createclient-query-before-connect)
+# Deepened: 2026-06-12 — pass 2 (+1 function: postgresConnectionString; +2 postconditions on sql: sql-incorrect-template-call, sql-missing-connection-string-on-first-use)
