@@ -4,6 +4,7 @@
  * Updated by deepen-stream-2 pass 4 on 2026-04-17.
  * Updated by deepen-stream-2 pass 7 on 2026-04-16.
  * Updated by deepen-stream-2 pass 8 on 2026-04-17.
+ * Updated by deepen-stream-1 pass 4 on 2026-06-12 (+wallet.signTransaction, +wallet.authorize).
  *
  * Postconditions covered:
  *  - wait-transaction-replaced (TransactionResponse.wait)
@@ -29,6 +30,10 @@
  *  - contract-method-no-signer (Contract.method)
  *  - provider-send-unsupported-method (provider.send)
  *  - provider-send-network-error (provider.send)
+ *  - signtransaction-from-address-mismatch (wallet.signTransaction)
+ *  - signtransaction-invalid-transaction-fields (wallet.signTransaction)
+ *  - authorize-no-provider-for-auto-fill (wallet.authorize)
+ *  - authorize-invalid-delegate-address (wallet.authorize)
  */
 
 import { ethers, isError, Wallet, ContractFactory, BaseContract, BrowserProvider, JsonRpcProvider } from 'ethers';
@@ -511,6 +516,107 @@ async function sendRawRpcWithErrorHandling(
     }
     if (isError(error, 'SERVER_ERROR') || isError(error, 'NETWORK_ERROR')) {
       throw new Error(`RPC request failed: ${error instanceof Error ? error.message : 'network error'}`);
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// Added by deepen-stream-1 pass 4 (2026-06-12):
+//   wallet.signTransaction (offline signing -- INVALID_ARGUMENT paths)
+//   wallet.authorize (EIP-7702 / Pectra -- ethers v6.16.0+)
+// ============================================================
+
+// @expect-violation: signtransaction-from-address-mismatch
+// @expect-violation: signtransaction-invalid-transaction-fields
+async function signRelayedTransactionWithoutErrorHandling(
+  wallet: Wallet,
+  to: string,
+  value: bigint
+) {
+  // Missing try-catch on signTransaction() -- INVALID_ARGUMENT (tx.from mismatch)
+  // and INVALID_ARGUMENT (bad type-2 fee fields) both crash this relayer flow
+  const signedTx = await wallet.signTransaction({
+    to,
+    value,
+    from: '0x0000000000000000000000000000000000000001', // wrong from -> assertArgument fires
+    maxFeePerGas: undefined as unknown as bigint, // bad type-2 field -> Transaction.from throws
+  });
+  return signedTx;
+}
+
+// @expect-clean
+async function signRelayedTransactionWithErrorHandling(
+  wallet: Wallet,
+  to: string,
+  value: bigint
+) {
+  try {
+    // Note: omit `from` so ethers fills it in correctly. Populate fee fields explicitly.
+    const signedTx = await wallet.signTransaction({
+      to,
+      value,
+      type: 2,
+      maxFeePerGas: 30_000_000_000n,
+      maxPriorityFeePerGas: 1_000_000_000n,
+      gasLimit: 21_000n,
+    });
+    return signedTx;
+  } catch (error) {
+    if (isError(error, 'INVALID_ARGUMENT')) {
+      throw new Error(
+        `Cannot sign transaction (${error.argument ?? 'unknown field'}): ${error.shortMessage ?? 'invalid request'}`
+      );
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: authorize-no-provider-for-auto-fill
+// @expect-violation: authorize-invalid-delegate-address
+async function authorizeDelegationWithoutErrorHandling(
+  wallet: Wallet,
+  delegateContract: string | null
+) {
+  // Missing try-catch on authorize() -- UNSUPPORTED_OPERATION fires when wallet
+  // has no provider attached and chainId/nonce are not supplied; INVALID_ARGUMENT
+  // fires when the delegate address is not a string (null from API response).
+  const authorization = await wallet.authorize({
+    address: delegateContract as string, // may be null from API -> INVALID_ARGUMENT
+    // chainId and nonce omitted -> provider lookup required
+  });
+  return authorization;
+}
+
+// @expect-clean
+async function authorizeDelegationWithErrorHandling(
+  wallet: Wallet,
+  delegateContract: string,
+  chainId: bigint,
+  nonce: number
+) {
+  try {
+    // Supply chainId + nonce explicitly so authorize() never touches the provider.
+    // Validate delegate address before calling.
+    if (!ethers.isAddress(delegateContract)) {
+      throw new Error(`Invalid delegate contract address: ${delegateContract}`);
+    }
+    const authorization = await wallet.authorize({
+      address: delegateContract,
+      chainId,
+      nonce,
+    });
+    return authorization;
+  } catch (error) {
+    if (isError(error, 'INVALID_ARGUMENT')) {
+      throw new Error(
+        `EIP-7702 authorization rejected: ${error.shortMessage ?? 'invalid field'}`
+      );
+    }
+    if (isError(error, 'UNSUPPORTED_OPERATION')) {
+      throw new Error(
+        'Wallet has no provider attached and chainId/nonce were not supplied -- attach a provider or pass both fields explicitly'
+      );
     }
     throw error;
   }

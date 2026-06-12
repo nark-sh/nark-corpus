@@ -2,7 +2,7 @@ package: ethers
 semver: ">=6.0.0 <7.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -36,7 +36,23 @@ evidence_quality: confirmed
 #   lib.esm/contract/contract.js:681-713 -- waitForDeployment() wraps deployTx.wait()
 #   lib.esm/contract/contract.js:770-798 -- queryFilter() delegates to provider.getLogs()
 #   lib.esm/wallet/base-wallet.js:105-124 -- signTypedData UNSUPPORTED_OPERATION, UNCONFIGURED_NAME
-coverage_score: 0.67  # 16 contracted / 24 total async-callable (11 intentionally omitted)
+#
+# Depth pass 2026-06-12 (deepen-stream-1 pass 4):
+# API surface: 26 distinct async-callable operations (2 more discovered: BaseWallet.signTransaction,
+#                       BaseWallet.authorize — the latter added in ethers v6.16.0 for EIP-7702/Pectra)
+# Contracted before: 18
+# Contracted after:  20 (+2 this pass: wallet.signTransaction, wallet.authorize)
+# Coverage: 20/26 = 0.77
+# Evidence sources confirmed from installed package source (ethers@6.16.0):
+#   lib.esm/wallet/base-wallet.js:80-103 -- signTransaction() assertArgument on tx.from mismatch,
+#     Transaction.from() throws INVALID_ARGUMENT on bad type-1/2/3/4 fields
+#   lib.esm/wallet/base-wallet.js:52-72 -- authorize() / authorizeSync() with assertArgument
+#     on auth.address; populateAuthorization (abstract-signer.js) uses checkProvider() which
+#     throws UNSUPPORTED_OPERATION when wallet has no provider
+#   https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTransaction
+#   https://docs.ethers.org/v6/api/wallet/#BaseWallet-authorize
+#   https://eips.ethereum.org/EIPS/eip-7702
+coverage_score: 0.77  # 20 contracted / 26 total async-callable (11 intentionally omitted)
 
 detection:
   type_names:
@@ -1039,6 +1055,162 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: wallet.signTransaction
+    import_path: "ethers"
+    description: >
+      Signs a transaction WITHOUT broadcasting it, returning the serialized signed transaction
+      as a hex string (RLP-encoded). Used for offline signing flows: cold wallet workflows,
+      hardware wallet integrations, meta-transactions, MEV bundle preparation, transaction
+      relayers (gas station / Biconomy / OpenZeppelin Defender), multi-sig propose-then-execute
+      flows, and any scenario where the signing entity is separated from the broadcasting entity.
+      Distinct from sendTransaction() which signs AND broadcasts. Critically, after signing,
+      the application is responsible for transporting the serialized string to a broadcaster
+      (often via provider.broadcastTransaction or a custom mempool API).
+    postconditions:
+      # Evidence: lib.esm/wallet/base-wallet.js:80-103 -- signTransaction():
+      #   assertArgument(getAddress((tx.from)) === this.address, "transaction from address mismatch", "tx.from", tx.from);
+      #   const btx = Transaction.from(tx);  // throws INVALID_ARGUMENT on invalid fields
+      #   btx.signature = this.signingKey.sign(btx.unsignedHash);
+      #   return btx.serialized;
+      # Evidence: lib.esm/transaction/transaction.js -- Transaction.from() asserts on:
+      #   - invalid chainId, invalid gasLimit, invalid type, missing required fields per type
+      # Evidence: https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTransaction
+      - id: signtransaction-from-address-mismatch
+        condition: >
+          wallet.signTransaction({ from, ... }) is called without a try-catch and the `from`
+          field does not match this wallet's address. ethers refuses to sign a transaction
+          that claims to be from a different address than the signing key owns — this is a
+          deliberate safety check that prevents accidentally signing transactions intended
+          for a different wallet (common in multi-wallet apps and key-rotation flows).
+        throws: "EthersError with code INVALID_ARGUMENT and argument 'tx.from' (error.code === 'INVALID_ARGUMENT', error.argument === 'tx.from')"
+        required_handling: >
+          Caller MUST wrap wallet.signTransaction() in try-catch and handle INVALID_ARGUMENT.
+          The typical fix is to either omit `from` from the TransactionRequest (ethers will
+          fill it in correctly) or verify it matches `await wallet.getAddress()` before
+          calling. Use isError(error, 'INVALID_ARGUMENT') to detect. Silent swallowing here
+          causes "stuck transaction" debugging nightmares because the offline-signing flow
+          fails before broadcast and the broadcaster has no signed payload to relay.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTransaction"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: signtransaction-invalid-transaction-fields
+        condition: >
+          wallet.signTransaction(tx) is called without a try-catch and Transaction.from(tx)
+          rejects the TransactionRequest because of invalid or inconsistent fields. Common
+          causes: type-2 (EIP-1559) transaction missing maxFeePerGas or maxPriorityFeePerGas,
+          type-1 (EIP-2930) missing accessList, type-3 (EIP-4844) blob transactions missing
+          blobVersionedHashes, type-4 (EIP-7702) authorizationList rejected on chains that
+          have not yet activated Pectra, chainId mismatch with provider, gasLimit out of
+          uint64 range, or value/nonce/gasPrice not coercible to bigint.
+        throws: "EthersError with code INVALID_ARGUMENT (error.code === 'INVALID_ARGUMENT')"
+        required_handling: >
+          Caller MUST wrap wallet.signTransaction() in try-catch and handle INVALID_ARGUMENT.
+          For type-2 transactions, populate maxFeePerGas/maxPriorityFeePerGas via
+          provider.getFeeData() before signing. For type-4 (EIP-7702) flows, verify the
+          chain has activated the EIP before constructing the authorizationList. For
+          dynamic-fee transactions on legacy chains, fall back to type-0 by setting
+          `type: 0` and `gasPrice` explicitly. Surface clear error to UI when a
+          transaction is unsignable so the user can adjust parameters.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTransaction"
+          - "https://docs.ethers.org/v6/api/transaction/#Transaction"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: wallet.authorize
+    import_path: "ethers"
+    description: >
+      Signs an EIP-7702 authorization (Pectra hardfork), returning an Authorization object
+      that designates an EOA's code to a smart-contract implementation. This is the
+      account-abstraction-without-erc-4337 primitive that lets a standard EOA temporarily
+      execute as a smart contract for a single transaction. The signed Authorization is
+      then bundled into a type-4 (SET_CODE_TX_TYPE) transaction's authorizationList by
+      the relayer. Available since ethers v6.16.0 (Pectra support shipped in this version).
+      Used in EIP-7702 batching, sponsored gas, session keys, and passkey-based wallets.
+    postconditions:
+      # Evidence: lib.esm/wallet/base-wallet.js:65-72 -- async authorize(auth):
+      #   auth = Object.assign({}, auth, { address: await resolveAddress(auth.address, this) });
+      #   return this.authorizeSync(await this.populateAuthorization(auth));
+      # Evidence: lib.esm/wallet/base-wallet.js:52-63 -- authorizeSync():
+      #   assertArgument(typeof (auth.address) === "string", "invalid address for authorizeSync", "auth.address", auth);
+      # Evidence: lib.esm/providers/abstract-signer.js -- populateAuthorization():
+      #   if (auth.chainId == null) { auth.chainId = (await checkProvider(this, "getNetwork").getNetwork()).chainId; }
+      #   if (auth.nonce == null) { auth.nonce = await this.getNonce(); }
+      # Evidence: lib.esm/providers/abstract-signer.js -- checkProvider() throws
+      #   UNSUPPORTED_OPERATION when wallet has no provider attached.
+      # Evidence: https://docs.ethers.org/v6/api/wallet/#BaseWallet-authorize
+      # Evidence: https://eips.ethereum.org/EIPS/eip-7702
+      - id: authorize-no-provider-for-auto-fill
+        condition: >
+          wallet.authorize({ address: '0x...' }) is called without a try-catch and either
+          chainId or nonce is omitted from the auth object. ethers needs a provider to fetch
+          the missing field — chainId via provider.getNetwork() and nonce via wallet.getNonce()
+          which calls provider.getTransactionCount(). A wallet constructed without a provider
+          (e.g., `new Wallet(privateKey)` instead of `new Wallet(privateKey, provider)`)
+          cannot auto-populate these and will throw UNSUPPORTED_OPERATION.
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION', error.operation === 'getNetwork' or 'getTransactionCount')"
+        required_handling: >
+          Caller MUST wrap wallet.authorize() in try-catch and either (a) attach a provider
+          via wallet.connect(provider) before calling, or (b) supply both chainId and nonce
+          explicitly: `wallet.authorize({ address, chainId: 1, nonce })`. For sponsored-gas
+          flows where the sponsor knows the chainId in advance, prefer option (b) to avoid
+          unnecessary RPC calls. Use isError(error, 'UNSUPPORTED_OPERATION') to detect.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#BaseWallet-authorize"
+          - "https://docs.ethers.org/v6/api/providers/#Provider-getNetwork"
+          - "https://eips.ethereum.org/EIPS/eip-7702"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: authorize-invalid-delegate-address
+        condition: >
+          wallet.authorize({ address }) is called without a try-catch and `address` is not a
+          valid checksummed/lowercased Ethereum address string. authorizeSync runs an
+          assertArgument check on typeof address === 'string' and then resolveAddress + getAddress
+          validate the format. Passing a Promise, undefined, an empty string, or a malformed
+          hex string raises INVALID_ARGUMENT. Common in session-key flows where the delegate
+          contract address comes from an API response that may have null fields.
+        throws: "EthersError with code INVALID_ARGUMENT and argument 'auth.address' (error.code === 'INVALID_ARGUMENT')"
+        required_handling: >
+          Caller MUST wrap wallet.authorize() in try-catch and validate the delegate address
+          BEFORE calling: use ethers.isAddress(address) to pre-check. Handle INVALID_ARGUMENT
+          with a clear error to the UI ("Session key contract address is invalid"). Silent
+          swallowing causes the user to see a generic "transaction failed" message with no
+          way to recover, because the authorization needed for the type-4 transaction is
+          never produced.
+        sources:
+          - "https://docs.ethers.org/v6/api/wallet/#BaseWallet-authorize"
+          - "https://docs.ethers.org/v6/api/utils/#getAddress"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -1073,11 +1245,11 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-04-17"
+  last_verified: "2026-06-12"
   evidence_quality: confirmed
-  coverage_score: 0.75
-  # 18 contracted functions / 24 total async-callable (11 intentionally omitted)
-  # Coverage: 18/24 = 0.75 (effective: 18 contracted of 13 non-omitted surface = well-covered)
+  coverage_score: 0.77
+  # 20 contracted functions / 26 total async-callable (11 intentionally omitted)
+  # Coverage: 20/26 = 0.77 (effective: 20 contracted of 15 non-omitted surface = well-covered)
   # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
   #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
   #   provider.waitForTransaction, provider.getLogs
@@ -1086,6 +1258,8 @@ metadata:
   # Added deepen-stream-2 pass 7: BrowserProvider.getSigner, Wallet.encrypt,
   #   JsonRpcProvider.getSigner
   # Added deepen-stream-2 pass 8 (2026-04-17): Contract.method, provider.send
+  # Added deepen-stream-1 pass 4 (2026-06-12): wallet.signTransaction (offline signing),
+  #   wallet.authorize (EIP-7702 / Pectra, ethers v6.16.0+)
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR
@@ -1097,6 +1271,9 @@ metadata:
   #   Contract.queryTransaction() -- throws "@TODO" (not implemented)
   #   Contract.getDeployedCode() -- read-only GET
   #   provider.getTransactionResult() -- read-only GET
+  #   JsonRpcProvider.listAccounts() -- delegates to provider.send("eth_accounts"),
+  #     error contract identical to provider.send
+  #   HDNodeWallet.fromPhrase/fromSeed/fromMnemonic -- sync factories
 
 # Category: blockchain
 # Latest version: 6.13.0
