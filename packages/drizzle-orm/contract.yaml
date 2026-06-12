@@ -1,16 +1,23 @@
 package: drizzle-orm
 semver: ">=0.45.0 <1.0.0"
-contract_version: "1.0.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.60
-# coverage_score = 6 contracted functions / (10 total - 4 intentionally omitted) = 6/10 = 60%
-# Contracted: select, insert, update, delete, transaction, execute
-# Intentionally omitted: selectDistinct (same error profile as select),
-#   selectDistinctOn (same), refreshMaterializedView (rare), $count (read-only returns 0)
+coverage_score: 0.69
+# Depth pass 2026-06-12 (deepen-stream-2 pass 8):
+# +3 functions, +6 postconditions:
+#   findFirst   (2 postconditions: undefined-on-missing-row, driver-error)
+#   findMany    (2 postconditions: driver-error, empty-array-on-stale-filter)
+#   batch       (2 postconditions: statement-failure-rolls-back-all, unsupported-on-non-batchable-driver)
+# API surface: 13 async-callable operations (4 intentionally omitted)
+# Contracted: 9 (select, insert, update, delete, transaction, execute, findFirst, findMany, batch)
+# Intentionally omitted: 4 (selectDistinct/selectDistinctOn — same error profile as select;
+#                            refreshMaterializedView — rare maintenance op; $count — read-only)
+# Coverage: 9/13 = 0.69 raw; effective (contracted/non-omitted) = 9/9 = 1.0
+# Note: db.run/db.all/db.get/db.values (sqlite-core variants) covered by execute postconditions
 
 detection:
   type_names:
@@ -219,6 +226,268 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Depth pass 2026-06-12 (deepen-stream-2 pass 8)
+  # API surface expansion: relational queries (db.query.<table>.findFirst/findMany)
+  # and the batch API (D1/LibSQL/Neon).
+  # Evidence sources:
+  #   /private/tmp/claude/bc-deepen/drizzle-orm/node_modules/drizzle-orm/pg-core/query-builders/query.d.ts (lines 20-21)
+  #   /private/tmp/claude/bc-deepen/drizzle-orm/node_modules/drizzle-orm/pg-core/query-builders/query.js (mode === "first" returns rows[0])
+  #   /private/tmp/claude/bc-deepen/drizzle-orm/node_modules/drizzle-orm/d1/driver.d.ts (batch signature)
+  #   /private/tmp/claude/bc-deepen/drizzle-orm/node_modules/drizzle-orm/d1/session.js (lines 35-52)
+  #   https://orm.drizzle.team/docs/rqb (relational queries)
+  #   https://orm.drizzle.team/docs/batch-api (batch API)
+  #   https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/pg-core/query-builders/query.ts
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: findFirst
+    import_path: "drizzle-orm"
+    description: >
+      The relational query API method accessed via db.query.<table>.findFirst().
+      Built on top of the schema's `relations` config and returns a single result
+      (with related data joined) or `undefined` when no row matches the filter.
+      Internally PgRelationalQuery sets `mode === 'first'` and returns `rows[0]`,
+      which is `undefined` when the prepared statement yielded zero rows. This is
+      the most common silent-failure surface in drizzle code: a missing record
+      looks identical to a successful lookup at the type level because TypeScript
+      types it as `T | undefined` and callers routinely access `.id`/`.email` on
+      the result without checking for undefined.
+    postconditions:
+      # Evidence: pg-core/query-builders/query.d.ts line 21 — return type is
+      # PgRelationalQuery<BuildQueryResult<...> | undefined>
+      # Evidence: pg-core/query-builders/query.js (_prepare callback) —
+      # if (this.mode === "first") return rows[0];  // undefined when rows is empty
+      - id: findfirst-undefined-on-missing-row
+        condition: >
+          db.query.<table>.findFirst({ where: ... }) is called and the filter
+          matches zero rows. The promise resolves with `undefined`, not a thrown
+          error.
+        throws: "No error thrown — returns undefined when no row matches the filter"
+        required_handling: >
+          Caller MUST check the result for undefined before accessing any property.
+          findFirst() returns `T | undefined` — the TypeScript type is honest, but
+          a missing row looks identical to a successful lookup at runtime. Common
+          anti-pattern:
+            const user = await db.query.users.findFirst({ where: eq(users.id, id) });
+            return user.email;  // TypeError if user is undefined
+          Correct pattern:
+            const user = await db.query.users.findFirst({ where: eq(users.id, id) });
+            if (!user) throw new NotFoundError(`User ${id} not found`);
+            return user.email;
+          This is the most common drizzle bug pattern in production — it surfaces
+          as `Cannot read properties of undefined (reading 'X')` in request logs,
+          usually triggered by stale IDs in URL params, deleted records, or
+          permission-filtered lookups.
+        sources:
+          - "https://orm.drizzle.team/docs/rqb"
+          - "https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/pg-core/query-builders/query.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: pg-core/query-builders/query.js execute() calls
+      # this._prepare().execute() which delegates to session.prepareQuery and the
+      # underlying driver (pg/postgres-js/etc). Driver errors propagate unchanged.
+      - id: findfirst-driver-error
+        condition: >
+          db.query.<table>.findFirst() is called and the underlying driver
+          throws — connection lost (ECONNRESET, ETIMEDOUT), table missing
+          (42P01), invalid relation config (the schema's `relations` object
+          references a column that does not exist on the target table), or
+          query syntax error in the generated SQL.
+        throws: "Driver error (pg.DatabaseError / postgres.PostgresError / etc.) propagates as a Promise rejection"
+        required_handling: >
+          Caller MUST wrap db.query.<table>.findFirst() in try-catch. Connection
+          failures during read paths crash the request handler. Invalid relations
+          configs (a `with: { posts: true }` referencing a relation that was not
+          declared in the schema) surface here at runtime, not at compile time —
+          these are common after schema refactors where relations were removed
+          but query call sites were not updated. The same try-catch should
+          handle both the driver error and (separately) the undefined-row case
+          covered by findfirst-undefined-on-missing-row.
+        sources:
+          - "https://orm.drizzle.team/docs/rqb"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: findMany
+    import_path: "drizzle-orm"
+    description: >
+      The relational query API method accessed via db.query.<table>.findMany().
+      Returns an array of results (with related data joined). Unlike findFirst,
+      findMany returns `T[]` — an empty array when no rows match, never
+      undefined. The silent-failure pattern is different: code that loops over
+      the result silently does nothing when the array is empty, masking
+      configuration errors and stale filters. The driver-error surface is the
+      same as findFirst — connection errors and invalid relations propagate.
+    postconditions:
+      # Evidence: pg-core/query-builders/query.d.ts line 20 — return type is
+      # PgRelationalQuery<BuildQueryResult<...>[]>
+      - id: findmany-driver-error
+        condition: >
+          db.query.<table>.findMany() is called and the underlying driver
+          throws — connection lost, table missing, invalid relation config in
+          the `with:` option referencing an undefined relation, or query
+          syntax error.
+        throws: "Driver error (pg.DatabaseError / postgres.PostgresError / etc.) propagates as a Promise rejection"
+        required_handling: >
+          Caller MUST wrap db.query.<table>.findMany() in try-catch. Connection
+          failures during list endpoints (paginated reads, dashboard data
+          loads) crash the request handler. Invalid `with:` configs that
+          reference removed/renamed relations surface here at runtime — they
+          do not produce TypeScript errors because the schema's relations
+          object is checked structurally and a missing key falls back to
+          `unknown`. The error message includes the SQL fragment but NOT the
+          variable name in the application code, so the call site is hard to
+          locate without a stack trace.
+        sources:
+          - "https://orm.drizzle.team/docs/rqb"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: pg-core/query-builders/query.js — return rows (the full array)
+      # when mode !== "first". Empty filter result returns [] silently.
+      # This is a behavioral contract on EMPTY-vs-EXPECTED rows, not on throws.
+      - id: findmany-empty-array-on-stale-filter
+        condition: >
+          db.query.<table>.findMany() is called with a `where:` filter that no
+          rows satisfy (deleted records, wrong organization scope, stale enum
+          value after a schema migration, etc.). The promise resolves with an
+          empty array.
+        throws: "No error thrown — returns [] silently when filter matches zero rows"
+        required_handling: >
+          Caller SHOULD distinguish empty-result-by-design from
+          empty-result-by-mistake. For endpoints that paginate user data, an
+          empty array is a valid response. For endpoints that expect at least
+          one row (e.g. fetching an organization's billing records during a
+          renewal job), the empty array is a silent indicator of misconfigured
+          filters or stale state and MUST be checked:
+            const rows = await db.query.invoices.findMany({ where: eq(invoices.orgId, orgId) });
+            if (rows.length === 0) {
+              logger.warn('No invoices found for org', { orgId });
+              // decide: throw, fallback, or return early
+            }
+          Without this check, downstream code that aggregates or averages over
+          the array silently produces zeros, NaN, or misleading dashboard
+          metrics — a common drizzle production-data bug.
+        sources:
+          - "https://orm.drizzle.team/docs/rqb"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: batch
+    import_path: "drizzle-orm"
+    description: >
+      Atomically executes multiple Drizzle statements in a single call. Available
+      on LibSQL, Neon, and Cloudflare D1 driver wrappers (NOT on node-postgres /
+      postgres-js / better-sqlite3). The wrapped client's `.batch()` method is
+      called with prepared queries; the database executes them in an implicit
+      transaction. Per docs: "If a statement in the sequence fails, then an
+      error is returned for that specific statement, and it aborts or rolls
+      back the entire sequence." Returns a typed tuple of results matching the
+      input statements.
+    postconditions:
+      # Evidence: d1/driver.d.ts line 9 — batch<U extends BatchItem<'sqlite'>>
+      #   returns Promise<BatchResponse<T>>
+      # Evidence: d1/session.js lines 35-52 — calls await this.client.batch(builtQueries)
+      #   which propagates the driver's error (D1 / LibSQL / Neon all throw on failure)
+      # Evidence: https://orm.drizzle.team/docs/batch-api — "the entire sequence is rolled back"
+      - id: batch-statement-failure-rolls-back-all
+        condition: >
+          db.batch([...]) is called and any statement in the batch fails
+          (constraint violation, syntax error, connection drop mid-batch). The
+          driver throws — the entire batch is rolled back, none of the
+          statements committed.
+        throws: >
+          Driver-specific error from the failing statement (D1Error,
+          LibsqlError, or NeonDbError). The error message names the failing
+          statement but the typed BatchResponse you expected to receive is
+          NEVER returned — the rejection replaces it.
+        required_handling: >
+          Caller MUST wrap db.batch() in try-catch. The atomic semantics mean
+          either all statements commit and you get the typed BatchResponse, or
+          NONE commit and you get a rejection. Application code that builds
+          on partial success (e.g. "if step 3 fails, statements 1 and 2 should
+          still be applied") MUST NOT use batch() — use sequential awaits
+          inside individual try-catch blocks instead.
+
+          Common silent-failure pattern: developers assume batch() returns a
+          per-statement result object indicating which statements succeeded.
+          It does NOT — the success path returns one typed tuple, the failure
+          path throws. Code that destructures the response without try-catch
+          crashes the entire request handler on any single-row constraint
+          violation buried in the batch.
+        sources:
+          - "https://orm.drizzle.team/docs/batch-api"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: batch only supported on D1/LibSQL/Neon drivers. Calling
+      # `.batch()` on a node-postgres or postgres-js db has no method — TS
+      # catches the obvious case but the runtime crash happens when developers
+      # have a generic `db: any` type or pass the wrong client to a shared
+      # function expecting batch support.
+      - id: batch-unsupported-on-non-batchable-driver
+        condition: >
+          db.batch([...]) is called on a driver wrapper that does not implement
+          batch — node-postgres (drizzle-orm/node-postgres), postgres-js
+          (drizzle-orm/postgres-js), better-sqlite3, mysql2, planetscale.
+          This occurs when shared code receives a db instance typed as a union
+          or `any`, and the user passed the wrong driver.
+        throws: "TypeError: db.batch is not a function (runtime) — TypeScript catches it if the type is precise, but `any`-typed code reaches runtime"
+        required_handling: >
+          Code that uses db.batch() MUST be invoked only with a D1, LibSQL, or
+          Neon db instance. When writing shared utility functions, either
+          parameterize the db type precisely (DrizzleD1Database, LibsqlDatabase,
+          NeonHttpDatabase) or feature-detect:
+            if (typeof db.batch === 'function') {
+              await db.batch([...]);
+            } else {
+              // fallback to db.transaction() for pg/sqlite drivers
+            }
+          A surprising number of drizzle batch() crashes in production come
+          from code that was written assuming D1 in dev/preview environments
+          but ran against postgres-js in production.
+        sources:
+          - "https://orm.drizzle.team/docs/batch-api"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: medium
         evidence_quality: confirmed
 
