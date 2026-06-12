@@ -8,13 +8,42 @@
 # All other Resend methods return { data, error } — webhooks.verify() is categorically different.
 package: resend
 semver: ">=3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.60
+coverage_score: 0.86  # 12 contracted / 14 high-impact contractable (after 2026-06-12 deepen)
+# Effective coverage: 12 contracted / 14 contractable = 0.86
+# API surface re-enumerated 2026-06-12 against resend@6.12.4 (was originally
+# enumerated against v3.x with ~10 methods; v6 now exposes ~70+ methods across
+# 17 sub-clients).
+#
+# Depth pass 2026-06-12 (deepen-stream-2 pass 3):
+# +6 functions: emails.create, emails.update, batch.create, domains.verify,
+#               broadcasts.create, webhooks.create
+# Rationale: v6.x SDK expansion added create() aliases for send()-style methods
+# (REST naming convention) and exposed 3 new high-impact admin operations
+# (emails.update for scheduled-email rescheduling, domains.verify for domain
+# verification gating, webhooks.create for webhook subscription management).
+# All 6 return { data, error } and have the same silent-failure mode as the
+# previously-contracted methods.
+# Intentionally omitted (~50+ admin/read-only methods): GET/list operations
+# across all sub-clients (apiKeys.list/remove, automations.list/get/update/remove,
+# automationRuns.*, contactProperties.*, contactSegments.*, contactTopics.*,
+# domains.list/get/update/remove, segments.*, templates.list/get/update/remove,
+# topics.*, events.list/get/remove, logs.*, broadcasts.list/get/update/remove,
+# webhooks.list/get/update/remove, receiving.*, attachments.*) — admin/management
+# ops with no unique error contract beyond the generic { data, error } pattern
+# already documented under emails-cancel-no-error-check.
+# Sources confirmed:
+#   node_modules/resend/dist/index.d.mts (resend@6.12.4 type declarations)
+#   https://resend.com/docs/api-reference/errors (full error code table)
+#   https://resend.com/docs/api-reference/emails/update-email
+#   https://resend.com/docs/api-reference/domains/verify-domain
+#   https://resend.com/docs/api-reference/broadcasts/create-broadcast
+#   https://resend.com/docs/api-reference/webhooks/create-webhook
 
 functions:
   - name: send
@@ -329,3 +358,315 @@ functions:
           - "https://resend.com/docs/api-reference/errors"
         evidence_quality: confirmed
         severity: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Deepen pass 2026-06-12 (deepen-stream-2 pass 3)
+  # API surface expanded from Resend v3 (~10 methods) to v6.12.4 (~70+ methods)
+  # across 17 sub-clients. Added 6 high-impact send/create/update/verify methods.
+  # Sources: node_modules/resend/dist/index.d.mts (v6.12.4 type declarations)
+  #          https://resend.com/docs/api-reference/errors (full error code table)
+  # ───────────────────────────────────────────────────────────────────────────
+
+  - name: emails.create
+    import_path: "resend"
+    description: >
+      Alias for emails.send() — added in Resend SDK v5.x as a more REST-conventional
+      method name. Identical behavior, identical signature, identical return shape
+      ({ data, error }). Same silent-failure mode: returns { data: null, error: ErrorResponse }
+      on API failure. Common in newer codebases that prefer .create() over .send()
+      naming for consistency with other resources (contacts.create, broadcasts.create).
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:1610 — declares
+      #   create(payload: CreateEmailOptions, options?: CreateEmailRequestOptions): Promise<CreateEmailResponse>
+      # CreateEmailResponse type confirms same { data, error } shape as send().
+      # Source: https://resend.com/docs/api-reference/emails/send-email
+      - id: emails-create-no-error-check
+        condition: >
+          emails.create() called without checking result.error — API failure, rate
+          limit, unverified domain, or network error returns { data: null, error:
+          ErrorResponse } silently. Behaviorally identical to emails.send() — the
+          underlying HTTP POST /emails endpoint is the same.
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Same error vocabulary as emails.send(): invalid_from_address (422),
+          validation_error (400/403), monthly_quota_exceeded (429), rate_limit_exceeded (429),
+          missing_required_field (422), restricted_api_key (401), application_error (500).
+        required_handling: >
+          Caller MUST check result.error after every emails.create() call. Same
+          patterns as emails.send():
+            const { data, error } = await resend.emails.create({...});
+            if (error) { handle error; }
+          OR wrap in try-catch as defensive double-check.
+          DO NOT return result.data without checking result.error first.
+        sources:
+          - "https://resend.com/docs/api-reference/emails/send-email"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: emails.update
+    import_path: "resend"
+    description: >
+      Updates a scheduled email (modifies scheduled_at timestamp before send). Only
+      works on emails with status='scheduled'. Returns { data, error } — does NOT
+      throw. Returns error if the email ID is not found, the email was already sent,
+      or the API key lacks permission. Used in workflows that reschedule reminders
+      or delay drip campaigns based on user activity. Silent failure here means
+      the schedule update is silently ignored and the original send time is used.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:1613 — declares
+      #   update(payload: UpdateEmailOptions): Promise<UpdateEmailResponse>
+      # UpdateEmailOptions accepts { id, scheduledAt }; UpdateEmailResponse is Response<UpdateEmailResponseSuccess>
+      # (the standard { data, error } envelope).
+      # Source: https://resend.com/docs/api-reference/emails/update-email
+      # Error vocabulary from https://resend.com/docs/api-reference/errors
+      - id: emails-update-no-error-check
+        condition: >
+          emails.update() called without checking result.error — silent failure if
+          email_id not found (404 not_found), email already sent (validation_error 400),
+          API key restricted (401 restricted_api_key), or scheduled_at format invalid
+          (422 validation_error).
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='not_found' (404) — email_id does not exist or was already sent
+          - name='validation_error' (400) — email is not in scheduled state (already sent/queued/canceled)
+          - name='restricted_api_key' (401) — API key only has sending_access, not full_access
+          - name='validation_error' (422) — scheduled_at not a valid ISO timestamp
+        required_handling: >
+          Caller MUST check result.error after every emails.update() call:
+            const { data, error } = await resend.emails.update({
+              id: emailId,
+              scheduledAt: newTime.toISOString(),
+            });
+            if (error) {
+              if (error.name === 'not_found') {
+                // Email already sent or never scheduled — log + treat as no-op
+              } else if (error.name === 'validation_error') {
+                throw new Error(`Cannot reschedule: ${error.message}`);
+              } else {
+                throw new Error(`Failed to update scheduled email: ${error.message}`);
+              }
+            }
+          DO NOT assume update succeeded without checking result.error.
+          Silent failures here cause drip campaigns to fire at the wrong time and
+          reminder emails to land before the rescheduled window.
+        sources:
+          - "https://resend.com/docs/api-reference/emails/update-email"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: batch.create
+    import_path: "resend"
+    description: >
+      Alias for batch.send() — added in Resend SDK v5.x to align with REST naming
+      conventions. Identical signature, identical return shape ({ data, error }).
+      Sends multiple emails in a single API request; atomic on the request side
+      (entire batch fails if request fails) but each email in data.data[] can have
+      its own delivery outcome. Same silent-failure mode as batch.send.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:1506 — declares
+      #   create<Options extends CreateBatchRequestOptions>(payload: CreateBatchOptions, options?: Options): Promise<CreateBatchResponse<Options>>
+      # CreateBatchResponse uses the same Response<T> envelope as send().
+      # Source: https://resend.com/docs/api-reference/emails/send-batch-emails
+      - id: batch-create-no-error-check
+        condition: >
+          batch.create() called without checking result.error — entire batch silently
+          fails if request returns an error. Same risk profile as batch.send().
+        throws: >
+          Does not throw. Returns { data: null, error: ErrorResponse } on failure.
+          All emails in batch are unsent if error is unchecked.
+        required_handling: >
+          Caller MUST check result.error after every batch.create() call:
+            const { data, error } = await resend.batch.create([...]);
+            if (error) {
+              logger.error('Batch send failed', { batchSize: emails.length, error });
+              throw new Error(`Batch failed: ${error.message}`);
+            }
+          Batch failures affect all emails — no partial success at the request layer.
+          Log error with batch size for debugging.
+        sources:
+          - "https://resend.com/docs/api-reference/emails/send-batch-emails"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: domains.verify
+    import_path: "resend"
+    description: >
+      Triggers a verification check for a domain after the user has added the
+      required DNS records (SPF, DKIM, DMARC). Returns { data, error } — does NOT
+      throw. The verification is asynchronous — a successful response only means
+      "verification triggered", not "domain verified". Used in onboarding flows
+      that gate email sending on domain verification. Silent failure here means
+      the verification was never triggered and downstream send attempts will fail
+      with invalid_from_address.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:1572 — declares
+      #   verify(id: string): Promise<VerifyDomainsResponse>
+      # VerifyDomainsResponse is Response<VerifyDomainsResponseSuccess>.
+      # Source: https://resend.com/docs/api-reference/domains/verify-domain
+      # Error vocabulary from https://resend.com/docs/api-reference/errors
+      - id: domains-verify-no-error-check
+        condition: >
+          domains.verify() called without checking result.error — silent failure
+          if domain_id not found (404), API key restricted (401), or backend
+          verification trigger errored (500).
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='not_found' (404) — domain_id does not exist in the team
+          - name='restricted_api_key' (401) — API key only has sending_access, not domain management
+          - name='validation_error' (400) — domain in wrong status (already verified, or not_started)
+          - name='internal_server_error' (500) — verification trigger failed at backend
+        required_handling: >
+          Caller MUST check result.error after every domains.verify() call:
+            const { data, error } = await resend.domains.verify(domainId);
+            if (error) {
+              logger.error('Domain verification trigger failed', { domainId, error });
+              throw new Error(`Cannot verify domain: ${error.message}`);
+            }
+            // NOTE: success here means "verification triggered" — poll domains.get(id)
+            // for status until status === 'verified' before allowing sends from this domain.
+          Silent failure means the user thinks verification is in progress but it
+          never started — downstream emails.send() calls fail with invalid_from_address
+          and the user has no signal that the verify call itself silently failed.
+        sources:
+          - "https://resend.com/docs/api-reference/domains/verify-domain"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: broadcasts.create
+    import_path: "resend"
+    description: >
+      Creates a broadcast (mass email draft) in the team's account. Returns
+      { data, error } — does NOT throw. The created broadcast must subsequently
+      be sent via broadcasts.send(). Silent failure here means the broadcast was
+      never created and the subsequent broadcasts.send(broadcastId) call fails
+      with not_found, masking the original creation failure.
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:1513 — declares
+      #   create(payload: CreateBroadcastOptions, options?: CreateBroadcastRequestOptions): Promise<SendBroadcastResponse>
+      # Returns the standard { data, error } envelope.
+      # Source: https://resend.com/docs/api-reference/broadcasts/create-broadcast
+      - id: broadcasts-create-no-error-check
+        condition: >
+          broadcasts.create() called without checking result.error — silent failure
+          if domain unverified (422 invalid_from_address), segment_id not found
+          (404 not_found), API key restricted (401), or required fields missing
+          (422 missing_required_field).
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='invalid_from_address' (422) — sender domain not verified
+          - name='not_found' (404) — segment_id does not exist
+          - name='restricted_api_key' (401) — API key only has sending_access, not broadcast management
+          - name='missing_required_field' (422) — name, subject, or audience missing
+          - name='validation_error' (400/403) — template_id invalid or unpublished
+        required_handling: >
+          Caller MUST check result.error after every broadcasts.create() call:
+            const { data, error } = await resend.broadcasts.create({
+              name, subject, from, segmentId, html,
+            });
+            if (error) {
+              logger.error('Broadcast create failed', { name, error });
+              throw new Error(`Failed to create broadcast: ${error.message}`);
+            }
+            const broadcastId = data!.id;
+            // Now broadcasts.send(broadcastId) can be called.
+          Silent create failures cascade — the subsequent broadcasts.send(undefined)
+          throws a different error (TypeError or not_found) that obscures the root
+          cause and wastes engineering time during incident response.
+        sources:
+          - "https://resend.com/docs/api-reference/broadcasts/create-broadcast"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: webhooks.create
+    import_path: "resend"
+    description: >
+      Creates a webhook subscription to receive email events (delivered, bounced,
+      complained, etc) at a caller-supplied URL. Returns { data, error } — does NOT
+      throw. The response includes a signing_secret that the caller MUST persist
+      (e.g. to environment variables or vault) because it is required by
+      webhooks.verify() at every incoming-webhook handler. Silent failure here is
+      doubly dangerous: (1) the webhook subscription is never created, so no events
+      are ever received, AND (2) if the create response is not checked, the caller
+      may use an undefined signing_secret in their handler, causing every webhook
+      to fail verification with "Secret can't be empty."
+    postconditions:
+      # Evidence: node_modules/resend/dist/index.d.mts:2107 — declares
+      #   create(payload: CreateWebhookOptions, options?: CreateWebhookRequestOptions): Promise<CreateWebhookResponse>
+      # CreateWebhookResponse includes signing_secret as documented at
+      # https://resend.com/docs/api-reference/webhooks/create-webhook
+      # Source: https://resend.com/docs/api-reference/webhooks/create-webhook
+      # Source: https://resend.com/docs/api-reference/errors
+      - id: webhooks-create-no-error-check
+        condition: >
+          webhooks.create() called without checking result.error — silent failure
+          on validation errors (invalid URL, unsupported events), restricted API key,
+          or quota errors (max webhooks per team).
+        throws: >
+          Does not throw. Returns { data: null, error: { name, message, statusCode } } on failure.
+          Common errors:
+          - name='validation_error' (400) — endpoint URL invalid or not https
+          - name='restricted_api_key' (401) — API key only has sending_access, not webhook management
+          - name='missing_required_field' (422) — endpoint URL or events array missing
+        required_handling: >
+          Caller MUST check result.error AND persist data.signing_secret:
+            const { data, error } = await resend.webhooks.create({
+              endpoint: 'https://my-app.com/webhooks/resend',
+              events: ['email.delivered', 'email.bounced'],
+            });
+            if (error) {
+              throw new Error(`Failed to create webhook: ${error.message}`);
+            }
+            // CRITICAL: persist data.signing_secret BEFORE deploying the handler
+            await secrets.set('RESEND_WEBHOOK_SECRET', data!.signing_secret);
+          Silent failure here cascades to webhooks.verify() failures in production
+          because the handler is deployed against an undefined RESEND_WEBHOOK_SECRET.
+          See webhooks-verify-missing-secret postcondition for the downstream impact.
+        sources:
+          - "https://resend.com/docs/api-reference/webhooks/create-webhook"
+          - "https://resend.com/docs/api-reference/errors"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
