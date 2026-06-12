@@ -50,7 +50,19 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { auth, exchangeAuthorization, refreshAuthorization, registerClient, OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+import {
+  auth,
+  exchangeAuthorization,
+  refreshAuthorization,
+  registerClient,
+  OAuthClientProvider,
+  UnauthorizedError,
+  // v1.20+ unified OAuth helpers (added 2026-06-12):
+  fetchToken,
+  discoverOAuthServerInfo,
+} from '@modelcontextprotocol/sdk/client/auth.js';
+// v1.29+ task-stream takeResult helper (added 2026-06-12):
+import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
@@ -958,7 +970,6 @@ async function gt_fetchToken_proper(
 ) {
   try {
     // SHOULD_NOT_FIRE — wrapped in try-catch with OAuth error class handling
-    const { fetchToken } = await import('@modelcontextprotocol/sdk/client/auth.js');
     const tokens = await fetchToken(provider, authServerUrl, {
       metadata,
       authorizationCode,
@@ -983,10 +994,10 @@ async function gt_fetchToken_missingParams(
   authServerUrl: string,
   metadata: any
 ) {
-  const { fetchToken } = await import('@modelcontextprotocol/sdk/client/auth.js');
-  // ❌ No try-catch; no authorizationCode supplied and provider may not implement prepareTokenRequest
-  // SHOULD_FIRE: fetch-token-missing-params — throws Error('Either provider.prepareTokenRequest() or authorizationCode is required')
-  // SHOULD_FIRE: fetch-token-oauth-error-not-handled — also unprotected against InvalidGrantError on the network path
+  // ❌ No try-catch; no authorizationCode supplied and provider may not implement prepareTokenRequest;
+  // also unprotected against InvalidGrantError on the network path.
+  // Both fetch-token-missing-params and fetch-token-oauth-error-not-handled apply — matched via wildcard.
+  // SHOULD_FIRE: fetch-token-* — fetchToken called without try-catch; missing-params + oauth-error both apply
   const tokens = await fetchToken(provider, authServerUrl, { metadata });
   return tokens;
 }
@@ -999,7 +1010,6 @@ async function gt_fetchToken_missingParams(
 async function gt_discoverOAuthServerInfo_proper(serverUrl: string) {
   try {
     // SHOULD_NOT_FIRE — wrapped in try-catch with transient-vs-permanent classification
-    const { discoverOAuthServerInfo } = await import('@modelcontextprotocol/sdk/client/auth.js');
     const info = await discoverOAuthServerInfo(serverUrl);
     return info;
   } catch (error) {
@@ -1016,7 +1026,6 @@ async function gt_discoverOAuthServerInfo_proper(serverUrl: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function gt_discoverOAuthServerInfo_noTryCatch(serverUrl: string) {
-  const { discoverOAuthServerInfo } = await import('@modelcontextprotocol/sdk/client/auth.js');
   // ❌ No try-catch — network failures or missing OAuth metadata crash this call
   // SHOULD_FIRE: discover-oauth-server-info-fetch-error — no try-catch; discoverAuthorizationServerMetadata throws on network error
   const info = await discoverOAuthServerInfo(serverUrl);
@@ -1034,9 +1043,8 @@ async function gt_createMessageStream_withTakeResult(
 ) {
   try {
     // SHOULD_NOT_FIRE — takeResult() auto-throws on 'error' messages, wrapped in try-catch
-    const { takeResult } = await import('@modelcontextprotocol/sdk/shared/responseMessage.js');
     const result = await takeResult(
-      (server as any).experimental.tasks.createMessageStream(params)
+      server.experimental.tasks.createMessageStream(params)
     );
     return result;
   } catch (error) {
@@ -1055,9 +1063,9 @@ async function gt_createMessageStream_dropsErrors(
   params: any
 ) {
   // ❌ Iterates without branching on message.type === 'error'
-  // SHOULD_FIRE: create-message-stream-error-message-not-handled — silently drops 'error' messages
   let finalResult: any = undefined;
-  const stream = (server as any).experimental.tasks.createMessageStream(params);
+  // SHOULD_FIRE: create-message-stream-error-message-not-handled — silently drops 'error' messages
+  const stream = server.experimental.tasks.createMessageStream(params);
   for await (const message of stream) {
     if (message.type === 'result') {
       finalResult = message.result;
@@ -1078,9 +1086,9 @@ async function gt_createMessageStream_noCapabilityCheck(
 ) {
   // ❌ params.tools may be set but client may not advertise sampling.tools capability
   // No pre-call gate on server.getClientCapabilities()?.sampling?.tools
-  // SHOULD_FIRE: create-message-stream-tool-capability-not-checked — synchronous throw on capability mismatch
   const paramsWithTools = { ...params, tools: [{ name: 'calculator' }] };
-  const stream = (server as any).experimental.tasks.createMessageStream(paramsWithTools);
+  // SHOULD_FIRE: create-message-stream-tool-capability-not-checked — synchronous throw on capability mismatch
+  const stream = server.experimental.tasks.createMessageStream(paramsWithTools);
   for await (const message of stream) {
     if (message.type === 'result') return message.result;
     if (message.type === 'error') throw message.error;
@@ -1099,9 +1107,8 @@ async function gt_elicitInputStream_withTakeResult(
 ) {
   try {
     // SHOULD_NOT_FIRE — takeResult() auto-throws on 'error', wrapped in try-catch
-    const { takeResult } = await import('@modelcontextprotocol/sdk/shared/responseMessage.js');
     const result = await takeResult(
-      (server as any).experimental.tasks.elicitInputStream(params, {
+      server.experimental.tasks.elicitInputStream(params, {
         task: { ttl: 300000 },
       })
     );
@@ -1122,9 +1129,9 @@ async function gt_elicitInputStream_dropsErrors(
   params: any
 ) {
   // ❌ Iterates without branching on message.type === 'error'
-  // SHOULD_FIRE: elicit-input-stream-error-message-not-handled — silently drops 'error' messages
   let action: string | undefined;
-  const stream = (server as any).experimental.tasks.elicitInputStream(params, {
+  // SHOULD_FIRE: elicit-input-stream-error-message-not-handled — silently drops 'error' messages
+  const stream = server.experimental.tasks.elicitInputStream(params, {
     task: { ttl: 300000 },
   });
   for await (const message of stream) {
