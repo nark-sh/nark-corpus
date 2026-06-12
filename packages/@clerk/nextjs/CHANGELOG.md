@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-11 — extends-fork created for v7+
+
+- **Latest published:** @clerk/nextjs@7.5.2
+- **New profile:** `packages/@clerk/nextjs-v7/contract.yaml` (extends `../nextjs/contract.yaml`)
+- **Parent narrowed to:** `<7.0.0` (already at this bound; no change needed)
+- **Diverged postconditions overridden:** `getToken` (added `get-token-ssr-not-handled`), `clerkMiddleware` (added `middleware-missing-encryption-key`)
+- **New postconditions added:** `get-token-ssr-not-handled`, `middleware-missing-encryption-key`
+- **Verified by:** bc-version-drift (sweep 2026-06-11)
+
 ## 2026-06-11 — flagged for extends-fork
 
 - **Latest published:** @clerk/nextjs@7.5.2

@@ -1,0 +1,114 @@
+package: "@clerk/nextjs"
+semver: ">=7.0.0"
+contract_version: "1.0.0"
+maintainer: "corpus-team"
+last_verified: "2026-06-11"
+coverage_status: covered
+status: production
+evidence_quality: confirmed
+coverage_score: 0.95
+extends: "../nextjs/contract.yaml"
+# Fork point: @clerk/nextjs v7.0.0 (2026-Q2).
+#
+# This profile inherits every postcondition from ../nextjs/contract.yaml
+# (which covers v5.0.0–v6.x) and adds ONLY the contracts that changed at v7:
+#
+#   1. useAuth().getToken now throws ClerkRuntimeError with code
+#      `clerk_runtime_not_browser` when called during SSR, instead of
+#      returning undefined silently as in v6 and earlier.
+#      Source: @clerk/nextjs v7.0.0 release notes; PR ref in needs-review.md
+#
+#   2. clerkMiddleware() throws at runtime when CLERK_ENCRYPTION_KEY is
+#      missing AND secretKey is provided. v6 silently used a generated
+#      fallback; v7 rejects the misconfiguration explicitly.
+#
+#   3. auth.protect() returns HTTP 401 (not 404) for unauthenticated
+#      requests on server actions. The prior `protect-not-in-try-catch`
+#      warning still applies — just the surfaced status code changed.
+#
+# Everything else (sign-in flow, sign-up flow, webhook verification via
+# svix or verifyWebhook, currentUser caching/null-checks, clerkClient
+# user CRUD, useUser isLoaded checks, useSignIn error state, useClerk
+# provider checks, clerkFrontendApiProxy env-var checks, attemptFirstFactor
+# error codes, missing-clerk-middleware check) is inherited unchanged —
+# those postconditions reference Clerk error classes and patterns that
+# did not move in v7.
+#
+# Detection (factory_methods, import_names, await_patterns) is inherited
+# wholesale from the parent — no v7-specific surface additions.
+
+functions:
+  # Override getToken to ADD the v7-specific SSR throw.
+  # The parent `get-token-null-not-handled` (null return path) still
+  # applies in client components, so it stays inherited unchanged.
+  - name: getToken
+    import_path: "@clerk/nextjs/server"
+    description: "Retrieves session token with optional refresh (v7+ throws on SSR misuse)"
+    postconditions:
+      - id: get-token-ssr-not-handled
+        condition: >
+          useAuth().getToken called during server-side rendering (SSR) or in any
+          non-browser environment where window is undefined. In v7+, this throws
+          ClerkRuntimeError with code `clerk_runtime_not_browser` instead of
+          returning undefined as it did in v5/v6. Code paths that previously
+          guarded with `if (token === undefined)` will now throw uncaught at SSR.
+        throws: "ClerkRuntimeError (code: clerk_runtime_not_browser)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        required_handling: >
+          MUST either (a) call useAuth().getToken only inside useEffect or a click
+          handler so it runs browser-side, or (b) wrap in try-catch and detect
+          ClerkRuntimeError with code `clerk_runtime_not_browser`. The token is
+          not available during SSR — design the component to skip the call when
+          window is undefined, or migrate to server-side auth() for SSR token needs.
+        detector: >
+          If useAuth().getToken() is called at the top level of a Server Component,
+          a server action, or anywhere outside a useEffect/event handler, flag
+          violation. Specifically flag calls that previously relied on the v6
+          `undefined` return (e.g. `const token = await getToken(); if (!token) return`)
+          — these silently break on upgrade.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/reference/clerk-react/use-auth"
+
+  # Override clerkMiddleware to ADD the v7-specific encryption-key throw.
+  # Parent postconditions (`middleware-not-exported`, `middleware-matcher-missing`)
+  # are inherited unchanged — v7 did not relax either requirement.
+  - name: clerkMiddleware
+    import_path: "@clerk/nextjs/server"
+    description: "Initializes Clerk authentication context (v7+ requires CLERK_ENCRYPTION_KEY when secretKey is provided)"
+    postconditions:
+      - id: middleware-missing-encryption-key
+        condition: >
+          clerkMiddleware() invoked at runtime with secretKey supplied (via env
+          var CLERK_SECRET_KEY or options.secretKey) but CLERK_ENCRYPTION_KEY
+          is not configured. v6 silently used an in-memory generated fallback;
+          v7 throws explicitly because the fallback created cross-request token
+          decryption failures in serverless deployments.
+        throws: "Error: Missing CLERK_ENCRYPTION_KEY environment variable"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        required_handling: >
+          MUST set CLERK_ENCRYPTION_KEY in environment variables for any
+          deployment using a custom secretKey. Generate a strong random key
+          (e.g. `openssl rand -hex 32`) and store it alongside CLERK_SECRET_KEY.
+          The key must be stable across all server instances — rotating it
+          invalidates all existing session tokens. Without it, EVERY request
+          through clerkMiddleware throws and the app returns 500.
+        detector: >
+          If clerkMiddleware is exported from middleware.ts AND CLERK_SECRET_KEY
+          is referenced anywhere in the project's .env files, check that
+          CLERK_ENCRYPTION_KEY is also present. Flag if missing.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/reference/nextjs/clerk-middleware"
