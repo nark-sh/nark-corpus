@@ -14,6 +14,14 @@
  *   - db.backup()        postconditions: backup-cantopen-destination, backup-misuse-after-finish
  *   See scanner concerns: concern-20260417-sqlite3-deepen-1 through -4
  *
+ *   Added 2026-06-12 (deepen pass 2):
+ *   - stmt.finalize()    postconditions: finalize-not-called, finalize-callback-error-ignored
+ *   - stmt.run()         postconditions: statement-run-callback-error-ignored,
+ *                                        statement-run-without-finalize-in-loop
+ *   - db.map()           postconditions: map-callback-error-ignored,
+ *                                        map-key-collision-silent-overwrite
+ *   See scanner concerns: concern-20260612-sqlite3-deepen-1 through -4
+ *
  * Detection path (prepare): new sqlite3.Database() → InstanceTracker tracks instance →
  *   ThrowingFunctionDetector fires prepare() → ContractMatcher checks try-catch →
  *   postcondition fires
@@ -175,5 +183,153 @@ export function backupWithErrorCheck(db: sqlite3.Database): Promise<void> {
       if (err) return reject(new Error(`Backup failed: ${err.message}`));
       resolve();
     });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Statement.finalize() — deepen 2026-06-12
+//
+// Postconditions: finalize-not-called, finalize-callback-error-ignored
+// Scanner concerns queued:
+//   concern-20260612-sqlite3-deepen-1 (finalize-not-called detection)
+//   concern-20260612-sqlite3-deepen-2 (finalize-callback-error-ignored detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pattern to detect: db.prepare() result never finalized
+// Postcondition: finalize-not-called (PENDING detection rule — see concern-20260612-sqlite3-deepen-1)
+// Once the scanner rule lands, the comment below becomes // SHOULD_FIRE.
+export function prepareWithoutFinalize(db: sqlite3.Database) {
+  // Missing stmt.finalize() — leaks native statement, breaks db.close()
+  const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+  stmt.run(42);
+  // PENDING_DETECTION (finalize-not-called): stmt goes out of scope unfinalized
+}
+
+// Correct pattern: finalize after use
+export function prepareWithFinalize(db: sqlite3.Database) {
+  const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+  stmt.run(42);
+  stmt.finalize(); // PENDING_NEGATIVE: finalize called — should not fire once rule lands
+}
+
+// Pattern to detect: finalize callback ignores err
+// Postcondition: finalize-callback-error-ignored (PENDING — concern-20260612-sqlite3-deepen-2)
+export function finalizeIgnoresError(db: sqlite3.Database) {
+  const stmt = db.prepare('INSERT INTO users (id, name) VALUES (?, ?)');
+  stmt.run([1, 'alice']);
+  stmt.finalize((err: Error) => {
+    // PENDING_DETECTION (finalize-callback-error-ignored): err not checked
+    console.log('Done');
+  });
+}
+
+// Correct pattern: check err in finalize callback
+export function finalizeChecksError(db: sqlite3.Database): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare('INSERT INTO users (id, name) VALUES (?, ?)');
+    stmt.run([1, 'alice']);
+    stmt.finalize((err: Error) => {
+      // PENDING_NEGATIVE: err checked — should not fire once rule lands
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Statement.run() — deepen 2026-06-12
+//
+// Postconditions: statement-run-callback-error-ignored, statement-run-without-finalize-in-loop
+// Scanner concern queued:
+//   concern-20260612-sqlite3-deepen-3 (statement.run callback err detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pattern to detect: stmt.run() callback ignores err — silent insert loss in batch
+// Postcondition: statement-run-callback-error-ignored (PENDING — concern-20260612-sqlite3-deepen-3)
+export function statementRunIgnoresError(db: sqlite3.Database, users: { id: number; name: string }[]) {
+  const stmt = db.prepare('INSERT INTO users (id, name) VALUES (?, ?)');
+  for (const user of users) {
+    stmt.run([user.id, user.name], function(err: Error | null) {
+      // PENDING_DETECTION (statement-run-callback-error-ignored): failed inserts swallowed
+      console.log('Inserted');
+    });
+  }
+  stmt.finalize();
+}
+
+// Correct pattern: check err in stmt.run callback
+export function statementRunChecksError(db: sqlite3.Database, users: { id: number; name: string }[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare('INSERT INTO users (id, name) VALUES (?, ?)');
+    let pending = users.length;
+    if (pending === 0) {
+      stmt.finalize();
+      return resolve();
+    }
+    for (const user of users) {
+      stmt.run([user.id, user.name], function(err: Error | null) {
+        if (err) {
+          stmt.finalize();
+          return reject(err);
+        }
+        if (--pending === 0) {
+          stmt.finalize();
+          resolve();
+        }
+      });
+    }
+  });
+}
+
+// Pattern to detect: prepared statement used in loop without finalize
+// Postcondition: statement-run-without-finalize-in-loop (PENDING — concern-20260612-sqlite3-deepen-3)
+export function preparedLoopNoFinalize(db: sqlite3.Database, ids: number[]) {
+  const stmt = db.prepare('UPDATE users SET seen = 1 WHERE id = ?');
+  for (const id of ids) {
+    stmt.run(id);
+  }
+  // PENDING_DETECTION (statement-run-without-finalize-in-loop): stmt leaks
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Database.map() / Statement.map() — deepen 2026-06-12
+//
+// Postconditions: map-callback-error-ignored, map-key-collision-silent-overwrite
+// Scanner concern queued:
+//   concern-20260612-sqlite3-deepen-4 (db.map callback err detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pattern to detect: db.map() callback ignores err — query failure looks like empty result
+// Postcondition: map-callback-error-ignored (PENDING — concern-20260612-sqlite3-deepen-4)
+export function mapIgnoresError(db: sqlite3.Database) {
+  db.map('SELECT id, name FROM users', (err: Error | null, usersById: Record<number, string>) => {
+    // PENDING_DETECTION (map-callback-error-ignored): SQL syntax error → empty {} silently
+    Object.keys(usersById).forEach(id => console.log(usersById[Number(id)]));
+  });
+}
+
+// Correct pattern: check err in db.map callback
+export function mapChecksError(db: sqlite3.Database): Promise<Record<number, string>> {
+  return new Promise((resolve, reject) => {
+    db.map('SELECT id, name FROM users', (err: Error | null, usersById: Record<number, string>) => {
+      // PENDING_NEGATIVE: err checked — should not fire once rule lands
+      if (err) return reject(new Error(`Map query failed: ${err.message}`));
+      resolve(usersById);
+    });
+  });
+}
+
+// Pattern to detect: db.map() on a query with potentially non-unique first column
+// Postcondition: map-key-collision-silent-overwrite (PENDING — needs schema heuristic)
+// Note: this is a static-analysis heuristic — flag db.map() on SQL that doesn't
+// have a UNIQUE/PRIMARY KEY guarantee on the first column. Detection requires
+// schema knowledge OR a permissive warning on every db.map() call site.
+export function mapWithCollidingKeys(db: sqlite3.Database) {
+  // user_id is NOT unique across events table — later events silently overwrite earlier
+  db.map('SELECT user_id, action FROM events', (err: Error | null, actionsByUser: Record<number, string>) => {
+    if (err) throw err;
+    // PENDING_DETECTION (map-key-collision-silent-overwrite): first column not unique
+    // Caller thinks "1 action per user" but events table may have many per user
+    console.log(actionsByUser);
   });
 }

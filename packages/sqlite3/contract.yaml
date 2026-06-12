@@ -1,12 +1,36 @@
 package: sqlite3
 semver: ">=5.0.3"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-12"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 intentionally omitted)
+coverage_score: 0.57  # 12 contracted / 21 total async-callable
+# Effective coverage: 12 contracted / 12 contractable = 1.0
+# Intentionally omitted (9): Statement.bind (immediate binding error, rare),
+#   Statement.reset (documented "never fails"), Statement.get/all/each (same
+#   error profile as Database equivalents — usage pattern documented under
+#   Statement.run + finalize), Statement.map (covered by Database.map shortcut),
+#   Database.serialize/parallelize (mode control; scheduled query errors report
+#   via own callbacks), Database.wait (undocumented in current wiki API).
+#
+# Depth pass 2026-06-12 (deepen-stream-2 pass 2):
+# +3 functions: Statement.finalize, Statement.run, map (Database#map / Statement#map)
+# Gap identified: previous pass contracted close() with close-unfinalised-statements
+# postcondition but never contracted finalize() itself as a first-class function.
+# The #1 cause of close-unfinalised-statements is "developer never called finalize"
+# — that needs its own postcondition (finalize-not-called) and its own scanner
+# detection rule. Statement.run is distinct from Database.run because it does NOT
+# auto-finalize, so silent-failure-in-loop is a unique pattern. Database.map is
+# distinct from Database.all because its silent-failure mode (returns {} on
+# query error AND on key-collision) is uniquely deceptive.
+# Sources confirmed:
+#   https://github.com/TryGhost/node-sqlite3/wiki/API (Statement#run, Statement#finalize,
+#     Database#map, Statement#map)
+#   node_modules/sqlite3/lib/sqlite3.d.ts (full type signatures)
+#   node_modules/sqlite3/lib/sqlite3.js:98-101 (Database.prototype.map impl)
+#   node_modules/sqlite3/lib/sqlite3.js:120-145 (Statement.prototype.map impl)
 
 # CRITICAL SECURITY NOTE:
 # sqlite3 has 1 CVE in versions < 5.0.3:
@@ -36,6 +60,8 @@ detection:
     - ".all("
     - ".exec("
     - ".prepare("
+    - ".finalize("  # Statement#finalize (deepen 2026-06-12)
+    - ".map("       # Database#map / Statement#map (deepen 2026-06-12)
 
 functions:
   - name: run
@@ -596,6 +622,262 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Deepen pass 2026-06-12 (deepen-stream-2 pass 2)
+  # Added: Statement.finalize, Statement.run, Database.map (silent-failure mode)
+  # Sources: GitHub wiki API + node_modules/sqlite3/lib/sqlite3.{js,d.ts}
+  # ───────────────────────────────────────────────────────────────────────────
+
+  - name: finalize
+    import_path: "sqlite3"
+    description: >
+      Statement instance method. Finalizes a prepared statement, releasing native
+      resources held by the underlying sqlite3_stmt. After finalize() the statement
+      object is unusable — all further calls throw errors. Errors during finalize
+      (e.g. constraint violations triggered by deferred FK checks, or final commit
+      failures on auto-commit statements) are delivered to the optional callback.
+    postconditions:
+      # Evidence:
+      #   https://github.com/TryGhost/node-sqlite3/wiki/API (Statement#finalize)
+      #   — "Finalizes the statement. After the statement is finalized, all further
+      #      function calls on that statement object will throw errors."
+      #   node_modules/sqlite3/lib/sqlite3.d.ts:77 — finalize(callback?: (err: Error) => void)
+      #   confirms callback receives Error on failure.
+      - id: finalize-not-called
+        condition: >
+          A Statement created via db.prepare(sql) is never finalized — the
+          statement object goes out of scope or the database is closed without
+          stmt.finalize() being called. This is the #1 cause of SQLITE_BUSY
+          errors on db.close() and resource leaks in long-running processes.
+        throws: >
+          Indirect: a subsequent db.close() callback receives Error with message
+          "SQLITE_BUSY: unable to close due to unfinalised statements"
+          (errno = sqlite3.BUSY). The leaked native sqlite3_stmt holds a row
+          cursor and a transaction handle until garbage-collected.
+        required_handling: >
+          Caller MUST call stmt.finalize() exactly once on every Statement
+          returned by db.prepare(). Pattern:
+            const stmt = db.prepare(sql);
+            stmt.run(params, (err) => {
+              stmt.finalize();
+            });
+          OR use db.run/get/all which auto-finalize the internal statement.
+          For long-running prepared statements (loops, batches), finalize after
+          the last execution.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+          - "https://github.com/TryGhost/node-sqlite3/issues/796"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: finalize-callback-error-ignored
+        condition: >
+          stmt.finalize(callback) is called with a callback that does not check
+          its err parameter. The native finalize call can fail when deferred
+          constraint checks fire at finalization time (e.g. FK constraint that
+          was deferred to end-of-statement) or when the statement is finalized
+          mid-transaction and the rollback path itself errors.
+        throws: >
+          Error passed to callback as first argument. The Error.message contains
+          the SQLITE_* error code and message. The most common cases are
+          SQLITE_CONSTRAINT (deferred constraint failure) and SQLITE_MISUSE
+          (double-finalize on an already-finalized statement).
+        required_handling: >
+          Caller MUST check the err parameter in finalize's callback. Pattern:
+            stmt.finalize((err) => {
+              if (err) {
+                // Deferred constraint failed OR statement already finalized
+                throw new Error(`Finalize failed: ${err.message}`);
+              }
+            });
+          Without this check, deferred constraint violations corrupt data
+          silently and double-finalize bugs go undetected.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+          - "https://www.sqlite.org/rescode.html"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: Statement.run
+    import_path: "sqlite3"
+    description: >
+      Statement instance method (NOT Database#run). Binds parameters and executes
+      a prepared statement without finalizing it, enabling repeated execution.
+      The statement remains active and reusable. On success the callback's `this`
+      is a RunResult exposing lastID and changes. Errors during parameter binding
+      or SQL execution are delivered to the callback's err argument.
+    postconditions:
+      # Evidence:
+      #   https://github.com/TryGhost/node-sqlite3/wiki/API (Statement#run)
+      #   — "Binds parameters and executes the statement... Errors during parameter
+      #     binding or execution trigger the callback with a non-null err object."
+      #   node_modules/sqlite3/lib/sqlite3.d.ts:79-81 — confirms callback type
+      #   includes Error | null as first argument.
+      - id: statement-run-callback-error-ignored
+        condition: >
+          stmt.run([params,] callback) where the callback does not check its
+          err parameter. Unlike db.run (which auto-finalizes a one-off statement),
+          a prepared Statement is reused — a swallowed error leaves stale binding
+          state and produces wrong results on subsequent calls.
+        throws: >
+          Error passed to callback as first argument. Includes binding errors
+          (SQLITE_RANGE for too many params, SQLITE_MISMATCH for type errors),
+          constraint violations (SQLITE_CONSTRAINT), and database-locked errors
+          (SQLITE_BUSY). On error, `this.lastID` and `this.changes` are undefined.
+        required_handling: >
+          Caller MUST check the err parameter. Pattern:
+            const stmt = db.prepare('INSERT INTO users VALUES (?, ?)');
+            for (const user of users) {
+              stmt.run([user.id, user.name], function(err) {
+                if (err) {
+                  stmt.finalize();
+                  throw new Error(`Insert ${user.id} failed: ${err.message}`);
+                }
+                // this.lastID, this.changes available here
+              });
+            }
+            stmt.finalize();
+          Ignoring err in a batch loop silently skips failed inserts and produces
+          incomplete writes — a classic silent-data-loss bug.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: statement-run-without-finalize-in-loop
+        condition: >
+          A prepared statement is run in a loop or repeatedly via stmt.run() but
+          never finalized. Each iteration leaves the statement bound to the
+          latest params; the underlying sqlite3_stmt accumulates state and
+          eventually triggers SQLITE_BUSY on db.close.
+        throws: >
+          Indirect: leaked sqlite3_stmt holds a transaction handle. db.close()
+          callback receives "SQLITE_BUSY: unable to close due to unfinalised
+          statements". On a long-running server, this leaks native memory.
+        required_handling: >
+          Always finalize after the last run(). Pattern:
+            const stmt = db.prepare(sql);
+            try {
+              for (const row of rows) {
+                await new Promise((resolve, reject) =>
+                  stmt.run(row, err => err ? reject(err) : resolve(null))
+                );
+              }
+            } finally {
+              stmt.finalize();
+            }
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: map
+    import_path: "sqlite3"
+    description: >
+      Database#map (and the underlying Statement#map). Executes a query and
+      returns rows as an object keyed by the first column instead of an array.
+      Documented as "Shortcut to Statement#map" and "Returns results as an
+      object instead of an array." Internally calls statement.all() and
+      transforms rows — meaning execution errors are delivered to the callback's
+      err argument, but EMPTY/MISSING data is silently returned as {} with no
+      error.
+    postconditions:
+      # Evidence:
+      #   https://github.com/TryGhost/node-sqlite3/wiki/API (Database#map, Statement#map)
+      #   — "Returns results as an object instead of an array."
+      #   node_modules/sqlite3/lib/sqlite3.js:98-101 (Database.prototype.map):
+      #     statement.map.apply(statement, params).finalize();
+      #   node_modules/sqlite3/lib/sqlite3.js:120-145 (Statement.prototype.map):
+      #     wraps .all() — if rows.length === 0 returns empty {} to callback.
+      #     If first column is duplicated across rows, later rows OVERWRITE
+      #     earlier ones (the map key collides) — silently lossy.
+      - id: map-callback-error-ignored
+        condition: >
+          db.map(sql, [params,] callback) where callback does not check err.
+          Underlying .all() can fail on SQL syntax, SQLITE_BUSY, or SQLITE_NOMEM
+          for large result sets — these errors are delivered to map's callback
+          but the failure mode (silent {} result) is visually indistinguishable
+          from "query succeeded but returned no rows".
+        throws: >
+          Error passed to callback's first argument. Same error profile as
+          Database#all (SQLITE_ERROR, SQLITE_BUSY, SQLITE_NOMEM). On error the
+          second argument (result object) is undefined.
+        required_handling: >
+          Caller MUST check err. Pattern:
+            db.map('SELECT id, name FROM users', (err, usersById) => {
+              if (err) throw new Error(`Map query failed: ${err.message}`);
+              // usersById is { 1: 'alice', 2: 'bob' }
+            });
+          Ignoring err means a failed query is indistinguishable from a query
+          returning no rows — a downstream lookup against `usersById[id]` will
+          return undefined and the caller will conclude "user not found"
+          instead of surfacing the database error.
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: map-key-collision-silent-overwrite
+        condition: >
+          The first column of the SELECT returns duplicate values across rows.
+          Statement#map keys the result object by the first column; later rows
+          OVERWRITE earlier rows that share the same key. The callback receives
+          err=null and a result object with fewer entries than the row count,
+          and no error or warning is logged.
+        throws: >
+          No error — this is silent data loss by design of the .map() transform.
+          The result object contains a subset of rows; the caller has no signal
+          that overwrites occurred.
+        required_handling: >
+          Caller MUST guarantee the first column is unique for the query, OR
+          use db.all() to get a row array and group manually. Pattern (safe):
+            // BAD — map silently collides:
+            db.map('SELECT user_id, action FROM events', (err, actionsByUser) => {
+              // Last action per user only — other actions silently lost
+            });
+            // GOOD — use .all() and group explicitly:
+            db.all('SELECT user_id, action FROM events', (err, rows) => {
+              if (err) throw err;
+              const actionsByUser = {};
+              for (const r of rows) {
+                (actionsByUser[r.user_id] ||= []).push(r.action);
+              }
+            });
+        sources:
+          - "https://github.com/TryGhost/node-sqlite3/wiki/API"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
 
 edge_cases:
   - id: callback-vs-promise
