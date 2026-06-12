@@ -365,3 +365,49 @@ export async function insertExternalIdValidated(externalId: bigint) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sync() postconditions (added 2026-06-11 deepen pass)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: sync-wrong-client-type
+// @expect-violation: sync-network-failure
+// @expect-violation: sync-client-closed
+// SHOULD_FIRE: sync() called without any error handling — SYNC_NOT_SUPPORTED thrown
+// on http/ws clients; network errors and CLIENT_CLOSED errors go unhandled
+export async function syncReplicaNoErrorHandling() {
+  // SHOULD_FIRE: no try-catch — throws LibsqlError(SYNC_NOT_SUPPORTED) on http clients
+  await db.sync();
+}
+
+// @expect-violation: sync-wrong-client-type
+// SHOULD_FIRE: caller catches generic Error but not LibsqlError specifically — misses
+// the SYNC_NOT_SUPPORTED code check; code assumes sync works on any client
+export async function syncReplicaGenericCatch() {
+  try {
+    await db.sync();
+  } catch (error) {
+    // SHOULD_FIRE: swallows SYNC_NOT_SUPPORTED without surfacing the misconfiguration
+    console.error("Sync failed:", error);
+  }
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: properly handles SYNC_NOT_SUPPORTED and network failures
+export async function syncReplicaWithProperHandling() {
+  try {
+    const replicated = await db.sync();
+    console.log(`Synced: ${replicated?.frames_synced} frames`);
+  } catch (error) {
+    if (error instanceof Error && (error as any).code === 'SYNC_NOT_SUPPORTED') {
+      // Not an embedded replica client — skip sync gracefully
+      return;
+    }
+    if (error instanceof Error && (error as any).code === 'CLIENT_CLOSED') {
+      console.error('Client closed before sync could complete');
+      return;
+    }
+    // Network failure — log but don't crash (local reads still work)
+    console.error('Sync failed — serving stale replica data:', error);
+  }
+}

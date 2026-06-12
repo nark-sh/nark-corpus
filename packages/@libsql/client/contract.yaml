@@ -42,15 +42,23 @@
 # API surface: 13 total (8 contracted, 5 intentionally omitted) — no new API surface discovered
 package: "@libsql/client"
 semver: ">=0.3.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-11"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.62  # 8 contracted / 13 total async-callable (5 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
-# Pass 5 added execute-invalid-number-arg and execute-invalid-bigint-arg postconditions
+# Depth pass 2026-06-11 (deepen-stream-2 pass 2):
+# Package version: @libsql/client v0.17.3 (patch from v0.17.2 — no new API surface)
+# sync() promoted from intentionally-omitted to contracted.
+# sync() in http/ws mode throws LibsqlError(SYNC_NOT_SUPPORTED) — real runtime footgun.
+# sync() in embedded replica mode can throw on network failure or closed client.
+# 3 new postconditions: sync-wrong-client-type, sync-network-failure, sync-client-closed.
+# API surface: 13 total (9 contracted, 4 omitted — sync promoted, close/reconnect/tx-variants remain)
+# Coverage: 9/13 = 0.69 (was 8/13 = 0.62)
+# Effective coverage (contracted/non-omitted): 9/9 = 1.0 (was 8/8 = 1.0)
+coverage_score: 0.69  # 9 contracted / 13 total async-callable functions (pass 2026-06-11)
+# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
 
 detection:
   function_names:
@@ -665,6 +673,115 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: low
 
+  - name: sync
+    import_path: "@libsql/client"
+    description: >
+      Manually synchronizes the embedded replica with the primary remote database.
+      Only functional when createClient() was configured with syncUrl (embedded replica
+      mode). On http:// and ws:// clients, throws immediately with SYNC_NOT_SUPPORTED.
+      Returns Promise<Replicated> with frame_no and frames_synced when successful.
+    postconditions:
+      # Evidence: @libsql/client v0.17.3 source (confirmed 2026-06-11):
+      #   lib-esm/http.js line 187: throw new LibsqlError("sync not supported in http mode", "SYNC_NOT_SUPPORTED")
+      #   lib-esm/ws.js line 191: throw new LibsqlError("sync not supported in ws mode", "SYNC_NOT_SUPPORTED")
+      #   lib-esm/sqlite3.js line 172: async sync() { this.#checkNotClosed(); const rep = await this.#getDb().sync(); }
+      #   lib-esm/sqlite3.js line 198: #checkNotClosed() { throw new LibsqlError("The client is closed", "CLIENT_CLOSED") }
+      # Docs: https://docs.turso.tech/sdk/ts/reference (embedded replicas section)
+      - id: sync-wrong-client-type
+        condition: >
+          sync() is called on a client configured with an http:// or wss:// URL
+          (standard Turso cloud connection) rather than a syncUrl-based embedded
+          replica configuration. This is the most common sync() mistake — callers
+          expect sync() to sync their cloud data when it actually only works for
+          local SQLite embedded replicas.
+        throws: >
+          LibsqlError with code SYNC_NOT_SUPPORTED. Message: "sync not supported in
+          http mode" or "sync not supported in ws mode". Throws synchronously before
+          any network call.
+        required_handling: >
+          Only call sync() when createClient() was configured with syncUrl and url
+          pointing to a local file path. Always check your client configuration before
+          calling sync(), or wrap in try-catch to handle SYNC_NOT_SUPPORTED gracefully:
+
+            try {
+              await client.sync();
+            } catch (error) {
+              if (error instanceof LibsqlError && error.code === 'SYNC_NOT_SUPPORTED') {
+                // Client is not an embedded replica — skip sync
+                return;
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/http.ts"
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/ws.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: sync-network-failure
+        condition: >
+          sync() is called on a correctly configured embedded replica client, but the
+          network connection to the primary remote database fails (timeout, unreachable
+          host, auth expiry). The native libsql-darwin/linux/windows addon propagates
+          the failure as a LibsqlError.
+        throws: >
+          LibsqlError with code SERVER_ERROR, AUTH_FAILED, or HRANA_WEBSOCKET_ERROR
+          depending on failure mode. The exact code comes from the native addon's
+          error translation layer.
+        required_handling: >
+          Wrap sync() calls in try-catch, especially in background sync jobs or
+          application startup paths. An offline embedded replica that fails to sync
+          continues serving reads from its local copy — callers should log sync failures
+          and continue rather than crashing:
+
+            try {
+              const replicated = await client.sync();
+              console.log(`Synced: ${replicated?.frames_synced} frames`);
+            } catch (error) {
+              console.error('Sync failed — serving stale replica data:', error);
+              // Do NOT throw — local reads still work
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/sqlite3.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: sync-client-closed
+        condition: >
+          sync() is called on a closed embedded replica client (after close() was
+          called or the client encountered an unrecoverable error). The #checkNotClosed()
+          guard fires before any sync attempt.
+        throws: >
+          LibsqlError with code CLIENT_CLOSED. Message: "The client is closed".
+        required_handling: >
+          Do not call sync() on closed clients. In background sync loops, check
+          client.closed before calling sync():
+
+            if (!client.closed) {
+              await client.sync();
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/sqlite3.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 notes:
   - "LibsqlError.code values: SERVER_ERROR (HTTP failure), AUTH_FAILED, SQLITE_ERROR, URL_INVALID, TRANSACTION_CLOSED, CLIENT_CLOSED, HRANA_CLOSED_ERROR, HRANA_WEBSOCKET_ERROR, HRANA_PROTO_ERROR, INTERNAL_ERROR, SYNC_NOT_SUPPORTED"
   - "LibsqlBatchError extends LibsqlError with statementIndex field — thrown by batch() and migrate() on per-statement failure"
@@ -675,4 +792,4 @@ notes:
   - "When used via Drizzle ORM adapter, errors are wrapped by Drizzle — not covered by this contract"
   - "createClient() itself does not throw — it's a synchronous factory function"
   - "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are the standard env var names"
-  - "sync() intentionally omitted — embedded replica feature only (syncUrl config), niche usage"
+  - "sync() promoted from omitted to contracted 2026-06-11: SYNC_NOT_SUPPORTED error on non-embedded-replica clients is a real runtime footgun"
