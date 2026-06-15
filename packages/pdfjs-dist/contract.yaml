@@ -33,16 +33,40 @@
 #   node_modules/pdfjs-dist/build/pdf.worker.mjs (ExtractPages handler lines 63522-63616)
 #   node_modules/pdfjs-dist/build/pdf.mjs (render() intent check line 15594)
 #   https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
+#
+# Depth pass 2026-06-15 (deepen-stream-1 pass 1):
+# Discovered 2 previously unenumerated contractable functions in pdfjs-dist@6.0.227.
+# Prior API surface count of 18 was understated — getPageIndex and getDestination were
+# not counted in either the contracted or omitted lists. Revised total: 20 async-callable.
+# Contracted before: 11 (getDocument, getPage, getTextContent, render, saveDocument, destroy,
+#   cleanup, getData, TextLayer.render, extractPages, getOptionalContentConfig)
+# Contracted after: 13 (+2 this pass: doc.getPageIndex, doc.getDestination)
+# Functions omitted this pass: none (same 13 as before)
+# Coverage: 13/20 = 0.65
+# Key insights:
+#   getPageIndex() has TWO distinct synchronous error types:
+#     (a) "Invalid pageIndex request." — non-RefProxy input (before worker call)
+#     (b) "GetPageIndex: page has been removed." — valid ref for deleted page
+#   getDestination() has ONE input-validation error type:
+#     "Invalid destination request." — non-string id (returns Promise.reject immediately)
+#   Both functions are used in PDF annotation navigation and ToC hyperlink resolution.
+#   The type validation errors (a) and getDestination's error happen BEFORE the worker call.
+# Evidence sources confirmed from:
+#   node_modules/pdfjs-dist/build/pdf.mjs (transport.getPageIndex lines 16506-16518)
+#   node_modules/pdfjs-dist/build/pdf.mjs (transport.getDestination lines 16538-16543)
+#   https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html
 package: "pdfjs-dist"
 semver: ">=2.0.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-15"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.61  # 11 contracted / 18 total async-callable (7 previously omitted + 6 new read-only omissions = 13 omitted)
-# Note: effective coverage (contracted/non-omitted) = 11/11 = 1.0 (new read-only methods appropriately omitted)
+coverage_score: 0.65  # 13 contracted / 20 total async-callable (+2 this pass: getPageIndex, getDestination; 13 omitted)
+# Note: getPageIndex and getDestination added as newly-discovered contractable functions.
+# Prior count of 18 total was understated — getPageIndex and getDestination were not enumerated.
+# Revised total: 20 (11 prior + 2 newly contracted). Coverage: 13/20 = 0.65.
 
 detection:
   # getDocument is the entry-point factory. Returns a PDFDocumentLoadingTask —
@@ -891,6 +915,209 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: getPageIndex
+    import_path: "pdfjs-dist"
+    description: >
+      Looks up the page index (0-based) for a given PDF internal reference (RefProxy).
+      Called on PDFDocumentProxy. Returns a Promise that resolves with the 0-based page
+      index for the given ref. Used in PDF viewers to convert annotation targets, hyperlinks,
+      and destination references into page numbers — for example, when clicking a PDF
+      hyperlink that references an internal page via its object reference.
+      A RefProxy must have the shape { num: integer >= 0, gen: integer >= 0 }.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs (transport.getPageIndex, lines 16506-16518)
+      # Source code:
+      #   async getPageIndex(ref) {
+      #     if (!isRefProxy(ref)) {
+      #       throw new Error("Invalid pageIndex request.");
+      #     }
+      #     ...
+      #     if (pageNumber === 0) {
+      #       throw new Error("GetPageIndex: page has been removed.");
+      #     }
+      #   }
+      # isRefProxy = v => typeof v === "object" && Number.isInteger(v?.num) && v.num >= 0
+      #                  && Number.isInteger(v?.gen) && v.gen >= 0
+      - id: getpageindex-invalid-ref-type
+        condition: >
+          doc.getPageIndex(ref) is called with a ref argument that is not a valid RefProxy
+          object. A RefProxy must be an object with integer properties num (>= 0) and gen (>= 0).
+          Common mistakes: passing a plain page number (integer), a string, null, undefined,
+          or an annotation object that does not directly expose the internal ref object.
+          PDF annotation data includes a `dest` array whose first element is a RefProxy —
+          callers who pass the annotation object directly instead of annotation.dest[0]
+          will trigger this error.
+        throws: >
+          Error with message: "Invalid pageIndex request."
+          Thrown synchronously before the worker call (in the transport layer).
+          This is a plain JavaScript Error, not a pdfjs-dist custom exception class.
+          Confirmed from build/pdf.mjs (transport.getPageIndex) lines 16506-16509.
+        required_handling: >
+          Caller MUST pass a valid RefProxy ({ num, gen }) — typically extracted from
+          annotation data or destination arrays, not constructed manually:
+
+            // CORRECT: extracting ref from destination array
+            const dest = await doc.getDestination(namedDest);
+            if (dest && dest[0] && typeof dest[0] === 'object' && 'num' in dest[0]) {
+              try {
+                const pageIndex = await doc.getPageIndex(dest[0]);
+                navigateToPage(pageIndex + 1);  // getPageIndex is 0-based, pages are 1-based
+              } catch (error) {
+                if (error.message.includes('page has been removed')) {
+                  console.warn('Link target page was removed from document');
+                  return;
+                }
+                console.error('Failed to resolve page reference:', error);
+              }
+            }
+
+            // WRONG: passing raw page number or annotation object directly
+            const pageIndex = await doc.getPageIndex(annotation);  // THROWS if annotation is not a RefProxy
+            const pageIndex = await doc.getPageIndex(3);           // THROWS — integer is not a RefProxy
+
+          Note: getPageIndex() returns a 0-based index. If using with doc.getPage(),
+          pass pageIndex + 1 since getPage() is 1-based.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: broken_navigation
+          incident_cost_range: low
+
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs (transport.getPageIndex, line 16516)
+      # Source code:
+      #   const pageNumber = this.pagesMapper.getPageNumber(index + 1);
+      #   if (pageNumber === 0) {
+      #     throw new Error("GetPageIndex: page has been removed.");
+      #   }
+      # This happens when the PDF document was modified (pages deleted) and the stored ref
+      # no longer maps to an existing page in the document. The worker-side GetPageIndex
+      # returns an index, but pagesMapper cannot find the page because it was removed.
+      - id: getpageindex-page-removed
+        condition: >
+          doc.getPageIndex(ref) is called with a valid RefProxy that refers to a page
+          that was removed from the document — for example, after doc.saveDocument() was
+          called on a PDF with page deletions, or when working with a PDF that has been
+          modified externally and reloaded. The pagesMapper resolves the page index from
+          the worker but cannot find the page number (returns 0), triggering this error.
+          This can also occur with annotation targets pointing to deleted pages in
+          documents that have been edited in a PDF viewer before re-loading.
+        throws: >
+          Error with message: "GetPageIndex: page has been removed."
+          Thrown after the worker responds successfully but pagesMapper lookup returns 0.
+          This is a plain JavaScript Error, not a pdfjs-dist custom exception class.
+          Confirmed from build/pdf.mjs line 16516.
+        required_handling: >
+          Caller MUST catch this error separately from the invalid-ref error to handle
+          gracefully when navigating to annotation targets in edited documents:
+
+            try {
+              const pageIndex = await doc.getPageIndex(ref);
+              await navigateToPage(pageIndex + 1);
+            } catch (error) {
+              if (error.message === 'Invalid pageIndex request.') {
+                console.error('Invalid reference object passed to getPageIndex');
+                return;
+              }
+              if (error.message === 'GetPageIndex: page has been removed.') {
+                showUserMessage('The linked page no longer exists in this document.');
+                return;
+              }
+              throw error;  // re-throw unexpected errors
+            }
+
+        sources:
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: broken_navigation
+          incident_cost_range: low
+
+  - name: getDestination
+    import_path: "pdfjs-dist"
+    description: >
+      Looks up a named destination in the PDF document and returns its destination array.
+      Called on PDFDocumentProxy with a string identifier. Returns a Promise that resolves
+      with an Array (destination data) or null when the named destination is not present.
+      Named destinations are used in PDF hyperlinks and table-of-contents navigation —
+      instead of storing a raw page number, PDFs store a symbolic name that maps to a
+      destination array containing a page reference and optional coordinates. Used in
+      PDF viewers to implement ToC navigation, hyperlink following, and Go-To-Named-Destination
+      actions from PDF annotations.
+
+    postconditions:
+      # Evidence: node_modules/pdfjs-dist/build/pdf.mjs (transport.getDestination, lines 16538-16543)
+      # Source code:
+      #   getDestination(id) {
+      #     if (typeof id !== "string") {
+      #       return Promise.reject(new Error("Invalid destination request."));
+      #     }
+      #     return this.messageHandler.sendWithPromise("GetDestination", { id });
+      #   }
+      - id: getdestination-invalid-id-type
+        condition: >
+          doc.getDestination(id) is called with an id argument that is not a string.
+          Common mistakes: passing undefined (when the destination name is extracted from
+          optional annotation fields), passing the destination array directly instead of
+          the name string, or passing a page number integer when the intent was to use
+          a named destination. PDF annotation objects store the destination as either a
+          string (named destination) or an array (explicit destination) — callers who
+          do not check the type before calling getDestination() will trigger this error
+          when the annotation contains an explicit destination array.
+        throws: >
+          Returns Promise.reject(Error("Invalid destination request."))
+          The promise is immediately rejected without calling the worker.
+          This is a plain JavaScript Error, not a pdfjs-dist custom exception class.
+          Confirmed from build/pdf.mjs (transport.getDestination) lines 16538-16542.
+        required_handling: >
+          Caller MUST verify that the destination id is a string before calling
+          getDestination(). PDF annotation `dest` fields can be either a string (named
+          destination) or an array (explicit destination) — only strings should be passed
+          to getDestination():
+
+            // CORRECT: type-guarded navigation
+            const dest = annotation.dest;
+            if (typeof dest === 'string') {
+              // Named destination — look it up
+              try {
+                const destArray = await doc.getDestination(dest);
+                if (destArray) {
+                  const pageIndex = await doc.getPageIndex(destArray[0]);
+                  navigateToPage(pageIndex + 1);
+                }
+              } catch (error) {
+                console.error('Named destination lookup failed:', error);
+              }
+            } else if (Array.isArray(dest)) {
+              // Explicit destination array — use directly
+              const pageIndex = await doc.getPageIndex(dest[0]);
+              navigateToPage(pageIndex + 1);
+            }
+
+            // WRONG: passing non-string without type check
+            const destArray = await doc.getDestination(annotation.dest);  // THROWS if dest is an array
+
+          Note: getDestination() resolving with null is NOT an error — it means the
+          named destination doesn't exist in this PDF. Always null-check the resolved value.
+        sources:
+          - "https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html"
+          - "https://raw.githubusercontent.com/mozilla/pdf.js/master/src/display/api.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: broken_navigation
           incident_cost_range: low
 
 notes:

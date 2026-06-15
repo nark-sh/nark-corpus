@@ -2,6 +2,23 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-15 — deepen pass — coverage 61% → 65%
+
+- **Profile:** `packages/pdfjs-dist/contract.yaml`
+- **Functions added:** `doc.getPageIndex`, `doc.getDestination` (2 total)
+- **Postconditions added:** 3
+  - `getpageindex-invalid-ref-type` — getPageIndex() throws Error("Invalid pageIndex request.") when called with non-RefProxy (before worker call)
+  - `getpageindex-page-removed` — getPageIndex() throws Error("GetPageIndex: page has been removed.") when ref points to a deleted page
+  - `getdestination-invalid-id-type` — getDestination() returns Promise.reject(Error("Invalid destination request.")) when id is not a string
+- **Functions intentionally omitted this pass:** none (same 13 as 2026-06-11 pass)
+- **API surface correction:** Prior count of 18 total was understated. getPageIndex and getDestination were not enumerated in either contracted or omitted lists. Revised total: 20 async-callable.
+- **Scanner concerns queued:** 3 (`concern-20260615-pdfjs-dist-deepen-1`, `concern-20260615-pdfjs-dist-deepen-2`, `concern-20260615-pdfjs-dist-deepen-3`)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:**
+  - `node_modules/pdfjs-dist/build/pdf.mjs` (transport.getPageIndex lines 16506-16518 — isRefProxy validation, pagesMapper lookup)
+  - `node_modules/pdfjs-dist/build/pdf.mjs` (transport.getDestination lines 16538-16542 — typeof id !== "string" check)
+  - `https://mozilla.github.io/pdf.js/api/draft/module-pdfjsLib-PDFDocumentProxy.html`
+- **Verified by:** bc-deepen-contract (deepen-stream-1, pass on 2026-06-15T01:34:49Z)
 
 ## 2026-06-14 — re-verified clean
 

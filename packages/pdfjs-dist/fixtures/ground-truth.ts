@@ -46,6 +46,11 @@
  *
  * Updated: 2026-04-17 (deepen-stream-1 pass 9) — added sections 14-19 for cleanup, getData, TextLayer.render
  * Updated: 2026-06-11 (deepen-stream-1 pass 1) — added sections 20-23 for extractPages, getOptionalContentConfig (v6.x)
+ * Updated: 2026-06-15 (deepen-stream-1 pass 1) — added sections 24-27 for getPageIndex, getDestination
+ *   - Section 24: doc.getPageIndex(ref) without try-catch → NO_DETECTOR (postcondition added, scanner upgrade needed)
+ *   - Section 25: doc.getPageIndex(ref) with try-catch → SHOULD_NOT_FIRE
+ *   - Section 26: doc.getDestination(id) without try-catch → NO_DETECTOR (postcondition added, scanner upgrade needed)
+ *   - Section 27: doc.getDestination(id) with try-catch → SHOULD_NOT_FIRE
  */
 
 import * as pdfjs from "pdfjs-dist";
@@ -538,4 +543,94 @@ export async function renderWithMatchingOptionalContentIntent(buffer: ArrayBuffe
   } finally {
     await doc.destroy();
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. doc.getPageIndex(ref) without try-catch → NO_DETECTOR
+//     (postcondition getpageindex-invalid-ref-type added; no scanner rule yet)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resolveAnnotationPageNoCatch(
+  doc: pdfjs.PDFDocumentProxy,
+  annotation: { dest: any }
+) {
+  // NO_DETECTOR: getpageindex-invalid-ref-type — if annotation.dest is an array (explicit
+  // destination), passing it directly instead of dest[0] throws "Invalid pageIndex request."
+  // NO_DETECTOR: getpageindex-page-removed — throws if the ref points to a deleted page
+  // Scanner upgrade needed to detect getPageIndex() calls outside try-catch.
+  const pageIndex = await doc.getPageIndex(annotation.dest);
+  return pageIndex + 1;  // convert 0-based to 1-based page number
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. doc.getPageIndex(ref) with try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function resolveAnnotationPageWithCatch(
+  doc: pdfjs.PDFDocumentProxy,
+  dest: any
+): Promise<number | null> {
+  // SHOULD_NOT_FIRE — both error cases caught and handled appropriately
+  try {
+    // Ensure we have a RefProxy (explicit destination's first element)
+    const ref = Array.isArray(dest) ? dest[0] : dest;
+    const pageIndex = await doc.getPageIndex(ref);
+    return pageIndex + 1;  // convert 0-based to 1-based page number
+  } catch (error: any) {
+    if (error.message === 'Invalid pageIndex request.') {
+      console.error('Invalid reference: not a RefProxy object');
+      return null;
+    }
+    if (error.message === 'GetPageIndex: page has been removed.') {
+      console.warn('Link target page was removed from document');
+      return null;
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. doc.getDestination(id) without try-catch → NO_DETECTOR
+//     (postcondition getdestination-invalid-id-type added; no scanner rule yet)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function navigateToNamedDestNoCatch(
+  doc: pdfjs.PDFDocumentProxy,
+  annotation: { dest: string | any[] }
+) {
+  // NO_DETECTOR: getdestination-invalid-id-type — if annotation.dest is an array (explicit
+  // destination), passing it directly throws "Invalid destination request."
+  // Scanner upgrade needed to detect getDestination() calls outside try-catch.
+  const destArray = await doc.getDestination(annotation.dest as string);
+  if (destArray) {
+    return destArray;
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. doc.getDestination(id) with try-catch and type guard → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-clean
+export async function navigateToDestWithCatch(
+  doc: pdfjs.PDFDocumentProxy,
+  dest: string | any[]
+): Promise<any[] | null> {
+  // SHOULD_NOT_FIRE — type-guarded: only calls getDestination with string IDs
+  if (typeof dest === 'string') {
+    // Named destination — look it up
+    try {
+      const destArray = await doc.getDestination(dest);
+      return destArray;  // may be null if destination not found — that's OK
+    } catch (error: any) {
+      console.error('Named destination lookup failed:', error);
+      return null;
+    }
+  } else if (Array.isArray(dest)) {
+    // Explicit destination array — return directly (no getDestination call needed)
+    return dest;
+  }
+  return null;
 }
