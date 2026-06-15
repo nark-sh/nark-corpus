@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** @google/generative-ai@0.24.1
+- **Profile semver:**  (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (patch/minor drift only, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-04-16 — backfilled
 
 - **Verified against:** @google/generative-ai@>=0.11.0 <1.0.0

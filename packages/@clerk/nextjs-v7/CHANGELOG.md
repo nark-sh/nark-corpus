@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** @clerk/nextjs@7.5.2
+- **Profile semver:** `>=7.0.0` (unchanged)
+- **Verdict:** no changes — v7.3–v7.5 changelog reviewed. Only patch/minor changes: middleware debug log hardening (credential key truncation), `<ConfigureSSO>` removal from experimental path (not a public API change). No new error-handling postconditions needed. Profile is current for v7.5.2.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-11 — extends-fork created for v7+
 
 - **Latest published:** @clerk/nextjs@7.5.2

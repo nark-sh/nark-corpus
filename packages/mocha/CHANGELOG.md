@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** mocha@11.7.6
+- **Profile semver:**  (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (patch/minor drift only, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-04-20 — backfilled
 
 - **Verified against:** mocha@>=8.0.0 <12.0.0

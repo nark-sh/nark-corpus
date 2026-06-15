@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** react-hook-form@7.79.0
+- **Profile semver:**  (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (patch/minor drift only, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-12 — deepen pass — coverage 67% → 67% (re-verification at v7.78.0)
 
 - **Profile:** `packages/react-hook-form/contract.yaml`

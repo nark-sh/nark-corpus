@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** @upstash/ratelimit@2.0.8
+- **Profile semver:**  (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (patch/minor drift only, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-04-13 — backfilled
 
 - **Verified against:** @upstash/ratelimit@>=1.0.0

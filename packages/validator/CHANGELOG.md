@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** validator@13.15.35
+- **Profile semver:**  (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (patch/minor drift only, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-12 — deepen pass — coverage 51% → 100% (deepen-stream-1 pass 6, tidy-up)
 
 - **Profile:** `packages/validator/contract.yaml`

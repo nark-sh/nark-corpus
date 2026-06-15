@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-14 — re-verified clean
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=8.0.0 <21.0.0` (unchanged — covered by stripe-v21 fork for v21+)
+- **Verdict:** no action on parent profile — stripe-v21/contract.yaml (semver `>=21.0.0`) covers v21 and v22 with open-ended range. v22 changelog reviewed: TypeScript type restructuring, constructor style change (`new Stripe()` required), callback removal. None of these invalidate error-handling postconditions. stripe-v21 profile correctly covers current surface.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-11 — re-verified clean
 
 - **Latest published:** stripe@22.2.0

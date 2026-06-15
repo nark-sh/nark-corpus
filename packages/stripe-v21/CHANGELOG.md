@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-14 — re-verified clean (v22 reviewed, no fork needed)
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=21.0.0` (unchanged — open-ended range covers v22)
+- **Verdict:** no action — v22 breaking changes are TypeScript type restructuring (`Stripe.errors.StripeError` type removed, `new Stripe()` constructor enforced, callback removal). None invalidate the v21 error-handling postconditions (TemporarySessionExpiredError, RateLimitError v2, parseEventNotification, fetchRelatedObject, fetchEvent). stripe-v21 profile correctly covers v22 with its open-ended range.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-11 — deepen pass — coverage 57% → 86%
 
 - **Profile:** `packages/stripe-v21/contract.yaml`

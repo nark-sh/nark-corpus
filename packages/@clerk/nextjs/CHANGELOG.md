@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-14 — re-verified clean (fork @clerk/nextjs-v7 confirmed current)
+
+- **Latest published:** @clerk/nextjs@7.5.2
+- **Profile semver:** `>=5.0.0 <7.0.0` (unchanged — v7 fork exists)
+- **Verdict:** no action — @clerk/nextjs-v7/contract.yaml (semver `>=7.0.0`, extends-fork) already covers v7+. v7.5.2 changelog reviewed (v7.3–v7.5): only patch/minor changes (middleware debug hardening, `<ConfigureSSO>` removal from experimental). No new error-handling postconditions needed. @clerk/nextjs-v7 profile is current.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-14)
+
 ## 2026-06-11 — extends-fork created for v7+
 
 - **Latest published:** @clerk/nextjs@7.5.2
