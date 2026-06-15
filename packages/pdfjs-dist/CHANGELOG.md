@@ -2,6 +2,18 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-14 — deepen pass — coverage 65% → 100% (effective)
+
+- **Profile:** `packages/pdfjs-dist/contract.yaml`
+- **Functions added:** none — 0 new postconditions (omission pass only)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** 7 — `getPageLabels`, `getPageLayout`, `getPageMode`, `getViewerPreferences`, `getOpenAction`, `getAttachments`, `doc.getJSActions` — all are pure `messageHandler.sendWithPromise()` transport passthrough with no local throws, no input validation, and no domain-specific error contracts. Evidence: pdf.mjs transport lines 16546-16580 (pdfjs-dist@6.0.227).
+- **Total omitted after this pass:** 20 (13 prior + 7 newly omitted)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:** `node_modules/pdfjs-dist/build/pdf.mjs` (transport layer lines 16546-16580, pdfjs-dist@6.0.227)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 2, 2026-06-14T00:00:00Z)
+
 ## 2026-06-15 — deepen pass — coverage 61% → 65%
 
 - **Profile:** `packages/pdfjs-dist/contract.yaml`
