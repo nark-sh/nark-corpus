@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-15 — re-verified clean (fork @clerk/nextjs-v7 confirmed current)
+
+- **Latest published:** @clerk/nextjs@7.5.3
+- **Profile semver:** `>=5.0.0 <7.0.0` (unchanged — v7 fork exists)
+- **Verdict:** no action — @clerk/nextjs-v7 (`>=7.0.0`, extends-fork) covers v7.5.3. v7.5.2→7.5.3 is a patch release, no error-handling changes.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-15)
+
 ## 2026-06-14 — re-verified clean (fork @clerk/nextjs-v7 confirmed current)
 
 - **Latest published:** @clerk/nextjs@7.5.2

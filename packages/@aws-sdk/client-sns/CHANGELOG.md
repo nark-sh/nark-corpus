@@ -3,6 +3,15 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+
+## 2026-06-15 — re-verified clean
+
+- **Latest published:** @aws-sdk/client-sns@3.1069.0
+- **Profile semver:** `>=3.0.0 <4.0.0` (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (or only patch/minor drift, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-15)
+
 ## 2026-06-14 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-sns@3.1068.0

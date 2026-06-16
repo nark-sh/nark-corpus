@@ -3,6 +3,15 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+
+## 2026-06-15 — re-verified clean
+
+- **Latest published:** unzipper@0.12.3
+- **Profile semver:** `>=0.9.0 <0.13.0` (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (or only patch/minor drift, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-15)
+
 ## 2026-06-14 — re-verified clean
 
 - **Latest published:** unzipper@0.12.3

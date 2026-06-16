@@ -2,6 +2,15 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+
+## 2026-06-15 — re-verified clean
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=21.0.0` (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver (or only patch/minor drift, no error-handling changes)
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-15)
+
 ## 2026-06-14 — re-verified clean (v22 reviewed, no fork needed)
 
 - **Latest published:** stripe@22.2.1

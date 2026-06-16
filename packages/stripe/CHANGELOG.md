@@ -2,6 +2,14 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-15 — re-verified clean
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=8.0.0 <21.0.0` (unchanged — covered by stripe-v21 fork for v21+)
+- **Verdict:** no action on parent. stripe-v21 (`>=21.0.0`, open range) continues to cover v22.2.1. No new stripe major between 2026-06-14 and 2026-06-15 sweeps.
+- **Scanner version used:** nark@1.0.3
+- **Verified by:** bc-version-drift (sweep 2026-06-15)
+
 ## 2026-06-14 — re-verified clean
 
 - **Latest published:** stripe@22.2.1
