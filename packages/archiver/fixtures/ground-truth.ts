@@ -12,6 +12,11 @@
  *   - symlink-zip-format-unsupported (concern-20260411-archiver-deepen-3)
  *   - QUEUECLOSED pattern for append/directory/file/symlink after finalize (concern-20260411-archiver-deepen-4)
  *
+ * Postconditions added 2026-06-18 deepen pass 7 (no scanner detection yet — concerns queued):
+ *   - append-directory-entry-unsupported (concern-20260618-archiver-deepen-1)
+ *   - symlink-missing-filepath           (concern-20260618-archiver-deepen-2)
+ *   - symlink-missing-target             (concern-20260618-archiver-deepen-3)
+ *
  * Detection path:
  *   - EventListenerAbsencePlugin checks archiver() for .on('error', ...) and .on('warning', ...)
  *
@@ -105,6 +110,82 @@ export async function createZipWithFullProperHandling() {
   archive.directory('uploads/', 'uploads');
   await archive.finalize();
   // SHOULD_NOT_FIRE: correct pattern — both handlers, finalize, and close event wait
+  await new Promise<void>((resolve, reject) => {
+    output.on('close', resolve);
+    output.on('error', reject);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. append-directory-entry-unsupported — append({ type: 'directory' }) on JSON archiver
+// ─────────────────────────────────────────────────────────────────────────────
+// Reference fixtures for postconditions added 2026-06-18 (no scanner detection yet).
+
+export async function appendDirectoryEntryOnJsonFormat() {
+  const output = fs.createWriteStream('archive.json');
+  const archive = archiver('json');
+  archive.on('error', (err) => { throw err; });
+  archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
+  archive.pipe(output);
+  // Reference: append-directory-entry-unsupported — JSON archiver emits DIRECTORYNOTSUPPORTED;
+  // entry is silently dropped. Detection requires scanner concern-20260618-archiver-deepen-1.
+  archive.append(Buffer.from(''), { name: 'subdir/', type: 'directory' });
+  await archive.finalize();
+  await new Promise<void>((resolve, reject) => {
+    output.on('close', resolve);
+    output.on('error', reject);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. symlink-missing-filepath / symlink-missing-target — argument validation gaps
+// ─────────────────────────────────────────────────────────────────────────────
+// Reference fixtures for postconditions added 2026-06-18 (no scanner detection yet).
+
+export async function symlinkMissingFilepathArgument() {
+  const output = fs.createWriteStream('archive.tar');
+  const archive = archiver('tar');
+  archive.on('error', (err) => { throw err; });
+  archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
+  archive.pipe(output);
+  // Reference: symlink-missing-filepath — empty-string filepath emits SYMLINKFILEPATHREQUIRED.
+  // Detection requires scanner concern-20260618-archiver-deepen-2.
+  archive.symlink('', '/target/path');
+  await archive.finalize();
+  await new Promise<void>((resolve, reject) => {
+    output.on('close', resolve);
+    output.on('error', reject);
+  });
+}
+
+export async function symlinkMissingTargetArgument() {
+  const output = fs.createWriteStream('archive.tar');
+  const archive = archiver('tar');
+  archive.on('error', (err) => { throw err; });
+  archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
+  archive.pipe(output);
+  // Reference: symlink-missing-target — empty-string target emits SYMLINKTARGETREQUIRED.
+  // Detection requires scanner concern-20260618-archiver-deepen-3.
+  archive.symlink('link.txt', '');
+  await archive.finalize();
+  await new Promise<void>((resolve, reject) => {
+    output.on('close', resolve);
+    output.on('error', reject);
+  });
+}
+
+export async function symlinkWithValidArguments() {
+  const output = fs.createWriteStream('archive.tar');
+  const archive = archiver('tar');
+  archive.on('error', (err) => { throw err; });
+  archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
+  archive.pipe(output);
+  // Reference: valid filepath and target; tar format supports symlinks. NOTE: scanner
+  // cannot statically distinguish zip vs tar archives at the symlink() call site, so it
+  // will currently emit symlink-zip-format-unsupported here as a known FP. Detection
+  // improvement tracked separately under scanner-upgrades backlog.
+  archive.symlink('link.txt', '/target/path.txt');
+  await archive.finalize();
   await new Promise<void>((resolve, reject) => {
     output.on('close', resolve);
     output.on('error', reject);
