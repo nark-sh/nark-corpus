@@ -1,3 +1,11 @@
+## 2026-06-17 — re-verified clean
+
+- **Latest published:** svix@1.95.2
+- **Profile semver:** >=1.0.0 (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-17)
+
 ## 2026-06-15 — re-verified clean
 
 - **Latest published:** svix@1.95.2
@@ -19,6 +27,22 @@
 # svix Profile Changelog
 
 Created by bc-deepen-contract Phase 6.4 — pre-CHANGELOG history not preserved.
+## 2026-06-18 — re-verified clean
+
+- **Latest published:** svix@1.96.0
+- **Profile semver:** `>=1.0.0` (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver
+- **Scanner version used:** nark@3.1.0
+- **Verified by:** bc-version-drift (sweep 2026-06-18)
+
+## 2026-06-16 — re-verified clean
+
+- **Latest published:** svix@1.95.2
+- **Profile semver:** `>=1.0.0` (unchanged)
+- **Verdict:** no changes — latest already satisfies declared semver
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-16)
+
 
 ## 2026-06-11 — deepen pass — coverage 75% → 92%
 

@@ -1,6 +1,30 @@
 # CHANGELOG — stripe
 
 All notable verification, deepen, and fork events for this profile. Newest first.
+## 2026-06-18 — re-verified (no action; sibling fork covers latest)
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=8.0.0 <21.0.0` (unchanged — this profile is the parent)
+- **Verdict:** major drift on parent, but sibling version-fork already covers stripe@22.2.1; no action on parent
+- **Scanner version used:** nark@3.1.0
+- **Verified by:** bc-version-drift (sweep 2026-06-18)
+
+## 2026-06-17 — re-verified (fork already current)
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=8.0.0 <21.0.0` (unchanged; parent profile)
+- **Verdict:** latest is outside parent range but covered by version fork `stripe-v21` — no action required on this profile
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-17)
+
+## 2026-06-16 — re-verified (fork already current)
+
+- **Latest published:** stripe@22.2.1
+- **Profile semver:** `>=8.0.0 <21.0.0` (unchanged; parent profile)
+- **Verdict:** latest is outside parent range but covered by version fork — no action required on this profile
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-16)
+
 
 ## 2026-06-15 — re-verified clean
 

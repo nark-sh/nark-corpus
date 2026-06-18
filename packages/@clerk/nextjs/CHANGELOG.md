@@ -1,6 +1,30 @@
 # CHANGELOG — @clerk/nextjs
 
 All notable verification, deepen, and fork events for this profile. Newest first.
+## 2026-06-18 — re-verified (no action; sibling fork covers latest)
+
+- **Latest published:** @clerk/nextjs@7.5.5
+- **Profile semver:** `>=5.0.0 <7.0.0` (unchanged — this profile is the parent)
+- **Verdict:** major drift on parent, but sibling version-fork already covers @clerk/nextjs@7.5.5; no action on parent
+- **Scanner version used:** nark@3.1.0
+- **Verified by:** bc-version-drift (sweep 2026-06-18)
+
+## 2026-06-17 — re-verified (fork already current)
+
+- **Latest published:** @clerk/nextjs@7.5.3
+- **Profile semver:** `>=5.0.0 <7.0.0` (unchanged; parent profile)
+- **Verdict:** latest is outside parent range but covered by version fork `@clerk/nextjs-v7` — no action required on this profile
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-17)
+
+## 2026-06-16 — re-verified (fork already current)
+
+- **Latest published:** @clerk/nextjs@7.5.3
+- **Profile semver:** `>=5.0.0 <7.0.0` (unchanged; parent profile)
+- **Verdict:** latest is outside parent range but covered by version fork — no action required on this profile
+- **Scanner version used:** nark@3.0.2
+- **Verified by:** bc-version-drift (sweep 2026-06-16)
+
 
 ## 2026-06-15 — re-verified clean (fork @clerk/nextjs-v7 confirmed current)
 
