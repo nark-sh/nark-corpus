@@ -1,8 +1,8 @@
 package: "@trigger.dev/sdk"
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -35,7 +35,27 @@ evidence_quality: confirmed
 #   @trigger.dev/sdk/dist/commonjs/v3/auth.js — createPublicToken, createTriggerPublicToken, createBatchTriggerPublicToken
 #   @trigger.dev/sdk/dist/commonjs/v3/tags.js — addTags() context check
 #   @trigger.dev/core/dist/commonjs/v3/runMetadata/manager.js — flush() error-swallowing
-coverage_score: 0.79  # 22 contracted / 28 ICP-relevant async-callable functions (28 intentionally omitted)
+#
+# Depth pass 2026-06-18 (deepen-stream-1 pass 4):
+# API surface re-enumerated against @trigger.dev/sdk@4.4.6 declaration files
+# (node_modules/@trigger.dev/sdk/dist/commonjs/v3/**/*.d.ts).
+# Contracted before: 22  Contracted after: 25 (+3 this pass)
+# Added: webhooks.constructEvent (security-critical webhook signature
+#   verification — WebhookError for all failures including missing-secret,
+#   missing-header, invalid-signature, malformed-payload), wait.forToken
+#   (pause-and-wait with WaitpointTimeoutError on expiry + synchronous
+#   "wait.forToken can only be used from inside a task.run()" if called
+#   outside a task), query.execute (TRQL query execution — full ApiError
+#   hierarchy plus ApiClientMissingError).
+# New error types: WebhookError, WaitpointTimeoutError, ManualWaitpointPromise.
+# Source-inspected (4.4.6):
+#   dist/commonjs/v3/webhooks.js — WebhookError thrown for all 5 failure modes
+#   dist/commonjs/v3/wait.js — forToken sync-throws outside task context, .unwrap() throws on timeout
+#   dist/commonjs/v3/query.js — uses apiClientManager.clientOrThrow() and apiClient.executeQuery()
+# Evidence URLs actually fetched:
+#   https://trigger.dev/docs/wait-for-token
+# Effective coverage (non-omitted contracted / non-omitted total) = 25/25 = 1.0.
+coverage_score: 0.57  # 25 contracted / 44 raw async-callable functions (19 intentionally omitted from raw count; effective = 25/25 = 1.0)
 
 detection:
   require_instance_tracking: false
@@ -1082,4 +1102,303 @@ functions:
           production_behavior: degraded_service
           visibility: silent
           user_experience: degraded_performance
+          incident_cost_range: low
+
+  # ── Added in depth pass 2026-06-18 (deepen-stream-1 pass 4) ─────────────────
+  # API surface re-enumerated against @trigger.dev/sdk@4.4.6 declaration files.
+  # This pass targets the 3 newest high-impact APIs that landed in 4.x:
+  #   - webhooks.constructEvent (security-critical signature verification)
+  #   - wait.forToken (pause-and-wait with timeout — task-internal but high adoption)
+  #   - query.execute (TRQL query execution, new in 4.x)
+
+  - name: constructEvent
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Verifies an incoming HTTP webhook from Trigger.dev and parses its payload.
+      Called as webhooks.constructEvent(request, secret) where request is either
+      a Fetch API Request or { payload, header }. Verifies the
+      x-trigger-signature-hmacsha256 header against the secret using HMAC-SHA256,
+      then parses the JSON body via the Webhook zod schema. THROWS WebhookError
+      on EVERY failure path: missing secret, missing signature header, invalid
+      signature, malformed JSON, or schema mismatch. Security-critical — if this
+      call is wrapped in a generic catch that returns 200, attackers can submit
+      forged webhooks and the application proceeds as if the event were authentic.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/webhooks.js (fetched 2026-06-18)
+      # WebhookError class defined inline; constructEvent throws WebhookError on:
+      #   - missing secret when passed a Request: throw WebhookError("Secret is required when passing a Request object")
+      #   - missing signature header: throw WebhookError("No signature header found")
+      #   - array-typed signature header: throw WebhookError("Signature header cannot be an array")
+      #   - signature verification fail: throw WebhookError("Invalid signature")
+      #   - JSON parse / zod parse fail: throw WebhookError(`Webhook parsing failed: ${error.message}`)
+      - id: constructevent-no-try-catch
+        condition: >
+          webhooks.constructEvent() called in a webhook handler without
+          surrounding try/catch. Any of five distinct failure modes (missing
+          secret, missing signature header, array header, invalid signature,
+          malformed payload) results in an unhandled rejected Promise that
+          crashes the handler with a 500.
+        throws: >
+          WebhookError (extends Error) — single error class for ALL failures:
+            - "Secret is required when passing a Request object"
+            - "No signature header found" (missing x-trigger-signature-hmacsha256)
+            - "Signature header cannot be an array"
+            - "Invalid signature" (HMAC-SHA256 verification failed)
+            - "Webhook parsing failed: <inner zod/JSON message>"
+          Distinguishable only by the message string — WebhookError does not
+          expose a discriminator code or type field.
+        required_handling: >
+          Caller MUST wrap webhooks.constructEvent() in try/catch and return
+          a non-2xx response on ANY error. NEVER catch-and-return-200, because
+          that allows attackers with no signing secret to deliver arbitrary
+          payloads to the handler.
+
+          // CORRECT — Next.js route handler pattern:
+          export async function POST(request: Request) {
+            try {
+              const event = await webhooks.constructEvent(request, process.env.TRIGGER_WEBHOOK_SECRET!);
+              // event is now a verified Webhook — safe to process
+              await processVerifiedWebhook(event);
+              return Response.json({ ok: true });
+            } catch (err) {
+              if (err instanceof WebhookError) {
+                console.warn("Rejected unverified webhook:", err.message);
+                return new Response("Invalid webhook", { status: 400 });
+              }
+              throw err;
+            }
+          }
+
+          // WRONG — silently treats forged webhooks as authentic:
+          // try { event = await webhooks.constructEvent(request, secret); }
+          // catch { return new Response("ok"); }  // 200 on forge — vulnerability
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/webhooks.ts"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: constructevent-swallowed-returns-200
+        condition: >
+          webhooks.constructEvent() is wrapped in a try/catch where the catch
+          block returns a 2xx response (e.g., Response.json({ok: true})). This
+          completely defeats signature verification — any unauthenticated POST
+          to the webhook URL receives a 200, signaling Trigger.dev (and any
+          downstream consumers) that the event was accepted. Attackers can
+          forge events with arbitrary payloads.
+        throws: >
+          No throw — but the application returns 200 for unverified webhooks,
+          which is a critical authentication bypass.
+        required_handling: >
+          The catch block for WebhookError MUST return a non-2xx response
+          (400 or 401 are appropriate). Logging and continuing without throwing
+          is fine, but the HTTP response itself must signal rejection.
+
+          // WRONG (vulnerability):
+          try { event = await webhooks.constructEvent(req, secret); }
+          catch (err) {
+            console.error(err);
+            return Response.json({ ok: true }); // 200 — attacker bypass
+          }
+
+          // RIGHT:
+          try { event = await webhooks.constructEvent(req, secret); }
+          catch (err) {
+            return new Response("Invalid webhook", { status: 400 });
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/webhooks.ts"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: forToken
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Pauses the current task run until an external waitpoint token is completed
+      via wait.completeToken(), or the configured timeout (default 10m) expires.
+      Called as wait.forToken<T>(tokenId, options?). MUST be called inside a
+      task's run() function — throws synchronously otherwise. Returns a
+      ManualWaitpointPromise<T> that resolves to a discriminated union:
+        { ok: true, output: T }  — token was completed with data of type T
+        { ok: false, error: Error } — timeout expired before completion
+      The .unwrap() helper throws WaitpointTimeoutError when ok=false.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/wait.js (fetched 2026-06-18)
+      # wait.forToken throws synchronously "wait.forToken can only be used from inside a task.run()"
+      # When called inside a task: returns Promise<{ok: true, output: T}> | {ok: false, error: Error}
+      # .unwrap() helper throws WaitpointTimeoutError when ok=false (timeout)
+      # Confirmed at https://trigger.dev/docs/wait-for-token (fetched 2026-06-18)
+      - id: fortoken-called-outside-task
+        condition: >
+          wait.forToken() called from outside a Trigger.dev task run() function —
+          e.g., from a Next.js route handler, an Express middleware, or
+          module-level code. The SDK throws synchronously, before any await.
+        throws: >
+          Error: "wait.forToken can only be used from inside a task.run()"
+          (Synchronous throw at the top of the implementation — does not
+           return a rejected Promise.)
+        required_handling: >
+          wait.forToken() is a task-internal API. To wait for external
+          confirmation from a non-task context, you must:
+          1. Create the token from anywhere with wait.createToken().
+          2. Inside a task, await wait.forToken(token) to pause the run.
+          3. From the external context (webhook, route handler), call
+             wait.completeToken(tokenId, data) to unblock the task.
+
+          // CORRECT (inside a task):
+          export const approvalTask = task({
+            id: "approval-flow",
+            run: async (payload) => {
+              const token = await wait.createToken({ timeout: "24h" });
+              await notifyApprover(token.url);
+              const result = await wait.forToken<{ approved: boolean }>(token);
+              if (!result.ok) { throw result.error; }
+              return result.output;
+            }
+          });
+
+          // WRONG (route handler):
+          // export async function GET() {
+          //   const result = await wait.forToken(tokenId); // throws synchronously
+          // }
+        sources:
+          - "https://trigger.dev/docs/wait-for-token"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/wait.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: fortoken-unwrap-timeout-unhandled
+        condition: >
+          wait.forToken(token).unwrap() called inside a task without
+          surrounding try/catch. When the timeout expires before
+          wait.completeToken() is called externally, unwrap() throws
+          WaitpointTimeoutError. The whole task run fails and is retried
+          per the task's retry config — potentially burning quota for a
+          token that will never be completed (e.g., the user abandoned the
+          approval flow).
+        throws: >
+          WaitpointTimeoutError (extends Error) — thrown by .unwrap() when
+          the underlying result is { ok: false, error: WaitpointTimeoutError }.
+          The error has a generic message indicating the timeout fired.
+        required_handling: >
+          For abandonment-tolerant flows (human approval, async sync, etc.):
+          - Either check result.ok BEFORE unwrapping, OR
+          - Wrap .unwrap() in try/catch and treat WaitpointTimeoutError as
+            a normal control-flow exit (return a fallback / skip the step).
+
+          // PATTERN 1: explicit check (recommended for abandonment flows):
+          const result = await wait.forToken<ApprovalData>(token);
+          if (!result.ok) {
+            // Approval timed out — mark as rejected, don't retry the task
+            await markAbandoned(payload.documentId);
+            return { status: "abandoned" };
+          }
+
+          // PATTERN 2: unwrap with explicit catch:
+          try {
+            const approval = await wait.forToken<ApprovalData>(token).unwrap();
+            return { approved: true, by: approval.userId };
+          } catch (err) {
+            if (err instanceof WaitpointTimeoutError) {
+              return { status: "timeout" };
+            }
+            throw err;
+          }
+
+          CRITICAL: Without explicit timeout handling, abandoned waitpoints
+          cause repeated task retries that all hit the same timeout —
+          wasting concurrency slots and run quota.
+        sources:
+          - "https://trigger.dev/docs/wait-for-token"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/wait.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: execute
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Executes a TRQL (Trigger Run Query Language) query against the
+      Trigger.dev runs database. Called as query.execute(queryString, options?).
+      Returns either { format: "json", results: T[] } or { format: "csv",
+      results: string } depending on the format option. Uses the same
+      apiClient as other management APIs — throws ApiClientMissingError if
+      TRIGGER_SECRET_KEY is not configured, AuthenticationError on 401,
+      BadRequestError (400) on TRQL syntax errors or invalid time ranges,
+      RateLimitError on 429.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/sdk/dist/commonjs/v3/query.js (fetched 2026-06-18)
+      # query.execute() calls apiClientManager.clientOrThrow() — synchronous throw if no key
+      # Then apiClient.executeQuery() — HTTP POST that can fail with ApiError hierarchy
+      # Error types confirmed from @trigger.dev/core/v3/apiClient/errors.d.ts
+      - id: query-execute-no-try-catch
+        condition: >
+          query.execute() called in async context (route handler, scheduled
+          report job, dashboard backend) without surrounding try/catch. Auth
+          failure, malformed TRQL, or invalid time range result in an
+          unhandled rejected Promise — the report endpoint returns 500
+          instead of a graceful empty/error response.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid or expired API key.
+          BadRequestError (status 400) — invalid TRQL syntax, unknown table,
+            or invalid time range (mixing `period` with `from`/`to`).
+          RateLimitError (status 429) — query rate limit exceeded.
+          ApiConnectionError — network failure reaching api.trigger.dev.
+        required_handling: >
+          Caller MUST wrap query.execute() in try/catch. Differentiate
+          BadRequestError (developer error, do not retry) from
+          ApiConnectionError / RateLimitError (transient, may retry).
+
+          try {
+            const result = await query.execute(
+              "SELECT run_id, status FROM runs",
+              { period: "7d", format: "json" }
+            );
+            return Response.json({ runs: result.results });
+          } catch (err) {
+            if (err instanceof BadRequestError) {
+              // TRQL syntax error or invalid params — log and return 400
+              console.error("Invalid TRQL:", err.message);
+              return new Response("Invalid query", { status: 400 });
+            }
+            if (err instanceof RateLimitError) {
+              return new Response("Too many requests", { status: 429 });
+            }
+            throw err;
+          }
+
+          NOTE: query.execute() can fan out across organization-scoped data
+          when scope: "organization" — large result sets may also fail with
+          server-side timeouts that surface as ApiConnectionError.
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/query.ts"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: low

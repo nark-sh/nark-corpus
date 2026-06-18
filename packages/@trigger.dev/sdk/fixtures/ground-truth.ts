@@ -29,6 +29,11 @@
  *   tags-add-outside-task-context      (tags.add outside task run)
  *   tags-add-no-try-catch              (tags.add inside task without try-catch)
  *   metadata-flush-silent-failure      (metadata.flush swallows errors — no detector possible)
+ *   constructevent-no-try-catch        (webhooks.constructEvent without try-catch)
+ *   constructevent-swallowed-returns-200 (webhooks.constructEvent catch returns 2xx)
+ *   fortoken-called-outside-task       (wait.forToken called from non-task context)
+ *   fortoken-unwrap-timeout-unhandled  (wait.forToken().unwrap() without try-catch)
+ *   query-execute-no-try-catch         (query.execute without try-catch)
  */
 import { tasks, schedules, runs, queues, wait, auth, tags, metadata, SubtaskUnwrapError, NotFoundError } from "@trigger.dev/sdk";
 
@@ -508,4 +513,112 @@ async function gt_metadataFlush_withLogging() {
   console.log("Flushing metadata:", current); // Log before flush for audit trail
   await metadata.flush();
   // Note: still no guarantee flush succeeded, but at least state is logged
+}
+
+// ──────────────────────────────────────────────────
+// 21. webhooks.constructEvent — no try/catch (SHOULD_FIRE)
+// Added in deepen pass 2026-06-18 (deepen-stream-1 pass 4)
+// ──────────────────────────────────────────────────
+
+// Stub imports referenced only as types in the new fixtures — actual webhooks/wait/query
+// exports come from @trigger.dev/sdk @ 4.x. We keep type-only references soft so the
+// fixture compiles in the existing ES2020 sandbox without DOM lib.
+declare const webhooks: { constructEvent: (req: any, secret: string) => Promise<any> };
+declare const query: { execute: (q: string, options?: any) => Promise<any> };
+declare class WebhookError extends Error {}
+declare class WaitpointTimeoutError extends Error {}
+
+// NOTE: scanner gap — constructevent-no-try-catch requires a new detector to be
+// added (concern-20260618-trigger-dev-sdk-deepen-1). Annotation kept as documentation.
+async function gt_webhookConstructEvent_missing(req: any, secret: string) {
+  // FUTURE_FIRE: constructevent-no-try-catch — webhooks.constructEvent without try-catch
+  const event = await webhooks.constructEvent(req, secret);
+  return event;
+}
+
+async function gt_webhookConstructEvent_safe(req: any, secret: string): Promise<{ status: number; body: any }> {
+  try {
+    // SHOULD_NOT_FIRE: webhooks.constructEvent has try-catch returning non-2xx on error
+    const event = await webhooks.constructEvent(req, secret);
+    return { status: 200, body: { ok: true, event } };
+  } catch (err) {
+    if (err instanceof WebhookError) {
+      return { status: 400, body: "Invalid webhook" };
+    }
+    throw err;
+  }
+}
+
+// 21b. webhooks.constructEvent — swallowed, returns 200 (FUTURE_FIRE on different pattern)
+// NOTE: scanner gap — constructevent-swallowed-returns-200 needs new detector
+// (concern-20260618-trigger-dev-sdk-deepen-2).
+async function gt_webhookConstructEvent_swallowed(req: any, secret: string): Promise<{ status: number; body: any }> {
+  try {
+    // FUTURE_FIRE: constructevent-swallowed-returns-200 — catch returns 200 on signature failure
+    const event = await webhooks.constructEvent(req, secret);
+    return { status: 200, body: { ok: true, event } };
+  } catch (err) {
+    console.error(err);
+    return { status: 200, body: { ok: true } }; // VULN: 200 on forge
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 22. wait.forToken — no try/catch + unwrap (SHOULD_FIRE)
+// Note: fortoken-called-outside-task fires at RUNTIME (taskContext.ctx is null).
+// The scanner gap (concern-20260618-trigger-dev-sdk-deepen-3) requires task-context
+// detection that does not yet exist. Outside-task SHOULD_FIRE annotation omitted
+// here pending scanner upgrade; see contract.yaml for postcondition definition.
+// ──────────────────────────────────────────────────
+
+// NOTE: scanner gap — fortoken-called-outside-task requires detecting that wait.forToken()
+// is NOT inside a task run() function. Scanner cannot determine task context statically yet.
+// NOTE: scanner gap — fortoken-unwrap-timeout-unhandled requires chain-aware
+// detection of .unwrap() on wait.forToken() result (concern-20260618-trigger-dev-sdk-deepen-4).
+async function gt_waitForToken_unwrap_missing(tokenId: string) {
+  // FUTURE_FIRE: fortoken-unwrap-timeout-unhandled — .unwrap() without try-catch
+  const approval = await wait.forToken<{ approved: boolean }>(tokenId).unwrap();
+  return approval;
+}
+
+async function gt_waitForToken_unwrap_safe(tokenId: string) {
+  try {
+    // SHOULD_NOT_FIRE: .unwrap() inside try-catch with timeout fallback
+    const approval = await wait.forToken<{ approved: boolean }>(tokenId).unwrap();
+    return { approved: true, data: approval };
+  } catch (err) {
+    if (err instanceof WaitpointTimeoutError) {
+      return { approved: false, reason: "timeout" as const };
+    }
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 23. query.execute — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// NOTE: scanner gap — query-execute-no-try-catch needs the standard try-catch
+// detector extended to recognize query.execute() (concern-20260618-trigger-dev-sdk-deepen-5).
+async function gt_queryExecute_missing(): Promise<{ status: number; body: any }> {
+  // FUTURE_FIRE: query-execute-no-try-catch — query.execute without try-catch
+  const result = await query.execute("SELECT run_id, status FROM runs", {
+    period: "7d",
+    format: "json",
+  });
+  return { status: 200, body: { runs: result.results } };
+}
+
+async function gt_queryExecute_safe(): Promise<{ status: number; body: any }> {
+  try {
+    // SHOULD_NOT_FIRE: query.execute has try-catch with structured error handling
+    const result = await query.execute("SELECT run_id, status FROM runs", {
+      period: "7d",
+      format: "json",
+    });
+    return { status: 200, body: { runs: result.results } };
+  } catch (err) {
+    console.error("TRQL query failed:", err);
+    return { status: 500, body: "Query failed" };
+  }
 }
