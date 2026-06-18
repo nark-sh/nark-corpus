@@ -198,6 +198,139 @@ function buildSchema_withoutTryCatch(sdl: string) {
   return buildSchema(sdl);
 }
 
+// ─── v17 fixtures (added 2026-06-18 deepen pass 3) ──────────────────────────
+// New v17 surface:
+//   experimentalExecuteIncrementally — @defer/@stream executor, discriminated union
+//   legacyExecuteIncrementally       — legacy-payload variant
+//   AbortedGraphQLExecutionError     — thrown from execute() on abortSignal abort
+//
+// NOTE: graphql v17 is ESM-only; these imports are valid in a TypeScript / ESM
+// fixture but will fail when compiled to CJS without proper interop. The fixture's
+// tsconfig.json uses "moduleResolution": "bundler" or "node16" to handle this.
+
+import {
+  execute as executeV17,
+  experimentalExecuteIncrementally,
+  legacyExecuteIncrementally,
+  AbortedGraphQLExecutionError,
+} from 'graphql';
+
+// ─── execute() with abortSignal — AbortedGraphQLExecutionError handling ───────
+
+async function execute_withAbortSignalProperHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // @expect-clean: execute-abort-signal-rejection — the AbortedGraphQLExecutionError
+  // is caught and the partial result is surfaced via a 499-equivalent path
+  try {
+    const result = await executeV17({ schema: s, document, abortSignal: signal });
+    return result;
+  } catch (error) {
+    if (error instanceof AbortedGraphQLExecutionError) {
+      // Client cancelled — surface the partial result, not a 500
+      const partial = await error.abortedResult;
+      return { ...partial, aborted: true };
+    }
+    throw error;
+  }
+}
+
+async function execute_withAbortSignalMissingHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // @expect-violation: execute-abort-signal-rejection
+  // abortSignal is passed but the awaited execute() is not wrapped in try-catch —
+  // AbortedGraphQLExecutionError surfaces as an unhandled rejection, partial result lost.
+  const result = await executeV17({ schema: s, document, abortSignal: signal });
+  return result;
+}
+
+// ─── experimentalExecuteIncrementally tests — discriminated union handling ────
+
+async function expIncremental_withDiscrimination(s: GraphQLSchema, document: any) {
+  // @expect-clean: experimental-incremental-result-not-discriminated
+  // Discriminates on 'initialResult' in result before serializing.
+  const result = await experimentalExecuteIncrementally({ schema: s, document });
+  if ('initialResult' in result) {
+    // Incremental delivery — stream initialResult + iterate subsequentResults
+    const payloads: any[] = [result.initialResult];
+    for await (const payload of result.subsequentResults) {
+      payloads.push(payload);
+    }
+    return payloads;
+  }
+  return result;
+}
+
+async function expIncremental_withoutDiscrimination(s: GraphQLSchema, document: any) {
+  // @expect-violation: experimental-incremental-result-not-discriminated
+  // Treats result as ExecutionResult without discriminating — when document has
+  // @defer / @stream, the incremental payloads silently dropped.
+  const result = await experimentalExecuteIncrementally({ schema: s, document });
+  // @ts-ignore — intentional violation for test purposes
+  return result.data;
+}
+
+async function expIncremental_withAbortProperHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // @expect-clean: experimental-incremental-abort-signal-rejection
+  try {
+    const result = await experimentalExecuteIncrementally({ schema: s, document, abortSignal: signal });
+    if ('initialResult' in result) {
+      try {
+        for await (const payload of result.subsequentResults) {
+          console.log('payload', payload);
+        }
+      } catch (iterErr) {
+        // abort fired mid-stream
+        console.error('incremental stream aborted', iterErr);
+      }
+      return;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AbortedGraphQLExecutionError) {
+      return null; // client cancelled
+    }
+    throw error;
+  }
+}
+
+async function expIncremental_withAbortMissingHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // @expect-violation: experimental-incremental-abort-signal-rejection
+  // abortSignal passed but neither the Promise nor the iterator are wrapped in error handling
+  const result = await experimentalExecuteIncrementally({ schema: s, document, abortSignal: signal });
+  if ('initialResult' in result) {
+    for await (const payload of result.subsequentResults) {
+      console.log(payload);
+    }
+  }
+}
+
+// ─── legacyExecuteIncrementally tests — same shape, legacy payload ────────────
+
+async function legacyIncremental_withDiscrimination(s: GraphQLSchema, document: any) {
+  // @expect-clean: legacy-incremental-result-not-discriminated
+  const result = await legacyExecuteIncrementally({ schema: s, document });
+  if ('initialResult' in result) {
+    const payloads: any[] = [result.initialResult];
+    for await (const payload of result.subsequentResults) {
+      payloads.push(payload);
+    }
+    return payloads;
+  }
+  return result;
+}
+
+async function legacyIncremental_withoutDiscrimination(s: GraphQLSchema, document: any) {
+  // @expect-violation: legacy-incremental-result-not-discriminated
+  const result = await legacyExecuteIncrementally({ schema: s, document });
+  // @ts-ignore — intentional violation for test purposes
+  return result.data;
+}
+
+async function legacyIncremental_withAbortMissingHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // @expect-violation: legacy-incremental-abort-signal-rejection
+  // abortSignal passed but no try-catch on the awaited call
+  const result = await legacyExecuteIncrementally({ schema: s, document, abortSignal: signal });
+  return result;
+}
+
 export {
   parse_withTryCatch,
   parse_withoutTryCatch,
@@ -214,4 +347,13 @@ export {
   subscribe_withoutEventErrorCheck,
   buildSchema_withTryCatch,
   buildSchema_withoutTryCatch,
+  execute_withAbortSignalProperHandling,
+  execute_withAbortSignalMissingHandling,
+  expIncremental_withDiscrimination,
+  expIncremental_withoutDiscrimination,
+  expIncremental_withAbortProperHandling,
+  expIncremental_withAbortMissingHandling,
+  legacyIncremental_withDiscrimination,
+  legacyIncremental_withoutDiscrimination,
+  legacyIncremental_withAbortMissingHandling,
 };

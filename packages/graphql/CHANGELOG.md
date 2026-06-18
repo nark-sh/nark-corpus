@@ -2,6 +2,29 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-18 — deepen pass — coverage 75% → 80%
+
+- **Profile:** `packages/graphql/contract.yaml`
+- **Functions added:** experimentalExecuteIncrementally, legacyExecuteIncrementally (2 total)
+- **Postconditions added:** 5
+  - `execute()` +1: execute-abort-signal-rejection (v17 AbortedGraphQLExecutionError + abortSignal arg)
+  - `experimentalExecuteIncrementally()` +2: experimental-incremental-result-not-discriminated, experimental-incremental-abort-signal-rejection
+  - `legacyExecuteIncrementally()` +2: legacy-incremental-result-not-discriminated, legacy-incremental-abort-signal-rejection
+- **Functions intentionally omitted this pass:** executeRootSelectionSet / experimentalExecuteRootSelectionSet / legacyExecuteRootSelectionSet (internal helpers for pre-validated args), mapSourceToResponseEvent (low-level subscription stream helper covered by subscribe), validateExecutionArgs / validateSubscriptionArgs (sync, only throw on invalid schema — startup-time deployment bugs not runtime errors)
+- **Scanner concerns queued:** 4 (`concern-20260618-graphql-deepen-1` through `concern-20260618-graphql-deepen-4`) — execute-abort detection, experimental-incremental detection, legacy-incremental detection, cross-cutting discriminated-union pattern
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - node_modules/graphql@17.0.1/execution/execute.d.ts (lines 56-95 — execute + experimentalExecuteIncrementally signatures)
+  - node_modules/graphql@17.0.1/execution/legacyIncremental/legacyExecuteIncrementally.d.ts (line 136 — return type)
+  - node_modules/graphql@17.0.1/execution/AbortedGraphQLExecutionError.d.ts (lines 7-32 — class signature + abortedResult getter)
+  - node_modules/graphql@17.0.1/execution/Executor.js (lines 159-168 — finish() throws AbortedGraphQLExecutionError)
+  - node_modules/graphql@17.0.1/execution/ExecutionArgs.d.ts (line 34 — abortSignal field)
+  - node_modules/graphql@17.0.1/execution/incremental/IncrementalPublisher.js (lines 14-25 — subsequentResults.throw on abort)
+  - https://github.com/graphql/graphql-spec/pull/742 (incremental delivery RFC)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-18T21:25:00Z)
+
+Closes the "Future deepen-pass candidate" callout left by the 2026-06-15 drift sweep ("add postconditions for partial-result-on-abort behavior in v17+").
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** graphql@17.0.1

@@ -1,8 +1,8 @@
 package: graphql
 semver: ">=16.0.0 <18.0.0"
-contract_version: "1.1.1"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-15"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -19,7 +19,39 @@ evidence_quality: confirmed
 #   execution/subscribe.js lines 153-161: GraphQLError → ExecutionResult, non-GraphQLError → re-thrown
 #   utilities/buildASTSchema.js lines 100-116: buildSchema calls parse + assertValidSDL
 #   validation/validate.js lines 137-149: assertValidSDL throws Error (not GraphQLError) on invalid SDL
-coverage_score: 0.75  # 6 contracted / 8 total callable (2 intentionally omitted)
+#
+# Depth pass 2026-06-18 (deepen-stream-1 pass 3 — v17 partial-result-on-abort follow-up):
+# Triggered by the 2026-06-15 drift sweep note: "Future deepen-pass candidate: add
+# postconditions for partial-result-on-abort behavior in v17+." Verified against
+# graphql@17.0.1 installed in /private/tmp/claude/bc-deepen/graphql/node_modules/graphql.
+# +2 functions contracted: experimentalExecuteIncrementally, legacyExecuteIncrementally
+#   (the two v17 async incremental-delivery executors, both returning a discriminated
+#    union ExecutionResult | IncrementalResults — silent failure when callers don't
+#    discriminate, and both honor abortSignal with AbortedGraphQLExecutionError).
+# +1 postcondition added to execute(): execute-abort-signal-rejection — v17's
+#   AbortedGraphQLExecutionError class wraps the partial result on abortSignal abort.
+# +4 postconditions total this pass (2 abort + 2 discrimination).
+# API surface (revised): 10 async-callable exports
+#   contracted: graphql, execute, subscribe, parse, validate, buildSchema,
+#               experimentalExecuteIncrementally, legacyExecuteIncrementally (8)
+#   omitted:    createSourceEventStream (lower-level primitive covered by subscribe),
+#               parseValue/parseType (sync SDL utilities)
+# Coverage: 8/10 = 0.80 (was 6/8 = 0.75); effective contracted/non-omitted = 8/8 = 1.0
+# v17 evidence sources (all from installed package, lines confirmed from .d.ts + .js):
+#   node_modules/graphql@17.0.1/execution/execute.d.ts lines 56-95
+#     (execute signature) + 93 (experimentalExecuteIncrementally return type)
+#   node_modules/graphql@17.0.1/execution/legacyIncremental/legacyExecuteIncrementally.d.ts
+#     lines 136 (return type) and the SubsequentResults shape difference
+#   node_modules/graphql@17.0.1/execution/AbortedGraphQLExecutionError.d.ts lines 7-32
+#     (class signature + abortedResult getter)
+#   node_modules/graphql@17.0.1/execution/Executor.js lines 159-168
+#     (finish() throws AbortedGraphQLExecutionError if this.aborted)
+#   node_modules/graphql@17.0.1/execution/ExecutionArgs.d.ts line 34
+#     (abortSignal field on ExecutionArgs)
+#   node_modules/graphql@17.0.1/execution/incremental/IncrementalPublisher.js lines 14-25
+#     (subsequentResults.throw(reason) on abort)
+#   https://github.com/graphql/graphql-spec/pull/742 (incremental delivery RFC)
+coverage_score: 0.80  # 8 contracted / 10 total callable async exports (2 intentionally omitted)
 
 detection:
   type_names:
@@ -108,6 +140,69 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence (v17): execution/Executor.js lines 159-168 — finish(result) checks
+      # this.aborted; if aborted, calls createAbortedExecutionError(result) which throws
+      # new AbortedGraphQLExecutionError(this.abortReason, result). The thrown error
+      # carries the PARTIAL execution result in error.abortedResult — a v17-new
+      # affordance for surfacing partial data on cancellation.
+      # Source: node_modules/graphql@17.0.1/execution/AbortedGraphQLExecutionError.d.ts
+      # Source: node_modules/graphql@17.0.1/execution/ExecutionArgs.d.ts (abortSignal arg)
+      - id: execute-abort-signal-rejection
+        condition: >
+          execute() is called with args.abortSignal (a v17+ AbortSignal). The signal aborts
+          mid-execution — typically because the inbound HTTP request was cancelled, a
+          per-request deadline elapsed, or an upstream supervisor cancelled the operation.
+          The returned Promise rejects with AbortedGraphQLExecutionError (NOT GraphQLError,
+          NOT a generic Error). The error carries `error.abortedResult` containing the
+          partial ExecutionResult collected before the abort fired (data + errors collected
+          so far). Without try/catch around the awaited execute() call, this rejection
+          surfaces as an UnhandledPromiseRejection, the partial result is lost, and the
+          calling HTTP handler returns 500 instead of a 499 / partial 200.
+        throws: >
+          AbortedGraphQLExecutionError (new v17 class — extends Error, name ===
+          'AbortedGraphQLExecutionError'). Distinct from GraphQLError. Properties:
+          - message / cause: set from the AbortSignal's abort reason
+          - abortedResult: PromiseOrValue<ExecutionResult> — the partial result with
+            whatever data + errors were collected before the abort took effect
+        required_handling: >
+          When execute() is called with an abortSignal, wrap the awaited call in
+          try/catch and check for AbortedGraphQLExecutionError BEFORE treating the
+          rejection as a server error:
+
+            import { execute, AbortedGraphQLExecutionError } from 'graphql';
+
+            try {
+              const result = await execute({
+                schema, document, rootValue,
+                abortSignal: req.signal,
+              });
+              return reply.send(result);
+            } catch (error) {
+              if (error instanceof AbortedGraphQLExecutionError) {
+                // Cancellation, not failure. Optionally surface the partial result:
+                const partial = await error.abortedResult;
+                return reply.code(499).send(partial); // 499 Client Closed Request
+              }
+              throw error; // genuine server error — let the framework handle it
+            }
+
+          DO NOT swallow this error silently — losing the partial result discards
+          work that already executed (potentially with side effects). DO NOT classify
+          it as a 500 — abort-on-cancellation is a normal client behavior, not a
+          server failure. For SSR frameworks (Apollo Server, Mercurius, GraphQL Yoga),
+          this rejection propagates up through the request handler and MUST be
+          recognized at the framework boundary.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/AbortedGraphQLExecutionError.ts"
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/Executor.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
 
   - name: subscribe
     import_path: "graphql"
@@ -314,6 +409,236 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  # Added by bc-deepen-contract 2026-06-18 (pass 3 — deepen-stream-1).
+  # Source: graphql@17.0.1 — node_modules/graphql/execution/execute.d.ts lines 56-95,
+  # node_modules/graphql/execution/execute.js lines 162-end, the @defer / @stream RFC
+  # at https://github.com/graphql/graphql-spec/pull/742, and Apollo Router's incremental
+  # delivery docs.
+  - name: experimentalExecuteIncrementally
+    import_path: "graphql"
+    description: >
+      Promise-returning variant of execute() that ALSO supports @defer and @stream
+      incremental delivery directives. Introduced in graphql-js v17 alongside the
+      finalized incremental delivery payload format. Unlike execute(), the resolved
+      value is a DISCRIMINATED UNION: either a single ExecutionResult (when the
+      operation contains no @defer/@stream fields) OR an
+      ExperimentalIncrementalExecutionResults object containing `initialResult` plus
+      an async-iterable `subsequentResults`. Production GraphQL servers that ship
+      @defer / @stream to clients (Apollo Router, GraphQL Yoga, Mercurius) call this
+      function instead of execute().
+    postconditions:
+      # Evidence (v17): node_modules/graphql@17.0.1/execution/execute.d.ts line 93
+      # — returns PromiseOrValue<ExecutionResult | ExperimentalIncrementalExecutionResults>.
+      # Source: node_modules/graphql@17.0.1/execution/incremental/IncrementalExecutor.d.ts
+      # — ExperimentalIncrementalExecutionResults has { initialResult, subsequentResults }
+      # not the flat { errors, data } shape of ExecutionResult.
+      - id: experimental-incremental-result-not-discriminated
+        condition: >
+          experimentalExecuteIncrementally() resolves but the caller treats the result
+          as if it were always a plain ExecutionResult — accesses result.errors and
+          result.data directly, ships the response body to the HTTP client as JSON, and
+          ignores result.initialResult / result.subsequentResults. When the document
+          contains @defer or @stream, the result is the INCREMENTAL shape — the JSON
+          serializer captures only the (undefined) data field, the subsequent payloads
+          never get sent, and the client hangs waiting for deferred fields that the
+          server already produced but discarded.
+        returns: >
+          ExperimentalIncrementalExecutionResults: an object with `initialResult`
+          (InitialIncrementalExecutionResult — has data, hasNext, pending) and
+          `subsequentResults` (AsyncGenerator<SubsequentIncrementalExecutionResult>).
+          The shape is DISTINCT from ExecutionResult — there is no top-level `data` or
+          `errors` field. Naive JSON.stringify of the result drops the iterator.
+        required_handling: >
+          Caller MUST discriminate before serializing. Pattern from the graphql-js
+          docs (execute.d.ts example) and Apollo Router's incremental-delivery layer:
+
+            import { experimentalExecuteIncrementally } from 'graphql';
+
+            const result = await experimentalExecuteIncrementally(args);
+
+            if ('initialResult' in result) {
+              // Incremental delivery path — use multipart/mixed or SSE transport
+              await streamIncrementalResponse(result, reply);
+              return;
+            }
+
+            // Non-incremental path — single response
+            return reply.send(result);
+
+          The `'initialResult' in result` check is the canonical discrimination —
+          ExecutionResult never has this key. For HTTP transports, incremental
+          delivery requires multipart/mixed or text/event-stream — sending the
+          initial result alone is a protocol violation. The `subsequentResults`
+          iterator MUST be consumed or explicitly returned (to allow internal
+          cleanup) — abandoning it leaks a Publisher subscription and the
+          executor's abort cleanup never fires.
+
+          DO NOT call experimentalExecuteIncrementally() for documents you know
+          contain no @defer/@stream — use execute() instead, which has the simpler
+          return type contract.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/execute.ts"
+          - "https://github.com/graphql/graphql-spec/pull/742"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: same AbortedGraphQLExecutionError plumbing as execute(); the Executor
+      # base class wraps both paths. See execute-abort-signal-rejection above for the
+      # full mechanism. Repeated here because callers who only see the incremental
+      # function in their codebase need the contract attached to the function they
+      # actually call.
+      - id: experimental-incremental-abort-signal-rejection
+        condition: >
+          experimentalExecuteIncrementally() is called with args.abortSignal and the
+          signal aborts before either the initial result OR all subsequent payloads
+          have been produced. The returned Promise rejects with
+          AbortedGraphQLExecutionError carrying the partial state — for incremental
+          delivery, the partial state is BOTH the initial-result-so-far AND the
+          stream of payloads emitted prior to the abort. The subsequent iterator is
+          also signalled (its `.throw(reason)` is invoked internally per
+          IncrementalPublisher.js:17) so an active consumer of `subsequentResults`
+          sees a thrown error inside the for-await loop.
+        throws: >
+          AbortedGraphQLExecutionError on the top-level Promise. Concurrently, if a
+          consumer is already iterating `subsequentResults`, the iterator's
+          for-await-of loop throws with the abort reason.
+        required_handling: >
+          Wrap BOTH the awaited call AND the iterator consumption in error handling
+          when using abortSignal with incremental delivery:
+
+            const result = await experimentalExecuteIncrementally({
+              schema, document, rootValue, abortSignal: req.signal,
+            }).catch(err => {
+              if (err instanceof AbortedGraphQLExecutionError) {
+                return null; // client cancelled — drop the response
+              }
+              throw err;
+            });
+            if (!result) return reply.code(499).send();
+
+            if ('initialResult' in result) {
+              try {
+                for await (const payload of result.subsequentResults) {
+                  await reply.sendPayload(payload);
+                }
+              } catch (err) {
+                // abort fired mid-stream — terminate the multipart response
+                await reply.endMultipart();
+                return;
+              }
+            }
+
+          Abandoning the iterator without consuming-or-throwing leaks the
+          IncrementalPublisher's pending work. For request-scoped servers (Apollo
+          Server, Yoga), wire abortSignal to req.signal; for queue-driven workers,
+          wire to the job-deadline AbortController.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/AbortedGraphQLExecutionError.ts"
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/incremental/IncrementalPublisher.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  # Added by bc-deepen-contract 2026-06-18 (pass 3 — deepen-stream-1).
+  # Source: graphql@17.0.1 — node_modules/graphql/execution/legacyIncremental/legacyExecuteIncrementally.d.ts
+  # and the legacyIncremental/BranchingIncrementalExecutor.d.ts type definitions.
+  # Used by Relay's incremental-delivery client (which has not yet migrated from the
+  # legacy payload format) and by graphql-js consumers that target the pre-finalized
+  # @defer/@stream payload shape.
+  - name: legacyExecuteIncrementally
+    import_path: "graphql"
+    description: >
+      Legacy-payload-format variant of experimentalExecuteIncrementally(), introduced
+      in v17 to provide a migration window for clients (notably Relay) that consume
+      the pre-finalized @defer / @stream payload shape. Subsequent payloads identify
+      their location via `path` (and optional `label`) instead of by `id` + `completed`.
+      Same Promise + iterator shape as experimentalExecuteIncrementally; same
+      discrimination requirement; same AbortedGraphQLExecutionError semantics.
+    postconditions:
+      # Evidence (v17): node_modules/graphql@17.0.1/execution/legacyIncremental/
+      # legacyExecuteIncrementally.d.ts line 136 — returns
+      # PromiseOrValue<ExecutionResult | LegacyExperimentalIncrementalExecutionResults>.
+      # The Legacy variant differs from the experimental variant in payload shape only;
+      # the discrimination requirement is identical.
+      - id: legacy-incremental-result-not-discriminated
+        condition: >
+          legacyExecuteIncrementally() resolves but the caller treats the result as a
+          plain ExecutionResult. Same failure mode as experimentalExecuteIncrementally
+          — incremental payloads silently dropped, client hangs. The legacy format is
+          specifically dangerous because callers porting from the experimental
+          function may assume the function names indicate same-shape responses with
+          only formatting differences; in fact both produce a discriminated union
+          with `initialResult` and `subsequentResults`.
+        returns: >
+          LegacyExperimentalIncrementalExecutionResults: { initialResult,
+          subsequentResults } — same top-level shape as the experimental variant,
+          but each payload uses `path` instead of `id` for incremental location.
+        required_handling: >
+          Discriminate exactly as for experimentalExecuteIncrementally:
+
+            const result = await legacyExecuteIncrementally(args);
+            if ('initialResult' in result) {
+              await streamLegacyIncremental(result, reply);
+              return;
+            }
+            return reply.send(result);
+
+          Choose between experimentalExecuteIncrementally and
+          legacyExecuteIncrementally based on the CLIENT — if you control the client
+          and it's modern, use the experimental (now-canonical) variant; if you ship
+          a public GraphQL API that Relay clients consume, use the legacy variant
+          until Relay's incremental layer migrates. DO NOT mix on the same operation
+          — the response shape is determined per-request by which function you call.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/legacyIncremental/legacyExecuteIncrementally.ts"
+          - "https://github.com/graphql/graphql-spec/pull/742"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: legacyIncremental/BranchingIncrementalPublisher.js lines 13-22 — same
+      # abort-signal plumbing as IncrementalPublisher.js (calls subsequentResults.throw
+      # with the abort reason). Same AbortedGraphQLExecutionError on top-level Promise.
+      - id: legacy-incremental-abort-signal-rejection
+        condition: >
+          legacyExecuteIncrementally() is called with args.abortSignal and the signal
+          aborts during execution. Same mechanism as experimental-incremental-abort-
+          signal-rejection: top-level Promise rejects with AbortedGraphQLExecutionError;
+          if subsequentResults is being consumed, its for-await-of throws.
+        throws: >
+          AbortedGraphQLExecutionError on the awaited Promise. The
+          subsequentResults iterator throws inside the for-await consumer with the
+          abort reason.
+        required_handling: >
+          Same as experimentalExecuteIncrementally: wrap both the awaited Promise
+          AND the iterator consumption. See experimental-incremental-abort-signal-
+          rejection for the canonical pattern. For legacy-format servers, the abort
+          handling shape is identical — only the payload identifiers (`path` vs.
+          `id`) differ in successful payloads.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/AbortedGraphQLExecutionError.ts"
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/legacyIncremental/BranchingIncrementalPublisher.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
 edge_cases:
   - id: resolver-error-masking
     description: "GraphQL resolvers should handle errors and return proper GraphQLError instances - uncaught errors expose internal stack traces to clients unless formatError is configured"
@@ -328,11 +653,14 @@ edge_cases:
       incident_cost_range: medium
 
 # Category: api
-# Latest version: 17.0.0
-# Depth-pass updated: 2026-04-16
+# Latest version: 17.0.1
+# Depth-pass updated: 2026-06-18
 # Drift sweep 2026-06-15: extended semver to <18 — v17 keeps the same error model
 # (graphql/execute/subscribe/parse/validate/buildSchema all preserve documented postconditions).
 # v17 changes are: ESM-only packaging, dropped Node 12/17 support, removed deprecated APIs
 # (getOperationRootType, graphql/subscription, *Enum, positional GraphQLError args), new tracing
 # channels feature, partial-result-on-abort enhancement. None invalidate existing postconditions.
-# Future deepen-pass candidate: add postconditions for partial-result-on-abort behavior in v17+.
+# Deepen 2026-06-18 (pass 3, deepen-stream-1): the "future deepen-pass candidate" callout
+# above is now closed — execute() received an abort-signal postcondition, and the v17 incremental
+# delivery executors (experimentalExecuteIncrementally + legacyExecuteIncrementally) are
+# contracted as first-class functions with both discrimination and abort-signal postconditions.
