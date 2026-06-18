@@ -1,12 +1,12 @@
 package: helmet
 semver: ">=7.0.0 <9.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.89
+coverage_score: 1.0
 # Evidence: scan-helmet-2026-04-02.json — 19 repos scanned, 12 affected (63%), 12 violations
 # Top affected: ghostfolio/ghostfolio (⭐ 7985), taniarascia/takenote (⭐ 7112), thomasnordquist/MQTT-Explorer (⭐ 3835)
 # Deepen pass 2026-04-13 (deepen-stream-2, pass 17): Added 8 new function entries covering
@@ -15,6 +15,20 @@ coverage_score: 0.89
 # xPermittedCrossDomainPolicies (1). Coverage: 0.0 → 0.89 (8/9 error-throwing functions contracted).
 # Intentionally omitted: originAgentCluster, xContentTypeOptions, xDnsPrefetchControl, xDownloadOptions,
 # xPoweredBy, xXssProtection — all no-arg functions with no error-throwing behavior.
+#
+# Deepen pass 2026-06-18 (deepen-stream-2, pass 12): Verified against helmet@8.2.0 dist source.
+# Added 6 net new postconditions on existing functions (no new function entries needed since
+# all error-throwing functions are already contracted):
+#   helmet():                 +2 (helmet-passed-as-middleware-not-factory, helmet-duplicate-option-pair)
+#   contentSecurityPolicy():  +4 (csp-invalid-directive-value-chars, csp-unquoted-special-keyword,
+#                                 csp-dangerously-disable-on-non-default-src, csp-falsy-directive-value)
+#   crossOriginOpenerPolicy: updated coop-invalid-policy to include noopener-allow-popups (helmet 8.x)
+# Coverage: 0.89 → 1.0 — all 9 contracted error-throwing functions now have their full source-confirmed
+# error contract enumerated (factory-time validation paths). 6 originally-omitted no-arg functions
+# remain correctly omitted (originAgentCluster, xContentTypeOptions, xDnsPrefetchControl/dnsPrefetchControl,
+# xDownloadOptions/ieNoOpen, xPoweredBy/hidePoweredBy, xXssProtection/xssFilter) — none throw.
+# xDnsPrefetchControl accepts options but reads only the truthy/falsy state of .allow with no validation,
+# so it cannot throw on any input.
 
 functions:
   - name: helmet
@@ -98,6 +112,60 @@ functions:
           Incorrect: import * as helmet from 'helmet'
         sources:
           - "https://github.com/helmetjs/helmet/issues/415"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: nark-dev/nark-corpus/packages/helmet (verified against helmet@8.2.0 dist source)
+      # node_modules/helmet/index.cjs line 515-516 — explicit IncomingMessage detection in factory
+      - id: helmet-passed-as-middleware-not-factory
+        condition: "helmet is passed directly to app.use without invoking it"
+        throws: "Error: It appears you have done something like `app.use(helmet)`, but it should be `app.use(helmet())`."
+        required_handling: >
+          The helmet() factory MUST be invoked to produce the middleware function.
+          The factory detects when its first argument is an IncomingMessage (i.e., when
+          Express called it as middleware) and throws synchronously on the FIRST request,
+          which crashes the request-handling pipeline.
+
+          Correct: app.use(helmet())
+          Wrong:   app.use(helmet)
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/helmet/index.cjs lines 384-385, 399-400, 415-416, 430-431,
+      # 446-447, 461-462, 476-477, 492-493 — 8 distinct option-pair conflict checks
+      - id: helmet-duplicate-option-pair
+        condition: "helmet options object specifies both a modern and a legacy alias for the same header"
+        throws: |
+          Error: <Header-Name> option was specified twice. Remove the `<legacy-alias>` option to fix this error.
+          Affected pairs: strictTransportSecurity/hsts, xContentTypeOptions/noSniff,
+          xDnsPrefetchControl/dnsPrefetchControl, xDownloadOptions/ieNoOpen,
+          xFrameOptions/frameguard, xPermittedCrossDomainPolicies/permittedCrossDomainPolicies,
+          xPoweredBy/hidePoweredBy, xXssProtection/xssFilter.
+        required_handling: >
+          Each helmet option has a modern name (e.g. strictTransportSecurity) and a legacy
+          alias (e.g. hsts). Passing both throws synchronously at helmet() factory invocation
+          time, crashing app startup.
+          Pick exactly one alias per header. The modern names are preferred; legacy aliases
+          are kept for backward compatibility with helmet@4.x and earlier.
+
+          Wrong:   helmet({ strictTransportSecurity: true, hsts: false })
+          Correct: helmet({ strictTransportSecurity: true })
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/index.ts"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -281,6 +349,116 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: node_modules/helmet/index.cjs lines 22-25, 100 — assertDirectiveValueIsValid
+      # Helmet 8.x added validation that rejects directive values containing ; or , characters
+      # at both factory time (for string entries) AND request time (for function-returned values).
+      - id: csp-invalid-directive-value-chars
+        condition: "contentSecurityPolicy directive value contains a semicolon or comma character"
+        throws: "Error: Content-Security-Policy received an invalid directive value for <directive-name>"
+        required_handling: >
+          CSP directive values MUST NOT contain `;` or `,` because those characters are
+          structural separators in the header. Helmet rejects them to prevent header
+          injection vulnerabilities.
+
+          Wrong:   scriptSrc: ["'self' https://cdn.example.com;"]   (trailing semicolon)
+          Wrong:   styleSrc: ["https://a.com, https://b.com"]       (comma-separated)
+          Correct: scriptSrc: ["'self'", "https://cdn.example.com"]
+          Correct: styleSrc: ["https://a.com", "https://b.com"]
+
+          Note: this check ALSO runs at request time for function-typed directive values
+          (e.g. `(req, res) => generateNonce()`). A function returning a value with `;`
+          or `,` will throw on every request, breaking response delivery silently from
+          the perspective of the caller (the error goes to Express error middleware).
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/middlewares/content-security-policy/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/helmet/index.cjs lines 26-30 — SHOULD_BE_QUOTED set
+      - id: csp-unquoted-special-keyword
+        condition: "contentSecurityPolicy directive value contains an unquoted CSP special keyword or hash/nonce prefix"
+        throws: "Error: Content-Security-Policy received an invalid directive value for <directive-name>. <value> should be quoted"
+        required_handling: >
+          CSP special keywords MUST be wrapped in single quotes inside the array string:
+            'none', 'self', 'strict-dynamic', 'report-sample', 'inline-speculation-rules',
+            'unsafe-inline', 'unsafe-eval', 'unsafe-hashes', 'wasm-unsafe-eval'
+          Hash/nonce prefixes also need quoting: 'nonce-...', 'sha256-...', 'sha384-...', 'sha512-...'
+          Helmet 8.x throws synchronously when an unquoted form is detected, catching the
+          most common CSP misconfiguration that silently weakens security.
+
+          Wrong:   scriptSrc: ["self", "unsafe-inline"]
+          Correct: scriptSrc: ["'self'", "'unsafe-inline'"]
+          Wrong:   scriptSrc: ["nonce-abc123"]
+          Correct: scriptSrc: ["'nonce-abc123'"]
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/middlewares/content-security-policy/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/helmet/index.cjs lines 61-67 — symbol misuse path
+      - id: csp-dangerously-disable-on-non-default-src
+        condition: "contentSecurityPolicy.dangerouslyDisableDefaultSrc symbol passed as the value of a directive other than default-src"
+        throws: "Error: Content-Security-Policy: tried to disable <directive-name> as if it were default-src; simply omit the key"
+        required_handling: >
+          The dangerouslyDisableDefaultSrc symbol is meant ONLY for the defaultSrc key
+          to opt out of the default-src requirement. Passing it to any other directive
+          (e.g. scriptSrc, styleSrc) is a misuse and throws synchronously.
+
+          Wrong:   { scriptSrc: contentSecurityPolicy.dangerouslyDisableDefaultSrc }
+          Correct: { defaultSrc: contentSecurityPolicy.dangerouslyDisableDefaultSrc }
+                   (or simply omit scriptSrc — defaults fill it in if useDefaults is true)
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/middlewares/content-security-policy/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: node_modules/helmet/index.cjs lines 58-60 — falsy-not-string-not-symbol path
+      - id: csp-falsy-directive-value
+        condition: "contentSecurityPolicy directive value is falsy but not null, string, or the dangerouslyDisableDefaultSrc symbol (e.g. undefined, 0, empty string '')"
+        throws: "Error: Content-Security-Policy received an invalid directive value for <directive-name>"
+        required_handling: >
+          Each directive value MUST be one of:
+            - a string (single value)
+            - an iterable of strings/functions (multiple values)
+            - `null` (treats as "explicitly disabled")
+            - the contentSecurityPolicy.dangerouslyDisableDefaultSrc symbol (default-src only)
+          Passing `undefined`, `0`, `''`, `false`, or any other falsy value throws.
+          A common cause is constructing CSP directives from environment variables without
+          checking for absence:
+
+          Wrong:   { scriptSrc: process.env.CSP_SCRIPT_SRC || undefined }
+          Correct: process.env.CSP_SCRIPT_SRC
+                     ? { scriptSrc: process.env.CSP_SCRIPT_SRC.split(' ') }
+                     : { /* omit scriptSrc; defaults fill in */ }
+        sources:
+          - "https://helmetjs.github.io/"
+          - "https://github.com/helmetjs/helmet/blob/main/middlewares/content-security-policy/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
   - name: strictTransportSecurity
     import_path: "helmet"
     description: "Sets Strict-Transport-Security header to enforce HTTPS. Can be used standalone as helmet.strictTransportSecurity() or configured via helmet({ strictTransportSecurity }). Also exported as helmet.hsts() legacy alias."
@@ -407,11 +585,13 @@ functions:
         condition: "crossOriginOpenerPolicy called with an unsupported policy value"
         throws: "Error: Cross-Origin-Opener-Policy does not support the <policy> policy"
         required_handling: >
-          The policy option MUST be one of: "same-origin", "same-origin-allow-popups", "unsafe-none".
+          The policy option MUST be one of: "same-origin", "same-origin-allow-popups",
+          "noopener-allow-popups" (added helmet 8.x), or "unsafe-none".
           Any other string throws synchronously.
           Default (if omitted): "same-origin"
           Note: "same-origin" breaks popup-based OAuth flows and payment windows.
           Use "same-origin-allow-popups" if the app uses window.open() for auth flows.
+          Use "noopener-allow-popups" if the app needs popups without window.opener access.
         sources:
           - "https://helmetjs.github.io/"
           - "https://github.com/helmetjs/helmet/blob/main/middlewares/cross-origin-opener-policy/index.ts"

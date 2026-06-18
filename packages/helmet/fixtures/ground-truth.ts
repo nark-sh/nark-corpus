@@ -287,4 +287,184 @@ function setupCspStandaloneWithCatch() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. helmet() misused — passed directly instead of invoked — without try-catch
+// (deepen pass 2026-06-18: helmet-passed-as-middleware-not-factory)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupHelmetMisusedAsMiddleware() {
+  // NOTE: This call is NOT a helmet() invocation — just passing the function
+  // reference. The scanner's helmet detector targets helmet() factory calls,
+  // not bare references. New postcondition helmet-passed-as-middleware-not-factory
+  // requires a new scanner rule (queued as concern). Omitting SHOULD_FIRE
+  // annotation here intentionally — see upgrade-concerns.json.
+  // @ts-expect-error - intentional misuse for test
+  app.use(helmet);
+}
+
+function setupHelmetMisusedAsMiddlewareWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: misuse wrapped in try-catch (even though Express won't
+    // invoke this synchronously, the registration call itself does not throw —
+    // this is a defensive pattern test)
+    // @ts-expect-error - intentional misuse for test
+    app.use(helmet);
+  } catch (error) {
+    console.error('Helmet misuse error:', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. helmet() with duplicate option-pair (modern + legacy alias both set)
+// (deepen pass 2026-06-18: helmet-duplicate-option-pair)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupHelmetDuplicateOptionPairNoCatch() {
+  // Both strictTransportSecurity and hsts specified would trigger the specific
+  // helmet-duplicate-option-pair error at runtime. Scanner currently fires the
+  // generic config-validation-error for any unwrapped helmet() call.
+  // SHOULD_FIRE: config-validation-error — helmet() factory called without try-catch
+  app.use(helmet({
+    // @ts-expect-error - intentional duplicate-pair misuse for test
+    strictTransportSecurity: true,
+    hsts: false,
+  }));
+}
+
+function setupHelmetDuplicateOptionPairWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: duplicate-pair wrapped in try-catch
+    app.use(helmet({
+      // @ts-expect-error - intentional duplicate-pair misuse for test
+      xFrameOptions: { action: 'deny' },
+      frameguard: { action: 'sameorigin' },
+    }));
+  } catch (error) {
+    console.error('Helmet duplicate option:', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. contentSecurityPolicy directive value with invalid chars (; or ,)
+// (deepen pass 2026-06-18: csp-invalid-directive-value-chars)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupCspInvalidDirectiveValueCharsNoCatch() {
+  // Specific helmet 8.x csp-invalid-directive-value-chars detector (semicolon/comma
+  // in value) requires a new scanner rule (queued).
+  // SHOULD_FIRE: csp-invalid-directive-name — contentSecurityPolicy() factory call
+  app.use(helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self' https://cdn.example.com;"],
+    },
+  }));
+}
+
+function setupCspInvalidDirectiveValueCharsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: value validation wrapped in try-catch
+    app.use(helmet.contentSecurityPolicy({
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["https://a.com, https://b.com"],
+      },
+    }));
+  } catch (error) {
+    console.error('CSP invalid value:', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. contentSecurityPolicy unquoted special keyword
+// (deepen pass 2026-06-18: csp-unquoted-special-keyword)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupCspUnquotedSpecialKeywordNoCatch() {
+  // Specific csp-unquoted-special-keyword detector requires a new scanner rule (queued).
+  // SHOULD_FIRE: csp-invalid-directive-name — contentSecurityPolicy() factory call
+  app.use(helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ['self'],
+      scriptSrc: ['self', 'unsafe-inline'],
+    },
+  }));
+}
+
+function setupCspUnquotedSpecialKeywordWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: unquoted keyword wrapped in try-catch
+    app.use(helmet.contentSecurityPolicy({
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ['nonce-abc123'],
+      },
+    }));
+  } catch (error) {
+    console.error('CSP unquoted keyword:', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. contentSecurityPolicy.dangerouslyDisableDefaultSrc misuse
+// (deepen pass 2026-06-18: csp-dangerously-disable-on-non-default-src)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupCspDangerouslyDisableMisuseNoCatch() {
+  // Specific csp-dangerously-disable-on-non-default-src detector requires a new scanner rule (queued).
+  // SHOULD_FIRE: csp-invalid-directive-name — contentSecurityPolicy() factory call
+  app.use(helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: helmet.contentSecurityPolicy.dangerouslyDisableDefaultSrc as any,
+    },
+  }));
+}
+
+function setupCspDangerouslyDisableMisuseWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: misuse wrapped in try-catch
+    app.use(helmet.contentSecurityPolicy({
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: helmet.contentSecurityPolicy.dangerouslyDisableDefaultSrc as any,
+      },
+    }));
+  } catch (error) {
+    console.error('CSP dangerously-disable misuse:', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. contentSecurityPolicy falsy directive value
+// (deepen pass 2026-06-18: csp-falsy-directive-value)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setupCspFalsyDirectiveValueNoCatch() {
+  // Specific csp-falsy-directive-value detector requires a new scanner rule (queued).
+  // SHOULD_FIRE: csp-invalid-directive-name — contentSecurityPolicy() factory call
+  app.use(helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"],
+      // @ts-expect-error - intentional falsy value for test
+      scriptSrc: process.env.CSP_SCRIPT_SRC || undefined,
+    },
+  }));
+}
+
+function setupCspFalsyDirectiveValueWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: falsy value wrapped in try-catch
+    app.use(helmet.contentSecurityPolicy({
+      directives: {
+        defaultSrc: ["'self'"],
+        // @ts-expect-error - intentional falsy value for test
+        scriptSrc: '',
+      },
+    }));
+  } catch (error) {
+    console.error('CSP falsy value:', error);
+  }
+}
+
 export { app };
