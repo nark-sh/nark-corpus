@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-18 — deepen pass — coverage 77% → 81%
+
+- **Profile:** `packages/ethers/contract.yaml`
+- **Functions added:** Signer.populateTransaction (1 total)
+- **Postconditions added:** 4 (populatetransaction-no-provider, -chainid-mismatch, -mixed-fee-fields, -network-fee-model-unsupported)
+- **Functions intentionally omitted this pass:** none new — previously-omitted list unchanged (read-only GETs, ENS utilities, sync-wrapped-as-async crypto)
+- **Scanner concerns queued:** 2 (`concern-20260618-ethers-deepen-1`, `concern-20260618-ethers-deepen-2`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - `lib.esm/providers/abstract-signer.js` populateTransaction() — assertArgument / assert calls (source-level evidence for all 4 postconditions)
+  - https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction
+  - https://docs.ethers.org/v6/api/providers/#Signer
+  - https://docs.ethers.org/v6/api/providers/#Provider-getFeeData
+  - https://docs.ethers.org/v6/api/utils/errors/#UnsupportedOperationError
+  - https://eips.ethereum.org/EIPS/eip-1559
+- **Verified by:** bc-deepen-contract (pass on 2026-06-18T19:00:00Z, deepen-stream-2 pass 4)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** ethers@6.17.0

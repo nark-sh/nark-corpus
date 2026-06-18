@@ -5,6 +5,7 @@
  * Updated by deepen-stream-2 pass 7 on 2026-04-16.
  * Updated by deepen-stream-2 pass 8 on 2026-04-17.
  * Updated by deepen-stream-1 pass 4 on 2026-06-12 (+wallet.signTransaction, +wallet.authorize).
+ * Updated by deepen-stream-2 pass 4 on 2026-06-18 (+Signer.populateTransaction).
  *
  * Postconditions covered:
  *  - wait-transaction-replaced (TransactionResponse.wait)
@@ -34,6 +35,10 @@
  *  - signtransaction-invalid-transaction-fields (wallet.signTransaction)
  *  - authorize-no-provider-for-auto-fill (wallet.authorize)
  *  - authorize-invalid-delegate-address (wallet.authorize)
+ *  - populatetransaction-no-provider (Signer.populateTransaction)
+ *  - populatetransaction-chainid-mismatch (Signer.populateTransaction)
+ *  - populatetransaction-mixed-fee-fields (Signer.populateTransaction)
+ *  - populatetransaction-network-fee-model-unsupported (Signer.populateTransaction)
  */
 
 import { ethers, isError, Wallet, ContractFactory, BaseContract, BrowserProvider, JsonRpcProvider } from 'ethers';
@@ -616,6 +621,79 @@ async function authorizeDelegationWithErrorHandling(
     if (isError(error, 'UNSUPPORTED_OPERATION')) {
       throw new Error(
         'Wallet has no provider attached and chainId/nonce were not supplied -- attach a provider or pass both fields explicitly'
+      );
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// Signer.populateTransaction — added 2026-06-18 (deepen-stream-2 pass 4)
+// ============================================================
+
+// @expect-violation: populatetransaction-no-provider
+// @expect-violation: populatetransaction-chainid-mismatch
+// @expect-violation: populatetransaction-mixed-fee-fields
+// @expect-violation: populatetransaction-network-fee-model-unsupported
+async function relayerPopulateTransactionMissingErrorHandling(
+  signer: ethers.Signer,
+  to: string,
+  value: bigint
+) {
+  // No try-catch — common relayer / MEV / cold-wallet anti-pattern.
+  // Any of: signer has no provider (UNSUPPORTED_OPERATION), chainId mismatch
+  // (INVALID_ARGUMENT), gasPrice mixed with maxFeePerGas (INVALID_ARGUMENT),
+  // or network fee-model mismatch (UNSUPPORTED_OPERATION) will surface as an
+  // un-handled promise rejection that kills the relayer worker mid-batch.
+  const populated = await signer.populateTransaction({
+    to,
+    value,
+    chainId: 1, // hard-coded mainnet — fails on testnet providers
+    gasPrice: 20_000_000_000n, // legacy fee
+    maxFeePerGas: 50_000_000_000n, // EIP-1559 fee — mixing these throws
+  });
+  return populated;
+}
+
+// @expect-clean
+async function relayerPopulateTransactionWithErrorHandling(
+  signer: ethers.Signer,
+  to: string,
+  value: bigint
+) {
+  try {
+    // Let ethers auto-detect chainId + fee model: omit chainId and pick one fee
+    // mode. For broad compatibility, omit all fee fields and let the provider
+    // populate via getFeeData().
+    const populated = await signer.populateTransaction({
+      to,
+      value,
+    });
+    return populated;
+  } catch (error) {
+    if (isError(error, 'UNSUPPORTED_OPERATION')) {
+      // Either: no provider attached, OR network doesn't support requested fee model.
+      const op = (error as { operation?: string }).operation;
+      if (op === 'getGasPrice') {
+        // Network is EIP-1559 only — retry with type=2.
+        throw new Error('Network requires EIP-1559 — set tx.type=2 and remove gasPrice');
+      }
+      if (op === 'populateTransaction') {
+        // Network is legacy only — retry with type=0 and gasPrice.
+        throw new Error('Network does not support EIP-1559 — set tx.type=0 and gasPrice');
+      }
+      throw new Error('Signer has no provider attached — call signer.connect(provider) first');
+    }
+    if (isError(error, 'INVALID_ARGUMENT')) {
+      // Either chainId mismatch or mixed fee fields.
+      const arg = (error as { argument?: string }).argument;
+      if (arg === 'tx.chainId') {
+        throw new Error(
+          `Transaction chainId does not match provider network — clear tx.chainId or switch providers`
+        );
+      }
+      throw new Error(
+        `Transaction has inconsistent fields (probably gasPrice + maxFeePerGas) — pick one fee mode`
       );
     }
     throw error;

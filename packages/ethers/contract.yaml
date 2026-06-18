@@ -1211,6 +1211,171 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: Signer.populateTransaction
+    import_path: "ethers"
+    description: >
+      Prepares a transaction for sending by populating missing fields: resolves to and
+      from addresses, populates nonce via signer.getNonce("pending"), populates gasLimit
+      via signer.estimateGas(tx), populates chainId via signer.provider.getNetwork(),
+      and populates type plus relevant fee data (gasPrice for legacy, maxFeePerGas /
+      maxPriorityFeePerGas for EIP-1559). The canonical pre-signing pipeline used by
+      sendTransaction internally, but also called directly in offline-signing flows,
+      meta-transaction relayers, MEV bundlers, hardware-wallet workflows, and any
+      scenario that constructs a fully-populated transaction object before sign.
+      Distinct from populateCall (which only resolves to/from for read-only call /
+      estimateGas) — populateTransaction additionally fetches nonce, gasLimit, chainId,
+      and fee data, making 3+ RPC roundtrips. AbstractSigner.populateTransaction is
+      the base implementation inherited by Wallet, JsonRpcSigner, NonceManager, and
+      every concrete Signer/Wallet.
+    postconditions:
+      # Evidence: lib.esm/providers/abstract-signer.js -- async populateTransaction(tx)
+      #   const provider = checkProvider(this, "populateTransaction");
+      #     -> throws UNSUPPORTED_OPERATION when this.provider is null
+      #   if (pop.chainId != null) {
+      #     const chainId = getBigInt(pop.chainId);
+      #     assertArgument(chainId === network.chainId, "transaction chainId mismatch", "tx.chainId", tx.chainId);
+      #   }
+      #   const hasEip1559 = (pop.maxFeePerGas != null || pop.maxPriorityFeePerGas != null);
+      #   if (pop.gasPrice != null && (pop.type === 2 || hasEip1559)) {
+      #     assertArgument(false, "eip-1559 transaction do not support gasPrice", "tx", tx);
+      #   }
+      #   else if ((pop.type === 0 || pop.type === 1) && hasEip1559) {
+      #     assertArgument(false, "pre-eip-1559 transaction do not support maxFeePerGas/maxPriorityFeePerGas", "tx", tx);
+      #   }
+      #   assert(feeData.gasPrice != null, "network does not support gasPrice", "UNSUPPORTED_OPERATION", { operation: "getGasPrice" });
+      #   assert(!hasEip1559, "network does not support EIP-1559", "UNSUPPORTED_OPERATION", { operation: "populateTransaction" });
+      # Evidence: https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction
+      # Evidence: https://docs.ethers.org/v6/api/providers/#Signer
+      - id: populatetransaction-no-provider
+        condition: >
+          signer.populateTransaction(tx) is called without a try-catch and the Signer
+          has no provider attached. Internally populateTransaction calls
+          checkProvider(this, "populateTransaction") which throws UNSUPPORTED_OPERATION
+          when this.provider is null — and it must call provider.getNetwork() to fetch
+          chainId, provider.getTransactionCount() for nonce, provider.estimateGas() for
+          gasLimit, and provider.getFeeData() for fee fields. All four are unavoidable
+          unless every field is pre-populated. Common in cold-wallet flows that
+          construct `new Wallet(pk)` without a provider intending to sign offline, then
+          accidentally invoke populateTransaction instead of just Transaction.from(...).
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION', error.operation === 'populateTransaction')"
+        required_handling: >
+          Caller MUST wrap signer.populateTransaction() in try-catch and either (a)
+          attach a provider via signer.connect(provider) or new Wallet(pk, provider)
+          before calling, or (b) skip populateTransaction entirely and use
+          Transaction.from(tx) directly when every field (nonce, gasLimit, chainId,
+          fee data) is already populated by the caller (typical for relayer flows
+          where the orchestrator pre-computes everything). Use
+          isError(error, 'UNSUPPORTED_OPERATION') to detect.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction"
+          - "https://docs.ethers.org/v6/api/utils/errors/#UnsupportedOperationError"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: populatetransaction-chainid-mismatch
+        condition: >
+          signer.populateTransaction({ chainId, ... }) is called without a try-catch
+          and the supplied tx.chainId does not match the connected provider's network
+          chainId. ethers refuses to populate a transaction that would be signed for
+          a different chain than the provider is connected to — a safety check that
+          prevents accidentally broadcasting a mainnet-signed transaction to a testnet
+          provider (or vice versa) and prevents replay-attack confusion. Common in
+          multi-chain dApps that switch providers but forget to clear stale tx.chainId
+          values from the request builder.
+        throws: "EthersError with code INVALID_ARGUMENT and argument 'tx.chainId' (error.code === 'INVALID_ARGUMENT', error.argument === 'tx.chainId')"
+        required_handling: >
+          Caller MUST wrap signer.populateTransaction() in try-catch and handle
+          INVALID_ARGUMENT. Either omit tx.chainId entirely so ethers fills it from
+          provider.getNetwork() (preferred), or verify it matches the active provider's
+          chainId before calling: `const network = await signer.provider.getNetwork();
+          tx.chainId = network.chainId;`. Use isError(error, 'INVALID_ARGUMENT') and
+          check error.argument === 'tx.chainId' to distinguish from other invalid-field
+          rejections. Silent swallowing causes wrong-chain transaction attempts that
+          fail at broadcast with cryptic "unknown chain" errors.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: populatetransaction-mixed-fee-fields
+        condition: >
+          signer.populateTransaction(tx) is called without a try-catch and tx mixes
+          pre-EIP-1559 fee fields (gasPrice) with EIP-1559 fee fields (maxFeePerGas,
+          maxPriorityFeePerGas) — or sets tx.type=0/1 alongside maxFeePerGas /
+          maxPriorityFeePerGas. ethers raises INVALID_ARGUMENT with one of two
+          distinct messages: "eip-1559 transaction do not support gasPrice" when
+          gasPrice + (type=2 or any 1559 field) is present, or "pre-eip-1559 transaction
+          do not support maxFeePerGas/maxPriorityFeePerGas" when type=0 or type=1 is
+          set with a 1559 field. Both are common when copy-pasting tx params across
+          legacy and modern chains, or when a UI lets the user toggle fee mode
+          without clearing the other mode's fields.
+        throws: "EthersError with code INVALID_ARGUMENT and argument 'tx' (error.code === 'INVALID_ARGUMENT')"
+        required_handling: >
+          Caller MUST wrap signer.populateTransaction() in try-catch and handle
+          INVALID_ARGUMENT. Either clear all fee fields and let ethers auto-detect
+          (omit gasPrice, maxFeePerGas, maxPriorityFeePerGas, and type — preferred
+          for cross-chain code), or explicitly pick one fee mode and clear the other:
+          `delete tx.gasPrice; tx.type = 2;` for EIP-1559 chains, or
+          `delete tx.maxFeePerGas; delete tx.maxPriorityFeePerGas; tx.type = 0;`
+          for legacy chains. Use isError(error, 'INVALID_ARGUMENT') to detect.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction"
+          - "https://eips.ethereum.org/EIPS/eip-1559"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: populatetransaction-network-fee-model-unsupported
+        condition: >
+          signer.populateTransaction(tx) is called without a try-catch on a network
+          whose fee model does not match the requested transaction type. Two distinct
+          UNSUPPORTED_OPERATION assertions fire here: (1) when tx.type is 0 or 1
+          (legacy) but provider.getFeeData() returns null gasPrice (an EIP-1559-only
+          chain like post-Merge mainnet test fixtures), ethers throws "network does not
+          support gasPrice" with operation='getGasPrice'; (2) when the tx requests
+          EIP-1559 fee fields but provider.getFeeData() returns null maxFeePerGas
+          (legacy chains like BNB Chain or older testnets), ethers throws "network
+          does not support EIP-1559" with operation='populateTransaction'. Common
+          when a multi-chain dApp assumes EIP-1559 is universal and ships a single
+          tx-builder configured for type-2 transactions across all chains.
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION', error.operation === 'getGasPrice' or 'populateTransaction')"
+        required_handling: >
+          Caller MUST wrap signer.populateTransaction() in try-catch and handle
+          UNSUPPORTED_OPERATION. Branch on error.operation: 'getGasPrice' means
+          retry with tx.type=2 and EIP-1559 fee fields; 'populateTransaction' means
+          retry with tx.type=0 and gasPrice from provider.getFeeData(). Better,
+          query provider.getFeeData() once at startup per chain and configure the
+          tx-builder per chain's actual fee model rather than assuming EIP-1559.
+          Use isError(error, 'UNSUPPORTED_OPERATION') to detect.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateTransaction"
+          - "https://docs.ethers.org/v6/api/providers/#Provider-getFeeData"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -1245,11 +1410,13 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-06-12"
+  last_verified: "2026-06-18"
   evidence_quality: confirmed
-  coverage_score: 0.77
-  # 20 contracted functions / 26 total async-callable (11 intentionally omitted)
-  # Coverage: 20/26 = 0.77 (effective: 20 contracted of 15 non-omitted surface = well-covered)
+  coverage_score: 0.81
+  # 21 contracted functions / 26 total async-callable (~5 effective non-omitted)
+  # Coverage: 21/26 = 0.81 raw (effective contracted/non-omitted surface = 21/21 = 1.0)
+  # Note: omitted_count drifted between contract.yaml header (11) and deepen-index (13);
+  # canonical list is in metadata comment below.
   # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
   #   provider.call, provider.broadcastTransaction, Wallet.fromEncryptedJson,
   #   provider.waitForTransaction, provider.getLogs
@@ -1260,6 +1427,13 @@ metadata:
   # Added deepen-stream-2 pass 8 (2026-04-17): Contract.method, provider.send
   # Added deepen-stream-1 pass 4 (2026-06-12): wallet.signTransaction (offline signing),
   #   wallet.authorize (EIP-7702 / Pectra, ethers v6.16.0+)
+  # Added deepen-stream-2 pass 4 (2026-06-18, ethers@6.17.0): Signer.populateTransaction
+  #   — the canonical pre-signing pipeline used by relayer / MEV / cold-wallet flows.
+  #   4 postconditions: no-provider (UNSUPPORTED_OPERATION), chainid-mismatch
+  #   (INVALID_ARGUMENT), mixed-fee-fields (INVALID_ARGUMENT — two distinct messages),
+  #   network-fee-model-unsupported (UNSUPPORTED_OPERATION — both getGasPrice and
+  #   populateTransaction operation variants). Evidence:
+  #   lib.esm/providers/abstract-signer.js populateTransaction() assertArgument / assert calls.
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR
