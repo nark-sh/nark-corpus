@@ -2,11 +2,11 @@ package: '@modelcontextprotocol/sdk'
 semver: ^1.0.0
 contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-06-12'
+last_verified: '2026-06-18'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.79  # 34 contracted / 43 total async-callable (was 30/39 = 0.77; +4 this pass: fetchToken, discoverOAuthServerInfo, experimental.tasks.createMessageStream, experimental.tasks.elicitInputStream — all net-new in v1.20+/v1.29)
+coverage_score: 0.86  # 37 contracted / 43 total async-callable (was 34/43 = 0.79; +3 this pass: takeResult, toArrayAsync, experimental.tasks.requestStream — promoted from omitted + net-new helpers)
 # Pass 1 deepen-stream-2 2026-04-16: +6 functions (WebSocketClientTransport.start, SSEClientTransport.start,
 # SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode,
 # ProxyOAuthServerProvider.exchangeRefreshToken). Coverage: 0.72 → 0.74.
@@ -2487,6 +2487,207 @@ functions:
             }
         sources:
           - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/server.ts"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: takeResult
+    import_path: "@modelcontextprotocol/sdk/shared/responseMessage.js"
+    description: >
+      Canonical helper for consuming an experimental.tasks AsyncGenerator.
+      Iterates the generator and returns the first 'result' message payload,
+      or throws the first 'error' message. Used to convert a streaming response
+      back into a Promise-shaped API. Async helper — every call site is an
+      await, and every await can throw. Added in SDK v1.20+ alongside the
+      experimental.tasks.*Stream() family. The most common idiom for consuming
+      callToolStream / createMessageStream / elicitInputStream / requestStream.
+    postconditions:
+      # Evidence: shared/responseMessage.js source:
+      #   async function takeResult(it) {
+      #     for await (const o of it) {
+      #       if (o.type === 'result') return o.result;
+      #       else if (o.type === 'error') throw o.error;
+      #     }
+      #     throw new Error('No result in stream.');
+      #   }
+      # Three throw paths:
+      #   1. 'error' ResponseMessage in the stream — throws the embedded McpError
+      #   2. Stream ends with no 'result' message — throws Error('No result in stream.')
+      #   3. Iteration error (transport drop, server crash) — propagates from for-await
+      - id: take-result-missing-error-handling
+        condition: >
+          A call to takeResult(stream) is awaited without try/catch and without
+          an upstream catch handler. takeResult MUST throw whenever the source
+          generator yields an 'error' ResponseMessage or terminates without a
+          'result'. The error type is the embedded McpError (carrying ErrorCode
+          and message from the server) OR a plain Error('No result in stream.')
+          when the stream ended prematurely (transport closed mid-task, server
+          crashed, network drop). Uncaught, this becomes an unhandled promise
+          rejection that crashes the worker / Express handler / event loop.
+        throws: >
+          McpError (from the 'error' ResponseMessage payload, code + data
+          from server) OR Error('No result in stream.') when the generator
+          terminates without yielding a result. Iteration-level errors from
+          the source stream propagate unchanged.
+        required_handling: >
+          Always wrap takeResult() in try/catch when consuming a tool/sampling
+          stream. The 'No result in stream.' case is real: when the transport
+          drops mid-iteration (StreamableHTTP session timeout, Stdio pipe
+          close), the generator returns without throwing a network error but
+          also without yielding 'result', and takeResult surfaces the truncation
+          with that exact message:
+            import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
+            try {
+              const result = await takeResult(
+                client.experimental.tasks.callToolStream({ name: 'search', arguments: {} })
+              );
+              return result.content;
+            } catch (err) {
+              if (err instanceof McpError) {
+                logger.error('Tool returned error', { code: err.code });
+              } else if (err.message === 'No result in stream.') {
+                logger.error('Stream closed without result — likely transport drop');
+              }
+              throw err;
+            }
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: toArrayAsync
+    import_path: "@modelcontextprotocol/sdk/shared/responseMessage.js"
+    description: >
+      Canonical helper that collects ALL messages yielded by an experimental.tasks
+      AsyncGenerator into an array. Used for debugging, testing, and use cases
+      where the consumer wants to inspect every taskCreated / taskStatus event
+      alongside the terminal result/error. Async helper — every call site is an
+      await. Unlike takeResult(), does NOT throw on 'error' messages — the
+      caller must inspect the returned array. Source iteration errors still
+      propagate.
+    postconditions:
+      # Evidence: shared/responseMessage.js source:
+      #   async function toArrayAsync(it) {
+      #     const arr = [];
+      #     for await (const o of it) { arr.push(o); }
+      #     return arr;
+      #   }
+      # toArrayAsync does NOT throw on 'error' ResponseMessages — it stores them
+      # in the array. But iteration errors (transport drop, network) propagate
+      # from the for-await loop.
+      - id: to-array-async-missing-error-handling
+        condition: >
+          A call to toArrayAsync(stream) is awaited without try/catch. While
+          toArrayAsync does NOT throw on 'error' ResponseMessages in the stream
+          (those land in the returned array), it DOES propagate any iteration
+          error from the underlying AsyncGenerator — transport closure mid-task,
+          parse errors on malformed server messages, McpError thrown during
+          stream setup. Uncaught, this becomes an unhandled promise rejection.
+          Additionally: callers using toArrayAsync MUST inspect the returned
+          array for 'error' messages before treating it as success.
+        throws: >
+          Propagates errors from the source AsyncGenerator (transport drop,
+          parse errors, McpError on setup). Does NOT throw on 'error' messages
+          within the stream — those land in the returned array.
+        required_handling: >
+          Wrap toArrayAsync() in try/catch AND inspect the returned array for
+          'error' entries before treating the result as success:
+            import { toArrayAsync } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
+            try {
+              const messages = await toArrayAsync(
+                client.experimental.tasks.callToolStream({ name: 'search', arguments: {} })
+              );
+              const errorMsg = messages.find(m => m.type === 'error');
+              if (errorMsg) {
+                throw errorMsg.error;
+              }
+              const resultMsg = messages.find(m => m.type === 'result');
+              if (!resultMsg) {
+                throw new Error('Stream produced no result');
+              }
+              return resultMsg.result;
+            } catch (err) {
+              logger.error('Tool stream collection failed', err);
+              throw err;
+            }
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: experimental.tasks.requestStream
+    import_path: "@modelcontextprotocol/sdk/experimental/tasks/client.js"
+    description: >
+      Client-side experimental generic-request stream. Returns an AsyncGenerator
+      that yields ResponseMessage<T> items for ANY JSON-RPC request (not just
+      tool calls). Sibling to callToolStream() but accepts an arbitrary
+      ClientRequest and a Zod resultSchema for validation. Used for custom MCP
+      methods or third-party extensions that want task-augmented streaming
+      semantics. Same termination guarantee as callToolStream — generator ends
+      with 'result' or 'error'. Same silent-error-drop failure mode if the
+      consuming loop doesn't branch on message.type === 'error'.
+    postconditions:
+      # Evidence: experimental/tasks/client.js requestStream() delegates to
+      # this._client.requestStream(). Same ResponseMessage iteration contract
+      # as callToolStream. shared/responseMessage.js takeResult() applies
+      # identically. The resultSchema is a Zod schema — schema validation
+      # failures surface as the 'error' ResponseMessage, NOT a synchronous
+      # ZodError throw, because validation happens inside the protocol layer.
+      - id: request-stream-error-message-not-handled
+        condition: >
+          The AsyncGenerator returned by requestStream() yields a ResponseMessage
+          with type === 'error' but the consuming for-await loop does not branch
+          on message.type. The 'error' message contains the actual MCP error
+          (McpError with ErrorCode from the server, schema validation failure
+          from the resultSchema, or timeout from RequestOptions.timeout) but the
+          loop continues iterating. Generic custom-method consumers often write
+          a for-await loop that only checks message.type === 'result', dropping
+          all errors silently. Downstream code receives undefined and behaves
+          as if the request succeeded with empty data.
+        throws: >
+          Does NOT throw automatically from the for-await loop. The 'error'
+          ResponseMessage carries the actual Error in its .error field. The
+          consumer must explicitly branch on message.type or use takeResult()
+          which auto-throws. Iteration errors from the underlying transport
+          propagate normally.
+        required_handling: >
+          Use takeResult() OR explicitly branch on message.type === 'error':
+            import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js';
+            try {
+              const result = await takeResult(
+                client.experimental.tasks.requestStream(
+                  { method: 'custom/operation', params: {...} },
+                  CustomResultSchema,
+                  { task: { ttl: 60000 } }
+                )
+              );
+              return result;
+            } catch (err) {
+              if (err instanceof McpError) {
+                logger.error('Custom request failed', { code: err.code });
+              }
+              throw err;
+            }
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/client.ts"
           - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts"
         severity: error
         evidence_quality: confirmed

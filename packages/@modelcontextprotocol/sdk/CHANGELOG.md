@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-18 — deepen pass — coverage 79% → 86%
+
+- **Profile:** `packages/@modelcontextprotocol/sdk/contract.yaml`
+- **Functions added:** `takeResult`, `toArrayAsync`, `experimental.tasks.requestStream` (3 total)
+- **Postconditions added:** 3 (one per function, each capturing the canonical missing-error-handling pattern for the helper)
+- **Functions intentionally omitted this pass:** none new — prior omissions stand
+- **Scanner concerns queued:** 3 (`concern-20260618-modelcontextprotocol-sdk-deepen-29` (takeResult unhandled rejection), `concern-20260618-modelcontextprotocol-sdk-deepen-30` (toArrayAsync dual gap — iteration error + post-call array inspection), `concern-20260618-modelcontextprotocol-sdk-deepen-31` (requestStream silent-error-drop; generalize across experimental.tasks.*Stream family))
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:** https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/shared/responseMessage.ts (read inline from installed v1.29.0 dist/cjs/shared/responseMessage.js), https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/experimental/tasks/client.ts (read inline from installed v1.29.0 dist/cjs/experimental/tasks/client.d.ts)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-18T23:31:12Z, deepen-stream-2 pass 13)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @modelcontextprotocol/sdk@1.29.0
