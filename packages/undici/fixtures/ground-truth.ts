@@ -15,6 +15,12 @@
  *   - response.arrayBuffer() postcondition: response-arraybuffer-body-already-read, response-arraybuffer-no-try-catch
  *   - WebSocket            postcondition: websocket-constructor-syntax-error, websocket-connection-error-not-handled
  *   - Dispatcher.close()   postcondition: dispatcher-close-already-destroyed
+ *   - response.blob()      postcondition: response-blob-no-try-catch, response-blob-body-already-read
+ *   - response.bytes()     postcondition: response-bytes-no-try-catch, response-bytes-body-already-read
+ *   - response.formData()  postcondition: response-formdata-no-try-catch, response-formdata-unsupported-content-type
+ *   - pipeline()           postcondition: pipeline-missing-error-listener
+ *   - Dispatcher.destroy() postcondition: dispatcher-destroy-no-try-catch
+ *   - EventSource          postcondition: eventsource-constructor-syntax-error, eventsource-connection-error-not-handled
  *
  * Detection path: request/fetch/stream/connect/upgrade imported from undici →
  *   ThrowingFunctionDetector fires direct call →
@@ -268,4 +274,176 @@ export async function dispatcherCloseWithCatch(baseUrl: string) {
   } catch (err) {
     console.error('Client close failed:', err);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. response.blob() — no try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: response-blob-no-try-catch
+export async function responseBlobNoCatch(url: string) {
+  const response = await fetch(url);
+  // SHOULD_FIRE: response-blob-no-try-catch — body stream can fail mid-download
+  const blob = await response.blob();
+  return blob.size;
+}
+
+// @expect-clean
+export async function responseBlobWithCatch(url: string) {
+  try {
+    const response = await fetch(url);
+    // SHOULD_NOT_FIRE: blob() inside try-catch satisfies error handling
+    const blob = await response.blob();
+    return blob.size;
+  } catch (err) {
+    console.error('Blob read failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. response.bytes() — no try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: response-bytes-no-try-catch
+export async function responseBytesNoCatch(url: string) {
+  const response = await fetch(url);
+  // SHOULD_FIRE: response-bytes-no-try-catch — body stream can fail mid-download
+  const bytes = await response.bytes();
+  return bytes.byteLength;
+}
+
+// @expect-clean
+export async function responseBytesWithCatch(url: string) {
+  try {
+    const response = await fetch(url);
+    // SHOULD_NOT_FIRE: bytes() inside try-catch satisfies error handling
+    const bytes = await response.bytes();
+    return bytes.byteLength;
+  } catch (err) {
+    console.error('Bytes read failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. response.formData() — no try-catch, unsupported content-type
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: response-formdata-no-try-catch
+export async function responseFormDataNoCatch(url: string) {
+  const response = await fetch(url);
+  // SHOULD_FIRE: response-formdata-no-try-catch — TypeError on bad content-type or parse error
+  const fd = await response.formData();
+  return fd.get('field');
+}
+
+// @expect-clean
+export async function responseFormDataWithCatch(url: string) {
+  try {
+    const response = await fetch(url);
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('form-data') && !contentType.includes('form-urlencoded')) {
+      throw new Error(`Unexpected content-type: ${contentType}`);
+    }
+    // SHOULD_NOT_FIRE: formData() inside try-catch satisfies error handling
+    const fd = await response.formData();
+    return fd.get('field');
+  } catch (err) {
+    console.error('FormData parse failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. pipeline() — missing 'error' listener on returned Duplex
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { pipeline } from 'undici';
+import { Readable } from 'node:stream';
+
+// @expect-violation: pipeline-missing-error-listener
+export async function pipelineNoErrorListener(url: string) {
+  // SHOULD_FIRE: pipeline-missing-error-listener — returned Duplex emits 'error' but no listener
+  const duplex = pipeline(url, { method: 'POST' }, ({ statusCode, body }) => {
+    return body;
+  });
+  return duplex;
+}
+
+// @expect-clean
+export async function pipelineWithErrorListener(url: string) {
+  const duplex = pipeline(url, { method: 'POST' }, ({ statusCode, body }) => {
+    return body;
+  });
+  // SHOULD_NOT_FIRE: 'error' listener registered on returned Duplex
+  duplex.on('error', (err) => {
+    console.error('Pipeline failed:', err);
+  });
+  return duplex;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. Dispatcher.destroy() — no try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: dispatcher-destroy-no-try-catch
+export async function dispatcherDestroyNoCatch(baseUrl: string) {
+  const client = new Client(baseUrl);
+  // ... use client for requests ...
+  // SHOULD_FIRE: dispatcher-destroy-no-try-catch — destroy() can fail with InvalidArgumentError
+  await client.destroy(new Error('shutdown'));
+}
+
+// @expect-clean
+export async function dispatcherDestroyWithCatch(baseUrl: string) {
+  const client = new Client(baseUrl);
+  try {
+    // SHOULD_NOT_FIRE: destroy() inside try-catch satisfies error handling
+    await client.destroy(new Error('shutdown'));
+  } catch (err) {
+    console.warn('Client destroy failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. EventSource — SyntaxError on bad URL + missing 'error' listener
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { EventSource } from 'undici';
+
+// @expect-violation: eventsource-constructor-syntax-error
+export function eventSourceBadUrl(url: string) {
+  // SHOULD_FIRE: eventsource-constructor-syntax-error — invalid URL throws DOMException
+  const es = new EventSource(url);
+  es.onmessage = (event) => console.log(event.data);
+  es.onerror = (event) => console.error('SSE error', event);
+  return es;
+}
+
+// @expect-violation: eventsource-connection-error-not-handled
+export function eventSourceNoErrorListener() {
+  // SHOULD_FIRE: eventsource-connection-error-not-handled — no error listener registered
+  const es = new EventSource('https://api.example.com/events');
+  es.onmessage = (event) => console.log(event.data);
+  return es;
+}
+
+// @expect-clean
+export function eventSourceWithErrorListener() {
+  let es: EventSource;
+  try {
+    // SHOULD_NOT_FIRE: constructor wrapped in try-catch
+    es = new EventSource('https://api.example.com/events');
+  } catch (err) {
+    console.error('EventSource SyntaxError:', err);
+    throw err;
+  }
+  // SHOULD_NOT_FIRE: error listener registered
+  es.onerror = (event) => {
+    console.error('SSE connection failed, readyState=' + es.readyState);
+    if (es.readyState === EventSource.CLOSED) es.close();
+  };
+  es.onmessage = (event) => console.log(event.data);
+  return es;
 }

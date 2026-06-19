@@ -1,12 +1,12 @@
 package: undici
 semver: ">=5.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.91
+coverage_score: 1.0
 category: http-client
 description: Official Node.js HTTP/1.1 client implementing the Fetch API standard
 
@@ -519,4 +519,430 @@ functions:
           close(), the close() call rejects with ClientDestroyedError. This crashes
           graceful shutdown handlers that don't handle the rejection. Check
           client.destroyed before calling close() in shutdown code.
+        evidence_quality: confirmed
+
+  - name: blob
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Reads the response body and returns it as a Blob. Called as response.blob()
+      on a Response object (Fetch API) or BodyMixin. Returns Promise<Blob>.
+      Used for binary data destined for file APIs, image manipulation, or browser
+      compatibility code paths.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/blob
+      # Error types confirmed from undici source: lib/web/fetch/body.js
+      # blob() shares the same consumeBody() code path as text/arrayBuffer/bytes/formData.
+      # All body-consumer methods reject with 'Body is unusable' TypeError on double-read.
+      # NOTE: response-blob-no-try-catch is listed first because the scanner fires the
+      # first error-severity postcondition; missing-try-catch is more common and detectable.
+      - id: response-blob-no-try-catch
+        condition: >
+          response.blob() called without try-catch. Body streaming errors (timeout,
+          socket drop, exceeded max response size) cause the promise to reject.
+        throws: >
+          BodyTimeoutError (UND_ERR_BODY_TIMEOUT) if body download exceeds bodyTimeout.
+          SocketError (UND_ERR_SOCKET) if TCP connection drops mid-body.
+          RequestAbortedError (UND_ERR_ABORTED) if AbortSignal fires during body read.
+          ResponseExceededMaxSizeError (UND_ERR_RES_EXCEEDED_MAX_SIZE) when Client is
+          configured with maxResponseSize limit.
+        required_handling: >
+          Wrap await response.blob() in try-catch. Like arrayBuffer(), blob() buffers
+          the entire body in memory, so large downloads can hit ResponseExceededMaxSizeError
+          when maxResponseSize is configured on the Client. Binary downloads have a higher
+          rate of bodyTimeout failures than text responses.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/blob"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+          - "https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          response.blob() is commonly used in file upload proxies, browser-compatibility
+          code paths, and image-fetching pipelines. Like arrayBuffer/bytes, it buffers the
+          entire response body in memory. Body-phase errors (timeouts, socket drops) after
+          headers arrive cause the promise to reject — and if the await is not wrapped in
+          try-catch, the rejection becomes an unhandled error that crashes the Node.js
+          process under default behavior.
+        evidence_quality: confirmed
+
+      - id: response-blob-body-already-read
+        condition: >
+          response.blob() called after the body has already been consumed by any prior
+          call to .text(), .json(), .arrayBuffer(), .bytes(), .formData(), .blob(),
+          or .body.getReader().
+        throws: >
+          TypeError: 'Body is unusable: Body has already been read'
+          (confirmed from undici/lib/web/fetch/body.js line 467)
+        required_handling: >
+          Use response.clone() before consuming the body if multiple reads are needed.
+          Store the Blob result in a variable rather than calling blob() twice.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/blob"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          Double-consumption of response bodies is a frequent foot-gun when logging
+          middleware reads the body for audit purposes and the handler then tries to
+          process it. blob() shares the same disturbed-stream guard as text/json/
+          arrayBuffer — once any consumer has touched the body, all subsequent reads
+          reject with the same TypeError. Always clone() before the first read if a
+          second read may be needed.
+        evidence_quality: confirmed
+
+  - name: bytes
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Reads the response body and returns it as a Uint8Array. Called as response.bytes()
+      on a Response object (Fetch API). Returns Promise<Uint8Array>. Modern, ergonomic
+      alternative to arrayBuffer() that avoids the .buffer/Uint8Array wrap step. Added
+      to the Fetch spec in 2024 and shipped in undici 6.x+.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/bytes
+      # Error types confirmed from undici source: lib/web/fetch/body.js line 388-394
+      # bytes() shares the same consumeBody() code path as text/arrayBuffer/blob/formData.
+      - id: response-bytes-no-try-catch
+        condition: >
+          response.bytes() called without try-catch. Body-streaming errors (timeout,
+          socket drop, exceeded max response size) cause the promise to reject.
+        throws: >
+          BodyTimeoutError (UND_ERR_BODY_TIMEOUT), SocketError (UND_ERR_SOCKET),
+          RequestAbortedError (UND_ERR_ABORTED), ResponseExceededMaxSizeError
+          (UND_ERR_RES_EXCEEDED_MAX_SIZE).
+        required_handling: >
+          Wrap await response.bytes() in try-catch. Behavior matches arrayBuffer() —
+          large binary payloads can hit bodyTimeout (default 300s) or ResponseExceededMaxSizeError
+          when a Client is configured with maxResponseSize. Unhandled rejections crash
+          the Node.js process under default settings.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/bytes"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          response.bytes() is the modern preferred way to read binary response bodies —
+          it avoids the .buffer property dance required with arrayBuffer(). Codebases
+          migrating from arrayBuffer() to bytes() can drop the try-catch wrapper if the
+          original was tied to the .buffer access; the network-phase errors are unchanged
+          and still require a try-catch around the await.
+        evidence_quality: confirmed
+
+      - id: response-bytes-body-already-read
+        condition: >
+          response.bytes() called after the body has already been consumed by a previous
+          call to any body-reading method or .body.getReader().
+        throws: >
+          TypeError: 'Body is unusable: Body has already been read'
+        required_handling: >
+          Use response.clone() before consuming the body if multiple reads are needed.
+          Store the Uint8Array result in a variable rather than calling bytes() twice.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/bytes"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          bytes() shares the same disturbed-stream guard as other body consumers. The
+          double-consumption foot-gun is identical to text/arrayBuffer/blob: any prior
+          read of the body marks the underlying ReadableStream as disturbed, and bytes()
+          rejects with 'Body is unusable' TypeError. clone() before the first read is
+          the canonical fix.
+        evidence_quality: confirmed
+
+  - name: formData
+    import_path: "undici"
+    namespace: "response.body"
+    description: >
+      Reads the response body and parses it as multipart/form-data or
+      application/x-www-form-urlencoded. Returns Promise<FormData>. Used in form
+      submission proxies, file upload handling, and webhook payload parsing.
+      The spec recommends a streaming parser (e.g. @fastify/busboy) for untrusted
+      servers — formData() buffers the entire body in memory.
+    postconditions:
+      # Evidence: https://developer.mozilla.org/en-US/docs/Web/API/Response/formData
+      # Error types confirmed from undici/lib/web/fetch/body.js lines 340-385
+      # formData() can throw THREE distinct TypeErrors:
+      # 1. consume errors (shared with text/arrayBuffer/blob/bytes)
+      # 2. multipart parsing failure (formData-specific)
+      # 3. Unsupported Content-Type (formData-specific, line 380-384)
+      - id: response-formdata-no-try-catch
+        condition: >
+          response.formData() called without try-catch. Body-streaming errors AND
+          multipart parsing errors AND unsupported Content-Type all cause rejection.
+        throws: >
+          BodyTimeoutError (UND_ERR_BODY_TIMEOUT), SocketError (UND_ERR_SOCKET),
+          RequestAbortedError (UND_ERR_ABORTED).
+          TypeError 'Content-Type was not one of "multipart/form-data" or
+          "application/x-www-form-urlencoded"' if the server returned a body with
+          a non-form Content-Type (e.g. application/json error responses).
+          TypeError from multipart parser if multipart boundaries are malformed.
+        required_handling: >
+          Wrap await response.formData() in try-catch. formData() has the highest
+          probability of throwing among body-consumer methods because it can fail
+          for THREE distinct reasons: network errors, multipart-parse errors, and
+          unsupported Content-Type. Always check response.ok first — error responses
+          rarely return form-encoded bodies, so .formData() on an HTTP 500 with a
+          JSON error body will throw the Content-Type TypeError.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/formData"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          formData() is the spec's lowest-confidence body method — it requires the
+          server to return either multipart/form-data or application/x-www-form-urlencoded.
+          Any other Content-Type throws TypeError. Webhook handlers and form-submission
+          proxies that call .formData() without first checking Content-Type will crash
+          when upstream services return JSON errors. Wrap in try-catch AND validate
+          response.headers.get('content-type') before calling.
+        evidence_quality: confirmed
+
+      - id: response-formdata-unsupported-content-type
+        condition: >
+          response.formData() called on a response whose Content-Type is not
+          multipart/form-data or application/x-www-form-urlencoded (e.g. an HTTP 500
+          response with application/json or text/html body).
+        throws: >
+          TypeError: 'Content-Type was not one of "multipart/form-data" or
+          "application/x-www-form-urlencoded".'
+          Confirmed from undici/lib/web/fetch/body.js line 380-384.
+        required_handling: >
+          Check response.headers.get('content-type') before calling .formData(),
+          OR always wrap the await in try-catch and treat the TypeError as a
+          parsing failure (not a network failure). Webhook proxies should validate
+          Content-Type explicitly to distinguish bad-payload from network-error.
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/lib/web/fetch/body.js"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/formData"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+        description: >
+          Unlike text() and json(), formData() is strict about Content-Type. A common
+          bug: a form-submission proxy expects multipart upstream but the upstream
+          returns a JSON error body on 4xx/5xx. .formData() throws TypeError that
+          looks like a parsing bug rather than the actual HTTP-level upstream failure.
+          The fix is to check response.ok first and inspect Content-Type before parsing.
+        evidence_quality: confirmed
+
+  - name: pipeline
+    import_path: "undici"
+    description: >
+      Streams an HTTP request through a node:stream pipeline. Unlike request/stream
+      which return Promise, pipeline() returns a Duplex stream synchronously and
+      emits errors via the 'error' event. Used for proxying request bodies through
+      transforms (compression, encryption, line parsing) without fully buffering.
+    postconditions:
+      # Evidence: undici/lib/api/api-pipeline.js source
+      # pipeline() returns a Duplex — error events fire on the duplex stream.
+      # Confirmed from source: line 198 'this.res.on('error', noop)' and line 214 '.on('error', ...)'
+      # The Duplex stream is destroyed with an error on network failure, abort, or factory error.
+      - id: pipeline-missing-error-listener
+        condition: >
+          undici.pipeline() return value used without registering an 'error' event
+          listener on the returned Duplex. Network failures (UND_ERR_SOCKET,
+          UND_ERR_CONNECT_TIMEOUT, UND_ERR_BODY_TIMEOUT) are dispatched as 'error'
+          events on the Duplex — they do NOT throw synchronously and do NOT reject
+          a Promise.
+        throws: >
+          Does NOT throw synchronously. Error is emitted as 'error' event on the
+          returned Duplex stream. If no 'error' listener is registered, Node.js
+          treats it as an uncaught exception and crashes the process under default
+          configuration.
+        required_handling: >
+          Always register an 'error' listener on the Duplex returned by pipeline(),
+          OR pass the Duplex to stream.pipeline() / pipeline.promisify() which
+          handles the error path. Direct usage:
+            const duplex = undici.pipeline(url, opts, handler);
+            duplex.on('error', (err) => { logger.error(err); });
+          Or via stream/promises:
+            await pipeline(source, undici.pipeline(url, opts, handler), dest);
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/lib/api/api-pipeline.js"
+          - "https://undici.nodejs.org/#/docs/api/Dispatcher.md?id=dispatcherpipelineoptions-handler"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          pipeline() is the streaming variant of request/stream and is commonly used
+          in proxy servers that pipe request/response bodies through transforms. Unlike
+          request() and stream() which return Promises and reject on network failure,
+          pipeline() returns a Duplex stream synchronously and emits 'error' events.
+          Code that wraps pipeline() in try-catch will NOT catch network failures
+          because the error fires later as an event. Missing 'error' listeners crash
+          the Node.js process under default configuration, making this a high-severity
+          gotcha specifically tied to the streaming API surface.
+        evidence_quality: confirmed
+
+  - name: destroy
+    import_path: "undici"
+    namespace: "Dispatcher"
+    description: >
+      Abruptly destroys the dispatcher (Client, Pool, or Agent). All pending and
+      running requests are asynchronously aborted with the given error. Waits until
+      the underlying socket is closed before resolving. Returns Promise<void> when
+      called without a callback. Used in emergency shutdown paths.
+    postconditions:
+      # Evidence: undici/lib/dispatcher/dispatcher-base.js lines 102-149
+      # destroy() validates the callback type SYNCHRONOUSLY and throws InvalidArgumentError
+      # if a non-function callback is passed. The Promise variant (no callback) is safe.
+      # Re-destroying an already-destroyed dispatcher is idempotent (line 113-119).
+      - id: dispatcher-destroy-no-try-catch
+        condition: >
+          dispatcher.destroy() called in async context without try-catch wrapping
+          the await. Pending request callbacks reject with the destroy error,
+          and the destroy() promise itself may reject if invalid arguments are
+          passed.
+        throws: >
+          InvalidArgumentError (UND_ERR_INVALID_ARG) if a non-function callback is
+          passed synchronously. The returned Promise resolves successfully in normal
+          shutdown, but rejection-handling is required when destroy() is called
+          inside finally blocks where errors may already be in flight.
+        required_handling: >
+          In emergency shutdown paths (process SIGTERM, error recovery), wrap
+          await dispatcher.destroy() in try-catch. Destroying a Pool/Agent during
+          active request handling can cause request callbacks to fire with the
+          destroy error — those handlers must also be try-catched. Pattern:
+            try { await client.destroy(new Error('shutdown')); } catch (e) { logger.warn('destroy failed', e); }
+        sources:
+          - "https://github.com/nodejs/undici/blob/main/lib/dispatcher/dispatcher-base.js"
+          - "https://undici.nodejs.org/#/docs/api/Dispatcher.md?id=dispatcherdestroyerror-callback"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          destroy() is the emergency-shutdown counterpart to close(). It aborts in-flight
+          requests with a synthesized ClientDestroyedError and waits for socket cleanup.
+          In SIGTERM handlers or error-recovery code, destroy() is often called inside a
+          finally block where another error is already in flight — failing to handle the
+          destroy rejection masks the original error and crashes the process under
+          unhandled-rejection settings.
+        evidence_quality: confirmed
+
+  - name: EventSource
+    import_path: "undici"
+    description: >
+      W3C EventSource (Server-Sent Events) constructor. Creates an EventSource that
+      streams events from the given URL using the SSE protocol. The constructor is
+      synchronous and initiates the HTTP connection asynchronously. Implements the
+      WHATWG EventSource spec. Available as undici.EventSource or globally after
+      undici.install().
+    postconditions:
+      # Evidence: undici/lib/web/eventsource/eventsource.js
+      # Constructor throws DOMException(SyntaxError) on invalid URLs (line 143-144).
+      # Connection failures dispatched as 'error' event (lines 243, 264, 299, 326).
+      # MDN: https://developer.mozilla.org/en-US/docs/Web/API/EventSource
+      - id: eventsource-constructor-syntax-error
+        condition: >
+          new EventSource(url) called with an invalid URL format that fails URL
+          parsing per the WHATWG URL spec.
+        throws: >
+          DOMException with name 'SyntaxError'. Thrown synchronously from the
+          constructor. Confirmed from undici/lib/web/eventsource/eventsource.js
+          line 143-144.
+        required_handling: >
+          Wrap new EventSource(url) in try-catch if the URL comes from user input,
+          query strings, env vars, or configuration. Hardcoded URLs are safe to
+          skip the try-catch. Dynamic URLs (e.g. SSE endpoint built from request
+          params) must be validated or wrapped.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/EventSource/EventSource"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/eventsource/eventsource.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        description: >
+          EventSource constructor validates the URL synchronously. Misconfigured SSE
+          endpoint URLs (e.g. env vars missing the scheme, whitespace from template
+          rendering) throw DOMException SyntaxError immediately. In server startup
+          the crash is visible; in per-connection or per-user EventSource creation
+          it causes unhandled exceptions in request handlers.
+        evidence_quality: confirmed
+
+      - id: eventsource-connection-error-not-handled
+        condition: >
+          EventSource connection failure (server unreachable, TLS handshake failure,
+          non-2xx response, malformed SSE stream) occurs but no 'onerror' or 'error'
+          event listener is registered. Connection errors are dispatched via the
+          error event, NOT thrown from the constructor.
+        throws: >
+          Does NOT throw. Instead dispatches an Event of type 'error' to the
+          'error' listener. If no error listener is registered, Node.js treats
+          the EventTarget error event as silent — but EventSource then enters
+          CONNECTING state and retries indefinitely, with no observability of
+          the failure.
+        required_handling: >
+          Always register es.onerror or es.addEventListener('error', handler)
+          before the connection attempt. Without it, SSE connection failures are
+          invisible AND EventSource silently retries forever — a hung SSE consumer
+          that never receives data with no log signal. Example:
+            const es = new EventSource('https://api.example.com/events');
+            es.onerror = (event) => {
+              logger.error('SSE connection failed, readyState=' + es.readyState);
+              if (es.readyState === EventSource.CLOSED) es.close();
+            };
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/EventSource#events"
+          - "https://github.com/nodejs/undici/blob/main/lib/web/eventsource/eventsource.js"
+          - "https://html.spec.whatwg.org/multipage/server-sent-events.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: >
+          EventSource is uniquely dangerous because it RETRIES INDEFINITELY on
+          connection errors per the SSE spec. A missing error listener means SSE
+          consumers silently hang in CONNECTING state with no events arriving and
+          no log signal that anything is wrong. Real-time features (notification
+          streams, live dashboards, AI streaming responses) that use EventSource
+          typically have long-lived connections — a missing error handler causes
+          permanent loss of real-time functionality with zero observability, much
+          worse than the WebSocket equivalent because EventSource auto-retries
+          mask the failure entirely.
         evidence_quality: confirmed
