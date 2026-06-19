@@ -54,6 +54,45 @@ async function noErrorHandlingFieldsSize(req: IncomingMessage) {
   return fields;
 }
 
+// @expect-violation: formidable-parse-error
+// @expect-violation: formidable-plugin-failed
+async function noErrorHandlingCustomPlugin(req: IncomingMessage) {
+  const form = formidable({});
+  // Custom plugin that may throw; pluginFailed wraps the inner rejection.
+  form.use(async (self: any) => {
+    const trust = await fetch('https://example.com/verify');
+    if (!trust.ok) throw new Error('plugin denied');
+  });
+  const [fields, files] = await form.parse(req);
+  return { fields, files };
+}
+
+// @expect-violation: formidable-parse-error
+// @expect-violation: formidable-smaller-than-min-file-size
+async function noErrorHandlingMinFileSize(req: IncomingMessage) {
+  const form = formidable({ minFileSize: 1024 }); // require >=1KB files
+  const [fields, files] = await form.parse(req);
+  return files;
+}
+
+// @expect-violation: formidable-parse-error
+// @expect-violation: formidable-unknown-transfer-encoding
+async function noErrorHandlingTransferEncoding(req: IncomingMessage) {
+  const form = formidable({});
+  // Multipart parser surfaces unknownTransferEncoding on exotic/malformed parts.
+  const [fields, files] = await form.parse(req);
+  return files;
+}
+
+// @expect-violation: formidable-parse-error
+// @expect-violation: formidable-filename-not-string
+async function noErrorHandlingFilenameNotString(req: IncomingMessage) {
+  const form = formidable({});
+  // Crafted Content-Disposition can produce non-string filenames.
+  const [fields, files] = await form.parse(req);
+  return files;
+}
+
 // ---------------------------------------------------------------------------
 // CLEAN CASES — scanner MUST NOT flag these
 // ---------------------------------------------------------------------------
@@ -132,5 +171,65 @@ async function expressMiddlewarePattern(req: IncomingMessage, res: any, next: an
     next();
   } catch (err: any) {
     res.status(err.httpCode || 400).json({ error: err.message });
+  }
+}
+
+// @expect-clean
+async function pluginFailedHandled(req: IncomingMessage) {
+  const form = formidable({});
+  form.use(async () => {
+    const trust = await fetch('https://example.com/verify');
+    if (!trust.ok) throw new Error('plugin denied');
+  });
+  try {
+    const [fields, files] = await form.parse(req);
+    return { fields, files };
+  } catch (err: any) {
+    if (err.code === formidableErrors.pluginFailed) {
+      return { error: 'Plugin failed', idx: err.idx, httpCode: 500 };
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function minFileSizeHandled(req: IncomingMessage) {
+  const form = formidable({ minFileSize: 1024 });
+  try {
+    const [fields, files] = await form.parse(req);
+    return files;
+  } catch (err: any) {
+    if (err.code === formidableErrors.smallerThanMinFileSize) {
+      return { error: 'File too small', httpCode: 400 };
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function transferEncodingHandled(req: IncomingMessage) {
+  const form = formidable({});
+  try {
+    const [fields, files] = await form.parse(req);
+    return files;
+  } catch (err: any) {
+    if (err.code === formidableErrors.unknownTransferEncoding) {
+      return { error: 'Unsupported transfer encoding', httpCode: 501 };
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function filenameNotStringHandled(req: IncomingMessage) {
+  const form = formidable({});
+  try {
+    const [fields, files] = await form.parse(req);
+    return files;
+  } catch (err: any) {
+    if (err.code === formidableErrors.filenameNotString) {
+      return { error: 'Malformed Content-Disposition', httpCode: 400 };
+    }
+    throw err;
   }
 }

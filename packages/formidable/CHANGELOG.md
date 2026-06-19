@@ -3,6 +3,25 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-18 — deepen pass — coverage 92% → 100%
+
+- **Profile:** `packages/formidable/contract.yaml`
+- **Functions added:** 0 (parse() was already the sole async surface)
+- **Postconditions added:** 4
+  - `formidable-plugin-failed` — FormidableError code 1017 (custom plugin throws during parse())
+  - `formidable-smaller-than-min-file-size` — code 1008 (uploaded file under options.minFileSize)
+  - `formidable-unknown-transfer-encoding` — code 1014 (exotic multipart Content-Transfer-Encoding)
+  - `formidable-filename-not-string` — code 1005 (Content-Disposition header type-confusion / injection)
+- **Functions intentionally omitted this pass:** use/pause/resume/write/onPart (synchronous EventEmitter or config methods), writeHeaders (internal — its rejection flows through parse())
+- **Scanner concerns queued:** 2 (`concern-20260618-formidable-deepen-1`, `concern-20260618-formidable-deepen-2`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js (all 20 error code constants)
+  - https://github.com/node-formidable/formidable/blob/master/src/Formidable.js (parse(), use(), writeHeaders() source confirming throw sites at lines 142, 274, 292, 313, 415, 471)
+  - https://github.com/node-formidable/formidable/blob/master/src/plugins/multipart.js (unknownTransferEncoding throw at line 154)
+  - https://github.com/node-formidable/formidable/blob/master/README.md (parse() and use() canonical usage)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-19T00:25:51Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** formidable@3.5.4

@@ -1,12 +1,12 @@
 package: formidable
 semver: ">=3.5.3"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.92
+coverage_score: 1.0
 
 functions:
   - name: parse
@@ -245,3 +245,130 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+
+      # Added 2026-06-18 (deepen pass — deepen-stream-6): pluginFailed surfaces
+      # whenever a registered plugin's async function rejects during parse().
+      # Source: src/Formidable.js:474 — `throw error` after `await plugin(...)`
+      # is wrapped in try/catch. Rejection is rethrown from inside the
+      # Promise.all over `this._plugins.map(async (plugin, idx) => { ... })`
+      # so the parse() promise rejects with this FormidableError. Users who
+      # register custom plugins via `form.use(myPlugin)` MUST handle this code
+      # — a plugin that throws an unhandled rejection during a form upload will
+      # crash the server unless `parse()` is wrapped in try/catch.
+      - id: formidable-plugin-failed
+        condition: "a registered plugin (built-in or via form.use(...)) throws or rejects during parse()"
+        throws: "FormidableError with .code === 1017 (pluginFailed) and .httpCode === 500. The error has an .idx property indicating which plugin index failed, and the message includes the inner plugin error's message."
+        required_handling: >
+          Catch the error from `await form.parse(req)`. On rejection: log the
+          error including .idx so you know which plugin failed, return HTTP 500
+          to the client. Custom plugins that perform validation or transformation
+          should throw FormidableError themselves with a more specific .httpCode
+          (e.g. 400 for validation) so the calling code can return an appropriate
+          status — the default 500 indicates an internal failure. Most applications
+          will hit this only after wiring a custom `form.use(plugin)`; the built-in
+          octetstream/querystring/multipart/json plugins do not throw under normal
+          input. Inspect error.code === 1017 (or errors.pluginFailed) to distinguish
+          plugin failures from parser/limit errors when handling.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js#L466-L481"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Added 2026-06-18 (deepen pass — deepen-stream-6): smallerThanMinFileSize
+      # fires when options.minFileSize is explicitly set above the default (1
+      # byte) and an uploaded file is below the threshold. Source:
+      # src/Formidable.js:415-422 — `if (fileSize < this.options.minFileSize)`
+      # then this._error(new FormidableError(..., errors.smallerThanMinFileSize,
+      # 400)). The async error flows through the parse() promise rejection path.
+      # Production callers who set a non-default minFileSize for business reasons
+      # (e.g. enforcing a minimum image resolution by file size) must handle the
+      # rejection.
+      - id: formidable-smaller-than-min-file-size
+        condition: "options.minFileSize is explicitly set above 1 and an uploaded file's size is below the threshold"
+        throws: "FormidableError with .code === 1008 (smallerThanMinFileSize) and .httpCode === 400. Message: 'options.minFileSize (N bytes) inferior, received M bytes of file data'."
+        required_handling: >
+          Catch the error and return HTTP 400 with a user-facing message explaining
+          the minimum file size requirement. Without catching it, every upload below
+          the threshold causes an unhandled rejection that crashes the server.
+          Only fires when minFileSize is explicitly configured — at the default
+          (1 byte) only truly empty files trigger noEmptyFiles instead. Common in
+          image-upload flows that require a minimum resolution/quality, or audio
+          upload flows that reject zero-content recordings.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js#L415-L422"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Added 2026-06-18 (deepen pass — deepen-stream-6): unknownTransferEncoding
+      # is raised by the multipart plugin when a part declares a Content-Transfer-
+      # Encoding the parser does not support (7bit/8bit/binary are supported; any
+      # other value such as quoted-printable, base64 in non-standard contexts, or
+      # malformed values trigger this). Source:
+      # src/plugins/multipart.js:154-160 — `new FormidableError('unknown
+      # transfer-encoding', errors.unknownTransferEncoding, 501)`. The error
+      # propagates through the multipart parser's `error` event and reaches the
+      # parse() promise rejection.
+      - id: formidable-unknown-transfer-encoding
+        condition: "multipart request part contains an unrecognized or unsupported Content-Transfer-Encoding header value"
+        throws: "FormidableError with .code === 1014 (unknownTransferEncoding) and .httpCode === 501 (Not Implemented). Message: 'unknown transfer-encoding'."
+        required_handling: >
+          Catch the error and return HTTP 501 (or HTTP 400 with a clearer client-facing
+          explanation) — the upload contained encoding the parser cannot process.
+          Without catching, the server crashes on malformed/exotic multipart parts.
+          Most modern HTTP clients send only `binary`, `7bit`, or `8bit` and never
+          trigger this; it surfaces against legacy clients, non-browser uploaders,
+          or adversarial requests crafted to probe for parser handling. Treat it as
+          a client error in normal flows — do not retry the request.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/plugins/multipart.js#L154-L160"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Added 2026-06-18 (deepen pass — deepen-stream-6): filenameNotString fires
+      # when a multipart part advertises a non-string `filename` (typically because
+      # an attacker crafted a malformed Content-Disposition header). Source:
+      # src/Formidable.js:310-318 — `if (part.originalFilename && typeof
+      # part.originalFilename !== 'string') this._error(new FormidableError(...,
+      # errors.filenameNotString))`. The error flows through the parse() rejection
+      # path. Security-relevant: catches header injection / type-confusion attempts
+      # against the parser.
+      - id: formidable-filename-not-string
+        condition: "a multipart part declares a Content-Disposition `filename` that is not a string (e.g. malformed/attacker-crafted header)"
+        throws: "FormidableError with .code === 1005 (filenameNotString) and .httpCode === 500. Message: 'the part.originalFilename should be string when it exists'."
+        required_handling: >
+          Catch the error and return HTTP 400 (treat as a malformed client request,
+          NOT a server fault — override the 500 default with a 400 if surfacing to
+          the client). Log the request for security review: this error is one of
+          formidable's input-validation guardrails against header injection. Most
+          legitimate clients never hit it. Without catching, the server crashes
+          on the first crafted upload — a denial-of-service vector. Defenders
+          should rate-limit endpoints that surface this error code repeatedly from
+          the same client.
+        sources:
+          - "https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js"
+          - "https://github.com/node-formidable/formidable/blob/master/src/Formidable.js#L310-L318"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
