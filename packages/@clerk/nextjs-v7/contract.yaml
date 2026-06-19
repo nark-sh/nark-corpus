@@ -2,11 +2,11 @@ package: "@clerk/nextjs"
 semver: ">=7.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-15"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.95
+coverage_score: 1.0
 extends: "../nextjs/contract.yaml"
 # Fork point: @clerk/nextjs v7.0.0 (2026-Q2).
 #
@@ -76,6 +76,42 @@ functions:
           - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
           - "https://clerk.com/docs/reference/clerk-react/use-auth"
 
+      - id: get-token-offline-not-handled
+        condition: >
+          useAuth().getToken called when the Clerk client is offline (no network
+          connectivity to Clerk's auth servers). In v7+, this throws
+          ClerkOfflineError instead of returning `null` as it did in v5/v6.
+          Code paths that previously guarded with `if (token === null) return`
+          will now throw uncaught when the user's network drops or the Clerk
+          backend is briefly unreachable. Particularly common in PWAs, mobile
+          web wrappers, and any flow that fetches tokens during retry loops.
+        throws: "ClerkOfflineError"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          MUST wrap useAuth().getToken() in try-catch and handle ClerkOfflineError
+          separately from authentication errors. Typical pattern: on
+          ClerkOfflineError, show a "Reconnecting..." UI and retry with
+          exponential backoff. Do NOT sign the user out on this error —
+          their session is still valid, just temporarily unreachable.
+          Code that previously checked `if (!token)` will silently miss this
+          branch and crash the calling component.
+        detector: >
+          Flag every `await useAuth().getToken()` or `await getToken()` call
+          whose surrounding code checks `if (!token)` or `if (token === null)`
+          without a try-catch handler that names ClerkOfflineError. Also flag
+          retry loops (while/setTimeout/setInterval) that call getToken()
+          without offline-error handling — these create infinite retry storms
+          on prolonged outages.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/reference/clerk-react/use-auth"
+
   # Override clerkMiddleware to ADD the v7-specific encryption-key throw.
   # Parent postconditions (`middleware-not-exported`, `middleware-matcher-missing`)
   # are inherited unchanged — v7 did not relax either requirement.
@@ -112,3 +148,152 @@ functions:
         sources:
           - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
           - "https://clerk.com/docs/reference/nextjs/clerk-middleware"
+
+  # Override protect to ADD the v7-specific 401-vs-404 server-action status code change.
+  # Parent `protect-not-in-try-catch` (warning, uncaught-error 500) still applies
+  # to ALL contexts — this fork narrows the server-action codepath to flag callers
+  # that hard-coded a 404 check on the v6 behavior.
+  - name: protect
+    import_path: "@clerk/nextjs/server"
+    namespace: "auth"
+    description: "Protects routes; v7 returns 401 (not 404) for unauthenticated server action requests"
+    postconditions:
+      - id: protect-server-action-status-code-changed
+        condition: >
+          auth.protect() called inside a Next.js server action ("use server"
+          file or `'use server'` inline directive). In v6 and earlier, an
+          unauthenticated request to a server action returned HTTP 404. In
+          v7+, it returns HTTP 401. Any client-side error handler, monitoring
+          rule, or test that previously branched on `response.status === 404`
+          to detect "logged out" will silently miss the unauthenticated case
+          after upgrade and surface confusing UI behavior (typically: the
+          action appears to fail without redirecting to sign-in).
+        throws: "HTTP 401 (auth.protect rejects unauthenticated server-action callers)"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+        required_handling: >
+          MUST audit every call site that compared response.status to 404
+          (fetch responses, useTransition error handlers, server-action
+          wrappers like `useActionState`) and update the comparison to 401.
+          Pattern: replace `if (res.status === 404) signOut()` with
+          `if (res.status === 401) signOut()`. Generic catch blocks that
+          treated any error as "auth failure" continue to work, but
+          status-aware branches MUST be migrated.
+        detector: >
+          In any file containing `'use server'` (top-of-file or inline in
+          an exported async function), flag direct calls to auth.protect()
+          OR `(await auth()).protect()` whose surrounding caller compares
+          `response.status === 404` or `error.status === 404`. Also flag
+          fetch/RSC-action error handlers that hard-code 404 as the
+          auth-failure signal anywhere a server action is invoked.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/reference/nextjs/app-router/auth"
+
+  # Override useUser to ADD the v7-specific initialAuthState removal.
+  # Parent `use-user-isLoaded-not-checked` still applies — this fork adds a
+  # build-time/upgrade-time error for code that passes a now-rejected option.
+  - name: useUser
+    import_path: "@clerk/nextjs"
+    description: "React hook for current-user data; v7 removes initialAuthState parameter"
+    postconditions:
+      - id: use-user-initial-auth-state-removed
+        condition: >
+          useUser() or useAuth() called with the legacy `initialAuthState`
+          option (e.g. `useUser({ initialAuthState: ... })`). In v7 the option
+          is removed; the hook silently ignores it and the initial state must
+          be passed at the ClerkProvider boundary via `initialState`. The
+          refactor to `useSyncExternalStore` changed how SSR/CSR state is
+          rehydrated — any app that passed `initialAuthState` per-hook will
+          flash a logged-out state on hydration before the real state catches
+          up, producing a hydration mismatch warning and a UI flicker.
+        throws: "Silent no-op on v7 (option ignored); React hydration mismatch warning at runtime"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        required_handling: >
+          MUST migrate the initial state to `<ClerkProvider initialState={...}>`
+          at the app root (typically in app/layout.tsx). Remove every
+          `initialAuthState` argument from useUser/useAuth call sites. Audit
+          shared component libraries that may still pass the option through.
+        detector: >
+          Flag any call to useUser() or useAuth() whose argument object
+          contains an `initialAuthState` key. Also flag destructuring patterns
+          that explicitly pull the legacy option from props before passing it
+          to the hook.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/reference/clerk-react/use-user"
+
+  # Override currentUser to ADD the v7-specific treatPendingAsSignedOut option.
+  # Parent `current-user-not-cached` and null-check postconditions still apply.
+  - name: currentUser
+    import_path: "@clerk/nextjs/server"
+    description: "Fetches current user; v7 adds treatPendingAsSignedOut option for pending sessions"
+    postconditions:
+      - id: current-user-pending-session-default-changed
+        condition: >
+          currentUser() called in a v7+ codebase without explicitly setting
+          the `treatPendingAsSignedOut` option. The new default treats users
+          in a "pending" verification state (MFA pending, email-verification
+          pending, organization-selection pending) as signed-OUT — meaning
+          currentUser() returns `null` for these users. In v6 and earlier,
+          pending users were returned with their User object intact, and
+          downstream guards typically gated access by checking specific
+          verification fields. Code that previously relied on the User
+          object being non-null for pending users (e.g. to redirect them
+          to a verification page) now incorrectly redirects them to the
+          sign-IN page.
+        throws: "Silent behavior change: currentUser() returns null for pending users (was: User object)"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+        required_handling: >
+          MUST either (a) pass `treatPendingAsSignedOut: false` to
+          currentUser() to restore v6 behavior for the existing verification
+          flow, OR (b) refactor the verification flow to handle pending
+          users at the ClerkProvider/middleware layer (recommended). Audit
+          every currentUser() call site that branched on
+          `user.unsafeMetadata` / `user.publicMetadata.pendingVerification`
+          or similar — these branches will silently dead-code in v7.
+        detector: >
+          Flag every currentUser() call in a v7+ codebase whose result is
+          checked for null-OR-User shape AND used as a verification gate
+          (look for downstream property access like `.publicMetadata`,
+          `.privateMetadata`, `.emailAddresses[0].verification.status`).
+          Suggest passing treatPendingAsSignedOut: false or migrating to
+          middleware-level handling.
+        sources:
+          - "https://clerk.com/docs/upgrade-guides/nextjs/v7"
+          - "https://clerk.com/docs/references/backend/user/get-user"
+
+metadata:
+  last_verified: "2026-06-18"
+  evidence_quality: confirmed
+  coverage_score: 1.0
+  coverage_rationale: >
+    @clerk/nextjs-v7 is an extends-fork that exists ONLY to document the
+    five v7.0.0 breaking-change surface points relative to the parent
+    @clerk/nextjs profile (v5-v6). All five are now contracted:
+    (1) getToken SSR throw,
+    (2) clerkMiddleware CLERK_ENCRYPTION_KEY requirement,
+    (3) auth.protect() 401 vs 404 server-action status change,
+    (4) useUser/useAuth removal of initialAuthState option,
+    (5) currentUser treatPendingAsSignedOut default behavior change.
+    Every other v7 API surface point is inherited unchanged from the parent
+    profile (sign-in/sign-up, webhook verification, clerkClient CRUD,
+    useClerk provider checks, attemptFirstFactor codes, etc.). Effective
+    coverage of v7-only delta = 5/5 = 1.0.

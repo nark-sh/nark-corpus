@@ -2,6 +2,24 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-18 — deepen pass — coverage 95% → 100%
+
+- **Profile:** `packages/@clerk/nextjs-v7/contract.yaml`
+- **Functions added:** protect (auth.protect), useUser, currentUser (3 new function overrides)
+- **Postconditions added:** 4 new
+  - `get-token-offline-not-handled` (added to existing getToken function)
+  - `protect-server-action-status-code-changed` (new protect override)
+  - `use-user-initial-auth-state-removed` (new useUser override)
+  - `current-user-pending-session-default-changed` (new currentUser override)
+- **Functions intentionally omitted this pass:** none — v7-fork delta surface is now fully covered (5/5)
+- **Scanner concerns queued:** 5 (`concern-20260618-clerk-nextjs-v7-deepen-1` through `-5`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - https://raw.githubusercontent.com/clerk/javascript/main/packages/nextjs/CHANGELOG.md (v7.0.0 entry)
+  - https://clerk.com/docs/reference/nextjs/app-router/auth (auth.protect status codes)
+- **Verified by:** bc-deepen-contract (pass 14, deepen-stream-1, 2026-06-18T23:46Z)
+- **Notes:** This v7 fork's API surface is the v7.0.0 BREAKING-CHANGE delta versus the parent profile, not the full @clerk/nextjs surface. Five v7 changes documented in the v7.0.0 changelog are now all contracted. The two previously-contracted functions (getToken SSR throw, clerkMiddleware encryption-key) were preserved unchanged; one new postcondition was added to getToken for the ClerkOfflineError case that the original fork missed. Top-level coverage_score promoted from 0.95 to 1.0.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @clerk/nextjs@7.5.5
