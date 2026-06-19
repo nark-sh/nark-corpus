@@ -1,8 +1,8 @@
 package: bcryptjs
 semver: ">=2.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-06-19"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -10,7 +10,10 @@ coverage_score: 1.0
 
 detection:
   # bcryptjs is a pure JavaScript library with simple function exports
-  # Functions are called directly on the module import
+  # Functions are called directly on the module import.
+  # async/await_patterns: only the Promise-returning entry points; sync functions
+  # (hashSync, compareSync, genSaltSync, getRounds, getSalt, truncates) throw
+  # synchronously and are flagged via require_try_catch scanner rules instead.
   await_patterns:
     - "bcrypt.hash("
     - "bcrypt.compare("
@@ -475,6 +478,168 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: getRounds
+    import_path: "bcryptjs"
+    description: >
+      Extracts the cost factor (rounds) from a bcrypt hash string. Used to detect when
+      stored hashes were generated with an outdated cost factor and need to be rehashed
+      on next login. This is a common pattern in production auth systems for
+      transparent password upgrades.
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 296-300)
+      # Source confirmed at bcryptjs@3.0.3 node_modules/bcryptjs/index.js:296-300
+      # Throws Error("Illegal arguments: " + typeof hash) if hash is not a string.
+      # Otherwise parseInt(hash.split("$")[2], 10) — returns NaN for malformed hashes (silent).
+      - id: get-rounds-type-error
+        condition: "hash parameter is not a string"
+        throws: "Error: Illegal arguments: [typeof hash]"
+        required_handling: >
+          Caller MUST wrap getRounds() in try-catch when the hash comes from a database
+          column or external source where it could be null, undefined, a Buffer, or any
+          non-string type. Common cause: the user record was not found (hash is undefined)
+          and the calling code did not guard, so a synchronous throw bubbles up into a
+          login or password-rotation handler that does not expect it. Validate that the
+          hash is a string of length 60 before calling getRounds().
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: get-rounds-silent-nan-on-malformed-hash
+        description: >
+          getRounds() does NOT validate the hash format. If the hash is a string but is
+          not a well-formed bcrypt hash (wrong length, wrong prefix, truncated, or
+          stored in a VARCHAR column too narrow to hold the full 60 chars), getRounds()
+          returns NaN silently — no throw, no warning. Comparing the result to a target
+          rounds value (`if (getRounds(hash) < 12) { rehash() }`) will evaluate to false
+          for NaN, so rehash logic silently never runs and weak hashes persist forever.
+          Always validate the hash format separately (length === 60 && starts with $2a$
+          or $2b$) before relying on getRounds(). This is a silent security-degradation
+          path that escapes most testing.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: getSalt
+    import_path: "bcryptjs"
+    description: >
+      Extracts the salt portion (first 29 characters) from a bcrypt hash. Used in
+      rare cases where an application wants to deterministically re-hash a known
+      password against the existing salt — for instance, during password verification
+      in legacy migration paths. In modern code, compare() should be preferred.
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 308-314)
+      # Source confirmed at bcryptjs@3.0.3 node_modules/bcryptjs/index.js:308-314.
+      # Throws Error("Illegal arguments: " + typeof hash) if hash is not a string.
+      # Throws Error("Illegal hash length: " + length + " != 60") if hash.length !== 60.
+      - id: get-salt-type-error
+        condition: "hash parameter is not a string"
+        throws: "Error: Illegal arguments: [typeof hash]"
+        required_handling: >
+          Caller MUST wrap getSalt() in try-catch when the hash comes from a database
+          row or external source where it may be null, undefined, or a non-string type
+          (Buffer, Object). The function throws synchronously — there is no Promise
+          and no .catch() path. Validate that the hash is a 60-character string
+          before calling.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: get-salt-illegal-length
+        condition: "hash is a string but its length is not exactly 60 characters"
+        throws: "Error: Illegal hash length: [length] != 60"
+        required_handling: >
+          Caller MUST handle the length-validation throw. Common cause: the hash was
+          stored in a VARCHAR column narrower than 60 (e.g. VARCHAR(40)), or it was
+          trimmed/encoded on insert, or it was migrated from a different bcrypt
+          variant (some libraries produce $2y$ hashes that may have different
+          lengths). Unlike compareSync() which silently returns false for malformed
+          hashes, getSalt() throws explicitly — so an uncaught throw will crash the
+          handler. Validate hash.length === 60 before calling, or wrap the call.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: truncates
+    import_path: "bcryptjs"
+    description: >
+      Returns true if a password's UTF-8 byte length exceeds 72 bytes (the bcrypt
+      algorithm's truncation boundary). Used as a preflight check in authentication
+      flows to either reject overly-long passwords up front or warn the user that
+      only the first 72 bytes will be considered. Without this check, users with
+      long passwords can change their password to a "different" one whose first
+      72 bytes match the old one and silently bypass the change.
+
+    postconditions:
+      # Evidence: https://github.com/dcodeIO/bcrypt.js/blob/master/index.js (lines 322-326)
+      # Source confirmed at bcryptjs@3.0.3 node_modules/bcryptjs/index.js:322-326.
+      # Throws Error("Illegal arguments: " + typeof password) if password is not a string.
+      - id: truncates-type-error
+        condition: "password parameter is not a string"
+        throws: "Error: Illegal arguments: [typeof password]"
+        required_handling: >
+          Caller MUST wrap truncates() in try-catch or validate the input is a string
+          first. Common cause: passing undefined when the user-submitted form field
+          is missing, or passing a Buffer from a binary upload path. The function is
+          synchronous — there is no Promise rejection or .catch() handler available.
+        sources:
+          - "https://github.com/dcodeIO/bcrypt.js/blob/master/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+    edge_cases:
+      - id: truncates-must-precede-hashing
+        description: >
+          If truncates() returns true and the caller proceeds to call hash() or
+          hashSync() anyway, bcryptjs silently hashes only the first 72 bytes of the
+          password. Two different long passwords whose first 72 bytes are identical
+          will produce verifiable matches — a serious authentication ambiguity. Best
+          practice in a registration/password-change flow is to (1) call truncates()
+          first, (2) reject the password and ask the user for a shorter one, OR
+          (3) pre-hash with SHA-256 to a fixed-length input before passing to bcrypt
+          (with the caveat that SHA-256-then-bcrypt should NOT mix passwords with
+          non-prehashed bcrypt hashes — pick one strategy app-wide).
+        sources:
+          - "https://raw.githubusercontent.com/dcodeIO/bcrypt.js/master/README.md"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
 # SOURCES.md has comprehensive documentation of all error conditions
 # See: corpus/packages/bcryptjs/SOURCES.md (489 lines)
 #
@@ -489,6 +654,15 @@ functions:
 # - Added compareSync (3 postconditions)
 # - Added genSaltSync (2 postconditions)
 # - Coverage: 50% → 100% (3/6 → 6/6 contractable async+sync-throwable functions)
+#
+# Depth pass 2026-06-19 (deepen-stream-1 pass 18):
+# - Added getRounds (1 postcondition + 1 silent-NaN edge case)
+# - Added getSalt (2 postconditions: type-error + illegal-length)
+# - Added truncates (1 postcondition + 1 security-risk edge case)
+# - Coverage: 6/12 contractable → 9/12 contractable (effective 9/9 once setRandomFallback
+#   / encodeBase64 / decodeBase64 are explicitly omitted as utility-only with no
+#   actionable error contracts).
+# - API surface verified against bcryptjs@3.0.3 dist/index.d.ts (12 exports total).
 #
 # Key findings:
 # - Most common mistake: Missing try-catch around bcrypt operations
