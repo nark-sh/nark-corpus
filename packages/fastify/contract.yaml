@@ -1,12 +1,12 @@
 package: fastify
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-18"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.90
+coverage_score: 0.91  # 10 contracted / 11 total async-callable functions (inject omitted as testing utility). +1 this pass: setNotFoundHandler (deepen-stream-2 pass 15, 2026-06-18 — fastify@5.8.5)
 
 detection:
   factory_methods:
@@ -431,6 +431,74 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: low
 
+  - name: setNotFoundHandler
+    import_path: "fastify"
+    description: >
+      Registers a route-handler-style function invoked when no registered route matches
+      the incoming request. Distinct from setErrorHandler — setErrorHandler does NOT
+      catch 404s. Encapsulated per plugin scope (each prefix can have its own 404
+      handler). Optional opts object accepts preValidation / preHandler hooks. Must be
+      called before listen()/ready(). The handler itself receives (request, reply) and
+      can be async; thrown errors flow through setErrorHandler, not back through the
+      404 path.
+    postconditions:
+      # Evidence: https://fastify.dev/docs/latest/Reference/Server/#setnotfoundhandler
+      # Error codes confirmed from fastify/fastify.js:694-697 and fastify/lib/four-oh-four.js:93-94
+      - id: setnotfoundhandler-called-after-start
+        # Source: throwIfAlreadyStarted('Cannot call "setNotFoundHandler"!') — fastify.js:695
+        condition: "setNotFoundHandler() is called after fastify.listen() or fastify.ready() has been awaited (server already started)"
+        throws: "Error: Cannot call \"setNotFoundHandler\" when fastify instance is already started!"
+        required_handling: "Call setNotFoundHandler() during server setup, before awaiting listen() or ready(). In plugins, setNotFoundHandler() is always safe to call since plugins execute before server starts. Late registration is a startup-only error — visible immediately on next deploy."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Server/#setnotfoundhandler
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: setnotfoundhandler-already-set
+        # Source: fastify/lib/four-oh-four.js:93-94 — throw new Error("Not found handler already set ...")
+        # Each prefix can have at most ONE 404 handler. Encapsulated plugin scopes
+        # may each register their own, but registering twice in the same scope throws.
+        condition: "setNotFoundHandler() is called twice for the same Fastify instance / plugin prefix"
+        throws: "Error: Not found handler already set for Fastify instance with prefix: '<prefix>' — thrown synchronously"
+        required_handling: "Register the 404 handler exactly once per encapsulated scope. If you need a different 404 response under a sub-prefix, register the handler inside the corresponding plugin's register() body — the plugin's scope owns its own 404 handler independently of the root."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Server/"
+          - "https://fastify.dev/docs/latest/Reference/Plugins/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: setnotfoundhandler-handler-throws-routes-via-error-handler
+        # Source: fastify/lib/four-oh-four.js — 404 handler errors are routed through the request lifecycle
+        # which means setErrorHandler catches them, NOT the 404 path. A 404 handler that
+        # throws bypasses the intended 404 response and may return 500 instead.
+        condition: "the registered 404 handler function itself throws synchronously, awaits a rejected promise, or fails to send a response"
+        throws: "Error is routed through setErrorHandler (NOT through the 404 path again) — the client receives the formatted error response from setErrorHandler, typically 500 Internal Server Error, NOT the intended 404. If no setErrorHandler is configured, returns an unformatted 500."
+        required_handling: "Wrap the 404 handler body in try-catch when it does I/O (e.g., logging unknown-route attempts to a database, fetching analytics). On failure, call reply.code(404).send({ message: 'Not Found' }) explicitly so the response status reflects the real intent. Without this, debugging looks confusing — client logs show 500 from a route that should be 404."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Server/#setnotfoundhandler"
+          - "https://fastify.dev/docs/latest/Reference/Hooks/#onerror"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 edge_cases:
   - id: error-handler-configuration
     description: "Configure setErrorHandler at app or route level for centralized error handling - prevents inconsistent error responses and provides proper error formatting"
@@ -445,13 +513,16 @@ edge_cases:
       incident_cost_range: medium
 
 # Category: framework
-# Latest version: 5.8.4
+# Latest version: 5.8.5
 # Generated: 2026-02-25
 # Audited: 2026-04-02 — scan-fastify-2026-04-02.json, 10 repos, 6 affected (60%), 111 violations, 0/100 FPs
 # Deepened: 2026-04-11 — deepen-stream-2 pass 1
 # Deepened: 2026-04-13 — deepen-stream-2 pass 2
-# Coverage: 9/10 non-omitted async-callable functions = 90%
+# Deepened: 2026-06-18 — deepen-stream-2 pass 15 (+1 function: setNotFoundHandler, +3 postconditions)
+# Coverage: 10/11 non-omitted async-callable functions = 91% (was 9/10 = 90% before pass 15)
 #   Contracted: get (route handlers + handlerTimeout), listen, close, ready, register, after, addHook,
-#               setErrorHandler (3 postconditions), addContentTypeParser (3 postconditions)
-#   Intentionally omitted: inject (testing utility), all/WebDAV route methods (same error profile as get)
+#               setErrorHandler (3 postconditions), addContentTypeParser (3 postconditions),
+#               setNotFoundHandler (3 postconditions — added pass 15)
+#   Intentionally omitted: inject (testing utility), all/WebDAV route methods (same error profile as get),
+#                          [Symbol.asyncDispose] (alias for close())
 #   Not yet contracted: route() — same error profile as get, FST_ERR_DUPLICATED_ROUTE is startup-time programming error
