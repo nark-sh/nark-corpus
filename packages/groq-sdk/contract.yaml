@@ -1,13 +1,18 @@
 package: groq-sdk
 semver: ">=0.3.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
 # Evidence: scan-groq-sdk-2026-04-02.json — 5 repos scanned, 2 affected (40%), 4 violations
 # Top affected: nbonamy/witsy (⭐ 1916), okisdev/ChatChat (⭐ 1275)
+# Deepen pass 2026-06-23 (deepen-stream-2 pass=16): enumerated full v1.3.0 API surface
+# (groq-sdk@1.3.0, types under package/resources/*.d.ts) — added 9 previously-uncontracted
+# resource management endpoints (batches.retrieve/list, files.list/delete/content/info,
+# models.retrieve/list/delete). v0.3.x → v1.3.x surface is additive-only for existing
+# functions; semver range stays unchanged at >=0.3.0.
 
 functions:
   - name: create
@@ -299,10 +304,358 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: retrieve
+    import_path: "groq-sdk"
+    namespace: "batches"
+    description: >
+      Retrieves a batch by batchID. Returns the current BatchRetrieveResponse with
+      status, request_counts, and error_file_id when applicable. Used to poll batch
+      progress after batches.create(). Used via groq.batches.retrieve(batchID).
+      Added in v0.3.x; surface unchanged through v1.3.0.
+
+    postconditions:
+      # Evidence: package/resources/batches.d.ts (groq-sdk@1.3.0):
+      #   retrieve(batchID: string, options?: RequestOptions): APIPromise<BatchRetrieveResponse>
+      # Error surface from package/core/error.d.ts — every API method on Groq throws
+      # APIError subclasses on non-2xx responses (see makeStatusError in client.d.ts:133).
+      - id: groq-batches-retrieve-no-try-catch
+        condition: >
+          groq.batches.retrieve() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, invalid or expired batchID),
+          AuthenticationError (401), RateLimitError (429), InternalServerError (5xx),
+          APIConnectionError (network)
+        required_handling: >
+          Caller MUST wrap in try-catch. Poll loops are the dominant usage pattern —
+          unhandled NotFoundError on a batchID that has expired (Groq batches expire
+          after 7 days per docs) crashes the polling worker. RateLimitError on a tight
+          polling loop is also common; back off using err.headers['retry-after'].
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: list
+    import_path: "groq-sdk"
+    namespace: "batches"
+    description: >
+      Lists all batches for the organization. Returns a BatchListResponse. Used via
+      groq.batches.list(). Common in admin UIs and cost-tracking jobs. Added in
+      v0.3.x; surface unchanged through v1.3.0.
+
+    postconditions:
+      # Evidence: package/resources/batches.d.ts (groq-sdk@1.3.0):
+      #   list(options?: RequestOptions): APIPromise<BatchListResponse>
+      - id: groq-batches-list-no-try-catch
+        condition: >
+          groq.batches.list() called without try-catch
+        throws: >
+          Groq.APIError subclasses: AuthenticationError (401, missing/invalid API key),
+          RateLimitError (429), InternalServerError (5xx), APIConnectionError (network),
+          APIConnectionTimeoutError (timeout)
+        required_handling: >
+          Caller MUST wrap in try-catch. Unhandled network errors crash the listing job
+          (common in scheduled cost-reporting workers).
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: list
+    import_path: "groq-sdk"
+    namespace: "files"
+    description: >
+      Lists all files uploaded to the organization. Returns a FileListResponse with
+      data array of file metadata. Used via groq.files.list(). Common in cleanup
+      and audit jobs.
+
+    postconditions:
+      # Evidence: package/resources/files.d.ts (groq-sdk@1.3.0):
+      #   list(options?: RequestOptions): APIPromise<FileListResponse>
+      - id: groq-files-list-no-try-catch
+        condition: >
+          groq.files.list() called without try-catch
+        throws: >
+          Groq.APIError subclasses: AuthenticationError (401), RateLimitError (429),
+          InternalServerError (5xx), APIConnectionError (network)
+        required_handling: >
+          Caller MUST wrap in try-catch. Listing failures in cleanup/audit cron jobs
+          should be surfaced rather than swallowed — silent failures leave orphaned
+          batch files accumulating against the 100MB-per-file storage limit.
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: delete
+    import_path: "groq-sdk"
+    namespace: "files"
+    description: >
+      Deletes a file by fileID. Returns a FileDeleteResponse indicating success.
+      Used via groq.files.delete(fileID). Common in batch-cleanup workflows after
+      batches.retrieve() shows status="completed".
+
+    postconditions:
+      # Evidence: package/resources/files.d.ts (groq-sdk@1.3.0):
+      #   delete(fileID: string, options?: RequestOptions): APIPromise<FileDeleteResponse>
+      - id: groq-files-delete-no-try-catch
+        condition: >
+          groq.files.delete() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, fileID already deleted or
+          never existed), AuthenticationError (401), ConflictError (409, file is
+          referenced by an active batch), InternalServerError (5xx), APIConnectionError
+        required_handling: >
+          Caller MUST wrap in try-catch. NotFoundError on idempotent delete loops
+          (deleting a file already removed by an earlier cleanup) is common — handle
+          it explicitly as a success-equivalent rather than swallowing all errors.
+          ConflictError indicates the file is still in use by a batch — block deletion
+          until batches.list() confirms no active batch references it.
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: content
+    import_path: "groq-sdk"
+    namespace: "files"
+    description: >
+      Returns the binary contents of a file as a fetch Response. Used via
+      groq.files.content(fileID) to retrieve batch-output JSONL after a batch
+      completes (output_file_id from the BatchRetrieveResponse). The return type
+      is a raw Response — callers MUST call .text() or .body stream to read content,
+      which itself can fail.
+
+    postconditions:
+      # Evidence: package/resources/files.d.ts (groq-sdk@1.3.0):
+      #   content(fileID: string, options?: RequestOptions): APIPromise<Response>
+      - id: groq-files-content-no-try-catch
+        condition: >
+          groq.files.content() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, invalid fileID),
+          AuthenticationError (401), RateLimitError (429), InternalServerError (5xx),
+          APIConnectionError (network), APIConnectionTimeoutError (timeout on large
+          batch-output downloads)
+        required_handling: >
+          Caller MUST wrap in try-catch. Batch-output files can be large (up to
+          100MB) and downloads time out under poor network conditions — wrap the
+          entire .content() call AND the subsequent .text()/.body stream consumption
+          in the same try-catch since stream errors can also throw mid-read. Failure
+          to retrieve batch output means the batch results are LOST until the file
+          expires, even though the batch itself completed successfully.
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: groq-files-content-response-not-consumed
+        condition: >
+          files.content() Response not consumed via .text(), .json(), or .body
+          stream — return value discarded or only checked for .ok / .status
+        throws: >
+          Does not throw. The Response body is left unconsumed, leading to
+          memory leaks and (in some fetch implementations) keeping the connection
+          open until the abort signal fires.
+        required_handling: >
+          Caller MUST consume the Response body (await .text(), .json(), or read
+          .body as a stream). Discarding the return value of files.content() means
+          the batch-output JSONL never reaches the caller — silent data loss.
+          Even on error paths (response.ok === false), call .text() to read the
+          error body before discarding.
+        sources:
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response"
+          - "https://console.groq.com/docs/batch"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: info
+    import_path: "groq-sdk"
+    namespace: "files"
+    description: >
+      Returns file metadata (id, bytes, created_at, filename, purpose) for the
+      given fileID. Used via groq.files.info(fileID). Useful for verifying upload
+      size before submitting a batch.
+
+    postconditions:
+      # Evidence: package/resources/files.d.ts (groq-sdk@1.3.0):
+      #   info(fileID: string, options?: RequestOptions): APIPromise<FileInfoResponse>
+      - id: groq-files-info-no-try-catch
+        condition: >
+          groq.files.info() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, invalid fileID),
+          AuthenticationError (401), RateLimitError (429), InternalServerError (5xx),
+          APIConnectionError (network)
+        required_handling: >
+          Caller MUST wrap in try-catch. NotFoundError on a fileID that the upstream
+          code thought existed indicates a race condition (file deleted between
+          create and info call) — surface as a user-visible error rather than
+          swallowing.
+        sources:
+          - "https://console.groq.com/docs/batch"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: retrieve
+    import_path: "groq-sdk"
+    namespace: "models"
+    description: >
+      Retrieves a model by its id. Returns a Model object with id, created,
+      object, and owned_by. Used via groq.models.retrieve(modelID). Common in
+      model-availability check flows before submitting a chat completion.
+
+    postconditions:
+      # Evidence: package/resources/models.d.ts (groq-sdk@1.3.0):
+      #   retrieve(model: string, options?: RequestOptions): APIPromise<Model>
+      - id: groq-models-retrieve-no-try-catch
+        condition: >
+          groq.models.retrieve() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, model id does not exist
+          or has been deprecated by Groq), AuthenticationError (401),
+          RateLimitError (429), InternalServerError (5xx), APIConnectionError
+        required_handling: >
+          Caller MUST wrap in try-catch. Groq deprecates models on a rolling
+          basis — NotFoundError on a hardcoded model id is the dominant
+          production failure mode for long-lived deployments. Handle it as
+          "model unavailable, fall back to default" rather than crashing.
+        sources:
+          - "https://console.groq.com/docs/models"
+          - "https://console.groq.com/docs/deprecations"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: list
+    import_path: "groq-sdk"
+    namespace: "models"
+    description: >
+      Lists all available models. Returns a ModelListResponse with data array of
+      Model objects. Used via groq.models.list(). Common in dynamic model-picker
+      UIs and at startup to discover currently-available models (Groq deprecates
+      models on rolling basis).
+
+    postconditions:
+      # Evidence: package/resources/models.d.ts (groq-sdk@1.3.0):
+      #   list(options?: RequestOptions): APIPromise<ModelListResponse>
+      - id: groq-models-list-no-try-catch
+        condition: >
+          groq.models.list() called without try-catch
+        throws: >
+          Groq.APIError subclasses: AuthenticationError (401), RateLimitError (429),
+          InternalServerError (5xx), APIConnectionError (network)
+        required_handling: >
+          Caller MUST wrap in try-catch. Models-list failures at startup should
+          fall back to a hardcoded known-good list rather than crashing the app —
+          the deployment must still serve traffic even if the discovery call
+          temporarily fails.
+        sources:
+          - "https://console.groq.com/docs/models"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: delete
+    import_path: "groq-sdk"
+    namespace: "models"
+    description: >
+      Deletes a fine-tuned model owned by the organization. Returns a ModelDeleted
+      response. Used via groq.models.delete(modelID). Only applicable to
+      organization-owned fine-tuned models (cannot delete Groq's built-in models).
+
+    postconditions:
+      # Evidence: package/resources/models.d.ts (groq-sdk@1.3.0):
+      #   delete(model: string, options?: RequestOptions): APIPromise<ModelDeleted>
+      - id: groq-models-delete-no-try-catch
+        condition: >
+          groq.models.delete() called without try-catch
+        throws: >
+          Groq.APIError subclasses: NotFoundError (404, model id does not exist
+          or already deleted), PermissionDeniedError (403, attempting to delete a
+          Groq-owned built-in model), AuthenticationError (401),
+          InternalServerError (5xx), APIConnectionError (network)
+        required_handling: >
+          Caller MUST wrap in try-catch. PermissionDeniedError on a built-in model
+          id (e.g. attempting to delete "llama-3.3-70b-versatile") indicates a bug
+          in the calling code — surface as a hard error, do NOT silently swallow.
+          NotFoundError on idempotent delete loops is success-equivalent.
+        sources:
+          - "https://console.groq.com/docs/models"
+          - "https://console.groq.com/docs/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
 metadata:
-  last_verified: "2026-04-02"
+  last_verified: "2026-06-23"
   evidence_quality: confirmed
-  coverage_score: 0.94
+  coverage_score: 1.0
 
 notes:
   - "groq-sdk throws exceptions on API failures (unlike Resend which uses { data, error } pattern)"
@@ -314,3 +667,7 @@ notes:
   - "groq-sdk API is structurally identical to openai SDK — same deep chain patterns"
   - "Batch API requires two-step workflow: files.create() then batches.create()"
   - "Batch results are per-item JSONL — batch 'completed' status does not mean all items succeeded"
+  - "v1.3.0 (2026-06-17): full v1.x surface covered — adds batches.retrieve/list, files.list/delete/content/info, models.retrieve/list/delete to the previously contracted set"
+  - "models.retrieve / models.list: Groq deprecates models on rolling basis — production code should not hardcode model ids without fallback"
+  - "files.content returns a raw fetch Response — callers must consume the body (.text()/.json()/.body stream) or the batch results are lost"
+  - "files.delete: ConflictError (409) when file is still referenced by an active batch — block delete until batches.list() confirms no active refs"
