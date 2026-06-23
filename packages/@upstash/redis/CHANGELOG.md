@@ -3,6 +3,42 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass 13 — drift-mode coverage maintained at 100% (effective)
+
+- **Profile:** `packages/@upstash/redis/contract.yaml`
+- **Drift baseline compared:** v1.34.7 (April-era surface) → v1.38.0 (latest, 2026-05-05)
+- **Functions added:** xadd, xgroup, xreadgroup, copy, flushdb (5 total)
+- **Postconditions added:** 6
+  - `xadd.wrongtype-or-network-error` — stream-append data-loss prevention
+  - `xgroup.busygroup-or-nogroup-error` — consumer-group lifecycle
+  - `xreadgroup.nogroup-error` — silent-halt on missing consumer group
+  - `copy.copy-result-not-checked` — silent NOT_COPIED return value pattern
+  - `copy.wrongtype-or-network-error` — copy network/WRONGTYPE
+  - `flushdb.destructive-no-try-catch` — destructive admin op guardrail
+- **Net-new API families enumerated (not all postconditioned this pass):**
+  - Streams: xadd, xack, xackdel, xautoclaim, xclaim, xdelex, xgroup, xinfo, xpending, xrange, xread, xreadgroup, xrevrange, xtrim (Redis 7.4+ streams shipped to Upstash SDK)
+  - Redis Functions: functions.load, functions.list, functions.delete, functions.flush, functions.stats, functions.call, functions.callRo
+  - Hash field expiration: hexpire, hexpireat, hexpiretime, httl, hpexpire, hpexpireat, hpexpiretime, hpttl, hpersist
+  - Misc: copy, flushdb, clientSetinfo, sintercard
+- **Functions enumerated but intentionally omitted this pass:** xack, xtrim, xpending, xinfo, xrange, xrevrange, xautoclaim, xclaim, xdelex, xackdel (share xadd's error profile); functions.list/delete/flush/stats/call/callRo (rare in app code, error profile mirrors eval()); hash-field-expiration family (mirrors expire()'s profile)
+- **Scanner concerns queued:** 6 (`concern-20260623-upstash-redis-deepen-stream3-pass13-xadd`, `-xgroup`, `-xreadgroup`, `-copy-result`, `-copy-network`, `-flushdb`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - https://redis.io/commands/xadd
+  - https://redis.io/commands/xgroup
+  - https://redis.io/commands/xreadgroup
+  - https://redis.io/commands/copy
+  - https://redis.io/commands/flushdb
+  - https://upstash.com/docs/redis/sdks/ts/commands/stream/xadd
+  - https://upstash.com/docs/redis/sdks/ts/commands/stream/xgroup
+  - https://upstash.com/docs/redis/sdks/ts/commands/stream/xreadgroup
+  - https://upstash.com/docs/redis/sdks/ts/commands/generic/copy
+  - https://upstash.com/docs/redis/sdks/ts/commands/server/flushdb
+- **Evidence path:** TypeScript declaration diff between
+  `@upstash/redis@1.34.7/package/zmscore-hRk-rDLY.d.ts` and
+  `@upstash/redis@1.38.0/package/error-8y4qG0W2.d.ts` (downloaded from npm registry)
+- **Verified by:** bc-deepen-contract (deepen-stream-3, pass 13, 2026-06-23)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @upstash/redis@1.38.0

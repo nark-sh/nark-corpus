@@ -2,7 +2,7 @@ package: "@upstash/redis"
 semver: ">=1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -631,3 +631,213 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: xadd
+    import_path: "@upstash/redis"
+    # Added in deepen pass 13 (2026-06-23) — drift: streams API was added in v1.34+ and
+    # is now stable in v1.38. xadd is the canonical write entry point for stream-based
+    # job queues, event sourcing pipelines, and ordered audit logs in serverless setups.
+    # Evidence: package source `error-8y4qG0W2.d.ts` — XAddCommand class; @see redis.io/commands/xadd
+    description: >
+      Append a new entry to a Redis stream at the given key. Returns the generated stream
+      entry ID (e.g. "1526919030474-55"). Used as redis.xadd(key, id, entries, opts).
+      Underpins event-sourcing, job queues, and audit trails. Stream entries are
+      append-only and ordered by ID.
+
+    postconditions:
+      - id: wrongtype-or-network-error
+        condition: >
+          Key exists but holds a non-stream type (WRONGTYPE error) OR network failure
+          after retries OR auth failure OR MAXLEN/MINID approximate-trim eviction edge
+        throws: "UpstashError (including WRONGTYPE) or Error"
+        required_handling: >
+          Caller MUST wrap in try-catch. WRONGTYPE is a data-model bug — a non-stream key
+          was reused as a stream — and should alert loudly because subsequent reads will
+          also fail. Network errors during stream append in event-sourcing pipelines can
+          cause lost events: callers MUST decide between (a) at-least-once with idempotent
+          consumers, or (b) catching and queueing the entry locally before retry. Discarding
+          the returned entry ID also discards the only handle that lets a consumer dedupe
+          (use the returned ID, not a client-side ULID, for downstream correlation).
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/xadd"
+          - "https://upstash.com/docs/redis/sdks/ts/commands/stream/xadd"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: xgroup
+    import_path: "@upstash/redis"
+    # Added in deepen pass 13 (2026-06-23) — drift: consumer groups are the only sane
+    # way to consume streams at scale (per-consumer cursor + pending entry list); their
+    # lifecycle errors (BUSYGROUP on CREATE, NOGROUP on DESTROY/SETID, ERR no such key)
+    # are the most common source of silent failure in stream pipelines.
+    description: >
+      Manage Redis Stream consumer groups. Supports CREATE, DESTROY, SETID, CREATECONSUMER,
+      DELCONSUMER subcommands via redis.xgroup({ type, ... }). Consumer groups enable
+      distributed stream consumption with cursor and pending-entry tracking.
+
+    postconditions:
+      - id: busygroup-or-nogroup-error
+        condition: >
+          CREATE called on an existing group (BUSYGROUP) OR DESTROY/SETID called on a
+          non-existent group (NOGROUP) OR the target stream key does not exist and MKSTREAM
+          was not supplied for CREATE
+        throws: "UpstashError — error messages include BUSYGROUP, NOGROUP, or 'ERR The XGROUP subcommand requires the key to exist.'"
+        required_handling: >
+          Caller MUST wrap in try-catch. BUSYGROUP on CREATE is benign during idempotent
+          startup — match on `e.message.includes('BUSYGROUP')` and continue. NOGROUP on
+          DESTROY/SETID indicates a configuration mismatch and should NOT be swallowed
+          silently — log loudly so consumer rebalancing can detect missing groups.
+          Pattern for idempotent consumer-group initialization:
+            try { await redis.xgroup({ type: 'CREATE', key, group, id: '$', mkstream: true }); }
+            catch (e) {
+              if (e instanceof UpstashError && e.message.includes('BUSYGROUP')) { /* ok */ }
+              else throw e;
+            }
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/xgroup"
+          - "https://upstash.com/docs/redis/sdks/ts/commands/stream/xgroup"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: xreadgroup
+    import_path: "@upstash/redis"
+    # Added in deepen pass 13 (2026-06-23) — drift: paired with xgroup CREATE; without
+    # error handling, an unconfigured consumer group silently breaks the entire downstream
+    # processor with no thrown signal beyond the bare UpstashError NOGROUP message.
+    description: >
+      Read new (or pending) stream entries on behalf of a consumer group. Used as
+      redis.xreadgroup({ group, consumer, ... }). Drives durable, parallel stream
+      consumption — each entry is delivered to exactly one consumer within the group.
+
+    postconditions:
+      - id: nogroup-error
+        condition: >
+          The named consumer group does not exist on the target stream (NOGROUP) OR
+          the stream key does not exist OR network failure after retries
+        throws: "UpstashError — 'NOGROUP No such key ... or consumer group ...'"
+        required_handling: >
+          Caller MUST wrap in try-catch. NOGROUP commonly fires on cold-start before
+          xgroup CREATE has run — handle it by creating the group (with MKSTREAM) and
+          retrying once. Swallowing NOGROUP without re-creation silently halts every
+          consumer in the group and the queue depth on the stream grows without bound
+          (no visible error in metrics until a depth alert fires hours later).
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/xreadgroup"
+          - "https://upstash.com/docs/redis/sdks/ts/commands/stream/xreadgroup"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: copy
+    import_path: "@upstash/redis"
+    # Added in deepen pass 13 (2026-06-23) — drift: copy returns a string union
+    # "COPIED" | "NOT_COPIED" rather than throwing when the destination exists. This is
+    # a classic silent-failure result-not-checked pattern; callers commonly fire-and-forget.
+    description: >
+      Copy the value at the source key to the destination key. Returns the literal string
+      "COPIED" on success or "NOT_COPIED" if the destination already exists (and REPLACE
+      was not supplied). Used as redis.copy(source, destination, opts).
+
+    postconditions:
+      - id: copy-result-not-checked
+        condition: >
+          redis.copy(...) called without checking the returned "COPIED" | "NOT_COPIED"
+          string union
+        throws: >
+          Does not throw on NOT_COPIED — silently returns the string literal. The caller
+          assumes the copy succeeded when in fact the destination key was left untouched.
+        required_handling: >
+          Caller MUST capture and branch on the return value. Pattern:
+            const status = await redis.copy(src, dst);
+            if (status === 'NOT_COPIED') { /* handle destination conflict */ }
+          OR pass `{ replace: true }` if overwrite is the intent. Treating copy() as
+          fire-and-forget produces stale/wrong reads from the destination key with no
+          error signal.
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/copy"
+          - "https://upstash.com/docs/redis/sdks/ts/commands/generic/copy"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: wrongtype-or-network-error
+        condition: >
+          Source key holds a type incompatible with the destination (rare) OR network
+          failure after retries OR auth failure
+        throws: "UpstashError or Error"
+        required_handling: >
+          Caller MUST wrap in try-catch in addition to checking the return value. Network
+          failures during copy leave the destination in an indeterminate state — implement
+          a verifying read (GET on destination) before assuming success.
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/copy"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: flushdb
+    import_path: "@upstash/redis"
+    # Added in deepen pass 13 (2026-06-23) — drift: destructive admin op now exposed at
+    # SDK level. Production accidents from flushdb in shared environments are rare but
+    # catastrophic; the lack of a try-catch typically means there is also no audit log.
+    description: >
+      Remove every key from the currently-selected Redis database. Returns "OK" on success.
+      Used as redis.flushdb(). Destructive — irreversible without a backup. Most commonly
+      used in tests; in production callers, its presence is almost always either an
+      accident or a deliberate isolated-environment reset.
+
+    postconditions:
+      - id: destructive-no-try-catch
+        condition: >
+          redis.flushdb() called without try-catch in production code paths
+        throws: >
+          UpstashError on auth failure (NOAUTH) or permission denied (NOPERM in Redis
+          ACL setups) or network failure after retries. Importantly, flushdb DOES succeed
+          on the first call when permissions are granted — silently wiping every key.
+        required_handling: >
+          Caller MUST wrap in try-catch AND wrap the call site in an explicit environment
+          guard. Pattern:
+            if (process.env.NODE_ENV !== 'test') throw new Error('flushdb in non-test env');
+            try { await redis.flushdb(); } catch (e) { log.error('flushdb failed', e); throw e; }
+          A bare flushdb() with no try-catch is treated by reviewers as a destructive op
+          with no logging, no audit trail, and no failure path — exactly the pattern that
+          turns a config typo into a P0 outage. ACL-based auth errors (NOPERM) are silent
+          when swallowed and mask permission-revocation rollouts.
+        evidence_quality: confirmed
+        sources:
+          - "https://redis.io/commands/flushdb"
+          - "https://upstash.com/docs/redis/sdks/ts/commands/server/flushdb"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high

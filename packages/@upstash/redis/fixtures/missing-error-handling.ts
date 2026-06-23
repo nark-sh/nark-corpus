@@ -81,3 +81,39 @@ export async function tryFinallyNoCatch(key: string): Promise<string | null> {
     console.log('cleanup');
   }
 }
+
+// VIOLATION: redis.xadd without try-catch (added pass 13)
+// @expect-violation: wrongtype-or-network-error
+export async function appendStreamEntryMissingCatch(stream: string, payload: Record<string, string>): Promise<string> {
+  const id = await redis.xadd(stream, '*', payload);
+  return id ?? '';
+}
+
+// VIOLATION: redis.xgroup without try-catch (added pass 13) — BUSYGROUP is the
+// canonical idempotent-startup case; without try-catch the entire consumer init crashes
+// @expect-violation: busygroup-or-nogroup-error
+export async function ensureConsumerGroupMissingCatch(stream: string, group: string): Promise<void> {
+  await redis.xgroup(stream, { type: 'CREATE', group, id: '$', options: { MKSTREAM: true } });
+}
+
+// VIOLATION: redis.xreadgroup without try-catch (added pass 13) — NOGROUP on
+// cold start silently halts every consumer if not handled
+// @expect-violation: nogroup-error
+export async function readGroupEntriesMissingCatch(stream: string, group: string, consumer: string): Promise<unknown[]> {
+  const entries = await redis.xreadgroup(group, consumer, stream, '>');
+  return entries ?? [];
+}
+
+// VIOLATION: redis.copy() called without checking return value (added pass 13) —
+// silent NOT_COPIED if destination exists; subsequent reads from dst return wrong data
+// @expect-violation: copy-result-not-checked
+export async function copyKeyResultIgnored(src: string, dst: string): Promise<void> {
+  await redis.copy(src, dst);
+}
+
+// VIOLATION: redis.flushdb() called without try-catch in non-test code path (added pass 13)
+// Destructive op with no audit trail
+// @expect-violation: destructive-no-try-catch
+export async function resetDatabaseMissingCatch(): Promise<void> {
+  await redis.flushdb();
+}
