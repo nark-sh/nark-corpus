@@ -300,3 +300,45 @@ export function useFormWithAsyncDefaultsWithFallback() {
 
   return form;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. useController — field.onChange Promise rejection (v7.79+ restored return)
+// ─────────────────────────────────────────────────────────────────────────────
+// As of react-hook-form@7.79.0 (PR #13518), useController's `field.onChange`
+// returns a Promise from the underlying register handler. If the form's
+// resolver or form-level validate throws, awaiting `field.onChange` rejects.
+
+import { useController, useForm as useFormForController } from 'react-hook-form';
+
+declare const checkEmailAvailable: (email: string) => Promise<boolean>;
+
+export function useControllerOnChangeUnhandled() {
+  const { control } = useFormForController<FormData>();
+  const { field } = useController({ name: 'email', control });
+
+  // SHOULD_NOT_FIRE: scanner gap — controller-onchange-resolver-rejection — await
+  // on Promise-returning field.onChange without try-catch. If the form's resolver
+  // throws (e.g. async backend validation), this rejection becomes unhandled.
+  const handleChange = async (value: string) => {
+    await field.onChange(value);
+  };
+
+  return handleChange;
+}
+
+export function useControllerOnChangeWithErrorHandling() {
+  // @expect-clean
+  const { control } = useFormForController<FormData>();
+  const { field } = useController({ name: 'email', control });
+
+  // SHOULD_NOT_FIRE: try-catch wraps the awaited field.onChange.
+  const handleChange = async (value: string) => {
+    try {
+      await field.onChange(value);
+    } catch (error) {
+      console.error('validation failed', error);
+    }
+  };
+
+  return handleChange;
+}

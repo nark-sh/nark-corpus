@@ -3,6 +3,24 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 67% → 78%
+
+- **Profile:** `packages/react-hook-form/contract.yaml`
+- **Functions added:** useController (1 total)
+- **Postconditions added:** 1 (controller-onchange-resolver-rejection)
+- **Functions intentionally omitted this pass:** none new — useFormState (read-only subscription) and useWatch (read-only value subscription) remain omitted. useController moved from omitted to contracted because v7.79.0 (PR #13518) restored the Promise return from field.onChange.
+- **Scanner concerns queued:** 1 (`concern-20260623-react-hook-form-deepen-1`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - https://github.com/react-hook-form/react-hook-form/releases/tag/v7.79.0
+  - https://github.com/react-hook-form/react-hook-form/releases/tag/v7.80.0
+  - https://github.com/react-hook-form/react-hook-form/pull/13518
+  - https://react-hook-form.com/docs/usecontroller
+  - node_modules/react-hook-form@7.80.0/dist/index.esm.mjs (lines 462-477, 1798-1854, 2082-2152)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23T20:53:47Z, deepen-stream-3 pass 6, public tier)
+
+Effective coverage (contracted / non-omitted async-callable) = 7/7 = 1.0. Raw coverage 7/9 = 0.78 (denominator includes useFormState and useWatch which are intentionally omitted as read-only subscriptions). Async-callable surface for v7.80.0: handleSubmit, useFormContext, useFieldArray, trigger, Form, useForm, useController — all contracted.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** react-hook-form@7.79.0
