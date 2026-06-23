@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 100% → 100% (re-confirmed complete)
+
+- **Profile:** `packages/@elastic/elasticsearch/contract.yaml`
+- **Functions added:** none (full re-enumeration of API surface against @elastic/elasticsearch@9.4.2 confirmed existing 22 contracted methods cover the production-async-callable surface)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** `helpers.search` (thin wrapper over `client.search()` — identical throws: ResponseError, ConnectionError, TimeoutError, NoLivingConnectionsError; covered by the `search` contract's `import_source` matching the same Client instance; documenting omission for parity with `helpers.scrollDocuments` / `helpers.msearch` / `helpers.esql` which were omitted on the same identical-error-profile reasoning in the 2026-04-03 pass). All other 9.4.x additions (esql.query, helpers.scrollSearch, msearch, reindex, closePointInTime, clearScroll) remain contracted from the 2026-04-03 deepen pass.
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** none (re-confirm pass — verified against locally installed @elastic/elasticsearch@9.4.2 dist files: `lib/api/index.d.ts`, `lib/helpers.d.ts`, `lib/client.d.ts`; no doc URLs re-fetched because no new postconditions written)
+- **Verified by:** bc-deepen-contract (pass 16, deepen-stream-3, 2026-06-23T23:27:46Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @elastic/elasticsearch@9.4.2
