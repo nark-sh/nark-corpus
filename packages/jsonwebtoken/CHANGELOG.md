@@ -3,6 +3,20 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 100% → 100% (re-verification)
+
+- **Profile:** `packages/jsonwebtoken/contract.yaml`
+- **Functions added:** none (API surface unchanged at jsonwebtoken@9.0.3)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** none — full surface already covered (`verify`, `sign`, `decode`)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/jsonwebtoken/index.js` (entry exports: `decode`, `verify`, `sign`, error classes only)
+  - `node_modules/@types/jsonwebtoken/index.d.ts` (exported functions confirmed: `sign`, `verify`, `decode` — same 3 as contracted)
+  - `node_modules/jsonwebtoken/README.md` "Errors & Codes" section (TokenExpiredError / JsonWebTokenError / NotBeforeError unchanged)
+- **Verified by:** bc-deepen-contract pass 18 (deepen-stream-2, drift-by-staleness mode — entry was the oldest `last_deepened` 2026-04-02). API surface unchanged since previous deepen pass; no new async functions added. `last_verified` bumped 2026-04-02 → 2026-06-23.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** jsonwebtoken@9.0.3
