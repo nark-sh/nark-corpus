@@ -1,14 +1,14 @@
 package: axios-retry
 semver: ">=1.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-18"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75  # 6 Nark profiles / 8 total (2 intentionally omitted: sync helpers + pure math)
+coverage_score: 0.78  # 7 Nark profiles / 9 total (2 intentionally omitted: sync helpers + pure math; 1 added 2026-06-23: onMaxRetryTimesExceeded)
 # effective_coverage: 1.00 — all meaningful Nark profiles documented
-# API surface: axiosRetry() (config), axios methods (exhaust), validateResponse, POST-not-retried, global-timeout, onRetry-swallowing
+# API surface: axiosRetry() (config), axios methods (exhaust), validateResponse, POST-not-retried, global-timeout, onRetry-swallowing, onMaxRetryTimesExceeded-swallowing
 # Omitted: isNetworkError/isRetryableError/isSafeRequestError/isIdempotentRequestError/isNetworkOrIdempotentRequestError/exponentialDelay/linearDelay/retryAfter (sync helpers, no error contracts)
 
 # SPECIAL CASE: axios-retry is a configuration/wrapper library.
@@ -303,3 +303,78 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: low
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # NEW CONTRACT (2026-06-23 depth pass — deepen-stream-3)
+  # Evidence: axios-retry@4.5.0 dist/cjs/index.d.ts line 30 + index.js lines 195-199
+  #           README: onMaxRetryTimesExceeded option documented in options table
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: "axiosRetry (onMaxRetryTimesExceeded async error swallowing)"
+    import_path: "axios-retry"
+    description: >
+      The onMaxRetryTimesExceeded callback is awaited AFTER all retries are exhausted
+      but BEFORE the final AxiosError is rejected to the caller. If this callback
+      throws (e.g., alerting service fails, fallback DB write rejects), the thrown
+      error PROPAGATES through the response interceptor chain and replaces the
+      original AxiosError in the caller's catch block — the same hazard pattern
+      as onRetry but at a different lifecycle point (final-failure instead of
+      between-retries). The original request error context is lost, making the
+      "we retried 3 times and got 500" diagnosis impossible from the caught error.
+    postconditions:
+      # Evidence: index.js lines 195-199: handleMaxRetryTimesExceeded awaits
+      #   currentState.onMaxRetryTimesExceeded(error, currentState.retryCount)
+      # Evidence: index.js line 226: yield handleMaxRetryTimesExceeded(currentState, error);
+      #   immediately followed by return Promise.reject(error) — if the await
+      #   throws, the generator unwinds with the new error before Promise.reject
+      #   runs, so the original AxiosError is dropped.
+      # Evidence: README options table — "After all the retries are failed, this
+      #   callback will be called with the last error before throwing the error."
+      - id: on-max-retry-times-exceeded-error-replaces-original-error
+        condition: >
+          onMaxRetryTimesExceeded callback throws an error (e.g., alerting fails,
+          fallback rejects, logging service unreachable)
+        throws: "Error thrown by onMaxRetryTimesExceeded callback (replaces original AxiosError)"
+        required_handling: >
+          onMaxRetryTimesExceeded callbacks MUST handle their own errors internally
+          via try-catch. If they throw, the error reaching the caller's catch block
+          is the callback error — NOT the original retry-exhausted AxiosError.
+          This silently destroys the failure diagnostic ("the API returned 500
+          three times" becomes "alerting service rejected").
+
+          Anti-pattern that swallows the real failure cause:
+            axiosRetry(instance, {
+              retries: 3,
+              onMaxRetryTimesExceeded: async (error, retryCount) => {
+                await alertingService.notify(error);  // If this throws, caller sees alerting error
+                await fallbackDb.write({ failed: true });  // Same hazard
+              }
+            });
+
+          Correct pattern — preserve original error context:
+            axiosRetry(instance, {
+              retries: 3,
+              onMaxRetryTimesExceeded: async (error, retryCount) => {
+                try {
+                  await alertingService.notify(error);
+                  await fallbackDb.write({ failed: true });
+                } catch (sideEffectError) {
+                  console.error('Side-effect failed during max-retry handler:', sideEffectError);
+                  // Do NOT re-throw — preserves the original AxiosError for the caller
+                }
+              }
+            });
+
+          Operational consequence: production incident triage sees the alerting
+          error first and walks the wrong call tree. The 503 from upstream is
+          invisible until log archaeology surfaces the original interceptor trace.
+        sources:
+          - "https://github.com/softonic/axios-retry#options"  # onMaxRetryTimesExceeded documented in options table
+          - "https://github.com/softonic/axios-retry/blob/master/src/index.ts"  # source: index.js lines 195-199 + line 226 sequence
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium

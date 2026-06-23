@@ -232,3 +232,65 @@ export async function fetchWithSafeOnRetry(url: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. onMaxRetryTimesExceeded async error swallowing
+//     Postcondition: on-max-retry-times-exceeded-error-replaces-original-error
+//     Added 2026-06-23 (deepen-stream-3 pass 8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// External services that may fail during final-failure handling
+declare const alertingService: { notify(error: any): Promise<void> };
+declare const fallbackDb: { write(payload: any): Promise<void> };
+
+// @expect-violation
+const instanceUnsafeMaxRetry = axios.create();
+axiosRetry(instanceUnsafeMaxRetry, {
+  retries: 3,
+  onMaxRetryTimesExceeded: async (error, retryCount) => {
+    // If alertingService.notify rejects, this rejection REPLACES the original
+    // AxiosError in the caller's catch — the 503-from-upstream evidence is lost.
+    await alertingService.notify(error);
+    await fallbackDb.write({ failed: true, retryCount });
+  },
+});
+
+export async function fetchWithUnsafeOnMaxRetry(url: string) {
+  // SHOULD_FIRE: onMaxRetryTimesExceeded swallows original error if side-effects fail
+  try {
+    const response = await instanceUnsafeMaxRetry.get(url);
+    return response.data;
+  } catch (err) {
+    // err may be the alerting/fallback rejection, not the original AxiosError.
+    // Triage will walk the wrong call tree.
+    console.error('Request failed:', err);
+    throw err;
+  }
+}
+
+// @expect-clean
+const instanceSafeMaxRetry = axios.create();
+axiosRetry(instanceSafeMaxRetry, {
+  retries: 3,
+  onMaxRetryTimesExceeded: async (error, retryCount) => {
+    try {
+      await alertingService.notify(error);
+      await fallbackDb.write({ failed: true, retryCount });
+    } catch (sideEffectError) {
+      // Swallow side-effect failure so the caller still sees the original AxiosError
+      console.error('Side-effect failed during max-retry handler:', sideEffectError);
+    }
+  },
+});
+
+export async function fetchWithSafeOnMaxRetry(url: string) {
+  // SHOULD_NOT_FIRE: onMaxRetryTimesExceeded wraps side effects in try-catch
+  try {
+    const response = await instanceSafeMaxRetry.get(url);
+    return response.data;
+  } catch (err) {
+    // err is always the original AxiosError after retries exhausted
+    console.error('Request failed:', err);
+    throw err;
+  }
+}
