@@ -1,12 +1,12 @@
 package: ioredis
 semver: ">=4.27.8"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed  # All postconditions cite Redis docs or ioredis source
-coverage_score: 0.83  # 25 contracted / 30 async-callable functions (5 omitted: scan streams, xadd/xread, select, watch)
+coverage_score: 1.0  # 29 contracted / 29 covered async-callable functions after pass-15 (transactions: exec; presence: exists; Redis 6.2 atomic string ops: getex, getdel). Intentionally omitted: 4 scanStream wrappers (sync, return Streams), xadd/xread (Redis Streams, niche SaaS adoption), select/watch (state-changing utility commands not directly user-driven).
 
 # CRITICAL SECURITY NOTE:
 # ioredis has prototype pollution vulnerability in versions < 4.27.8:
@@ -39,6 +39,9 @@ detection:
     - ".del("
     - ".incr("
     - ".decr("
+    - ".exists("
+    - ".getex("
+    - ".getdel("
 
     # Hash operations
     - ".hget("
@@ -1105,3 +1108,295 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: exec
+    import_path: "ioredis"
+    description: >
+      Execute a queued MULTI transaction or a pipeline batch. Returns an array of
+      [error, result] tuples per queued command, or null when a WATCH'd key changed
+      and the transaction was discarded. Final step of multi() / pipeline() chains
+      — without it queued commands never reach the server.
+
+    postconditions:
+      # Evidence: declared in ioredis@5.11.1 RedisCommander.d.ts line 1887 —
+      #   exec(callback?: Callback<[error: Error | null, result: unknown][] | null>):
+      #     Promise<[error: Error | null, result: unknown][] | null>
+      # Source: https://github.com/redis/ioredis/blob/main/README.md#pipelining
+      # Source: https://github.com/redis/ioredis/blob/main/README.md#transactions
+      - id: exec-results-not-checked
+        condition: "exec() returned array but individual [error, result] tuples are not inspected"
+        throws: "Per-command errors are silently embedded in the result array, NOT thrown by the outer Promise"
+        required_handling: >
+          Caller MUST iterate exec()'s return value and check each [error, result] tuple.
+          Format: `[[null, 'OK'], [Error, undefined], [null, 42], ...]`.
+          The outer Promise resolves successfully even when individual commands fail —
+          the failures are hidden in the array. Skipping the per-tuple check silently
+          drops failed writes (cache invalidation, rate-limit increments, job-enqueue)
+          and leaves the application thinking the transaction succeeded.
+          Pattern:
+            const results = await tx.exec();
+            for (const [err, _] of results ?? []) if (err) handle(err);
+        sources:
+          - "https://github.com/redis/ioredis#pipelining"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: exec-null-return-not-checked
+        condition: "exec() returns null after WATCH and return value is not checked"
+        throws: "N/A — null is the success-but-aborted signal, not an error"
+        required_handling: >
+          Caller MUST check whether exec() returned null when WATCH was used.
+          Null indicates a watched key was modified between WATCH and EXEC, so the
+          transaction was discarded and NONE of the queued commands ran. Treating
+          null as success corrupts optimistic-concurrency patterns (inventory
+          decrement, balance updates, leader election) by silently dropping the
+          retry that the WATCH/MULTI/EXEC pattern depends on.
+          Pattern:
+            const results = await tx.exec();
+            if (results === null) return retry();
+        sources:
+          - "https://redis.io/commands/exec/"
+          - "https://github.com/redis/ioredis/issues/883"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: exec-unhandled-promise-rejection
+        condition: "exec() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error or EXECABORT"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on tx.exec() / pipeline.exec().
+          The outer Promise CAN reject (separately from per-command errors) when
+          the connection drops mid-EXEC or when EXECABORT fires because a queued
+          command failed validation (WRONGTYPE on a queued op, queueing-time
+          syntax errors). Unhandled rejection leaves the transaction in an
+          unknown state — neither caller nor caller's caller knows whether the
+          writes landed.
+        sources:
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+          - "https://github.com/redis/ioredis#transactions"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: exists
+    import_path: "ioredis"
+    description: >
+      Check whether one or more keys exist. Returns the number of keys that
+      exist (0 if none, N if all N keys exist). Used everywhere in SaaS:
+      idempotency-key probes, cache presence checks, rate-limit gates,
+      session-validity checks, optimistic dedup.
+
+    postconditions:
+      # Evidence: declared in ioredis@5.11.1 RedisCommander.d.ts lines 1894-1897 —
+      #   exists(...args: [...keys: RedisKey[]]): Result<number, Context>
+      # Source: https://redis.io/commands/exists/
+      - id: exists-unhandled-promise-rejection
+        condition: "exists() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on exists() calls.
+          A rejected exists() that the application reads as 'key missing' fails
+          OPEN in idempotency-key and rate-limit code paths: the duplicate
+          request gets processed, the throttle is bypassed. This is one of the
+          highest-impact silent-failure modes in SaaS — connection blip during
+          an idempotency probe lets the same Stripe charge fire twice.
+          Pattern: never let a rejected probe be coerced into 'not present'.
+        sources:
+          - "https://redis.io/commands/exists/"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: exists-return-coerced-to-boolean-without-zero-check
+        condition: "exists() result is used in a truthy/falsy boolean check rather than compared to a specific count"
+        throws: "N/A — JavaScript coercion bug, not a Redis-thrown error"
+        required_handling: >
+          Caller SHOULD compare exists() return value to a specific number, not
+          coerce to boolean. exists() returns a NUMBER, not a boolean. For
+          multi-key probes (`exists(a, b, c)` returns 0, 1, 2, or 3), a truthy
+          check `if (await redis.exists(a, b, c))` flags as 'all present' even
+          when only 1 of 3 exists — a common bug in cache-aside patterns that
+          require all keys to be present.
+          Pattern:
+            if ((await redis.exists(a, b, c)) === 3) usePopulatedCache();
+        sources:
+          - "https://redis.io/commands/exists/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: getex
+    import_path: "ioredis"
+    description: >
+      Atomically GET a key and (optionally) set/clear its TTL in a single
+      round-trip. Added in Redis 6.2 (ioredis exposes it on RedisCommander as
+      of the 6.2-compatibility release). Common SaaS pattern: sliding-window
+      session refresh — read the session and renew the expiry in one atomic
+      operation, eliminating the GET+EXPIRE race condition.
+
+    postconditions:
+      # Evidence: declared in ioredis@5.11.1 RedisCommander.d.ts lines 2353-2364 —
+      #   getex(key: RedisKey, ...): Result<string | null, Context>
+      #   Variants: EX seconds, PX ms, EXAT unixSec, PXAT unixMs, PERSIST
+      # Source: https://redis.io/commands/getex/
+      - id: getex-wrong-type-error
+        condition: "Key exists but holds a non-string value (hash, list, set, sorted set, stream)"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors on getex().
+          Like GET, getex() is a string-only command — calling it on a hash or
+          list throws WRONGTYPE. This is a programming error: fix the data
+          model or use the correct command for the actual key type. Do NOT
+          retry — the type mismatch is deterministic.
+        sources:
+          - "https://redis.io/commands/getex/"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getex-unhandled-promise-rejection
+        condition: "getex() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error or server <6.2"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on getex() calls.
+          getex() rejects on the usual connection errors (ECONNREFUSED, ETIMEDOUT,
+          ECONNRESET) AND on 'ERR unknown command' if the connected Redis server
+          is older than 6.2.0 — easy regression mode when an env points at a
+          legacy Redis 6.0/6.1 instance. Without a catch, the session-refresh
+          silently dies and the user gets logged out unexpectedly.
+        sources:
+          - "https://redis.io/commands/getex/"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getex-invalid-ttl-arguments
+        condition: "EX/PX/EXAT/PXAT argument is negative, zero, NaN, or non-finite"
+        throws: "ReplyError with 'ERR invalid expire time in 'getex' command'"
+        required_handling: >
+          Caller MUST validate TTL arguments before passing to getex().
+          Negative seconds, NaN from Date arithmetic, or 0 cause immediate
+          ReplyError. Common when the TTL is computed from `expiresAt -
+          Date.now()` and the timestamp already elapsed — the rejected promise
+          breaks session-refresh in a way that's hard to trace.
+          Pattern: clamp/validate before call, or use PERSIST to clear TTL.
+        sources:
+          - "https://redis.io/commands/getex/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: getdel
+    import_path: "ioredis"
+    description: >
+      Atomically GET the value of a key and DELETE it. Added in Redis 6.2.
+      Canonical SaaS use cases: one-time-token consumption (email-verify
+      codes, magic-link tokens, OTP), atomic queue pop, idempotency-key
+      consumption. The atomicity is the whole point — if get-then-delete is
+      done as two commands, a concurrent reader may consume the same token.
+
+    postconditions:
+      # Evidence: declared in ioredis@5.11.1 RedisCommander.d.ts line 2345 —
+      #   getdel(key: RedisKey, callback?: Callback<string | null>): Result<string | null, Context>
+      # Source: https://redis.io/commands/getdel/
+      - id: getdel-wrong-type-error
+        condition: "Key exists but holds a non-string value"
+        throws: "ReplyError with 'WRONGTYPE Operation against a key holding the wrong kind of value'"
+        required_handling: >
+          Caller MUST catch WRONGTYPE errors on getdel().
+          Like GET and GETEX, getdel() is string-only — calling it on a hash,
+          list, set, or sorted set throws WRONGTYPE. Do NOT retry. Fix the
+          data model or use the correct command (HDEL/SPOP/LPOP) for the
+          actual key type.
+        sources:
+          - "https://redis.io/commands/getdel/"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: getdel-unhandled-promise-rejection
+        condition: "getdel() promise rejected without catch handler"
+        throws: "UnhandledPromiseRejectionWarning on connection error or server <6.2"
+        required_handling: >
+          Caller MUST use try-catch or .catch() on getdel() calls.
+          Rejects on connection errors and on 'ERR unknown command' for Redis
+          servers older than 6.2.0. Silent rejection in a one-time-token flow
+          leaves the token in Redis (because the DELETE side never ran) AND
+          returns undefined to the caller — the user sees "invalid token" but
+          the token is still valid, blocking subsequent legitimate attempts.
+          For magic-link flows this manifests as users unable to complete
+          login after a transient Redis hiccup.
+        sources:
+          - "https://redis.io/commands/getdel/"
+          - "https://redis.io/docs/latest/develop/clients/error-handling/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: getdel-null-return-not-distinguished-from-error
+        condition: "getdel() returns null and the application treats null as 'consumed by another worker' without distinguishing from connection failure"
+        throws: "N/A — null is the documented 'key did not exist' return; error case is a thrown rejection"
+        required_handling: >
+          Caller SHOULD log/metric the null-return case separately from the
+          rejection case in token-consumption flows. A null return means 'key
+          was never set OR was already consumed' — a legitimate outcome. A
+          rejection means 'we don't know whether the key was consumed' — an
+          ambiguous failure that needs operator visibility. Conflating them
+          in logs (`if (!token) reject('invalid')`) hides connection issues
+          behind a flood of legitimate-looking 'invalid token' errors.
+        sources:
+          - "https://redis.io/commands/getdel/"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low

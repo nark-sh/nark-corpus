@@ -177,3 +177,106 @@ export async function blpopWithCatch(redis: Redis, queue: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. tx.exec() — transaction / pipeline finalizer (pass 15)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function execNoCatch(redis: Redis, key: string) {
+  // SHOULD_FIRE: exec-unhandled-promise-rejection — exec() promise rejected without catch handler
+  const results = await redis.multi().set(key, '1').incr(key).exec();
+  return results;
+}
+
+// @expect-clean
+export async function execWithCatch(redis: Redis, key: string) {
+  try {
+    // SHOULD_NOT_FIRE: exec() inside try-catch
+    const results = await redis.multi().set(key, '1').incr(key).exec();
+    if (results === null) {
+      // WATCH'd key changed — caller handled the discard signal
+      return null;
+    }
+    for (const [err] of results) {
+      if (err) throw err;
+    }
+    return results;
+  } catch (err) {
+    console.error('Redis transaction failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. redis.exists() — presence probe (idempotency, rate-limit, cache-aside)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function existsNoCatch(redis: Redis, key: string) {
+  // SHOULD_FIRE: exists-unhandled-promise-rejection — exists() promise rejected without catch handler
+  const n = await redis.exists(key);
+  return n === 1;
+}
+
+// @expect-clean
+export async function existsWithCatch(redis: Redis, key: string) {
+  try {
+    // SHOULD_NOT_FIRE: exists() inside try-catch + numeric comparison
+    const n = await redis.exists(key);
+    return n === 1;
+  } catch (err) {
+    console.error('Redis exists probe failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. redis.getex() — atomic GET + TTL refresh (sliding session windows)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getexNoCatch(redis: Redis, sessionId: string) {
+  // SHOULD_FIRE: getex-unhandled-promise-rejection — getex() promise rejected without catch handler
+  const value = await redis.getex(`sess:${sessionId}`, 'EX', 3600);
+  return value;
+}
+
+// @expect-clean
+export async function getexWithCatch(redis: Redis, sessionId: string, ttlSeconds: number) {
+  try {
+    // SHOULD_NOT_FIRE: getex() inside try-catch + validated TTL
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+      throw new Error('Invalid TTL');
+    }
+    const value = await redis.getex(`sess:${sessionId}`, 'EX', ttlSeconds);
+    return value;
+  } catch (err) {
+    console.error('Redis getex failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. redis.getdel() — atomic get-and-delete (one-time token consumption)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getdelNoCatch(redis: Redis, token: string) {
+  // SHOULD_FIRE: getdel-unhandled-promise-rejection — getdel() promise rejected without catch handler
+  const userId = await redis.getdel(`magic-link:${token}`);
+  return userId;
+}
+
+// @expect-clean
+export async function getdelWithCatch(redis: Redis, token: string) {
+  try {
+    // SHOULD_NOT_FIRE: getdel() inside try-catch + null is distinguished from error
+    const userId = await redis.getdel(`magic-link:${token}`);
+    if (userId === null) {
+      // Token was never set or already consumed — legitimate "invalid" case
+      return { ok: false as const, reason: 'invalid-or-consumed' as const };
+    }
+    return { ok: true as const, userId };
+  } catch (err) {
+    // Distinct from null-return: this is a connection-level failure
+    console.error('Redis getdel failed (connection error):', err);
+    throw err;
+  }
+}
