@@ -14,6 +14,8 @@
  *   isvalid-non-validation-error-rethrows — isValid() without catch (async test may throw)
  *   cast-type-error                     — cast() without try-catch (throws TypeError)
  *   cast-transform-throws               — cast() without try-catch (custom transform throws)
+ *   standard-validate-infrastructure-error-rethrows — ~standard.validate() without try-catch
+ *     (re-throws non-ValidationError from async test functions; added 2026-06-23 pass)
  */
 
 import * as Yup from 'yup';
@@ -182,6 +184,51 @@ function castWithAssertFalse(rawInput: unknown) {
   return result;
 }
 
+// ============================================================
+// ~standard.validate() — SHOULD_FIRE cases
+// (Standard Schema interface; re-throws non-ValidationError from async test functions)
+// ============================================================
+
+async function standardValidateWithoutCatch(data: unknown) {
+  // SHOULD_FIRE: standard-validate-infrastructure-error-rethrows
+  // ~standard.validate() does NOT throw ValidationError (returns { issues } instead),
+  // but DOES re-throw non-ValidationError exceptions from async test() functions.
+  // Common in integration libraries (react-hook-form standardResolver, tRPC, conform).
+  const result = await schemaWithAsyncTest['~standard'].validate(data);
+  if (result.issues) {
+    return { ok: false, errors: result.issues };
+  }
+  return { ok: true, value: result.value };
+}
+
+// ============================================================
+// ~standard.validate() — SHOULD_NOT_FIRE cases
+// ============================================================
+
+async function standardValidateWithTryCatch(data: unknown) {
+  try {
+    // SHOULD_NOT_FIRE: ~standard.validate() with try-catch — handles infrastructure errors
+    const result = await schemaWithAsyncTest['~standard'].validate(data);
+    if (result.issues) {
+      return { ok: false, errors: result.issues };
+    }
+    return { ok: true, value: result.value };
+  } catch (error) {
+    console.error('Validation infrastructure error:', error);
+    return { ok: false, errors: [{ message: 'Validation service unavailable' }] };
+  }
+}
+
+async function standardValidateWithCatchChain(data: unknown) {
+  // SHOULD_NOT_FIRE: ~standard.validate() with .catch() handler
+  return schemaWithAsyncTest['~standard']
+    .validate(data)
+    .catch((error: unknown) => {
+      console.error('Standard schema validation failed:', error);
+      return { issues: [{ message: 'Service unavailable' }] };
+    });
+}
+
 export {
   validateNoTryCatch,
   validateArrowNoTryCatch,
@@ -197,4 +244,7 @@ export {
   isValidWithCatchFallback,
   castWithTryCatch,
   castWithAssertFalse,
+  standardValidateWithoutCatch,
+  standardValidateWithTryCatch,
+  standardValidateWithCatchChain,
 };

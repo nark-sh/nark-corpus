@@ -1,14 +1,34 @@
 package: yup
 semver: ">=0.32.0 <2.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.71  # 5 contracted / 7 total async-callable (2 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 5/5 = 1.0
+coverage_score: 0.78  # 7 contracted / 9 total async-callable (2 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 7/7 = 1.0
 # analyzer_limitation: Current analyzer cannot detect validation calls on schema instances created by Yup.object(), Yup.string(), etc. Detection requires tracking methods on objects returned from factory functions. Contract is accurate but not enforceable with current analyzer capabilities. Expected detection rate: 0%.
+#
+# Depth pass 2026-06-23 (deepen-stream-2 pass 8 — re-verification at v1.7.1):
+# Re-enumerated full API surface against yup@1.7.1 (latest published, was 1.x at April pass).
+# Async-callable surface: 9 total (7 contracted, 2 omitted)
+#   validate                  CONTRACTED (1 postcondition)
+#   validateSync              CONTRACTED (2 postconditions)
+#   validateAt                CONTRACTED (1 postcondition)
+#   validateSyncAt            CONTRACTED (1 postcondition)
+#   isValid                   CONTRACTED (1 postcondition)
+#   cast                      CONTRACTED (2 postconditions)
+#   ~standard.validate        NEW: 1 postcondition (Standard Schema interface, added in yup v1.x)
+#   isValidSync               OMITTED (sync equivalent of isValid)
+#   reach                     OMITTED (sync schema utility)
+# New function this pass: ~standard.validate (1 postcondition: standard-validate-infrastructure-error-rethrows)
+# Evidence sources confirmed at v1.7.1:
+#   node_modules/yup/index.js lines 1189-1213 (~standard getter on Schema)
+#   node_modules/yup/index.js lines 2566-2585 (~standard getter on Lazy)
+#   node_modules/yup/README.md lines 476-478 (Standard Schema Support)
+#   https://github.com/standard-schema/standard-schema
+# Coverage: 7/9 raw = 0.78; effective contracted/non-omitted = 7/7 = 1.0
 #
 # Depth pass 2026-04-17 (deepen-stream-1 pass 10):
 # API surface: 7 async-callable operations (2 intentionally omitted)
@@ -354,8 +374,102 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: "~standard.validate"
+    import_path: "yup"
+    description: >
+      Standard Schema interface (~standard.validate) — Promise-returning entry point that
+      Yup schemas expose to integration libraries via the schema['~standard'] getter. Added
+      in yup v1.x as part of the Standard Schema spec (compatibility with react-hook-form
+      standardResolver, tRPC validators, conform, TanStack Form). Unlike validate(), this
+      method does NOT throw ValidationError — failures are returned as { issues } on a
+      resolved Promise. HOWEVER, non-ValidationError exceptions from custom test() functions
+      (database errors, network errors, unexpected TypeErrors) ARE re-thrown — the standard
+      interface does not swallow infrastructure errors. Callers that assume "Standard Schema
+      validate() never throws" are wrong for schemas with async test() functions that hit
+      external systems.
+    postconditions:
+      # Evidence: node_modules/yup/index.js lines 1189-1213 (Schema.~standard getter)
+      # Evidence: node_modules/yup/index.js lines 2566-2585 (Lazy.~standard getter)
+      # Both implementations have identical try/catch logic:
+      #   try { result = await schema.validate(value, { abortEarly: false }); return { value: result }; }
+      #   catch (err) { if (err instanceof ValidationError) return { issues: ... }; throw err; }
+      # Confirmed: only ValidationError is caught and converted to issues[]. Any other
+      # thrown value (DatabaseError, NetworkError, TypeError, etc.) propagates as-is via
+      # `throw err` on line 1206 / 2581.
+      # Source: https://github.com/standard-schema/standard-schema
+      # Source: node_modules/yup/README.md lines 476-478 (Standard Schema Support)
+      - id: standard-validate-infrastructure-error-rethrows
+        condition: >
+          schema['~standard'].validate(value) is called without a catch handler (typically
+          by integration libraries like react-hook-form's standardResolver, tRPC procedures,
+          conform actions, or TanStack Form validators), and a custom test() function in
+          the schema throws a non-ValidationError exception. Common cases:
+          (a) An async test() makes a database query that rejects:
+              schema.test('unique', 'taken', async (val) => !(await db.findByEmail(val)))
+              — if db.findByEmail() throws, ~standard.validate() propagates the DatabaseError.
+          (b) An async test() calls an external API that rejects (network failure, 5xx).
+          (c) A test() throws unexpectedly (TypeError on bad input access).
+          Standard Schema consumers commonly write code assuming ~standard.validate resolves
+          either { value } or { issues } — they do NOT wrap it in try/catch because the
+          spec implies validation failures are returned as data, not thrown. This assumption
+          is correct for ValidationError but WRONG for infrastructure errors.
+        throws: >
+          Whatever non-ValidationError the test() function throws. Common cases:
+          - DatabaseError / Prisma errors (when test() checks uniqueness in DB)
+          - NetworkError / FetchError (when test() calls an external API)
+          - TypeError (when test() encounters unexpected input types)
+          - Generic Error (when test() throws new Error('service unavailable'))
+          Confirmed from index.js line 1206 (`throw err`) and line 2581 — the error is not
+          wrapped or transformed, it propagates as-is on the returned Promise.
+        required_handling: >
+          When using the Standard Schema interface directly (rare — usually wrapped by an
+          integration), wrap the call in try-catch:
+
+            try {
+              const result = await schema['~standard'].validate(rawInput);
+              if (result.issues) {
+                // Validation failed — ValidationError converted to issues[]
+                return { ok: false, errors: result.issues };
+              }
+              return { ok: true, value: result.value };
+            } catch (error) {
+              // Non-ValidationError from a test() function (DB error, network error, etc.)
+              // Standard Schema consumers commonly do NOT handle this — infrastructure
+              // failures appear as crashes / 500 errors with no validation context.
+              console.error('Validation infrastructure error:', error);
+              return { ok: false, errors: [{ message: 'Validation service unavailable' }] };
+            }
+
+          When using yup via an integration library (react-hook-form standardResolver,
+          tRPC, conform), check the integration's error model — most propagate the
+          rejection as an unhandled promise. Ensure your schema's async test() functions
+          internally try-catch any I/O and return false / a string message instead of
+          throwing.
+
+          Best practice for schemas with async test() that hit external systems:
+            schema.test('unique', async (val) => {
+              try {
+                return !(await db.findByEmail(val));
+              } catch (error) {
+                // ✅ Convert infrastructure errors to validation messages
+                console.error('Uniqueness check failed:', error);
+                return new yup.ValidationError('Could not verify email uniqueness', val);
+              }
+            });
+        sources:
+          - "https://github.com/standard-schema/standard-schema"
+          - "https://github.com/jquense/yup"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "yup v1.x changes: reach() now returns a schema (not a reference) for nested paths"
+  - "yup v1.x: ~standard.validate getter on Schema/Lazy exposes Standard Schema interface (Promise-returning validate that returns { value } or { issues }); re-throws non-ValidationError from test() functions"
   - "validate() and isValid() both support async test() functions. validateSync/isValidSync do not."
   - "ValidationError.errors[] contains all failed validation messages (abortEarly:false)"
   - "ValidationError.inner[] contains individual errors for nested fields"
@@ -363,6 +477,7 @@ notes:
   - "isValid() catches ValidationError internally (returns false), but re-throws non-ValidationError from test() functions"
   - "cast() throws TypeError (not ValidationError) when the cast result is the wrong type"
   - "isValidSync() has same re-throw behavior as isValid() — non-ValidationError from test() propagates"
+  - "~standard.validate() forces abortEarly:false internally (returns all issues in one pass)"
   - "analyzer_limitation: yup schema instances (string(), object(), etc.) are created by factory functions — the analyzer cannot track method calls on these instances without factory-method tracking"
   - "Intentionally omitted: isValidSync() (sync equivalent of isValid, same caveat applies), reach() (sync utility)"
 
