@@ -2,11 +2,11 @@ package: axios
 semver: '>=1.0.0 <2.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-06'
+last_verified: '2026-06-23'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.91
+coverage_score: 1.0
 functions:
   - name: get
     import_path: axios
@@ -621,6 +621,139 @@ functions:
           visibility: visible
           user_experience: lost_data
           incident_cost_range: high
+  - name: query
+    import_path: axios
+    description: >
+      Makes an HTTP QUERY request (draft-ietf-httpbis-safe-method-w-body) to the
+      specified URL with a request body. QUERY is a safe AND idempotent read
+      method designed for complex queries whose parameters do not fit comfortably
+      in the URL — e.g. structured search payloads, GraphQL-over-QUERY,
+      filter/projection trees. Added to axios in v1.16.0 (2026-05-02, PR #10802).
+      Internally delegates to axios.request() with method:'query'. Error behavior
+      mirrors post/put/patch but with safe-idempotent retry semantics: retrying
+      after a network failure is safe by spec, unlike POST/PATCH. NOTE: there is
+      no queryForm shorthand — multipart bodies are not compatible with QUERY's
+      read semantics.
+    postconditions:
+      # Evidence: https://github.com/axios/axios/pull/10802 (CHANGELOG v1.16.0 — May 2, 2026)
+      # Evidence: https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-09.html
+      # Error class: AxiosError (same hierarchy as get/post/put/patch — query() shares
+      # the request() error pipeline, no QUERY-specific exception type was introduced).
+      - id: query-error-4xx-5xx
+        condition: response status is 4xx or 5xx and validateStatus is default
+        throws: AxiosError with error.response containing status, headers, and body
+        required_handling: >
+          Caller MUST catch AxiosError and check error.response.status to distinguish
+          client errors (4xx — bad query payload, unsupported QUERY method on the
+          target endpoint, 405 Method Not Allowed) from server errors (5xx). Many
+          servers/proxies do not yet implement QUERY and will return 405 or 501 —
+          handle these explicitly.
+        sources:
+          - https://github.com/axios/axios/pull/10802
+          - https://axios-http.com/docs/handling_errors
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+      - id: query-method-not-allowed-405
+        condition: server responds with 405 Method Not Allowed or 501 Not Implemented
+        throws: AxiosError with error.response.status === 405 or 501
+        required_handling: >
+          Caller MUST handle 405/501 explicitly for QUERY requests. QUERY is a
+          newer HTTP method (still on the standards track) and many origins, CDNs,
+          reverse proxies, and WAFs reject it. Fall back to POST + idempotency key,
+          or surface a clear error indicating the upstream does not support QUERY.
+          Silently catching this and retrying as POST may change resource
+          semantics if the server treats POST as non-idempotent.
+        sources:
+          - https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-09.html
+          - https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/405
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: query-rate-limited-429
+        condition: response status is 429 (Too Many Requests)
+        throws: AxiosError with error.response.status === 429
+        required_handling: >
+          Caller MUST implement exponential backoff with the Retry-After header.
+          QUERY is safe AND idempotent per the HTTPbis draft, so retrying after
+          429 is safe (unlike POST/PATCH where retry safety depends on
+          idempotency keys). Silently catching and ignoring 429 without retry
+          logic is a violation.
+        sources:
+          - https://axios-http.com/docs/handling_errors
+          - https://github.com/axios/axios/pull/10802
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+      - id: query-network-failure
+        condition: network error, connection timeout (ETIMEDOUT/ECONNABORTED), connection refused (ECONNREFUSED), or DNS failure (ERR_NETWORK)
+        throws: >-
+          AxiosError with error.request populated but error.response === undefined;
+          error.code is ETIMEDOUT, ECONNABORTED, ECONNREFUSED, or ERR_NETWORK
+        required_handling: >
+          Caller MUST check error.response exists before accessing error.response.status.
+          Network errors populate error.request (raw http.ClientRequest) but NOT
+          error.response. The ECONNREFUSED constant was added in axios 1.16.0 (PR #10680)
+          so callers can match connection-refused failures via AxiosError.ECONNREFUSED
+          instead of string-compare on the code field. Because QUERY is safe and
+          idempotent, retry on network failure is safe — but bound the retry budget
+          to avoid hammering an unreachable origin.
+        sources:
+          - https://axios-http.com/docs/handling_errors
+          - https://github.com/axios/axios/blob/v1.x/lib/core/AxiosError.js
+          - https://github.com/axios/axios/pull/10680
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+    edge_cases:
+      - id: query-no-queryform-shorthand
+        description: >
+          Unlike post/put/patch, axios does NOT generate a queryForm() shorthand.
+          QUERY is a read method and multipart/form-data bodies do not fit its
+          semantics. Attempting axios.queryForm() will throw TypeError: not a function.
+          Use axios.query(url, body, { headers: { 'Content-Type': '...' } }) and
+          serialize the body manually if a non-JSON content type is needed.
+        sources:
+          - https://github.com/axios/axios/blob/v1.x/lib/core/Axios.js
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+      - id: query-upstream-support-uneven
+        description: >
+          QUERY is a recent IETF draft method. CDNs (Cloudflare, Fastly),
+          API gateways (AWS API Gateway, Kong, Apigee), and reverse proxies
+          (older nginx, HAProxy) may reject or strip QUERY requests. Test
+          end-to-end through your full request path before relying on QUERY in
+          production. Have a POST-with-idempotency-key fallback ready.
+        sources:
+          - https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-09.html
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
   - name: patchForm
     import_path: axios
     description: >

@@ -419,3 +419,41 @@ export async function patchFormWithTryCatch(id: string, avatar: File) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. axios.query() — safe/idempotent read with body (added v1.16.0, depth pass 2026-06-23)
+// @expect-violation: query-error-4xx-5xx
+// @expect-violation: query-network-failure
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareQueryNoCatch(filter: object) {
+  // SHOULD_FIRE: query-error-4xx-5xx — axios.query throws AxiosError on 4xx/5xx, no try-catch
+  const r = await axios.query("https://api.example.com/search", filter);
+  return r.data;
+}
+
+// @expect-clean
+export async function queryWithTryCatch(filter: object) {
+  try {
+    // SHOULD_NOT_FIRE: axios.query inside try-catch
+    const r = await axios.query("https://api.example.com/search", filter);
+    return r.data;
+  } catch (err: any) {
+    if (err.response?.status === 405 || err.response?.status === 501) {
+      // upstream does not support QUERY — fall back to POST with idempotency-key
+      throw new Error("QUERY not supported by upstream; fall back path required.");
+    }
+    if (!err.response) {
+      throw new Error("Search query failed: network error.");
+    }
+    throw err;
+  }
+}
+
+// Instance-method shape — confirms detection works through axios.create()
+export async function instanceQueryNoCatch(filter: object) {
+  const httpClient = axios.create({ baseURL: "https://api.example.com" });
+  // SHOULD_FIRE: query-error-4xx-5xx — axios instance.query, no try-catch
+  const r = await httpClient.query("/search", filter);
+  return r.data;
+}
