@@ -2,11 +2,11 @@ package: typeorm
 semver: ">=0.3.0 <2.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.65
+coverage_score: 0.96
 
 detection:
   type_names:
@@ -57,9 +57,15 @@ detection:
     # DataSource lifecycle
     - ".initialize("
     - ".destroy("
+    - ".synchronize("
+    - ".runMigrations("
 
     # Transaction
     - ".transaction("
+    - ".startTransaction("
+    - ".commitTransaction("
+    - ".rollbackTransaction("
+    - ".release("
 
 functions:
   - name: find
@@ -739,6 +745,245 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  # DataSource.synchronize - Create/sync database schema from entities
+  - name: synchronize
+    import_path: "typeorm"
+    description: >
+      Synchronizes the database schema with the entity definitions.
+      Creates new tables, columns, and indices to match entity metadata.
+      With dropBeforeSync=true, drops the existing schema first.
+      NOT SAFE for production — silent data loss when columns are renamed/removed.
+    postconditions:
+      # Evidence: DataSource.synchronize() delegates to SchemaBuilder.build() which executes
+      # ALTER/CREATE/DROP SQL — QueryFailedError on any DDL failure.
+      # https://raw.githubusercontent.com/typeorm/typeorm/master/src/data-source/DataSource.ts
+      - id: synchronize-query-failed-error
+        condition: "DDL execution fails (schema lock, permission denied, conflicting constraints)"
+        throws: "QueryFailedError with driverError containing the DDL error"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          synchronize() runs many DDL statements — partial failure leaves schema half-migrated.
+          DO NOT call synchronize() in production code paths. Use migrations instead.
+          Common bug: synchronize: true in DataSource config silently corrupts production schema.
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/data-source/DataSource.ts"
+          - "https://typeorm.io/data-source-options"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: synchronize-not-connected
+        condition: "synchronize() called on DataSource that is not yet initialized"
+        throws: "CannotExecuteNotConnectedError (extends TypeORMError)"
+        required_handling: >
+          Ensure dataSource.initialize() has been awaited before calling synchronize().
+          Pattern: await dataSource.initialize(); await dataSource.synchronize().
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/CannotExecuteNotConnectedError.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # DataSource.runMigrations - Run pending database migrations
+  - name: runMigrations
+    import_path: "typeorm"
+    description: >
+      Executes all pending migrations against the database.
+      Each migration runs in a transaction by default (transaction:"each").
+      Returns the list of migrations that were executed in this call.
+      Standard startup gate for schema versioning in production apps.
+    postconditions:
+      # Evidence: DataSource.runMigrations() delegates to MigrationExecutor.executePendingMigrations()
+      # which executes migration SQL — QueryFailedError on any failure.
+      # https://raw.githubusercontent.com/typeorm/typeorm/master/src/data-source/DataSource.ts
+      # https://raw.githubusercontent.com/typeorm/typeorm/master/src/migration/MigrationExecutor.ts
+      - id: run-migrations-query-failed-error
+        condition: "A migration fails mid-execution (DDL error, constraint violation, data conversion failure)"
+        throws: "QueryFailedError with driverError containing the failing SQL and database error"
+        required_handling: >
+          Caller MUST wrap in try-catch and stop application startup on failure.
+          With transaction:"each" (default) the failing migration rolls back, but earlier migrations
+          in the batch have already committed — the schema is in a partially-migrated state.
+          Pattern: on failure, log error, exit non-zero; do NOT proceed to serve traffic with
+          a half-migrated schema. Re-running runMigrations() after a fix is safe.
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/migration/MigrationExecutor.ts"
+          - "https://typeorm.io/migrations"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: run-migrations-not-connected
+        condition: "runMigrations() called before dataSource.initialize() has resolved"
+        throws: "CannotExecuteNotConnectedError (extends TypeORMError)"
+        required_handling: >
+          Always await dataSource.initialize() before runMigrations().
+          Pattern: await dataSource.initialize(); await dataSource.runMigrations().
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/CannotExecuteNotConnectedError.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # QueryRunner.startTransaction - Begin manual transaction
+  - name: startTransaction
+    import_path: "typeorm"
+    description: >
+      Begins a database transaction on the QueryRunner.
+      Manual transaction control — caller is responsible for commitTransaction()
+      or rollbackTransaction(), and for release() of the underlying connection.
+      Used heavily in NestJS services that need transaction scope across multiple repos.
+    postconditions:
+      # Evidence: QueryRunner.startTransaction() throws TransactionAlreadyStartedError when
+      # isTransactionActive is true. Source: src/driver/<dialect>/<dialect>QueryRunner.ts.
+      # Error class: src/error/TransactionAlreadyStartedError.ts
+      - id: start-transaction-already-started
+        condition: "startTransaction() called when QueryRunner already has an active transaction"
+        throws: "TransactionAlreadyStartedError (extends TypeORMError)"
+        required_handling: >
+          Check queryRunner.isTransactionActive before calling startTransaction().
+          Common bug: calling startTransaction() twice in nested service methods on the same runner.
+          Nested transactions need savepoints, not a second startTransaction() call.
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/TransactionAlreadyStartedError.ts"
+          - "https://typeorm.io/transactions"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: start-transaction-already-released
+        condition: "startTransaction() called on a QueryRunner that has already been released"
+        throws: "QueryRunnerAlreadyReleasedError (extends TypeORMError)"
+        required_handling: >
+          Acquire a fresh QueryRunner via dataSource.createQueryRunner() for each transaction.
+          Do NOT reuse a runner after calling release() — it cannot run further queries.
+          Pattern: const qr = ds.createQueryRunner(); try { await qr.startTransaction(); ... } finally { await qr.release(); }
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/QueryRunnerAlreadyReleasedError.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # QueryRunner.commitTransaction - Commit active transaction
+  - name: commitTransaction
+    import_path: "typeorm"
+    description: >
+      Commits the active transaction on the QueryRunner.
+      Throws if no transaction was started, or if the runner was already released.
+      A failed commit leaves the transaction open — caller must rollback or release.
+    postconditions:
+      # Evidence: TransactionNotStartedError thrown when isTransactionActive is false.
+      # https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/TransactionNotStartedError.ts
+      - id: commit-transaction-not-started
+        condition: "commitTransaction() called when no transaction is active on the QueryRunner"
+        throws: "TransactionNotStartedError (extends TypeORMError)"
+        required_handling: >
+          Check queryRunner.isTransactionActive before commit.
+          Common bug: calling commitTransaction() in a finally block when an early error
+          prevented startTransaction() from running.
+          Pattern: if (queryRunner.isTransactionActive) await queryRunner.commitTransaction().
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/TransactionNotStartedError.ts"
+          - "https://typeorm.io/transactions"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: commit-transaction-query-failed
+        condition: "Underlying COMMIT SQL fails (deadlock, serialization failure, connection lost)"
+        throws: "QueryFailedError with driverError (e.g. Postgres 40001 serialization_failure, 40P01 deadlock_detected)"
+        required_handling: >
+          Caller MUST wrap commit in try-catch AND rollback on failure.
+          A failed commit means the transaction may be in an indeterminate state — the safe
+          path is rollbackTransaction() then release(), and surface the error to the caller.
+          Retry policy for serialization/deadlock errors lives at the caller layer, not here.
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/QueryFailedError.ts"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  # QueryRunner.release - Release the underlying connection back to the pool
+  - name: release
+    import_path: "typeorm"
+    description: >
+      Releases the QueryRunner's underlying connection back to the pool.
+      Must be called for every createQueryRunner() to avoid connection leaks.
+      After release(), the runner cannot execute further queries.
+    postconditions:
+      # Evidence: BaseQueryRunner.release() and driver-specific runners throw
+      # QueryRunnerAlreadyReleasedError when isReleased is true.
+      # https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/QueryRunnerAlreadyReleasedError.ts
+      - id: release-already-released
+        condition: "release() called on a QueryRunner that has already been released"
+        throws: "QueryRunnerAlreadyReleasedError (extends TypeORMError)"
+        required_handling: >
+          Release the runner exactly once, in a finally block at the end of its scope.
+          Common bug: double-release when error handling code calls release() AND a finally
+          block also calls release().
+          Pattern: const qr = ds.createQueryRunner(); try { ... } finally { await qr.release(); }
+        sources:
+          - "https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/QueryRunnerAlreadyReleasedError.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: release-not-called-connection-leak
+        condition: "QueryRunner created via createQueryRunner() but release() never called"
+        throws: "Does not throw — silent connection pool exhaustion"
+        required_handling: >
+          ALWAYS call queryRunner.release() in a finally block.
+          Forgetting release() under error paths is the dominant cause of TypeORM connection
+          pool exhaustion (DataSource hangs on next query waiting for a free connection).
+          Pattern: const qr = ds.createQueryRunner(); try { ... } finally { await qr.release(); }.
+          Never put logic between createQueryRunner() and the try block.
+        sources:
+          - "https://typeorm.io/data-source-api"
+          - "https://typeorm.io/query-runner"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
 
 edge_cases:
   - id: datasource-initialization

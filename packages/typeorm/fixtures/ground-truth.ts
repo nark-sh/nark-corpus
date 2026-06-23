@@ -27,6 +27,11 @@
  *   - repository.decrement()         postcondition: decrement-type-mismatch
  *   - dataSource.initialize()        postconditions: initialize-already-connected, initialize-connection-failure
  *   - dataSource.destroy()           postcondition: destroy-not-initialized
+ *   - dataSource.synchronize()       postconditions: synchronize-query-failed-error, synchronize-not-connected
+ *   - dataSource.runMigrations()     postconditions: run-migrations-query-failed-error, run-migrations-not-connected
+ *   - queryRunner.startTransaction() postconditions: start-transaction-already-started, start-transaction-already-released
+ *   - queryRunner.commitTransaction() postconditions: commit-transaction-not-started, commit-transaction-query-failed
+ *   - queryRunner.release()          postconditions: release-already-released, release-not-called-connection-leak
  *
  * Detection path: DataSource/Repository instances tracked →
  *   ThrowingFunctionDetector fires method calls →
@@ -502,5 +507,88 @@ export async function destroyWithCatch() {
     }
   } catch (err) {
     console.error('DataSource destroy failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. dataSource.synchronize() — schema sync (NOT for production)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function synchronizeNoCatch() {
+  // SHOULD_FIRE: synchronize-query-failed-error — DDL can fail. No try-catch.
+  await dataSource.synchronize();
+}
+
+export async function synchronizeWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: synchronize inside try-catch
+    await dataSource.synchronize();
+  } catch (err) {
+    console.error('DataSource synchronize failed:', err);
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. dataSource.runMigrations() — execute pending migrations on startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function runMigrationsNoCatch() {
+  // SHOULD_FIRE: run-migrations-query-failed-error — migrations can fail mid-execution. No try-catch.
+  const ran = await dataSource.runMigrations();
+  return ran;
+}
+
+export async function runMigrationsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: runMigrations inside try-catch with fail-fast startup pattern
+    const ran = await dataSource.runMigrations({ transaction: 'each' });
+    return ran;
+  } catch (err) {
+    console.error('runMigrations failed — refusing to serve traffic with half-migrated schema', err);
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. queryRunner.startTransaction() / commitTransaction() / release()
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function startTransactionNoCatch() {
+  const queryRunner = dataSource.createQueryRunner();
+  // SHOULD_FIRE: start-transaction-already-started — throws if already in a transaction. No try-catch.
+  await queryRunner.startTransaction();
+  await queryRunner.release();
+}
+
+export async function commitTransactionNoCatch() {
+  const queryRunner = dataSource.createQueryRunner();
+  await queryRunner.startTransaction();
+  // SHOULD_FIRE: commit-transaction-not-started — throws on commit-without-start or commit failure. No try-catch.
+  await queryRunner.commitTransaction();
+  await queryRunner.release();
+}
+
+export async function releaseNoCatch() {
+  const queryRunner = dataSource.createQueryRunner();
+  // SHOULD_FIRE: release-already-released — throws if released twice. No try-catch.
+  await queryRunner.release();
+}
+
+export async function manualTransactionProperPattern() {
+  const queryRunner = dataSource.createQueryRunner();
+  await queryRunner.connect();
+  try {
+    // SHOULD_NOT_FIRE: full try/catch/finally pattern for manual transaction
+    await queryRunner.startTransaction();
+    await queryRunner.manager.save({});
+    await queryRunner.commitTransaction();
+  } catch (err) {
+    if (queryRunner.isTransactionActive) {
+      await queryRunner.rollbackTransaction();
+    }
+    throw err;
+  } finally {
+    await queryRunner.release();
   }
 }

@@ -3,6 +3,32 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 92% -> 96%
+
+- **Profile:** `packages/typeorm/contract.yaml`
+- **Functions added:** synchronize, runMigrations, QueryRunner.startTransaction, QueryRunner.commitTransaction, QueryRunner.release (5 total)
+- **Postconditions added:** 10
+  - synchronize-query-failed-error, synchronize-not-connected
+  - run-migrations-query-failed-error, run-migrations-not-connected
+  - start-transaction-already-started, start-transaction-already-released
+  - commit-transaction-not-started, commit-transaction-query-failed
+  - release-already-released, release-not-called-connection-leak
+- **Functions intentionally omitted this pass:** none new (kept previous omissions: deprecated aliases, thin aggregate methods)
+- **Scanner concerns queued:** 10 (`concern-20260623-typeorm-deepen-1` .. `concern-20260623-typeorm-deepen-10`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/data-source/DataSource.ts
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/migration/MigrationExecutor.ts
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/TransactionAlreadyStartedError.ts
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/TransactionNotStartedError.ts
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/QueryRunnerAlreadyReleasedError.ts
+  - https://raw.githubusercontent.com/typeorm/typeorm/master/src/error/CannotExecuteNotConnectedError.ts
+  - https://typeorm.io/migrations
+  - https://typeorm.io/transactions
+  - https://typeorm.io/data-source-options
+  - https://typeorm.io/query-runner
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23T23:33:00Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** typeorm@1.0.0
