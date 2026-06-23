@@ -2,11 +2,11 @@ package: mongoose
 semver: ">=5.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.81  # 35 contracted / (43 total - 8 intentionally omitted)
+coverage_score: 1.0  # effective coverage: 41 contracted / (52 total - 11 intentionally omitted) — pass 17 added bulkWrite (conn-level), destroy, createCollections, documentDeleteOne, createSearchIndexes, eachAsync against mongoose@9.7.2 surface; raw contracted/total = 41/52 = 0.79 tracked in deepen-index.json
 
 # Detection rules for analyzer integration
 detection:
@@ -1433,4 +1433,360 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: high
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # New in pass 17 (2026-06-23) — drift-by-staleness re-enumeration against
+  # mongoose@9.7.2 surface. Adds Connection-level bulk/destroy/createCollections,
+  # Document.deleteOne, Model.createSearchIndexes (plural), Query.cursor.eachAsync.
+  # ─────────────────────────────────────────────────────────────────────────
+
+  # Connection.bulkWrite() — client-level bulk write across multiple collections.
+  # Added in mongoose 8.x (lib/connection.js bulkWrite method, types/connection.d.ts:87-91).
+  # Distinct from Model.bulkWrite — operates on the Connection (MongoClient) and
+  # accepts a `models` array tagging each op with a `namespace`.
+  - name: bulkWrite
+    import_path: "mongoose"
+    description: >
+      Connection-level bulk write — sends multiple writes across multiple
+      collections in a single round-trip. Returns mongodb.ClientBulkWriteResult
+      with optional `mongoose.validationErrors` and `mongoose.results` arrays.
+
+    postconditions:
+      # Evidence: types/connection.d.ts:85-91 — Promise<ClientBulkWriteResult
+      # & { mongoose?: { validationErrors: Error[], results: Array<Error | WriteError | null> } }>
+      # Error class: lib/error/bulkWriteError.js — MongooseBulkWriteError thrown
+      # when throwOnValidationError: true and any validation fails.
+      - id: connection-bulkwrite-mongoose-bulkwrite-error-no-try-catch
+        condition: >
+          Connection.bulkWrite() with `throwOnValidationError: true` (the
+          default in Mongoose 8.x+) throws MongooseBulkWriteError when ANY
+          op fails Mongoose schema validation (cast error, required field
+          missing, validator returns false). Valid ops in the same batch
+          still execute and persist — the error contains a `results` array
+          of {success: true | error} per op and a `validationErrors` array
+          of just the failures. Without try-catch the caller doesn't know
+          which writes landed and which didn't.
+        throws: "MongooseBulkWriteError (extends MongooseError) with .validationErrors, .results, .rawResult, .operation"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          Catch MongooseBulkWriteError and inspect err.validationErrors to
+          enumerate which ops failed validation; inspect err.results to
+          determine which ops succeeded on the server. Do NOT assume the
+          entire bulkWrite was a no-op on failure — partial application is
+          the normal case. To opt out of throwing, pass
+          { throwOnValidationError: false } and inspect
+          result.mongoose.validationErrors after the call.
+        sources:
+          - "https://mongoosejs.com/docs/api/connection.html#Connection.prototype.bulkWrite()"
+          - "https://github.com/Automattic/mongoose/blob/master/lib/error/bulkWriteError.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: connection-bulkwrite-write-error-partial-application
+        condition: >
+          Mongo-side write errors (E11000 duplicate key, document validation
+          failure, server timeouts mid-batch) reject the returned Promise
+          with the underlying mongodb driver's MongoBulkWriteError. Earlier
+          ops in the batch may have already been applied. The error's
+          .writeErrors array identifies which ops failed and .insertedCount /
+          .modifiedCount / .deletedCount say how many succeeded before the
+          batch aborted.
+        throws: "MongoBulkWriteError (from mongodb driver) — propagates as Promise rejection"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          Catch MongoBulkWriteError and reconcile state: read err.result for
+          per-op success counts. The order ops execute in is implementation-
+          defined when `ordered: false`; when `ordered: true` (default), all
+          ops AFTER the first failure are skipped. Always log err.writeErrors
+          before deciding whether to retry — duplicate key errors are not
+          retryable but server-selection errors are.
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/method/db.collection.bulkWrite/"
+          - "https://mongoosejs.com/docs/api/connection.html#Connection.prototype.bulkWrite()"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # Connection.destroy() — force-shutdown variant of Connection.close()
+  # Added in mongoose 8.x (types/connection.d.ts:97). Differs from close():
+  # destroy aborts any in-flight operations immediately and tears down the
+  # MongoClient without waiting for pending writes to drain.
+  - name: destroy
+    import_path: "mongoose"
+    description: >
+      Force-closes the connection without waiting for pending operations.
+      Pass force=true to close even when operations are mid-flight.
+      Unlike close(), in-flight writes are not given a chance to complete.
+
+    postconditions:
+      # Evidence: types/connection.d.ts:97 — destroy(force?: boolean): Promise<void>
+      # lib/connection.js destroy() — does NOT call collection.drainOps; cancels
+      # outstanding work via this.client.close(true) which fails inflight cursors.
+      - id: connection-destroy-pending-writes-discarded
+        condition: >
+          Connection.destroy() force-closes the underlying MongoClient without
+          waiting for pending operations to drain. Writes mid-flight that have
+          been sent to the server but whose acknowledgement hasn't returned
+          may or may not have been applied — the Promise resolves to void
+          regardless. There is no API to enumerate which ops were aborted.
+          Calling destroy() in a graceful-shutdown handler before draining
+          writes loses commit acks.
+        throws: "Resolves void on success; rejects only on internal MongoClient close errors"
+        required_handling: >
+          PREFER Connection.close() over destroy() in graceful shutdown
+          handlers — close() waits for in-flight ops to complete. Use
+          destroy() only when shutting down a process that is already
+          failing (uncaughtException, SIGKILL pending) and you cannot
+          afford to wait. If you must use destroy(), drain critical writes
+          first (await Promise.all(pendingWrites)) before calling it.
+          Wrap in try-catch defensively — internal close errors are rare
+          but possible.
+        sources:
+          - "https://mongoosejs.com/docs/api/connection.html#Connection.prototype.destroy()"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # Connection.createCollections() — plural variant of createCollection.
+  # Added in mongoose 8.x (types/connection.d.ts:121). Continues on per-collection
+  # errors when continueOnError=true and aggregates them in CreateCollectionsError.
+  - name: createCollections
+    import_path: "mongoose"
+    description: >
+      Creates all collections defined by the connection's registered models.
+      With continueOnError=true, individual collection-creation failures do
+      NOT abort the batch — they are collected and re-thrown as a single
+      CreateCollectionsError whose .errors property maps collectionName → Error.
+
+    postconditions:
+      # Evidence: types/connection.d.ts:121 — createCollections(continueOnError?: boolean):
+      # Promise<Record<string, Error | mongodb.Collection<any>>>
+      # Error class: lib/error/createCollectionsError.js — CreateCollectionsError(message, errorsMap)
+      - id: createcollections-create-collections-error-no-try-catch
+        condition: >
+          createCollections(true) aggregates per-collection failures into a
+          CreateCollectionsError thrown after the batch completes. The
+          .errors property is a Record mapping each failed collection name
+          to its underlying error. Without try-catch, the partial-success
+          state (which collections WERE created) is lost — the caller can't
+          tell whether to retry only the failed names or assume all failed.
+        throws: "CreateCollectionsError (extends MongooseError) with .errors map"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          Catch CreateCollectionsError and inspect err.errors (Record<string,
+          Error>) to enumerate which specific collections failed. Successfully-
+          created collections are NOT rolled back — retry by passing only the
+          failed names back into a follow-up createCollection() loop. If
+          continueOnError is false (default), the first failure rejects
+          immediately and the remaining collections in the batch are not
+          attempted; partial creation still occurred for collections before
+          the failure.
+        sources:
+          - "https://mongoosejs.com/docs/api/connection.html#Connection.prototype.createCollections()"
+          - "https://github.com/Automattic/mongoose/blob/master/lib/error/createCollectionsError.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Document.deleteOne() — instance method returning Query. Distinct from
+  # Model.deleteOne() (static, filter-based). Document.deleteOne() deletes the
+  # current document by its _id. Awaitable via Query.then.
+  - name: documentDeleteOne
+    import_path: "mongoose"
+    description: >
+      Document instance method — deletes the document from the database by
+      its _id. Returns a Query that resolves to a DeleteResult with
+      .deletedCount. Runs pre/post `deleteOne` document middleware.
+      DATA_LOSS hazard: this is the canonical "delete this exact doc" API
+      and silent failures (auth issues, transient connection errors) mean
+      the doc remains in the DB while the caller thinks it's gone.
+
+    postconditions:
+      # Evidence: types/document.d.ts:139-144 — deleteOne(options?: QueryOptions):
+      # QueryWithHelpers<...> — the returned Query is then-able and rejects on
+      # connection / cast / middleware failure.
+      - id: document-deleteone-middleware-error-no-try-catch
+        condition: >
+          Document.deleteOne() runs pre('deleteOne', { document: true,
+          query: false }) middleware. Any pre-hook that throws or rejects
+          (auth check failing, business rule blocking the delete) propagates
+          out of the await. Without try-catch the caller assumes deletion
+          succeeded — the document remains in the database while application
+          state moves on as if it were gone.
+        throws: "MongooseError or middleware-thrown error (any Error subclass thrown in pre('deleteOne') hook)"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          After catching, treat the deletion as NOT having occurred — re-read
+          the document by _id to confirm its state before retrying. Do not
+          update dependent state (cache invalidation, downstream notifications)
+          on the assumption that deleteOne succeeded.
+        sources:
+          - "https://mongoosejs.com/docs/api/document.html#Document.prototype.deleteOne()"
+          - "https://mongoosejs.com/docs/middleware.html#types-of-middleware"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: document-deleteone-zero-deletedcount-silent-noop
+        condition: >
+          Document.deleteOne() resolves to a DeleteResult with
+          deletedCount=0 when the document no longer exists in the database
+          (race with another delete) or when a query-level filter eliminates
+          it. The Promise does NOT reject — it resolves successfully with
+          a "did nothing" result. Without inspecting deletedCount the caller
+          believes the delete succeeded.
+        throws: "Does not throw — silent zero-deletedCount on race or stale doc"
+        required_handling: >
+          ALWAYS inspect result.deletedCount after await. If 0, treat the
+          delete as a no-op and decide whether to surface a 404 to the caller,
+          retry, or proceed (idempotent delete semantics). Do NOT assume
+          deletedCount > 0 just because the await did not throw.
+        sources:
+          - "https://mongoosejs.com/docs/api/document.html#Document.prototype.deleteOne()"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Model.createSearchIndexes() — plural Atlas Search variant.
+  # Added in mongoose 8.x (types/models.d.ts:372). Creates ALL Atlas Search
+  # indexes declared on the schema. Atlas-only; throws on connection failure
+  # or invalid index description.
+  - name: createSearchIndexes
+    import_path: "mongoose"
+    description: >
+      Creates every Atlas Search index declared on the schema in a single
+      batch. Returns Promise<string[]> with the created index names. Atlas-only —
+      the underlying $listSearchIndexes admin command is unavailable on
+      community-edition MongoDB and rejects the Promise with a command-
+      not-supported error.
+
+    postconditions:
+      # Evidence: types/models.d.ts:372 — createSearchIndexes(): Promise<string[]>
+      # lib/model.js createSearchIndexes — wraps mongodb driver's
+      # collection.createSearchIndexes; throws on non-Atlas deployments.
+      - id: createsearchindexes-not-atlas-command-error-no-try-catch
+        condition: >
+          createSearchIndexes() requires MongoDB Atlas (or Atlas Search Local).
+          Running it against a self-hosted community-edition deployment
+          rejects with a command-not-supported error (server reports
+          $listSearchIndexes is not recognized). Without try-catch the
+          deployment pipeline aborts silently on local-dev environments
+          that don't have Atlas configured.
+        throws: "MongoServerError (code 40324 or similar, 'Unrecognized pipeline stage name: $listSearchIndexes')"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          Inspect err.codeName / err.code — if the cluster is non-Atlas,
+          gracefully skip search index creation rather than crashing the
+          startup sequence. In multi-environment deployments (Atlas in
+          prod, community-edition in dev), conditionally call this only
+          when process.env.MONGODB_ATLAS === 'true' to avoid the error
+          entirely.
+        sources:
+          - "https://mongoosejs.com/docs/api/model.html#Model.createSearchIndexes()"
+          - "https://www.mongodb.com/docs/atlas/atlas-search/manage-indexes/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: createsearchindexes-partial-creation-no-rollback
+        condition: >
+          createSearchIndexes() iterates the schema's searchIndexes array and
+          creates them sequentially. If the 3rd of 5 indexes fails (invalid
+          definition, duplicate name, quota), the first 2 are already
+          created and remain in the cluster after the Promise rejects.
+          There is no automatic rollback.
+        throws: "MongoServerError on first-failed index — earlier indexes remain"
+        required_handling: >
+          After catching, call Model.listSearchIndexes() to enumerate what
+          WAS created and decide whether to drop the partial set and retry
+          from scratch (atomic-like behavior) or accept the partial state.
+          In CI/CD pipelines treat partial creation as a deployment
+          failure and roll forward with explicit cleanup.
+        sources:
+          - "https://mongoosejs.com/docs/api/model.html#Model.createSearchIndexes()"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Query.cursor().eachAsync() — async iteration helper. Added in mongoose 5.x
+  # but gained EachAsyncMultiError support in mongoose 8.x (continueOnError).
+  - name: eachAsync
+    import_path: "mongoose"
+    description: >
+      Iterates a Query cursor asynchronously, invoking the callback for
+      each document. With continueOnError=true, per-document errors are
+      collected and re-thrown as a single EachAsyncMultiError after
+      iteration completes (added in mongoose 8.x).
+
+    postconditions:
+      # Evidence: lib/error/eachAsyncMultiError.js — EachAsyncMultiError(errors)
+      # extends MongooseError with .errors: Error[]
+      - id: eachasync-multi-error-no-try-catch
+        condition: >
+          eachAsync(fn, { continueOnError: true }) collects errors thrown
+          by fn() across all documents and rejects the final Promise with
+          an EachAsyncMultiError whose .errors array contains all failures.
+          Without try-catch the caller cannot enumerate which documents
+          were processed successfully and which failed — partial-success
+          state is silently dropped.
+        throws: "EachAsyncMultiError (extends MongooseError) with .errors: Error[]"
+        required_handling: >
+          Caller MUST wrap in try-catch.
+          Inspect err.errors to enumerate per-document failures. Each
+          element retains the original error message; correlate by index
+          if the iteration order is deterministic. Without continueOnError,
+          the FIRST per-document error rejects immediately and remaining
+          documents in the cursor are not visited — wrap that case as well.
+        sources:
+          - "https://mongoosejs.com/docs/api/query.html#Query.prototype.cursor()"
+          - "https://github.com/Automattic/mongoose/blob/master/lib/error/eachAsyncMultiError.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
         evidence_quality: confirmed
