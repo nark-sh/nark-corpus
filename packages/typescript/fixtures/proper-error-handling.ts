@@ -215,6 +215,89 @@ function compileProject(rootDir: string, outDir: string): boolean {
   }
 }
 
+/**
+ * Example 7: ts.transform() with proper error handling and dispose
+ * ✅ Wraps transform call in try/finally, calls result.dispose()
+ */
+// @expect-clean
+function applyTransformerSafely(
+  source: ts.SourceFile,
+  transformer: ts.TransformerFactory<ts.SourceFile>
+): ts.SourceFile | null {
+  let result: ts.TransformationResult<ts.SourceFile> | undefined;
+  try {
+    result = ts.transform(source, [transformer]);
+    return result.transformed[0];
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Transformer failed:', error.message);
+    }
+    return null;
+  } finally {
+    result?.dispose();
+  }
+}
+
+/**
+ * Example 8: ts.findConfigFile() with proper undefined check
+ * ✅ Explicitly checks for undefined before forwarding to readConfigFile
+ */
+// @expect-clean
+function loadConfigSafely(searchPath: string) {
+  const configPath = ts.findConfigFile(searchPath, ts.sys.fileExists, 'tsconfig.json');
+  if (!configPath) {
+    throw new Error(`Could not find tsconfig.json starting from ${searchPath}`);
+  }
+  const { config, error } = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (error) {
+    const msg = ts.flattenDiagnosticMessageText(error.messageText, '\n');
+    throw new Error(`Failed to read tsconfig.json: ${msg}`);
+  }
+  return config;
+}
+
+/**
+ * Example 9: getParsedCommandLineOfConfigFile with full guard rail
+ * ✅ Checks for undefined return AND inspects errors[]
+ */
+// @expect-clean
+function parseConfigSafely(configFileName: string) {
+  const host: ts.ParseConfigFileHost = {
+    ...ts.sys,
+    onUnRecoverableConfigFileDiagnostic: (diagnostic) => {
+      throw new Error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+    },
+  };
+
+  const parsed = ts.getParsedCommandLineOfConfigFile(configFileName, undefined, host);
+  if (!parsed) {
+    throw new Error(`Failed to parse ${configFileName}`);
+  }
+  if (parsed.errors.length > 0) {
+    const messages = parsed.errors
+      .map((e) => ts.flattenDiagnosticMessageText(e.messageText, '\n'))
+      .join('; ');
+    throw new Error(`tsconfig has invalid options: ${messages}`);
+  }
+  return ts.createProgram(parsed.fileNames, parsed.options);
+}
+
+/**
+ * Example 10: convertCompilerOptionsFromJson with errors check
+ * ✅ Inspects result.errors before using result.options
+ */
+// @expect-clean
+function convertOptionsSafely(jsonOptions: unknown, basePath: string) {
+  const { options, errors } = ts.convertCompilerOptionsFromJson(jsonOptions, basePath);
+  if (errors.length > 0) {
+    const messages = errors
+      .map((e) => ts.flattenDiagnosticMessageText(e.messageText, '\n'))
+      .join('; ');
+    throw new Error(`Invalid compilerOptions: ${messages}`);
+  }
+  return options;
+}
+
 // Export functions for testing
 export {
   readSourceFileSafely,
@@ -223,4 +306,8 @@ export {
   createProgramSafely,
   createCustomCompilerHost,
   compileProject,
+  applyTransformerSafely,
+  loadConfigSafely,
+  parseConfigSafely,
+  convertOptionsSafely,
 };

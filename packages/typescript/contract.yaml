@@ -1,24 +1,37 @@
 package: typescript
 semver: ">=4.0.0 <7.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-18"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.70
-# Depth pass 2026-04-18 (deepen-stream-1 pass 8):
-# API surface: ~20 callable Compiler API functions with distinct Nark profiles
+coverage_score: 0.90
+# Depth pass 2026-06-23 (deepen-stream-2 pass 11):
+# API surface: 20 callable Compiler API functions with distinct Nark profiles
+# Contracted before: 14
+# Contracted after: 18 (+4 new: transform, findConfigFile,
+#   getParsedCommandLineOfConfigFile, convertCompilerOptionsFromJson)
+# Postconditions added: 7 (transform: custom-transformer-throws, hooks-set-after-init,
+#   result-not-disposed; findConfigFile: undefined-result-not-checked;
+#   getParsedCommandLineOfConfigFile: undefined-not-checked, host-missing-callback;
+#   convertCompilerOptionsFromJson: errors-not-checked)
+# Intentionally omitted: 2 (createWatchProgram + createWatchCompilerHost — IDE/watch APIs
+#   with no unique error contract beyond createProgram's; parseCommandLine, tokenToString,
+#   textSpan* utilities, sys.createDirectory, createIncrementalProgram, resolveModuleName,
+#   formatDiagnostics, preProcessFile, nodeModuleNameResolver, resolveTypeReferenceDirective
+#   are pure utilities or return diagnostic arrays with no new throw paths)
+# Coverage: 18/20 = 0.90
+# Verified against typescript@6.0.3 (latest, fits declared semver)
+# Evidence sources confirmed from:
+#   node_modules/typescript@6.0.3/lib/typescript.js — throw sites and implementation
+#   https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+#
+# Earlier depth pass 2026-04-18 (deepen-stream-1 pass 8):
 # Contracted before: 5 (sys.readFile, sys.readDirectory, sys.writeFile, createProgram, createCompilerHost)
 # Contracted after: 14 (+9 new: transpileModule, program.emit, program.getSemanticDiagnostics,
 #   readConfigFile, parseJsonConfigFileContent, createSourceFile,
 #   LanguageService.getSyntacticDiagnostics, LanguageService.getSemanticDiagnostics, getPreEmitDiagnostics)
-# Intentionally omitted: 6 (createWatchProgram, createWatchCompilerHost, parseCommandLine,
-#   tokenToString, textSpan* utilities, sys.createDirectory — niche/utility with no unique error contract)
-# Coverage: 14/20 = 0.70
-# Evidence sources confirmed from:
-#   node_modules/typescript/lib/typescript.js — throw sites and implementation
-#   https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
 
 functions:
   - name: readFile
@@ -1030,4 +1043,437 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: transform
+    import_path: "typescript"
+    description: >
+      Stand-alone Compiler API transformation entry point. Applies a sequence of
+      TransformerFactory functions to one or more source nodes and returns a
+      TransformationResult ({ transformed, diagnostics, dispose, substituteNode,
+      ... }). Used by ts-jest, ts-loader, custom build tools, and any code that
+      runs TypeScript transformers outside a full Program. Does NOT throw for
+      type errors (no type checker runs). DOES propagate uncaught exceptions
+      from the user-supplied transformer functions, and triggers an internal
+      Debug.assert when transformation hooks (onSubstituteNode, onEmitNode) are
+      mutated after initialization completes. The returned object exposes a
+      `dispose()` method that releases retained source-file emit nodes — callers
+      that skip it can leak memory across thousands of transforms.
+    postconditions:
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 154826
+      # function transform(source, transformers, compilerOptions) calls
+      # transformNodes() at line 120794. The transformers loop at line 120865-120878
+      # runs each `transformer(context)` then `transformation(node)` directly with
+      # NO try/catch — any exception thrown from inside a TransformerFactory or
+      # the visitor function it returns propagates straight to the caller.
+      # Source: https://github.com/microsoft/TypeScript/blob/main/src/compiler/transformer.ts
+      - id: transform-custom-transformer-throws
+        condition: >
+          A user-supplied TransformerFactory or the visitor it returns throws an
+          uncaught exception while ts.transform() is running. This commonly happens
+          when a transformer assumes a node shape that doesn't match (e.g. expects
+          ts.isCallExpression(node) but a parent visitor returned a different node
+          kind), dereferences node.parent without setParentNodes:true, or calls
+          factory.createX with the wrong argument shape. The transformation loop
+          in transformNodes() has no catch — the exception terminates the call.
+        throws: "Whatever the transformer throws (TypeError, custom Error, etc.)"
+        required_handling: >
+          Wrap ts.transform() in try-catch when running user-defined or composed
+          transformers:
+
+            import * as ts from 'typescript';
+
+            // WRONG — visitor crashes mid-traversal and aborts the whole transform
+            const result = ts.transform(sourceFile, [myTransformer], options);
+
+            // CORRECT — catch and surface which transformer failed
+            try {
+              const result = ts.transform(sourceFile, [myTransformer], options);
+              return result.transformed[0];
+            } catch (error) {
+              throw new Error(
+                `Transformation failed in ${myTransformer.name}: ${(error as Error).message}`
+              );
+            } finally {
+              // dispose() is required even on success — see transform-result-not-disposed
+            }
+
+          For pipelines that chain transformers, wrap each one individually so
+          the failing transformer is identifiable. ts.transform() does not tag
+          the error with the offending TransformerFactory.
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/transformer.ts"
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 120841-120856
+      # The context object's `onSubstituteNode` and `onEmitNode` setters call:
+      #   Debug.assert(state < 1 /* Initialized */, "Cannot modify transformation hooks after initialization has completed.")
+      # State transitions to Initialized (=1) at line 120872, immediately before
+      # the transformation loop. Any setter call after that throws.
+      - id: transform-hooks-set-after-init-throws
+        condition: >
+          A transformer attempts to assign context.onSubstituteNode or
+          context.onEmitNode AFTER transformNodes() has flipped state to
+          Initialized (which happens before the visitor loop starts). This is a
+          structural-bug pattern: hooks must be wired up inside the
+          TransformerFactory (which runs while state is still Uninitialized),
+          not inside the returned visitor function (which runs after init).
+        throws: "Error: Cannot modify transformation hooks after initialization has completed."
+        required_handling: >
+          Set substitution/emit hooks in the TransformerFactory body, NOT in the
+          returned visitor:
+
+            // WRONG — hooks set inside visitor, after init has completed
+            const badTransformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+              return (sourceFile) => {
+                context.onSubstituteNode = (hint, node) => node;  // THROWS
+                return ts.visitNode(sourceFile, () => sourceFile);
+              };
+            };
+
+            // CORRECT — hooks set before the visitor runs
+            const goodTransformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+              context.onSubstituteNode = (hint, node) => node;
+              context.enableSubstitution(ts.SyntaxKind.Identifier);
+              return (sourceFile) => ts.visitNode(sourceFile, () => sourceFile);
+            };
+
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/transformer.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js — TransformationResult
+      # exposes a `dispose` method that calls disposeEmitNodes on each transformed
+      # SourceFile to release retained transformation context. Without it, the
+      # context object (resolver, host, factory closures, accumulated nodes) stays
+      # rooted across every transform call.
+      # Source: https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md
+      - id: transform-result-not-disposed
+        condition: >
+          The caller uses result.transformed but never calls result.dispose(). The
+          TransformationResult retains references to the transformation context
+          and the transformed nodes' emit metadata. In a long-running process
+          (compiler service, language server, build watcher, batch transformer)
+          that runs ts.transform() repeatedly, undisposed results accumulate and
+          drive memory growth proportional to source-file size × transform count.
+        returns: >
+          A TransformationResult whose internal disposeEmitNodes path was never
+          invoked. The Node EmitFlags and SourceMapRange data on each transformed
+          node remain reachable from the GC root path that holds the result.
+        required_handling: >
+          Always dispose the result when done — use try/finally so dispose runs
+          even if the consumer of `transformed` throws:
+
+            import * as ts from 'typescript';
+
+            const result = ts.transform(sourceFile, transformers, options);
+            try {
+              const printer = ts.createPrinter();
+              return printer.printFile(result.transformed[0] as ts.SourceFile);
+            } finally {
+              result.dispose();
+            }
+
+          For batch pipelines, dispose after each transform — do not accumulate
+          results across the batch.
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/transformer.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: findConfigFile
+    import_path: "typescript"
+    description: >
+      Walks parent directories from searchPath looking for a config file matching
+      configName (defaults to 'tsconfig.json'). Returns the absolute path on
+      success or `undefined` if no matching file is found in any ancestor. The
+      undefined-on-miss contract is the entire failure mode — callers who pass
+      the result directly into ts.readConfigFile(), ts.sys.readFile(), or any
+      string-typed downstream API will crash with TypeError or hit an
+      ENOENT/EACCES from the fileExists callback.
+    postconditions:
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 126738-126743
+      # function findConfigFile(searchPath, fileExists, configName = "tsconfig.json") {
+      #   return forEachAncestorDirectory(searchPath, (ancestor) => {
+      #     const fileName = combinePaths(ancestor, configName);
+      #     return fileExists(fileName) ? fileName : void 0;
+      #   });
+      # }
+      # forEachAncestorDirectory returns the first truthy callback result or
+      # undefined if every ancestor returned undefined.
+      - id: findconfigfile-undefined-result-not-checked
+        condition: >
+          The caller forwards the return value of ts.findConfigFile() into a
+          downstream function that requires a string (ts.readConfigFile,
+          ts.sys.readFile, path.dirname, fs.readFileSync) without first checking
+          for undefined. The miss case is silent: no diagnostic, no thrown
+          error — just `undefined`. The crash happens at the next call site,
+          usually with a confusing TypeError like "Cannot read properties of
+          undefined" or "path must be of type string".
+        returns: >
+          undefined when no tsconfig.json (or the configured name) exists at
+          searchPath or any of its ancestors. Common causes: running from outside
+          the project root, the project has a non-standard tsconfig filename,
+          fileExists callback returns false for a path that does exist
+          (case sensitivity / symlink issues).
+        required_handling: >
+          Always check the return value before using it:
+
+            import * as ts from 'typescript';
+
+            const configPath = ts.findConfigFile(
+              searchPath,
+              ts.sys.fileExists,
+              'tsconfig.json'
+            );
+
+            if (!configPath) {
+              throw new Error(
+                `Could not find tsconfig.json starting from ${searchPath}. ` +
+                `Pass an explicit --project flag or run from inside a TypeScript project.`
+              );
+            }
+
+            const { config, error } = ts.readConfigFile(configPath, ts.sys.readFile);
+            // ... continue with the readConfigFile contract checks
+
+          Do not use the non-null assertion operator (configPath!) — it suppresses
+          the TS warning but the runtime TypeError is identical. The check is
+          the contract.
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/program.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: getParsedCommandLineOfConfigFile
+    import_path: "typescript"
+    description: >
+      One-shot wrapper that reads a tsconfig.json file, parses its JSON, and
+      converts the result into a ParsedCommandLine ({ options, fileNames,
+      projectReferences, errors }). Replaces the manual readConfigFile +
+      parseJsonConfigFileContent dance for the common case. Returns undefined
+      when the config file cannot be read — but ONLY signals this failure via
+      `host.onUnRecoverableConfigFileDiagnostic`, which the caller must
+      implement on the ParseConfigFileHost. Two failure modes: (1) host omits
+      onUnRecoverableConfigFileDiagnostic and gets a TypeError, (2) host
+      provides it but the caller doesn't check the undefined return.
+    postconditions:
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 42600-42623
+      # function getParsedCommandLineOfConfigFile(configFileName, ..., host, ...) {
+      #   const configFileText = tryReadFile(configFileName, (fileName) => host.readFile(fileName));
+      #   if (!isString(configFileText)) {
+      #     host.onUnRecoverableConfigFileDiagnostic(configFileText);   // host method REQUIRED
+      #     return void 0;                                              // silent undefined
+      #   }
+      #   ...
+      # }
+      # tryReadFile (line 42644) wraps host.readFile in try/catch and converts
+      # exceptions into Diagnostics — they do NOT propagate out as throws.
+      - id: getparsedcommandline-undefined-not-checked
+        condition: >
+          The caller invokes ts.getParsedCommandLineOfConfigFile(...) and uses
+          result.options or result.fileNames without checking that the result
+          itself is non-undefined. The undefined path fires when host.readFile
+          returns undefined, throws (caught by tryReadFile), or the file content
+          is not a string. The caller then crashes on the next property access.
+        returns: >
+          undefined when the config file cannot be read. The
+          host.onUnRecoverableConfigFileDiagnostic callback fires with a
+          ts.Diagnostic describing the read failure (ENOENT, EACCES, throw from
+          readFile), but the function still returns void 0 to its caller.
+        required_handling: >
+          Always check for undefined AND check result.errors when defined:
+
+            import * as ts from 'typescript';
+
+            const host: ts.ParseConfigFileHost = {
+              ...ts.sys,
+              onUnRecoverableConfigFileDiagnostic: (diagnostic) => {
+                const msg = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
+                throw new Error(`tsconfig read failed: ${msg}`);
+              },
+            };
+
+            const parsed = ts.getParsedCommandLineOfConfigFile(
+              configFileName,
+              /*optionsToExtend*/ undefined,
+              host
+            );
+
+            if (!parsed) {
+              // onUnRecoverableConfigFileDiagnostic already fired if it was
+              // wired up to throw; this guard catches the case where it just
+              // logged a warning.
+              throw new Error(`Failed to parse ${configFileName}`);
+            }
+
+            if (parsed.errors.length > 0) {
+              parsed.errors.forEach(e =>
+                console.error(ts.flattenDiagnosticMessageText(e.messageText, '\n'))
+              );
+              throw new Error(`tsconfig has invalid options: ${parsed.errors.length} errors`);
+            }
+
+            // Safe to use parsed.options and parsed.fileNames
+            const program = ts.createProgram(parsed.fileNames, parsed.options);
+
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 42603
+      # The function calls host.onUnRecoverableConfigFileDiagnostic UNCONDITIONALLY
+      # when the read fails. The ParseConfigFileHost interface declares this method
+      # as required (not optional). Hosts that omit it crash with TypeError when
+      # the read path triggers (any time the config file is missing or unreadable).
+      - id: getparsedcommandline-host-missing-callback
+        condition: >
+          The ParseConfigFileHost passed to ts.getParsedCommandLineOfConfigFile()
+          does not define onUnRecoverableConfigFileDiagnostic (or defines it as
+          undefined). When the function hits the read-failure path, calling
+          undefined as a function raises TypeError. A spread of ts.sys does NOT
+          include this method — ts.sys is a System, not a ParseConfigFileHost.
+        throws: "TypeError: host.onUnRecoverableConfigFileDiagnostic is not a function"
+        required_handling: >
+          Explicitly provide onUnRecoverableConfigFileDiagnostic when constructing
+          the host — do not rely on object spread to supply it:
+
+            // WRONG — ts.sys does not have onUnRecoverableConfigFileDiagnostic
+            const host = { ...ts.sys } as ts.ParseConfigFileHost;
+            ts.getParsedCommandLineOfConfigFile(configFileName, undefined, host);
+            // Crashes with TypeError on any read failure.
+
+            // CORRECT — explicitly wire the diagnostic callback
+            const host: ts.ParseConfigFileHost = {
+              ...ts.sys,
+              onUnRecoverableConfigFileDiagnostic: (diagnostic) => {
+                throw new Error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+              },
+            };
+
+          The host interface also requires getCurrentDirectory and
+          useCaseSensitiveFileNames, both of which ts.sys provides.
+        sources:
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: convertCompilerOptionsFromJson
+    import_path: "typescript"
+    description: >
+      Converts a JSON-shaped compilerOptions object (raw values from a tsconfig
+      "compilerOptions" field) into a typed CompilerOptions object plus an
+      errors[] array. Used when callers have already extracted "compilerOptions"
+      from JSON and want to validate / coerce string enum values without running
+      the full parseJsonConfigFileContent pipeline. Follows the same
+      "errors in result, not throws" pattern as parseJsonConfigFileContent —
+      callers who ignore result.errors silently use partial / default options.
+    postconditions:
+      # Evidence: node_modules/typescript@6.0.3/lib/typescript.js line 43815-43818
+      # function convertCompilerOptionsFromJson(jsonOptions, basePath, configFileName) {
+      #   const errors = [];
+      #   const options = convertCompilerOptionsFromJsonWorker(jsonOptions, basePath, errors, configFileName);
+      #   return { options, errors };
+      # }
+      # The worker (line 43829+) accumulates Diagnostics for unknown options,
+      # wrong-type values, invalid enum strings — it never throws. The options
+      # object may have valid keys applied and invalid ones silently skipped.
+      - id: convertcompileroptions-errors-not-checked
+        condition: >
+          The caller destructures `{ options }` from the result and passes it to
+          ts.createProgram or persists it to disk without inspecting
+          result.errors. Common failures captured silently in errors[] include:
+          unknown option names (typos like "extendend"), string values for enum
+          fields outside the valid set (target: "ES2050"), wrong-typed values
+          (strict: "true" instead of boolean true), and invalid paths/extends.
+          The returned options object has whatever values WERE valid plus
+          defaults for the invalid ones — compilation proceeds with silently
+          wrong settings.
+        returns: >
+          { options: CompilerOptions, errors: Diagnostic[] } where errors may be
+          non-empty. options contains successfully-converted entries; invalid
+          entries are omitted (so missing target → default ES3, missing module →
+          default CommonJS, etc.).
+        required_handling: >
+          Always inspect errors and abort on non-empty:
+
+            import * as ts from 'typescript';
+
+            const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            const { options, errors } = ts.convertCompilerOptionsFromJson(
+              raw.compilerOptions,
+              path.dirname(configPath),
+              configPath
+            );
+
+            if (errors.length > 0) {
+              errors.forEach(e =>
+                console.error(ts.flattenDiagnosticMessageText(e.messageText, '\n'))
+              );
+              throw new Error(
+                `Invalid compilerOptions in ${configPath}: ${errors.length} error(s)`
+              );
+            }
+
+            // Safe to use options — fully validated
+            const program = ts.createProgram(fileNames, options);
+
+          For the common case (load + parse tsconfig.json from disk), prefer
+          ts.getParsedCommandLineOfConfigFile, which handles the read + parse +
+          extends-resolution in one call. Reach for
+          convertCompilerOptionsFromJson only when the JSON object is already
+          in memory (e.g. embedded in a parent config schema).
+        sources:
+          - "https://raw.githubusercontent.com/microsoft/TypeScript-wiki/main/Using-the-Compiler-API.md"
+          - "https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
         evidence_quality: confirmed

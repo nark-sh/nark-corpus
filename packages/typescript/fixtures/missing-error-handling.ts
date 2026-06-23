@@ -190,6 +190,84 @@ function createLanguageServiceHost(dir: string): ts.LanguageServiceHost {
   };
 }
 
+/**
+ * Example 11: ts.transform() with custom transformer, no try-catch
+ * ❌ Should trigger: transform-custom-transformer-throws,
+ *                    transform-result-not-disposed
+ *
+ * Custom transformers can crash inside the visitor loop. ts.transform()
+ * has no internal catch, so the exception terminates the call.
+ */
+// @expect-violation: transform-custom-transformer-throws
+// @expect-violation: transform-result-not-disposed
+function applyTransformerUnsafe(
+  source: ts.SourceFile,
+  transformer: ts.TransformerFactory<ts.SourceFile>
+): ts.SourceFile {
+  // ❌ VIOLATION: no try/catch, no dispose() call
+  const result = ts.transform(source, [transformer]);
+  return result.transformed[0];
+}
+
+/**
+ * Example 12: ts.findConfigFile() result used without nullish check
+ * ❌ Should trigger: findconfigfile-undefined-result-not-checked
+ *
+ * findConfigFile returns undefined when no tsconfig.json is found in any
+ * ancestor directory. Passing the result directly to readConfigFile() or
+ * path.dirname() crashes with TypeError on the miss case.
+ */
+// @expect-violation: findconfigfile-undefined-result-not-checked
+function loadConfigUnsafe(searchPath: string) {
+  // ❌ VIOLATION: configPath may be undefined; readConfigFile crashes
+  const configPath = ts.findConfigFile(searchPath, ts.sys.fileExists);
+  const { config } = ts.readConfigFile(configPath!, ts.sys.readFile);
+  return config;
+}
+
+/**
+ * Example 13: getParsedCommandLineOfConfigFile result used without check
+ * ❌ Should trigger: getparsedcommandline-undefined-not-checked
+ *
+ * Returns undefined when readFile fails. Calling .options on undefined
+ * crashes the build pipeline silently.
+ */
+// @expect-violation: getparsedcommandline-undefined-not-checked
+function parseConfigUnsafe(configFileName: string, host: ts.ParseConfigFileHost) {
+  // ❌ VIOLATION: parsed could be undefined
+  const parsed = ts.getParsedCommandLineOfConfigFile(configFileName, undefined, host);
+  return ts.createProgram(parsed!.fileNames, parsed!.options);
+}
+
+/**
+ * Example 14: getParsedCommandLineOfConfigFile with bare ts.sys spread
+ * ❌ Should trigger: getparsedcommandline-host-missing-callback
+ *
+ * ts.sys is a System, not a ParseConfigFileHost — it does NOT define
+ * onUnRecoverableConfigFileDiagnostic. Any read failure raises TypeError.
+ */
+// @expect-violation: getparsedcommandline-host-missing-callback
+function parseConfigUnsafeHost(configFileName: string) {
+  // ❌ VIOLATION: host is missing onUnRecoverableConfigFileDiagnostic
+  const host = { ...ts.sys } as ts.ParseConfigFileHost;
+  return ts.getParsedCommandLineOfConfigFile(configFileName, undefined, host);
+}
+
+/**
+ * Example 15: convertCompilerOptionsFromJson result.errors ignored
+ * ❌ Should trigger: convertcompileroptions-errors-not-checked
+ *
+ * Invalid option values (typos, wrong-type values) accumulate in errors[]
+ * while options[] silently falls back to defaults — the compilation
+ * proceeds with the wrong settings.
+ */
+// @expect-violation: convertcompileroptions-errors-not-checked
+function convertOptionsUnsafe(jsonOptions: unknown, basePath: string) {
+  // ❌ VIOLATION: result.errors silently dropped
+  const { options } = ts.convertCompilerOptionsFromJson(jsonOptions, basePath);
+  return options;
+}
+
 // Export for testing
 export {
   readSourceFileUnsafe,
@@ -202,4 +280,9 @@ export {
   UnsafeCompiler,
   getTsFiles,
   createLanguageServiceHost,
+  applyTransformerUnsafe,
+  loadConfigUnsafe,
+  parseConfigUnsafe,
+  parseConfigUnsafeHost,
+  convertOptionsUnsafe,
 };
