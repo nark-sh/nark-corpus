@@ -1,12 +1,12 @@
 package: "@prisma/client"
 semver: ">=4.0.0 <8.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-06"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.94
+coverage_score: 1.0
 
 functions:
   - name: create
@@ -963,6 +963,515 @@ functions:
           incident_cost_range: medium
 
       - id: executeraw-connection-error
+        condition: "Database connection failed during raw mutation"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff. Ensure idempotency before retrying mutations."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: findMany
+    import_path: "@prisma/client"
+    description: "Finds all records matching the filter, returns array (empty if no match)"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#findmany
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#error-reference
+      # findMany returns [] when no records match — does NOT throw.
+      # Silent-empty-array is a common source of "logic looks fine but UI is empty" bugs.
+      - id: findmany-empty-array-not-checked
+        condition: "No records match the filter"
+        returns: "[] (empty array) — does NOT throw"
+        required_handling: >
+          findMany returns an empty array when no records match — it does NOT throw.
+          Caller MUST check result.length if zero results indicate a business error
+          (e.g. listing a tenant's records that should always have >=1 row).
+          Silent-empty results often manifest as blank UI rather than visible errors.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#findmany"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: findmany-connection-error
+        condition: "Database connection failed during query"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff for transient connection errors."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: findmany-pagination-unbounded
+        condition: "findMany called without take/skip pagination on large tables"
+        returns: "All matching rows — can be unbounded"
+        required_handling: >
+          Without `take` and `skip` (or `cursor`-based pagination), findMany loads the
+          entire result set into memory and across the wire. On large tables this can
+          cause OOM in the app process and database client buffer overflows.
+          ALWAYS paginate user-facing queries.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/pagination"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: findmany-orderby-non-indexed
+        description: >
+          Using orderBy on a non-indexed column triggers a full table sort.
+          On large tables this causes query timeouts. Verify the orderBy column
+          has a database index before deploying.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/filtering-and-sorting"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: count
+    import_path: "@prisma/client"
+    description: "Counts records matching the filter"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#count
+      # count returns 0 silently when no records match — never throws on zero-match.
+      - id: count-zero-result-silent
+        condition: "No records match the where clause"
+        returns: "0 — does NOT throw"
+        required_handling: >
+          count() returns 0 silently when no rows match. If zero-count indicates a
+          business condition (e.g. tenant has no records but should), caller MUST
+          treat 0 as an alert condition explicitly. Don't pass count() result
+          directly into business logic without a zero-check.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#count"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: count-connection-error
+        condition: "Database connection failed during count query"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff for transient connection errors."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+    edge_cases:
+      - id: count-on-large-tables
+        description: >
+          count() on multi-million-row tables can be slow (full table scan on Postgres
+          unless using approximate counts). Use approximate counts (e.g. pg_class.reltuples)
+          for dashboards on huge tables.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/aggregation-grouping-summarizing#count"
+        severity: info
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: aggregate
+    import_path: "@prisma/client"
+    description: "Aggregates values across records (_count, _sum, _min, _max, _avg)"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#aggregate
+      # Evidence: https://www.prisma.io/docs/orm/prisma-client/queries/aggregation-grouping-summarizing
+      # aggregate returns null for _min/_max/_avg/_sum when no rows match — silent failure pattern.
+      - id: aggregate-null-when-no-rows
+        condition: "No records match the where clause"
+        returns: "{ _min: { field: null }, _max: { field: null }, _avg: { field: null }, _sum: { field: null }, _count: 0 }"
+        required_handling: >
+          When no rows match, aggregate returns null for _min/_max/_avg/_sum fields
+          (not 0, not undefined — null). Code that does `result._sum.amount + tax`
+          will crash with "Cannot read properties of null". Caller MUST null-check
+          every aggregate field before arithmetic or comparison.
+          The _count field returns 0 (not null) when no rows match.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#aggregate"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: aggregate-connection-error
+        condition: "Database connection failed during aggregation"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff for transient connection errors."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+    edge_cases:
+      - id: aggregate-decimal-precision
+        description: >
+          _avg on Decimal/Float fields may lose precision. For financial calculations
+          requiring exact precision, fetch raw values and aggregate in application
+          code using a decimal library.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/aggregation-grouping-summarizing"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: groupBy
+    import_path: "@prisma/client"
+    description: "Groups records by field(s) and aggregates within each group"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#groupby
+      # groupBy returns [] when no records match — silent zero-result pattern.
+      # having clause requires by/orderBy alignment — type errors at compile time but runtime errors if dynamically built.
+      - id: groupby-empty-array-not-checked
+        condition: "No records match the filter"
+        returns: "[] (empty array) — does NOT throw"
+        required_handling: >
+          groupBy returns an empty array when no records match. Code that assumes
+          at least one group exists (e.g. dashboard charts) MUST handle empty arrays.
+          Empty groupBy results often manifest as blank charts rather than visible errors.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#groupby"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: groupby-having-validation-error
+        condition: "having clause references field not in by clause"
+        throws: "PrismaClientValidationError"
+        required_handling: >
+          The fields used in `having` must also appear in `by` or be aggregations.
+          Dynamic queries that build `having` from user input MUST validate the field
+          list against the `by` list before sending to Prisma.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/aggregation-grouping-summarizing#groupby"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: groupby-connection-error
+        condition: "Database connection failed during groupBy query"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff for transient connection errors."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: createManyAndReturn
+    import_path: "@prisma/client"
+    description: "Creates multiple records and returns the created rows (added in v5.14.0)"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#createmanyandreturn
+      # createManyAndReturn is PostgreSQL/CockroachDB/SQLite only — MySQL/MongoDB/SQLServer throw.
+      # Otherwise behaves like createMany but returns the created rows.
+      - id: createmanyandreturn-unsupported-provider
+        condition: "Called on MySQL, MongoDB, or SQL Server"
+        throws: "PrismaClientValidationError or runtime error — provider does not support RETURNING"
+        required_handling: >
+          createManyAndReturn is supported only on PostgreSQL, CockroachDB, and SQLite.
+          On unsupported providers, calls throw at runtime. Detect the provider via
+          schema introspection or use createMany + a separate findMany on the unique
+          keys when targeting MySQL/MongoDB/SQL Server.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#createmanyandreturn"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: createmanyandreturn-unique-constraint-violation
+        condition: "One or more records violate a unique constraint"
+        throws: "PrismaClientKnownRequestError with code 'P2002'"
+        required_handling: >
+          Identical to createMany: caller MUST either use skipDuplicates: true OR
+          catch P2002. When P2002 fires, the entire batch is rolled back and
+          NO rows are returned. Idempotency requires inspecting which rows were
+          already present before retry.
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference#p2002"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: createmanyandreturn-foreign-key-constraint
+        condition: "One or more records reference a non-existent foreign key"
+        throws: "PrismaClientKnownRequestError with code 'P2003'"
+        required_handling: >
+          Entire batch is rejected on the first foreign key violation.
+          Caller MUST validate all referenced IDs exist before calling.
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference#p2003"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: createmanyandreturn-connection-error
+        condition: "Database connection failed during batch insert"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Entire batch fails on connection loss. Implement retry with idempotency checks."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: updateManyAndReturn
+    import_path: "@prisma/client"
+    description: "Updates multiple records matching a filter and returns the updated rows (added in v6.2.0)"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/reference/prisma-client-reference#updatemanyandreturn
+      # updateManyAndReturn is PostgreSQL/CockroachDB/SQLite only — MySQL/MongoDB/SQLServer throw.
+      # Returns array of updated rows (may be empty if no rows matched — does NOT throw).
+      - id: updatemanyandreturn-unsupported-provider
+        condition: "Called on MySQL, MongoDB, or SQL Server"
+        throws: "PrismaClientValidationError or runtime error — provider does not support RETURNING"
+        required_handling: >
+          updateManyAndReturn is supported only on PostgreSQL, CockroachDB, and SQLite.
+          On unsupported providers, calls throw at runtime. Use updateMany + a separate
+          findMany when targeting MySQL/MongoDB/SQL Server.
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#updatemanyandreturn"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: updatemanyandreturn-zero-rows-empty-array
+        condition: "No records match the where clause"
+        returns: "[] (empty array) — does NOT throw P2025"
+        required_handling: >
+          Unlike update(), updateManyAndReturn does NOT throw when zero records match —
+          it returns []. Caller MUST check result.length if zero-match indicates a
+          business error (e.g. updating a record that should exist).
+        sources:
+          - "https://www.prisma.io/docs/orm/reference/prisma-client-reference#updatemanyandreturn"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: updatemanyandreturn-unique-constraint-violation
+        condition: "Update would cause a unique constraint violation"
+        throws: "PrismaClientKnownRequestError with code 'P2002'"
+        required_handling: >
+          If setting a field to a value that conflicts with existing unique records,
+          updateManyAndReturn throws P2002. Caller MUST validate uniqueness or catch P2002.
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference#p2002"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: updatemanyandreturn-connection-error
+        condition: "Database connection failed during bulk update"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: $queryRawUnsafe
+    import_path: "@prisma/client"
+    description: "Executes a raw SQL SELECT query with string interpolation — UNSAFE for user input"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries#queryrawunsafe
+      # $queryRawUnsafe bypasses tagged template parameterization — direct SQL injection vector
+      # if any user input reaches the query string.
+      - id: queryrawunsafe-sql-injection
+        condition: "User input concatenated into the SQL string"
+        throws: "Silent data exfiltration, data corruption, or PrismaClientKnownRequestError on malformed SQL"
+        required_handling: >
+          $queryRawUnsafe is documented as UNSAFE and bypasses Prisma's parameterization.
+          NEVER pass user-supplied strings directly. Either:
+          1. Use $queryRaw with tagged template literals (parameterized), OR
+          2. Pass values as the second-arg array: $queryRawUnsafe(sql, ...params) — the
+             ...params arguments ARE parameterized; only the SQL string is unsafe.
+          Auditors will flag any $queryRawUnsafe call. Document why it was necessary
+          and prove the SQL string contains no user input.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries#queryrawunsafe"
+          - "https://owasp.org/www-community/attacks/SQL_Injection"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: queryrawunsafe-connection-error
+        condition: "Database connection failed during raw query"
+        throws: "PrismaClientInitializationError"
+        required_handling: "Implement retry with exponential backoff for transient connection failures."
+        sources:
+          - "https://www.prisma.io/docs/reference/api-reference/error-reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: queryrawunsafe-type-mismatch
+        condition: "SQL return columns do not match the TypeScript generic type T"
+        throws: "Runtime type error at property access — TypeScript does not validate raw results"
+        required_handling: >
+          Validate raw query results at runtime (e.g. with Zod) before using them.
+          TypeScript generics on $queryRawUnsafe<T> are not enforced — the cast is unsafe.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: $executeRawUnsafe
+    import_path: "@prisma/client"
+    description: "Executes a raw SQL mutation with string interpolation — UNSAFE for user input"
+
+    postconditions:
+      # Evidence: https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries#executerawunsafe
+      # $executeRawUnsafe is the mutation counterpart to $queryRawUnsafe — same SQL injection risk
+      # but with the additional risk of data corruption rather than just exfiltration.
+      - id: executerawunsafe-sql-injection
+        condition: "User input concatenated into the SQL string"
+        throws: "Silent data corruption, unauthorized writes, or PrismaClientKnownRequestError"
+        required_handling: >
+          $executeRawUnsafe is documented as UNSAFE for the SQL string. Mutation
+          equivalent of $queryRawUnsafe — same SQL injection risk PLUS write/delete impact.
+          NEVER concatenate user input into the SQL. Either:
+          1. Use $executeRaw with tagged template literals (parameterized), OR
+          2. Pass values via the ...params second-arg array: $executeRawUnsafe(sql, ...params).
+          Audit every call site and document why a parameterized $executeRaw is insufficient.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries#executerawunsafe"
+          - "https://owasp.org/www-community/attacks/SQL_Injection"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: executerawunsafe-zero-rows-not-error
+        condition: "SQL mutation affects zero rows"
+        returns: "0 — does NOT throw"
+        required_handling: >
+          Returns the number of affected rows. 0 is NOT an error condition by default.
+          Caller MUST check the return value if zero-affected rows indicates a business
+          logic failure.
+        sources:
+          - "https://www.prisma.io/docs/orm/prisma-client/queries/raw-database-access/raw-queries"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: executerawunsafe-connection-error
         condition: "Database connection failed during raw mutation"
         throws: "PrismaClientInitializationError"
         required_handling: "Implement retry with exponential backoff. Ensure idempotency before retrying mutations."
