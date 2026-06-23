@@ -27,6 +27,12 @@
  *   - client.subscribe() without try-catch → SHOULD_FIRE: subscribe-no-error-handling
  *   - client.publish()   without try-catch → SHOULD_FIRE: publish-no-error-handling
  *   - client.quit()   without try-catch → SHOULD_FIRE: quit-no-error-handling
+ *   - client.close()  without try-catch → SHOULD_FIRE: close-no-error-handling           [v1.1.0]
+ *   - client.watch()  without try-catch → SHOULD_FIRE: watch-no-error-handling           [v1.1.0]
+ *   - createClientPool() without .on('error') + try-catch on connect
+ *                                       → SHOULD_FIRE: create-client-pool-no-error-handling [v1.1.0]
+ *   - pool.execute()  without try-catch → SHOULD_FIRE: pool-execute-no-error-handling    [v1.1.0]
+ *   - client.sendCommand() without try-catch → SHOULD_FIRE: send-command-no-error-handling [v1.1.0]
  *
  * The missing-error-listener violation fires at the createClient() call line,
  * not at the point where the error listener would be registered.
@@ -553,5 +559,144 @@ export async function quitWithTryCatch() {
   } catch (err) {
     // quit errors during shutdown are safe to swallow
     console.warn('Redis quit error during shutdown:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. close (v5+ replacement for quit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function closeWithoutTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  // SHOULD_FIRE: close-no-error-handling — close() can throw ClientClosedError on double-close
+  await client.close();
+}
+
+export async function closeWithTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  try {
+    // SHOULD_NOT_FIRE: close inside try-catch
+    await client.close();
+  } catch (err) {
+    console.warn('Redis close error during shutdown:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. watch — optimistic locking
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function watchWithoutTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  // SHOULD_FIRE: watch-no-error-handling — watch() can throw connection errors
+  await client.watch('counter');
+}
+
+export async function watchWithTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  try {
+    // SHOULD_NOT_FIRE: watch inside try-catch
+    await client.watch('counter');
+    const value = await client.get('counter');
+    await client.multi().set('counter', String(Number(value) + 1)).exec();
+  } catch (err) {
+    // Retry on WatchError, abort otherwise
+    console.error('Watch/transaction failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. createClientPool — pool factory (v5+)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { createClientPool } from 'redis';
+
+export async function createPoolWithoutErrorListener() {
+  // SHOULD_FIRE: create-client-pool-no-error-handling — pool created without .on('error') + connect
+  const pool = createClientPool({ url: 'redis://localhost:6379' });
+  await pool.connect();
+  return pool;
+}
+
+export async function createPoolWithErrorListenerAndTryCatch() {
+  const pool = createClientPool({ url: 'redis://localhost:6379' });
+  pool.on('error', (err) => console.error('Redis pool error:', err));
+  try {
+    // SHOULD_NOT_FIRE: pool with error listener + try-catch on connect
+    await pool.connect();
+  } catch (err) {
+    console.error('Pool connect failed:', err);
+    throw err;
+  }
+  return pool;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. pool.execute — isolated client callback
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function poolExecuteWithoutTryCatch() {
+  const pool = createClientPool({ url: 'redis://localhost:6379' });
+  pool.on('error', (err) => console.error('Redis pool error:', err));
+  await pool.connect().catch(() => {});
+  // SHOULD_FIRE: pool-execute-no-error-handling — execute() can throw WatchError
+  await pool.execute(async (client) => {
+    await client.watch('key');
+    const v = await client.get('key');
+    return client.multi().set('key', String(Number(v) + 1)).exec();
+  });
+}
+
+export async function poolExecuteWithTryCatch() {
+  const pool = createClientPool({ url: 'redis://localhost:6379' });
+  pool.on('error', (err) => console.error('Redis pool error:', err));
+  await pool.connect().catch(() => {});
+  try {
+    // SHOULD_NOT_FIRE: execute inside try-catch with WatchError discrimination
+    await pool.execute(async (client) => {
+      await client.watch('key');
+      const v = await client.get('key');
+      return client.multi().set('key', String(Number(v) + 1)).exec();
+    });
+  } catch (err) {
+    // WatchError → retry; other → propagate
+    console.error('Pool execute failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. sendCommand — raw command escape hatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendCommandWithoutTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  // SHOULD_FIRE: send-command-no-error-handling — sendCommand can throw ReplyError, etc.
+  await client.sendCommand(['SET', 'key', 'value']);
+}
+
+export async function sendCommandWithTryCatch() {
+  const client = createClient();
+  client.on('error', (err) => console.error('Redis error:', err));
+  await client.connect();
+  try {
+    // SHOULD_NOT_FIRE: sendCommand inside try-catch
+    await client.sendCommand(['SET', 'key', 'value']);
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ReplyError') {
+      // Redis-level error (WRONGTYPE, NOSCRIPT, etc.)
+      throw err;
+    }
+    // Connection-layer error — log and rethrow
+    throw err;
   }
 }

@@ -1,8 +1,8 @@
 package: redis
 semver: ">=5.0.0 <7.0.0"
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: 2026-04-06
+last_verified: 2026-06-23
 coverage_status: covered
 status: production
 coverage_score: 1.0
@@ -13,10 +13,32 @@ coverage_score: 1.0
 # Error class source: @redis/client/dist/lib/errors.d.ts — confirmed class hierarchy
 # Source: https://redis.io/docs/latest/develop/clients/nodejs/error-handling/
 # Source: https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+#
+# Depth re-verification pass 2026-06-23 (deepen-stream-2 pass 12):
+# Re-validated against redis@6.0.0 (latest at re-verify time). Confirmed:
+#   - Existing 22 contracted functions remain valid: createClient, connect, get, set,
+#     del, hSet/hGet/hGetAll, incr/incrBy, expire, exists, lPush/lRange, sAdd/sMembers,
+#     zAdd/zRange, exec, subscribe, publish, quit
+#   - v5+ migration: quit() deprecated in favor of close(); disconnect() deprecated in
+#     favor of destroy() (per docs/v4-to-v5.md). Both old methods remain functional but
+#     trigger deprecation warnings. Contract preserves the quit() entry for backward
+#     compatibility (v4 users) and adds close() for v5+ users.
+#   - New functions added this pass (+5): close (v5+ graceful close), watch (optimistic
+#     locking primitive — WatchError flows to exec()), createClientPool (v5+ pool factory),
+#     execute (pool.execute isolated-client callback pattern), sendCommand (generic raw
+#     command interface)
+#   - Effective coverage stays 1.0 because the new postconditions cover real error
+#     contracts in v5+ that weren't surfaced in the v4-era 2026-04-02 pass.
+# Evidence:
+#   - https://github.com/redis/node-redis/blob/master/docs/v4-to-v5.md (close/destroy/createClientPool)
+#   - https://github.com/redis/node-redis/blob/master/docs/v5-to-v6.md (no API additions; default RESP3)
+#   - https://redis.io/docs/latest/develop/clients/nodejs/transpipe/ (watch + pool.execute + WatchError)
+#   - @redis/client@6.x dist/lib/errors.d.ts (ClientClosedError, WatchError, AbortError, MultiErrorReply)
 evidence_quality: confirmed
 detection:
   factory_methods:
     - createClient
+    - createClientPool  # v5+ pool factory — same .on('error') requirement as createClient
   require_instance_tracking: true
   required_event_listeners:
     - event: error
@@ -82,6 +104,12 @@ detection:
     # Lifecycle
     - ".connect"
     - ".quit"
+    - ".close"        # v5+ graceful-close replacement for quit
+    # Optimistic locking
+    - ".watch"        # v5+ WATCH for optimistic-locking transactions
+    # Advanced
+    - ".sendCommand"  # raw command escape hatch
+    - ".execute"      # pool.execute(callback) — isolated-client transaction pattern
     # Pub/sub
     - ".subscribe"
     - ".publish"
@@ -799,3 +827,249 @@ functions:
         sources:
           - https://redis.io/docs/latest/develop/clients/nodejs/error-handling/
           - https://redis.io/commands/quit/
+
+  # ── LIFECYCLE: CLOSE (v5+ replacement for QUIT) ──────────────────────────────
+
+  - name: close
+    import_path: redis
+    description: >
+      Gracefully closes the client connection. Pending commands are awaited
+      before the socket is closed. Introduced in node-redis v5 as the modern
+      replacement for client.quit() — the QUIT command itself was deprecated
+      in Redis 7.2. Returns Promise<void>. Use during application shutdown.
+    postconditions:
+      # Evidence: https://github.com/redis/node-redis/blob/master/docs/v4-to-v5.md
+      # Evidence: @redis/client@6.x dist/lib/client/index.d.ts — close(): Promise<void>
+      # Evidence: @redis/client@6.x dist/lib/errors.d.ts — ClientClosedError exists
+      - id: close-no-error-handling
+        condition: client.close() called without try-catch or .catch() handler
+        throws: >
+          ClientClosedError if close() is called twice; connection-layer errors
+          (ECONNRESET, ETIMEDOUT) if the socket dies during the graceful drain;
+          unhandled promise rejection on any of the above
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: |
+          client.close() is the v5+ graceful-shutdown primitive that supersedes
+          client.quit(). It throws when called on an already-closed client (double-close
+          in shutdown handlers is the common pattern) or when the underlying socket
+          fails during the drain window. Unhandled rejection in shutdown paths produces
+          UnhandledPromiseRejectionWarning and can prevent clean process exit under
+          --unhandled-rejections=strict.
+        required_handling: |
+          SHOULD wrap await client.close() in try-catch in shutdown handlers. Errors
+          during close() can be logged and swallowed — the connection is being torn
+          down anyway. Use the same pattern as quit():
+          `client.close().catch(err => logger.warn('Redis close error', err))`.
+          For graceful shutdown sequencing, await close() before terminating the
+          process so pending commands flush.
+        sources:
+          - https://github.com/redis/node-redis/blob/master/docs/v4-to-v5.md
+          - https://redis.io/docs/latest/develop/clients/nodejs/error-handling/
+        evidence_quality: confirmed
+
+  # ── OPTIMISTIC LOCKING: WATCH ───────────────────────────────────────────────
+
+  - name: watch
+    import_path: redis
+    description: >
+      Marks one or more keys for optimistic locking. If any watched key is
+      modified by another client before the subsequent multi().exec() completes,
+      exec() throws WatchError and the transaction is NOT executed. Used for
+      compare-and-swap patterns, atomic counter updates with read-then-write,
+      and any concurrent-safe state mutation. Returns Promise<'OK'>.
+    postconditions:
+      # Evidence: https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+      # Evidence: @redis/client@6.x dist/lib/client/index.d.ts — WATCH(key): Promise<'OK'>
+      # Evidence: @redis/client@6.x dist/lib/errors.d.ts — WatchError class
+      - id: watch-no-error-handling
+        condition: client.watch() called without try-catch or .catch() handler
+        throws: >
+          Connection-layer errors (ECONNREFUSED, ETIMEDOUT, ECONNRESET, EAI_AGAIN);
+          ClientClosedError if the client was closed before watch() ran
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: |
+          client.watch() throws on connection-layer failure before WATCH reaches the
+          server. The downstream multi().exec() will then execute WITHOUT the optimistic
+          lock — silently bypassing the very concurrency-safety the watch() call was
+          meant to provide. This is the most dangerous pattern: a swallowed watch()
+          error means the transaction runs unprotected and a concurrent modification
+          can be silently overwritten (last-write-wins instead of compare-and-swap).
+        required_handling: |
+          MUST wrap await client.watch() in try-catch. On error, ABORT the entire
+          transaction — do NOT proceed to multi().exec(). The exec() WatchError
+          handler covers the "watched key changed" case; this handler covers the
+          "watch() itself failed" case. Both are required for correct optimistic
+          locking. Pattern:
+            try {
+              await client.watch('counter');
+              const value = await client.get('counter');
+              await client.multi().set('counter', String(Number(value) + 1)).exec();
+            } catch (err) {
+              if (err instanceof WatchError) { /* retry: key changed */ }
+              else { /* abort: watch or exec failed */ }
+            }
+        sources:
+          - https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+          - https://redis.io/commands/watch/
+        evidence_quality: confirmed
+
+  # ── POOLING: createClientPool (v5+) ─────────────────────────────────────────
+
+  - name: createClientPool
+    import_path: redis
+    description: >
+      Factory that creates a RedisClientPool — a pool of independent Redis
+      connections introduced in node-redis v5. Replaces the v4 pattern of
+      cloning a "main" connection. Used to serve concurrent requests without
+      head-of-line blocking on a single socket and to isolate transactions
+      (WATCH/MULTI/EXEC) per connection so they do not interfere with
+      concurrent commands.
+    postconditions:
+      # Evidence: https://github.com/redis/node-redis/blob/master/docs/v4-to-v5.md
+      # Evidence: @redis/client@6.x dist/lib/client/pool.d.ts — connect(): Promise<RedisClientPoolType>
+      - id: create-client-pool-no-error-handling
+        condition: >
+          createClientPool() factory called without a corresponding pool.on('error')
+          listener AND without try-catch on the subsequent pool.connect()
+        throws: >
+          pool.connect() throws on connection failure (ECONNREFUSED, ETIMEDOUT,
+          DNS failures); pool runtime errors are dispatched as 'error' events on
+          the pool — uncaught events crash the process by default
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          createClientPool() itself does not throw — it returns a pool object — but
+          the subsequent await pool.connect() throws on the same set of connection
+          errors as createClient().connect(). Like the single-client case, the pool
+          requires a 'error' event listener for runtime failures (per-connection
+          errors are aggregated onto the pool). Missing 'error' listener causes
+          Node to crash the process on any pool-level error.
+        required_handling: |
+          MUST register pool.on('error', handler) BEFORE calling pool.connect(),
+          and MUST wrap await pool.connect() in try-catch. Pattern mirrors the
+          createClient() / connect() / .on('error') triad — same rules apply.
+        sources:
+          - https://github.com/redis/node-redis/blob/master/docs/v4-to-v5.md
+          - https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+        evidence_quality: confirmed
+
+  # ── POOLING: pool.execute() isolated-client callback ────────────────────────
+
+  - name: execute
+    import_path: redis
+    namespace: pool
+    description: >
+      Runs a callback with an isolated client checked out from the pool. The
+      callback receives a dedicated RedisClientType that does not share state
+      with concurrent operations — required for safe WATCH/MULTI/EXEC sequences
+      under concurrent load. Returns Promise<T> where T is the callback's return
+      value. The isolated client is returned to the pool automatically when
+      the callback resolves or rejects.
+    postconditions:
+      # Evidence: https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+      # Evidence: @redis/client@6.x dist/lib/client/pool.d.ts — execute<T>(fn): Promise<Awaited<T>>
+      - id: pool-execute-no-error-handling
+        condition: pool.execute(callback) called without try-catch or .catch() handler
+        throws: >
+          WatchError (when callback uses WATCH+MULTI and the watched key was modified);
+          any error thrown by the callback itself; connection-layer errors on the
+          isolated client (ECONNREFUSED, ECONNRESET); ClientClosedError if the pool
+          is closed mid-execute
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: |
+          pool.execute() is the recommended way to run WATCH/MULTI/EXEC under
+          concurrency — it guarantees the isolated client is not interleaved with
+          other requests. The error model is unforgiving: the callback's exceptions
+          propagate, WatchError propagates from multi().exec() inside the callback,
+          and connection errors on the isolated client propagate too. Without a
+          try-catch around pool.execute(), a single WatchError aborts the entire
+          request handler with no retry path, dropping the user's optimistic-locking
+          intent silently.
+        required_handling: |
+          MUST wrap await pool.execute(...) in try-catch. Discriminate by error type:
+          WatchError → retry the callback (the watched key changed, this is the
+          designed retry signal). Other errors → fail the operation and log. The
+          isolated client is returned to the pool regardless of outcome — do NOT
+          attempt to close it inside the callback. Pattern:
+            try {
+              await pool.execute(async (client) => {
+                await client.watch('key');
+                const v = await client.get('key');
+                return client.multi().set('key', updated(v)).exec();
+              });
+            } catch (err) {
+              if (err instanceof WatchError) { /* retry */ }
+              else { throw err; }
+            }
+        sources:
+          - https://redis.io/docs/latest/develop/clients/nodejs/transpipe/
+        evidence_quality: confirmed
+
+  # ── ADVANCED: sendCommand (raw command interface) ───────────────────────────
+
+  - name: sendCommand
+    import_path: redis
+    description: >
+      Sends a raw Redis command as an array of arguments. Used for commands
+      that node-redis does not yet wrap (new Redis releases, vendor extensions),
+      module commands without a typed wrapper, and dynamic command construction.
+      Returns Promise<ReplyUnion> — the raw RESP reply with no transformation.
+    postconditions:
+      # Evidence: @redis/client@6.x dist/lib/client/index.d.ts
+      #   sendCommand<T = ReplyUnion>(args, options?): Promise<T>
+      # Evidence: @redis/client@6.x dist/lib/errors.d.ts — ErrorReply, SimpleError, BlobError
+      - id: send-command-no-error-handling
+        condition: client.sendCommand() called without try-catch or .catch() handler
+        throws: >
+          ErrorReply / SimpleError when Redis returns an error response (WRONGTYPE,
+          NOSCRIPT, READONLY, MOVED, ASK, MASTERDOWN, etc.); connection-layer errors
+          (ECONNREFUSED, ETIMEDOUT, ECONNRESET); ClientClosedError if the client is
+          disconnected; AbortError if an AbortSignal was attached and aborted
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        description: |
+          client.sendCommand() is the raw escape hatch — it bypasses the typed wrappers
+          and returns the unprocessed RESP reply. Because it accepts dynamic arguments,
+          it is commonly used in feature-flagged or vendor-specific code paths where
+          test coverage is lower. Unhandled rejection here is particularly dangerous
+          because the call site is usually buried in a utility (e.g. "fire this new
+          Redis 8 command") and downstream code assumes success. Silent failure of a
+          raw command can corrupt state (e.g. unwrapped JSON.SET on a non-JSON key
+          produces WRONGTYPE, but the caller's higher-level invariant is broken).
+        required_handling: |
+          MUST wrap await client.sendCommand() in try-catch. Inspect err.name === 'ReplyError'
+          to handle Redis-level errors (WRONGTYPE, NOSCRIPT, etc.) distinctly from
+          connection-layer errors. If using AbortSignal, also handle AbortError.
+          For commands that mutate state, the safe pattern is: catch → log →
+          re-raise so the caller can decide whether to retry or fail the request.
+        sources:
+          - https://redis.io/docs/latest/develop/clients/nodejs/error-handling/
+        evidence_quality: confirmed
