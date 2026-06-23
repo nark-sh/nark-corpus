@@ -285,3 +285,91 @@ export async function responseBlobWithCatch(url: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. response.formData() — TypeError on missing Content-Type, FetchError on stream, TypeError on body-used
+//     Postconditions: response-formdata-throws-on-missing-content-type,
+//                     response-formdata-throws-on-stream-error,
+//                     response-formdata-throws-on-body-used
+//     Evidence: node_modules/node-fetch/src/body.js lines 110-126
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function responseFormDataNoCatch(url: string) {
+  // FUTURE_SHOULD_FIRE: response-formdata-throws-on-stream-error / missing-content-type / body-used
+  // (detection rule not yet implemented — queued as deepen concern)
+  const response = await fetch(url);
+  const formData = await response.formData();
+  return formData;
+}
+
+export async function responseFormDataWithCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: formData() inside try-catch
+    const response = await fetch(url);
+    const formData = await response.formData();
+    return formData;
+  } catch (err) {
+    if (err instanceof TypeError) {
+      console.error('Missing Content-Type or body already used');
+      return null;
+    }
+    console.error('Form data parse failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. blobFrom(path) — rejects on fs.stat failure
+//     Postcondition: blobfrom-rejects-on-fs-stat-failure
+//     Evidence: node_modules/fetch-blob/from.js line 21 — fs.promises.stat(path).then(...)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { blobFrom, fileFrom } from 'node-fetch';
+
+export async function blobFromNoCatch(path: string) {
+  // FUTURE_SHOULD_FIRE: blobfrom-rejects-on-fs-stat-failure — fs.stat ENOENT/EACCES rejection. No try-catch.
+  // (detection rule not yet implemented — queued as deepen concern)
+  const blob = await blobFrom(path);
+  return blob;
+}
+
+export async function blobFromWithCatch(path: string) {
+  try {
+    // SHOULD_NOT_FIRE: blobFrom inside try-catch
+    const blob = await blobFrom(path);
+    return blob;
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      console.error('File not found:', path);
+      return null;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. fileFrom(path) — rejects on fs.stat failure
+//     Postcondition: filefrom-rejects-on-fs-stat-failure
+//     Evidence: node_modules/fetch-blob/from.js line 28 — fs.promises.stat(path).then(...)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function fileFromNoCatch(path: string) {
+  // FUTURE_SHOULD_FIRE: filefrom-rejects-on-fs-stat-failure — fs.stat ENOENT/EACCES rejection. No try-catch.
+  // (detection rule not yet implemented — queued as deepen concern)
+  const file = await fileFrom(path, 'application/octet-stream');
+  return file;
+}
+
+export async function fileFromWithCatch(path: string) {
+  try {
+    // SHOULD_NOT_FIRE: fileFrom inside try-catch
+    const file = await fileFrom(path, 'application/octet-stream');
+    return file;
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      console.error('File not found:', path);
+      return null;
+    }
+    throw err;
+  }
+}
