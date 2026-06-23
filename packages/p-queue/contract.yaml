@@ -1,13 +1,18 @@
 package: p-queue
 semver: ">=7.0.0 <10.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.78  # 7 contracted / 9 total async-callable (2 intentionally omitted)
-# Note: effective coverage (contracted/non-omitted) = 7/7 = 1.0
+coverage_score: 1.0  # 9 contracted / 9 total async-callable (0 intentionally omitted)
+# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
+# Pass 9 (deepen-stream-3, 2026-06-23): added onRateLimit + onRateLimitCleared with 4 postconditions,
+#   moving them from intentionally-omitted to contracted. p-queue@9.3.0 readme explicitly positions
+#   these as a backpressure pattern (intervalCap+interval rate-limit drain/resume), promoting them
+#   above the "narrow use case" threshold the 2026-04-17 pass applied. Verified against p-queue@9.3.0
+#   dist/index.d.ts + dist/index.js source.
 # Pass 2 (deepen-stream-2) added onPendingZero with 2 postconditions
 
 # Detection rules for analyzer integration
@@ -398,6 +403,207 @@ functions:
             // If you want ALL work done (queued + running), always use onIdle():
             await queue.onIdle();  // handles the already-idle case internally too
         sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: onRateLimit
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when the queue enters the rate-limited
+      state — i.e. the number of tasks that have executed in the current
+      `intervalCap` / `interval` window reaches the configured `intervalCap` and
+      there are still tasks waiting to start. Resolves immediately if the queue
+      is already rate-limited (fast-path: `if (this.isRateLimited) return`).
+      Documented as a backpressure primitive: producers can `await queue.onRateLimit()`
+      to pause new task submission once the queue's interval budget is exhausted,
+      preventing unbounded queue growth during burst traffic.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md (lines 280-296)
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts
+      # Implementation confirmed from p-queue@9.3.0 dist/index.js lines 549-554:
+      #   async onRateLimit() {
+      #     if (this.isRateLimited) { return; }
+      #     await this.#onEvent('rateLimit');
+      #   }
+      - id: onratelimit-no-intervalcap-never-resolves
+        condition: >
+          await queue.onRateLimit() is called on a PQueue instance that was constructed
+          without an `intervalCap` (or with `intervalCap: Infinity`, the default). The
+          queue can never enter the rate-limited state — `isRateLimited` is always false
+          — so the promise never resolves. There is no built-in timeout. The producer
+          task that awaited onRateLimit() hangs forever, leaking memory and event-loop
+          slots, and downstream consumers stop receiving new work.
+        # No `throws:` field — this is a behavioral pattern (silent infinite-wait), not
+        # an exception. Detection requires construction-options tracking on the PQueue
+        # receiver (concern-20260623-p-queue-deepen-1). Documented for awareness.
+        required_handling: >
+          Only call queue.onRateLimit() on a queue that has BOTH `intervalCap` AND
+          `interval` configured to finite values:
+            const queue = new PQueue({intervalCap: 5, interval: 1000});
+            await queue.onRateLimit();   // safe — queue can enter rate-limited state
+
+          For queues without intervalCap, do not call onRateLimit(). Use queue.onSizeLessThan()
+          for size-based backpressure instead:
+            const queue = new PQueue({concurrency: 10});
+            await queue.onSizeLessThan(100);   // size-based backpressure (no rate-limit needed)
+
+          If a queue is constructed dynamically and may or may not have intervalCap,
+          guard the await with a feature check or race against a timeout:
+            await Promise.race([
+              queue.onRateLimit(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('onRateLimit timed out')), 30_000))
+            ]);
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: onratelimit-resolves-immediately-misses-transition
+        condition: >
+          queue.onRateLimit() is called when the queue is already rate-limited
+          (queue.isRateLimited === true) — for example, called inside a tight
+          producer loop that adds tasks faster than the interval budget allows.
+          The method takes the fast-path early return and resolves IMMEDIATELY
+          without waiting for any state change. Code expecting to "wait for the
+          next rate-limit event" continues without pause and the loop floods the
+          queue with more tasks, defeating the intended backpressure pattern.
+        # No `throws:` field — this is a behavioral pattern (silent fast-path),
+        # not an exception. Detection requires queue.isRateLimited tracking on
+        # the receiver. Documented for awareness.
+        required_handling: >
+          Use queue.onRateLimit() to wait for the FIRST transition into rate-limited
+          state, not as a per-iteration gate. For per-iteration backpressure during
+          an ongoing rate-limited period, await queue.onRateLimitCleared() (wait for
+          the rate-limit to lift) before scheduling the next batch:
+
+            // CORRECT — drain pattern:
+            for (const task of bigBatch) {
+              if (queue.isRateLimited) {
+                await queue.onRateLimitCleared();
+              }
+              queue.add(() => doWork(task)).catch(() => {});
+            }
+
+            // WRONG — onRateLimit() inside the loop returns instantly once rate-limited:
+            for (const task of bigBatch) {
+              await queue.onRateLimit();   // returns immediately every iteration
+              queue.add(() => doWork(task)).catch(() => {});
+            }
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: onRateLimitCleared
+    import_path: "p-queue"
+    description: >
+      Returns a Promise that resolves once when the queue leaves the rate-limited
+      state — i.e. the interval window resets or the backlog drains enough that
+      the next task can start running. Resolves immediately if the queue is NOT
+      currently rate-limited (fast-path: `if (!this.isRateLimited) return`).
+      Documented complement to onRateLimit(): consumers can `await queue.onRateLimitCleared()`
+      to know when more tasks can be added without immediately tripping the cap.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md (lines 298-308)
+      # Evidence: https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts
+      # Implementation confirmed from p-queue@9.3.0 dist/index.js lines 558-563:
+      #   async onRateLimitCleared() {
+      #     if (!this.isRateLimited) { return; }
+      #     await this.#onEvent('rateLimitCleared');
+      #   }
+      - id: onratelimitcleared-paused-queue-hangs
+        condition: >
+          await queue.onRateLimitCleared() is called on a queue that is rate-limited
+          AND has been paused via queue.pause() (or constructed with autoStart: false
+          and never started). The 'rateLimitCleared' event is emitted from the
+          internal #next() method, which only runs when the queue is processing
+          tasks. A paused queue never processes tasks, so the rate-limit window
+          never elapses from the queue's perspective, the event never fires, and
+          the awaited promise hangs forever. There is no built-in timeout.
+        # No `throws:` field — this is a behavioral pattern (silent deadlock), not
+        # an exception. Detection requires pause()/start() lifecycle tracking on the
+        # receiver (concern-20260623-p-queue-deepen-2). Documented for awareness.
+        required_handling: >
+          Always ensure the queue is processing (queue.start() called, or autoStart
+          default true and queue.pause() NOT in effect) before awaiting onRateLimitCleared().
+          For pause-then-resume patterns:
+            queue.pause();
+            // ... do other work ...
+            queue.start();                       // resume processing FIRST
+            await queue.onRateLimitCleared();   // now safe to await
+
+          For shutdown sequences, do not use onRateLimitCleared() at all — use
+          queue.clear() + await queue.onIdle() to fully drain instead.
+
+          If the queue MAY be paused at call time, race against a timeout:
+            await Promise.race([
+              queue.onRateLimitCleared(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('onRateLimitCleared timed out')), 30_000))
+            ]);
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: onratelimitcleared-resolves-immediately-when-not-rate-limited
+        condition: >
+          queue.onRateLimitCleared() is called when the queue is NOT currently
+          rate-limited (queue.isRateLimited === false) — for example, called in
+          a producer that wraps every add() with a "wait until rate-limit clears"
+          guard. The method takes the fast-path early return and resolves
+          IMMEDIATELY. Code expecting to "wait for the next rate-limit-cleared
+          transition" continues without any backpressure delay, and on the very
+          next add() the rate-limit may engage again, requiring another guard,
+          and so on — the backpressure intent is silently bypassed.
+        # No `throws:` field — this is a behavioral pattern (silent fast-path),
+        # not an exception. Detection requires queue.isRateLimited tracking on
+        # the receiver. Documented for awareness.
+        required_handling: >
+          Use queue.onRateLimitCleared() only INSIDE a rate-limited window, gated
+          on queue.isRateLimited:
+            if (queue.isRateLimited) {
+              await queue.onRateLimitCleared();
+            }
+            queue.add(() => doWork()).catch(() => {});
+
+          For unconditional per-task pacing, use a different primitive such as
+          p-throttle or a manual setTimeout — onRateLimitCleared() is event-based
+          and only delays when an actual rate-limit window is active.
+
+          DO NOT pattern an entire producer loop as:
+            // WRONG — first iteration resolves instantly, no pacing applied:
+            for (const task of bigBatch) {
+              await queue.onRateLimitCleared();
+              queue.add(() => doWork(task)).catch(() => {});
+            }
+        sources:
+          - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/readme.md"
           - "https://raw.githubusercontent.com/sindresorhus/p-queue/main/source/index.ts"
         severity: warning
         business_impact:

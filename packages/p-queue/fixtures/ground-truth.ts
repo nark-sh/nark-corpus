@@ -14,6 +14,10 @@
  *   - onsizelessthan-excludes-pending
  *   - onpendingzero-ignores-queued-tasks
  *   - onpendingzero-resolves-immediately-when-no-running-tasks
+ *   - onratelimit-no-intervalcap-never-resolves         (added pass 9, 2026-06-23)
+ *   - onratelimit-resolves-immediately-misses-transition (added pass 9, 2026-06-23)
+ *   - onratelimitcleared-paused-queue-hangs              (added pass 9, 2026-06-23)
+ *   - onratelimitcleared-resolves-immediately-when-not-rate-limited (added pass 9, 2026-06-23)
  *
  * Key rules:
  *   - await queue.add() without try-catch → SHOULD_FIRE
@@ -24,6 +28,8 @@
  *   - await queue.onError() without Promise.race → SHOULD_FIRE
  *   - await queue.onEmpty() as "all done" signal → SHOULD_FIRE
  *   - await queue.onPendingZero() used as "all work done" signal → SHOULD_FIRE (behavioral)
+ *   - await queue.onRateLimit() on queue without intervalCap → SHOULD_FIRE (behavioral)
+ *   - await queue.onRateLimitCleared() on paused queue → SHOULD_FIRE (behavioral)
  */
 
 import PQueue from 'p-queue';
@@ -234,4 +240,62 @@ export async function onPendingZeroCalledWhenQueuePausedNotStarted() {
   // even though q.size === 3 (3 tasks are waiting to run)
   await q.onPendingZero(); // resolves immediately — nothing is running
   // caller mistakenly thinks all 3 tasks finished, but they never ran
+}
+
+// ─── 15. onRateLimit() on queue WITHOUT intervalCap — hangs forever ──────────
+
+// @expect-clean (detection not implemented — requires construction-options tracking on PQueue receiver)
+export async function onRateLimitWithoutIntervalCapHangs() {
+  const q = new PQueue({ concurrency: 5 });   // no intervalCap, no interval
+  q.add(async () => 'task1').catch(() => {});
+  q.add(async () => 'task2').catch(() => {});
+  // Behavioral violation: queue can NEVER enter rate-limited state without intervalCap,
+  // so this awaits indefinitely with no timeout. Detection requires tracking the
+  // constructor options on the PQueue instance — concern-20260623-p-queue-deepen-1.
+  await q.onRateLimit();
+  // caller never reaches this line — silent infinite wait
+}
+
+// ─── 16. onRateLimit() on queue WITH intervalCap — correct usage ─────────────
+
+// @expect-clean
+export async function onRateLimitWithIntervalCapCorrect() {
+  const q = new PQueue({ intervalCap: 5, interval: 1000 });
+  for (let i = 0; i < 10; i++) {
+    q.add(async () => 'task' + i).catch(() => {});
+  }
+  // SHOULD_NOT_FIRE: configured intervalCap + interval means the queue CAN enter rate-limited state
+  await q.onRateLimit();
+  // safely reaches here when the 5th task in the current interval starts
+}
+
+// ─── 17. onRateLimitCleared() on PAUSED queue — hangs forever ────────────────
+
+// @expect-clean (detection not implemented — requires pause()/start() lifecycle tracking on PQueue receiver)
+export async function onRateLimitClearedPausedQueueHangs() {
+  const q = new PQueue({ intervalCap: 3, interval: 1000 });
+  q.add(async () => 'task1').catch(() => {});
+  q.add(async () => 'task2').catch(() => {});
+  q.add(async () => 'task3').catch(() => {});
+  q.add(async () => 'task4').catch(() => {});   // this one trips rate-limit
+  q.pause();                                     // CRITICAL: queue stops processing
+  // Behavioral violation: 'rateLimitCleared' event only fires from #next() which a
+  // paused queue never runs — silent deadlock. Detection requires pause()/start()
+  // lifecycle analysis on the receiver — concern-20260623-p-queue-deepen-2.
+  await q.onRateLimitCleared();
+  // caller never reaches this line — deadlock
+}
+
+// ─── 18. onRateLimitCleared() on running queue — correct usage ───────────────
+
+// @expect-clean
+export async function onRateLimitClearedDrainPattern() {
+  const q = new PQueue({ intervalCap: 5, interval: 1000 });
+  for (let i = 0; i < 20; i++) {
+    if (q.isRateLimited) {
+      // SHOULD_NOT_FIRE: correct drain pattern — gated on isRateLimited check
+      await q.onRateLimitCleared();
+    }
+    q.add(async () => 'task' + i).catch(() => {});
+  }
 }
