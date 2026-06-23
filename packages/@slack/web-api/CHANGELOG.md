@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 100% → 100%
+
+- **Profile:** `packages/@slack/web-api/contract.yaml`
+- **Functions added:** chat.startStream, chat.appendStream, chat.stopStream (3 total)
+- **Postconditions added:** 3 (chat-startstream-no-trycatch, chat-appendstream-no-trycatch, chat-stopstream-no-trycatch)
+- **Functions intentionally omitted this pass:** chat.meMessage / chat.unfurl / chat.deleteScheduledMessage / chat.scheduledMessages.list (read-only or duplicate error-profile of contracted methods)
+- **Scanner concerns queued:** 3 (`concern-20260623-slack-web-api-deepen-1`, `concern-20260623-slack-web-api-deepen-2`, `concern-20260623-slack-web-api-deepen-3`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://docs.slack.dev/reference/methods/chat.startStream ; https://docs.slack.dev/reference/methods/chat.appendStream ; https://docs.slack.dev/reference/methods/chat.stopStream
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23T19:30Z, deepen-stream-2 pass=20)
+- **Notes:** Re-verified against installed @slack/web-api@7.17.0 dist/methods.d.ts. Found 3 new methods on the `Methods` class that did not exist in the 2026-04-03 deepen pass (which scanned v7.10) — the Slack AI streaming surface (chat.startStream / appendStream / stopStream) shipped in v7.13+. Coverage stays at 1.0 effective on the SaaS-relevant async surface (21/21 contracted; 30 total methods with 13 intentional omissions for read-only / duplicate-profile methods). Existing 30 ground-truth tests + 6 new (NoCatch + WithCatch pairs for each new method) = 36 pass.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @slack/web-api@7.17.0

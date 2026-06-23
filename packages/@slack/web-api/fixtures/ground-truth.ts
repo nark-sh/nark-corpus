@@ -17,6 +17,11 @@
  *   - client.filesUploadV2()        postcondition: filesuploadv2-no-trycatch
  *   - client.users.lookupByEmail()  postcondition: users-lookupbyemail-no-trycatch
  *
+ * Contracted functions (new — added depth pass 2026-06-23, Slack AI streaming v7.13+):
+ *   - client.chat.startStream()     postcondition: chat-startstream-no-trycatch
+ *   - client.chat.appendStream()    postcondition: chat-appendstream-no-trycatch
+ *   - client.chat.stopStream()      postcondition: chat-stopstream-no-trycatch
+ *
  * Previously contracted (from existing contract):
  *   - client.chat.postMessage()     postcondition: chat-postmessage-no-trycatch
  *   - client.users.list()           postcondition: users-list-no-trycatch
@@ -328,6 +333,111 @@ export async function lookupUserByEmailWithCatch(email: string) {
       console.error('Token missing users:read.email scope — check OAuth permissions');
       throw error;
     }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. chat.startStream — without vs with try-catch (NEW depth pass 2026-06-23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function startStreamNoCatch(channel: string, recipient_team_id: string) {
+  // SHOULD_FIRE: chat-startstream-no-trycatch — channel_not_found/messages_tab_disabled thrown without catch
+  const response = await client.chat.startStream({
+    channel,
+    recipient_team_id,
+    markdown_text: 'Thinking...',
+  } as any);
+  return response.ts;
+}
+
+export async function startStreamWithCatch(channel: string, recipient_team_id: string) {
+  try {
+    // SHOULD_NOT_FIRE: chat.startStream() inside try-catch satisfies error handling
+    const response = await client.chat.startStream({
+      channel,
+      recipient_team_id,
+      markdown_text: 'Thinking...',
+    } as any);
+    return response.ts;
+  } catch (error: any) {
+    if (error.data?.error === 'channel_not_found' || error.data?.error === 'is_archived') {
+      console.error('Cannot start stream — channel gone:', error.data.error);
+      return null;
+    }
+    if (error.data?.error === 'messaging_processing_failed') {
+      // Transient — retry once
+      console.warn('Transient stream start failure, will retry');
+      return null;
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. chat.appendStream — without vs with try-catch (NEW depth pass 2026-06-23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function appendStreamNoCatch(channel: string, ts: string, chunk: string) {
+  // SHOULD_FIRE: chat-appendstream-no-trycatch — message_not_in_streaming_state thrown without catch
+  const response = await client.chat.appendStream({
+    channel,
+    ts,
+    markdown_text: chunk,
+  } as any);
+  return response.ts;
+}
+
+export async function appendStreamWithCatch(channel: string, ts: string, chunk: string) {
+  try {
+    // SHOULD_NOT_FIRE: chat.appendStream() inside try-catch satisfies error handling
+    const response = await client.chat.appendStream({
+      channel,
+      ts,
+      markdown_text: chunk,
+    } as any);
+    return response.ts;
+  } catch (error: any) {
+    if (error.data?.error === 'stopped_by_user') {
+      // User clicked stop — exit token loop cleanly
+      return null;
+    }
+    if (
+      error.data?.error === 'message_not_in_streaming_state' ||
+      error.data?.error === 'message_not_found'
+    ) {
+      // Stream is terminal — stop appending
+      console.warn('Stream no longer accepting chunks:', error.data.error);
+      return null;
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. chat.stopStream — without vs with try-catch (NEW depth pass 2026-06-23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function stopStreamNoCatch(channel: string, ts: string) {
+  // SHOULD_FIRE: chat-stopstream-no-trycatch — message_not_in_streaming_state thrown without catch
+  await client.chat.stopStream({ channel, ts } as any);
+}
+
+export async function stopStreamWithCatch(channel: string, ts: string) {
+  try {
+    // SHOULD_NOT_FIRE: chat.stopStream() inside try-catch satisfies error handling
+    await client.chat.stopStream({ channel, ts } as any);
+  } catch (error: any) {
+    if (error.data?.error === 'message_not_in_streaming_state') {
+      // Already stopped — safe no-op (idempotent cleanup path)
+      return;
+    }
+    if (error.data?.error === 'message_not_found') {
+      // Message gone — nothing to terminate
+      return;
+    }
+    // Critical: failing to stop the stream leaves the typing indicator hanging
+    console.error('Failed to terminate Slack stream — orphaned state may persist:', error);
     throw error;
   }
 }

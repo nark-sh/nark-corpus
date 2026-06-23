@@ -2,13 +2,17 @@ package: "@slack/web-api"
 semver: ">=6.0.0 <8.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 # Evidence: 5 repos scanned, 0 violations found in scan-slack-web-api-2026-04-02.json
 # Small sample (5 repos) but FP check 0/49 — confirmed
 # Depth pass 2026-04-03: 18 functions total (8 prev + 10 new), 9 intentionally omitted
-# coverage_score: 1.0 (18 contracted / 18 total-minus-omitted SaaS-relevant functions)
+# Depth pass 2026-06-23 (re-verify against @slack/web-api@7.17.0): added 3 new
+#   Slack AI streaming methods that did not exist on 2026-04-03 (chat.startStream,
+#   chat.appendStream, chat.stopStream — shipped in v7.13+). 21 functions total now.
+#   Same 9 read-only/duplicate-profile functions remain intentionally omitted.
+# coverage_score: 1.0 (21 contracted / 21 total-minus-omitted SaaS-relevant functions)
 evidence_quality: confirmed
 coverage_score: 1.0
 
@@ -24,6 +28,11 @@ detection:
     - ".chat.postEphemeral("
     - ".chat.delete("
     - ".chat.scheduleMessage("
+
+    # Chat streaming methods (v7.13+ — Slack AI streaming surface)
+    - ".chat.startStream("
+    - ".chat.appendStream("
+    - ".chat.stopStream("
 
     # Conversations methods
     - ".conversations.create("
@@ -683,4 +692,177 @@ functions:
           with retry backoff.
         sources:
           - "https://docs.slack.dev/reference/methods/users.lookupByEmail"
+        evidence_quality: confirmed
+
+  # ── NEW FUNCTIONS — added in depth pass 2026-06-23 (Slack AI streaming v7.13+) ──
+
+  # Chat startStream function — initiates a streaming message (Slack AI)
+  - name: "chat.startStream"
+    import_path: "@slack/web-api"
+    description: >
+      Starts a new streaming chat message in a conversation. Returns a recipient_team_id
+      and a message ts that the caller must thread subsequent chat.appendStream calls
+      against. Used by AI assistant apps (the assistant.threads.* namespace surface)
+      to progressively stream LLM token output into a Slack message rather than posting
+      the full reply at once. Added in @slack/web-api v7.13 alongside chat.appendStream
+      and chat.stopStream as the public-facing wire calls behind WebClient.chatStream().
+
+    postconditions:
+      # Evidence: https://docs.slack.dev/reference/methods/chat.startStream
+      # Error types confirmed from docs: 81 documented response codes including
+      # channel_not_found, is_archived, messaging_processing_failed, messages_tab_disabled,
+      # message_limit_exceeded, msg_blocks_too_long, restricted_action_*, rate_limited,
+      # service_unavailable, invalid_blocks, missing_scope (chat:write required)
+      - id: chat-startstream-no-trycatch
+        condition: "chat.startStream() called without try-catch or .catch() handler"
+        severity: error
+        throws: "WebAPIPlatformError or WebAPIRateLimitedError"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          chat.startStream() is called without try-catch. Can throw WebAPIPlatformError
+          with channel_not_found (invalid or archived channel), is_archived (channel
+          archived between selection and stream start), messages_tab_disabled (target
+          is an app DM but the app's Messages tab is disabled), messaging_processing_failed
+          (transient Slack-side failure starting the stream), message_limit_exceeded
+          (Free plan workspace message cap reached), msg_blocks_too_long / msg_blocks_too_many
+          (initial blocks payload too big), restricted_action / restricted_action_read_only_channel
+          / restricted_action_thread_locked (workspace or channel write restriction),
+          invalid_blocks (malformed Block Kit JSON), missing_scope (chat:write missing),
+          or WebAPIRateLimitedError (429). Because streaming is the entry point of an
+          AI assistant reply, a swallowed error here means the user sees the typing
+          indicator forever and never gets a response — silent failure mode.
+        detector: >
+          If client.chat.startStream() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: >
+          MUST wrap await client.chat.startStream() in try-catch. Handle channel_not_found /
+          is_archived (fall back to chat.postMessage in a different channel or surface
+          to user), messages_tab_disabled (instruct user to enable Messages tab),
+          messaging_processing_failed (retry with backoff — transient), invalid_blocks
+          (validate Block Kit before sending), missing_scope (surface OAuth scope gap
+          to admin), and RateLimitedError (wait retryAfter seconds). Never start a
+          stream without a corresponding chat.stopStream call — leaving a stream open
+          locks the message in "streaming" state.
+        sources:
+          - "https://docs.slack.dev/reference/methods/chat.startStream"
+        evidence_quality: confirmed
+
+  # Chat appendStream function — appends content to an active streaming message
+  - name: "chat.appendStream"
+    import_path: "@slack/web-api"
+    description: >
+      Appends text/markdown content to an existing streaming message that was started
+      by chat.startStream. Called repeatedly during LLM token-stream callbacks to
+      progressively render the response. Returns once the chunk is accepted. Added
+      in @slack/web-api v7.13 as part of the Slack AI streaming surface.
+
+    postconditions:
+      # Evidence: https://docs.slack.dev/reference/methods/chat.appendStream
+      # Error types confirmed from docs: 65 documented response codes including
+      # message_not_found, message_not_in_streaming_state, message_not_owned_by_app,
+      # stopped_by_user (caller signaled stop mid-stream), invalid_chunks (malformed
+      # chunk payload), msg_blocks_too_long, channel_not_found, is_archived,
+      # invalid_blocks, missing_scope, ratelimited, service_unavailable
+      - id: chat-appendstream-no-trycatch
+        condition: "chat.appendStream() called without try-catch or .catch() handler"
+        severity: error
+        throws: "WebAPIPlatformError or WebAPIRateLimitedError"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          chat.appendStream() is called without try-catch. Can throw WebAPIPlatformError
+          with message_not_found (target ts was deleted between chunks), message_not_in_streaming_state
+          (the message was already stopped or never started as a stream — very common
+          if stopStream was called early or another worker started a fresh message),
+          message_not_owned_by_app (token rotated to an app that does not own the
+          original message), stopped_by_user (the end user clicked Stop and the stream
+          should be aborted), invalid_chunks (chunk payload malformed — caller bug),
+          msg_blocks_too_long (cumulative blocks exceeded limit), channel_not_found
+          / is_archived (channel went away mid-stream), invalid_blocks (malformed
+          Block Kit), missing_scope (chat:write missing), or WebAPIRateLimitedError
+          (429 — common because LLM token streams can fire dozens of chunks/second).
+          Because chat.appendStream is called inside a tight token-streaming loop,
+          an uncaught rejection there often crashes the entire LLM response handler
+          and leaves the message in "streaming" state forever, requiring manual
+          cleanup or the 30-minute Slack auto-finalize timeout.
+        detector: >
+          If client.chat.appendStream() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: >
+          MUST wrap await client.chat.appendStream() in try-catch. Handle stopped_by_user
+          as a clean exit signal (break out of the token loop, do NOT call stopStream
+          again — message is already terminal). Handle message_not_in_streaming_state
+          as terminal (LLM response continues to a new message if needed). Handle
+          message_not_found by aborting the loop. Handle invalid_chunks by logging
+          the offending chunk and continuing (or aborting on repeated failures).
+          Handle RateLimitedError with delay (Slack throttles streaming on a separate
+          bucket — buffer chunks before retry). On any unhandled error, call
+          chat.stopStream to release the streaming lock.
+        sources:
+          - "https://docs.slack.dev/reference/methods/chat.appendStream"
+        evidence_quality: confirmed
+
+  # Chat stopStream function — terminates a streaming message and finalizes content
+  - name: "chat.stopStream"
+    import_path: "@slack/web-api"
+    description: >
+      Stops an active streaming message started by chat.startStream and finalizes its
+      content. Can include concluding arguments such as blocks (feedback widgets) or
+      attachments. Until stopStream is called the message remains in "streaming" state
+      with a typing indicator visible to the user. Added in @slack/web-api v7.13.
+
+    postconditions:
+      # Evidence: https://docs.slack.dev/reference/methods/chat.stopStream
+      # Error types confirmed from docs: 67 documented response codes including
+      # message_not_found, message_not_in_streaming_state, message_not_owned_by_app,
+      # cannot_reply_to_message, attachment_payload_limit_exceeded, too_many_attachments,
+      # too_many_contact_cards, channel_not_found, is_archived, invalid_blocks,
+      # missing_scope, ratelimited, service_unavailable
+      - id: chat-stopstream-no-trycatch
+        condition: "chat.stopStream() called without try-catch or .catch() handler"
+        severity: error
+        throws: "WebAPIPlatformError or WebAPIRateLimitedError"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          chat.stopStream() is called without try-catch. Can throw WebAPIPlatformError
+          with message_not_found (message deleted mid-stream), message_not_in_streaming_state
+          (stream was already stopped — common in cleanup paths that run twice from
+          finally blocks and error handlers), message_not_owned_by_app (token rotated
+          to an app that does not own the message), cannot_reply_to_message (target
+          thread no longer accepts replies), attachment_payload_limit_exceeded /
+          too_many_attachments / too_many_contact_cards (final payload exceeds limits),
+          channel_not_found / is_archived (channel went away), invalid_blocks (final
+          Block Kit malformed — caller bug), missing_scope (chat:write missing), or
+          WebAPIRateLimitedError (429). Because stopStream is typically called in a
+          finally/cleanup block, swallowing the error is tempting but leaves the
+          message in "streaming" state indefinitely — the typing indicator persists
+          until Slack auto-finalizes after 30 minutes, presenting as a hung response.
+        detector: >
+          If client.chat.stopStream() is called in an async context without try-catch
+          wrapping the await, or without .catch() in promise chain
+        required_handling: >
+          MUST wrap await client.chat.stopStream() in try-catch. Treat
+          message_not_in_streaming_state as a safe no-op (idempotent — message is
+          already terminal). Treat message_not_found as a safe no-op (already deleted).
+          Handle attachment_payload_limit_exceeded / too_many_attachments by trimming
+          the final payload and retrying without the concluding attachments. Handle
+          RateLimitedError with retry (this is the LAST chance to terminate the stream
+          — failing to retry leaves a hung "streaming" message). On unrecoverable
+          errors, log loudly so operations can clear the orphaned stream state.
+        sources:
+          - "https://docs.slack.dev/reference/methods/chat.stopStream"
         evidence_quality: confirmed
