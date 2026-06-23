@@ -182,3 +182,168 @@ function replaceFunctionWithStub() {
     sandbox.restore();
   }
 }
+
+// ============================================================
+// sandbox.define() — define-existing-property-throws
+// (deepen pass 2026-06-23, deepen-stream-3 pass 10)
+// ============================================================
+
+// @expect-violation: define-existing-property-throws
+function defineOnExistingPropertyThrows() {
+  const sandbox = sinon.createSandbox();
+  const obj = { existingMethod: () => 'original' };
+
+  try {
+    // WRONG: defining a property that already exists
+    // TypeError: Cannot define the already existing property 'existingMethod'
+    (sandbox as any).define(obj, 'existingMethod', sandbox.stub().returns('stubbed'));
+  } finally {
+    sandbox.restore();
+  }
+}
+
+// @expect-clean
+function defineNewProperty() {
+  const sandbox = sinon.createSandbox();
+  const obj: { existing: string; newMethod?: () => string } = { existing: 'value' };
+
+  try {
+    // Correct: defining a NEW property (does not exist yet)
+    (sandbox as any).define(obj, 'newMethod', sandbox.stub().returns('added'));
+  } finally {
+    sandbox.restore();
+  }
+}
+
+// ============================================================
+// sandbox.verify() — verify-unmet-expectation-throws
+// (deepen pass 2026-06-23, deepen-stream-3 pass 10)
+// ============================================================
+
+// @expect-violation: verify-unmet-expectation-throws
+function verifyWithoutTryFinally() {
+  const sandbox = sinon.createSandbox();
+  const obj = { method: () => 'result' };
+  const mock = sandbox.mock(obj);
+  mock.expects('method').once();
+
+  // WRONG: bare verify() — if verification fails, restore() is skipped,
+  // polluting subsequent tests with leftover sandbox state
+  sandbox.verify();
+  sandbox.restore(); // never reached if verify throws ExpectationError
+}
+
+// @expect-clean
+function verifyWithTryFinally() {
+  const sandbox = sinon.createSandbox();
+  const obj = { method: () => 'result' };
+  const mock = sandbox.mock(obj);
+  mock.expects('method').once();
+
+  try {
+    // Correct: verify inside try/finally so restore always runs
+    obj.method();
+    sandbox.verify();
+  } finally {
+    sandbox.restore();
+  }
+}
+
+// ============================================================
+// sandbox.verifyAndRestore() — verify-and-restore-expectation-throws
+// (deepen pass 2026-06-23, deepen-stream-3 pass 10)
+// ============================================================
+
+// @expect-violation: verify-and-restore-expectation-throws
+function verifyAndRestoreSilentlySwallowed() {
+  const sandbox = sinon.createSandbox();
+  const obj = { method: () => 'result' };
+  const mock = sandbox.mock(obj);
+  mock.expects('method').once();
+
+  // WRONG: swallow the ExpectationError — failing mocks pass CI undetected
+  try {
+    sandbox.verifyAndRestore();
+  } catch {
+    // silent swallow
+  }
+}
+
+// @expect-clean
+function verifyAndRestoreInAfterEach() {
+  const sandbox = sinon.createSandbox();
+  const obj = { method: () => 'result' };
+  const mock = sandbox.mock(obj);
+  mock.expects('method').once();
+
+  obj.method();
+
+  // Correct: let any ExpectationError propagate to the test framework.
+  // sandbox.restore() is guaranteed by verifyAndRestore itself.
+  sandbox.verifyAndRestore();
+}
+
+// @expect-clean
+function verifyAndRestoreWithExplicitRecorder() {
+  const sandbox = sinon.createSandbox();
+  const obj = { method: () => 'result' };
+  const mock = sandbox.mock(obj);
+  mock.expects('method').once();
+
+  obj.method();
+
+  try {
+    // Correct: explicit catch records the failure and re-throws
+    sandbox.verifyAndRestore();
+  } catch (e) {
+    console.error('Mock verification failed:', e);
+    throw e;
+  }
+}
+
+// ============================================================
+// sinon.restoreObject() — restore-object-falsy-input-throws
+// (deepen pass 2026-06-23, deepen-stream-3 pass 10)
+// ============================================================
+
+// @expect-violation: restore-object-falsy-input-throws
+function restoreObjectFalsyInput() {
+  const maybeUndefined: { method: () => string } | undefined = undefined;
+  // WRONG: no guard against undefined
+  // Error: Trying to restore object but received undefined
+  (sinon as any).restoreObject(maybeUndefined);
+}
+
+// @expect-violation: restore-object-falsy-input-throws
+function restoreObjectNullInput() {
+  const maybeNull: { method: () => string } | null = null;
+  // WRONG: passing null directly
+  // Error: Trying to restore object but received null
+  (sinon as any).restoreObject(maybeNull);
+}
+
+// @expect-clean
+function restoreObjectWithGuard() {
+  const target: { method: () => string } | undefined = { method: () => 'real' };
+  // Correct: truthy check before restoreObject
+  if (target) {
+    (sinon as any).restoreObject(target);
+  }
+}
+
+// @expect-clean
+function restoreObjectInCleanupLoop() {
+  const targets: Array<{ method: () => string } | undefined> = [
+    { method: () => 'a' },
+    undefined,
+    { method: () => 'c' },
+  ];
+  // Correct: defensive try/catch in cleanup loop
+  for (const t of targets) {
+    try {
+      (sinon as any).restoreObject(t);
+    } catch {
+      /* already cleared or never set */
+    }
+  }
+}

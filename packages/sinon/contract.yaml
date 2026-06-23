@@ -1,20 +1,35 @@
 package: sinon
 semver: ">=1.0.0"
-contract_version: "2.1.0"
+contract_version: "2.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-20"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.73
+coverage_score: 0.8
+# Depth pass 2026-06-23 (deepen-stream-3 pass 10):
+# Re-enumerated API surface against sinon@22.0.0 (released 2026-05-05). Top-level
+# surface confirmed via src/create-sinon-api.js (extends Sandbox prototype):
+#   API methods exported at sinon.* level:
+#     createSandbox, match, restoreObject*, expectation, timers, createStubInstance,
+#     addBehavior, promise
+#   Plus sandbox-extended methods exposed at sinon.* via extend(sandbox, apiMethods):
+#     spy, stub, mock, useFakeTimers, fake, replace, replace.usingAccessor,
+#     define*, replaceGetter, replaceSetter, reset, resetBehavior, resetHistory,
+#     verify*, verifyAndRestore*, restore, restoreContext, inject
+# +4 functions this pass: define, verify, verifyAndRestore, restoreObject
+# Coverage: 12 contracted / 15 total = 0.80 (was 8/11 = 0.73)
+# Effective coverage (contracted / non-utility / non-omitted): 12/12 = 1.0
+# Intentionally omitted (3):
+#   - promise (testing utility — only throws on resolve/reject twice)
+#   - replaceGetter / replaceSetter (narrow accessor variants, same throw shape as replace)
+#
 # Depth pass 2026-04-20 (deepen-stream-2 pass 3):
 # +2 functions: fake, replace (sandbox.replace with 4 postconditions)
-# API surface: 11 callable-with-error-contract functions total
+# API surface at that time: 11 callable-with-error-contract functions total
 #   Previously contracted (6): stub, spy, mock, useFakeTimers, createSandbox, createStubInstance
 #   New (2): fake (2 postconditions), replace (4 postconditions)
-#   Intentionally omitted (3): promise (only throws if resolved twice — testing utility),
-#     replaceGetter (narrow accessor use case, same pattern as replace),
-#     replaceSetter (narrow accessor use case)
+#   Intentionally omitted (3): promise, replaceGetter, replaceSetter
 # Coverage: 8 contracted / 11 total = 0.73
 #
 # Scan: scan-sinon-2026-04-03.json — 4 repos scanned, 0 violations found
@@ -447,6 +462,231 @@ functions:
         sources:
           - "https://sinonjs.org/releases/latest/sandbox/"
           - "https://github.com/sinonjs/sinon/blob/main/lib/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: define
+    import_path: "sinon"
+    description: >
+      Sandbox method (sandbox.define) that ADDS a new property to an object that does
+      NOT already exist. The defined property is tracked and removed when sandbox.restore()
+      is called. Complement to sandbox.replace (which mutates an existing property).
+      Mistakes are common: callers reach for define() when they meant replace() (or vice
+      versa) — sinon enforces the distinction with TypeError throws to surface the
+      confusion immediately.
+    postconditions:
+      # Evidence: sinon@22.0.0 src/sinon/sandbox.js lines 403-432 (verified 2026-06-23):
+      #   if (typeof property === "undefined") {
+      #     throw new TypeError("Cannot define the already existing property ${property}. Perhaps you meant sandbox.replace()?");
+      #   }
+      #   if (descriptor && descriptor.isOwn) {
+      #     throw new TypeError("Cannot define the already existing property ${property}. Perhaps you meant sandbox.replace()?");
+      #   }
+      # Documentation: https://sinonjs.org/releases/latest/sandbox/#sandboxdefineobject-property-value
+      - id: define-existing-property-throws
+        condition: >
+          sandbox.define(object, property, value) is called where `property` already exists
+          as an own property on `object`. Common mistake when test setup code reuses the
+          same property name across tests, or when refactoring stub() → define() without
+          checking whether the property pre-exists. Also fires when `property` is undefined
+          (e.g. sandbox.define(obj, obj.missingKey, val) where missingKey resolves to undefined).
+        throws: "TypeError: Cannot define the already existing property '<property>'. Perhaps you meant sandbox.replace()?"
+        required_handling: >
+          MUST use sandbox.replace() (or sandbox.stub() for functions) when the property
+          already exists on the object. Use sandbox.define() only to add NEW properties
+          that need to be tracked for cleanup.
+
+            const obj = { existingMethod: () => 'original' };
+
+            // Correct: define a NEW property (does not exist yet)
+            sandbox.define(obj, 'newMethod', sandbox.stub().returns('test'));
+
+            // Correct: replace an EXISTING property
+            sandbox.replace(obj, 'existingMethod', sandbox.stub().returns('test'));
+
+            // WRONG: define on an existing property
+            sandbox.define(obj, 'existingMethod', sandbox.stub()); // TypeError!
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/v22.0.0/src/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: verify
+    import_path: "sinon"
+    description: >
+      Sandbox method (sandbox.verify) that asserts every mock expectation registered in
+      the sandbox has been satisfied. Walks the sandbox collection and invokes verify() on
+      each mock, throwing ExpectationError on the first unmet expectation. Unlike
+      sandbox.verifyAndRestore(), this does NOT call sandbox.restore() — the sandbox state
+      remains. Test code commonly calls this in afterEach to confirm mock contracts;
+      production code paths that defensively verify a mock-based mock-DI configuration
+      may also invoke it.
+    postconditions:
+      # Evidence: sinon@22.0.0 src/sinon/sandbox.js sandbox.verify uses applyOnEach(collection, "verify")
+      # which calls verify() on each mock; mock.verify() throws ExpectationError (mock-expectation.js)
+      # when callCount is outside [minCalls, maxCalls] or when expected args / contexts don't match.
+      # Documentation: https://sinonjs.org/releases/latest/mocks/#mockverify
+      - id: verify-unmet-expectation-throws
+        condition: >
+          sandbox.verify() is called and at least one registered mock has an unmet
+          expectation (e.g. expects(method).withArgs(X) was set but the method was never
+          called with X, or was called fewer/more times than expects(method).once()/atLeast()/exactly()).
+          This is the canonical 'mock verification failed' signal — typical in test
+          assertions but DANGEROUS in production code or test cleanup hooks that swallow
+          the error and let subsequent tests pollute the state.
+        throws: "ExpectationError: expected <method> to be called with arguments matching ... but was called <n> times"
+        required_handling: >
+          When sandbox.verify() is called outside a test framework's explicit assertion
+          phase (e.g. in afterEach where the test result has already been reported), the
+          caller MUST wrap in try/catch to attach the verification failure to the right
+          test, AND MUST still call sandbox.restore() in a finally block to clean up the
+          sandbox state. Otherwise the ExpectationError escapes into the test framework,
+          subsequent tests run against a polluted sandbox, and the original failing test
+          may already be marked passing.
+
+          Best practice: use sandbox.verifyAndRestore() instead — it wraps the verify+
+          restore pattern correctly:
+
+            // Correct: verifyAndRestore handles try/finally for you
+            afterEach(() => { sandbox.verifyAndRestore(); });
+
+            // Manual verify path requires explicit try/finally
+            afterEach(() => {
+              try {
+                sandbox.verify();
+              } finally {
+                sandbox.restore();
+              }
+            });
+
+            // WRONG: bare verify() — if verification fails, restore() is skipped
+            afterEach(() => {
+              sandbox.verify();
+              sandbox.restore(); // never reached if verify throws!
+            });
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://sinonjs.org/releases/latest/mocks/"
+          - "https://github.com/sinonjs/sinon/blob/v22.0.0/src/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          # ExpectationError without try/finally cleanup pollutes the next test —
+          # the failing test may be misattributed and the next test's mocks fight
+          # leftover sandbox state, producing flaky failures elsewhere.
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: verifyAndRestore
+    import_path: "sinon"
+    description: >
+      Sandbox method (sandbox.verifyAndRestore) that calls sandbox.verify() and then
+      sandbox.restore() in a try/catch sequence: if verify throws ExpectationError, the
+      sandbox is still restored before the error propagates. Distinct from verify() in
+      that restore is guaranteed; distinct from restore() in that mock expectations are
+      enforced. The recommended afterEach pattern when using mocks.
+    postconditions:
+      # Evidence: sinon@22.0.0 src/sinon/sandbox.js sandbox.verifyAndRestore:
+      #   try { sandbox.verify(); } catch (e) { exception = e; }
+      #   sandbox.restore();
+      #   if (exception) { throw exception; }
+      # Documentation: https://sinonjs.org/releases/latest/sandbox/#sandboxverifyandrestore
+      - id: verify-and-restore-expectation-throws
+        condition: >
+          sandbox.verifyAndRestore() is called and at least one registered mock has an
+          unmet expectation. Unlike bare verify(), the sandbox IS guaranteed restored
+          before ExpectationError propagates — but the test framework still receives the
+          throw, so the caller must let it bubble to a test failure or catch it.
+        throws: "ExpectationError: expected <method> to be called with arguments matching ... but was called <n> times"
+        required_handling: >
+          In test afterEach hooks, allow the ExpectationError to propagate so the test
+          framework can record the failure. The sandbox is guaranteed restored, so no
+          finally block is required.
+
+          Production code calling verifyAndRestore() (e.g. mock-driven integration tests
+          run in CI) MUST allow the throw to surface or wrap in try/catch to record the
+          assertion failure; swallowing it silently means failing mocks pass the test
+          suite undetected.
+
+            // Correct: afterEach lets the error reach the test framework
+            afterEach(() => { sandbox.verifyAndRestore(); });
+
+            // Correct: explicit catch records the failure
+            try {
+              sandbox.verifyAndRestore();
+            } catch (e) {
+              reporter.recordFailure(e);
+              throw e;
+            }
+
+            // WRONG: silent swallow — mock failures pass undetected
+            try { sandbox.verifyAndRestore(); } catch {}
+        sources:
+          - "https://sinonjs.org/releases/latest/sandbox/"
+          - "https://github.com/sinonjs/sinon/blob/v22.0.0/src/sinon/sandbox.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          # A swallowed ExpectationError lets broken mock contracts pass CI — the
+          # production behavior they were meant to verify is no longer verified.
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: restoreObject
+    import_path: "sinon"
+    description: >
+      Top-level sinon API that walks every property of the given object and calls
+      .restore() on each property whose value was previously stubbed/spied by sinon
+      (identified by the .restore.sinon marker). Used to mass-restore an object whose
+      multiple methods have been individually stubbed without the sandbox API. Distinct
+      from sandbox.restore() in that it operates on a specific object, not on a tracked
+      collection.
+    postconditions:
+      # Evidence: sinon@22.0.0 src/sinon/restore-object.js (verified 2026-06-23):
+      #   if (!object) { throw new Error(`Trying to restore object but received ${String(object)}`); }
+      # Documentation: https://sinonjs.org/releases/latest/utils/#sinonrestoreobjectobject
+      - id: restore-object-falsy-input-throws
+        condition: >
+          sinon.restoreObject(object) is called with a falsy value: null, undefined, 0,
+          false, NaN, or ''. Common in test teardown code that loops over a collection
+          of stubbed targets and forgets to filter out already-cleared references, or
+          where a teardown helper receives an optional object that is sometimes absent.
+        throws: "Error: Trying to restore object but received <stringified-falsy-value>"
+        required_handling: >
+          MUST guard with a truthy check before calling sinon.restoreObject(), or wrap
+          the call in try/catch in cleanup loops that may legitimately encounter
+          already-cleared references.
+
+            // Correct: guard
+            if (target) {
+              sinon.restoreObject(target);
+            }
+
+            // Correct: defensive try-catch in a cleanup loop
+            for (const target of targets) {
+              try { sinon.restoreObject(target); } catch { /* already cleared */ }
+            }
+
+            // WRONG: no guard
+            sinon.restoreObject(maybeUndefined); // throws Error!
+        sources:
+          - "https://sinonjs.org/releases/latest/utils/"
+          - "https://github.com/sinonjs/sinon/blob/v22.0.0/src/sinon/restore-object.js"
         severity: error
         business_impact:
           incident_label: DOWNTIME
