@@ -2,7 +2,7 @@ package: "@sendgrid/mail"
 semver: ">=7.0.0 <9.0.0"
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: 2026-04-02
+last_verified: 2026-06-23
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -50,6 +50,61 @@ functions:
         source: https://github.com/sendgrid/sendgrid-nodejs/blob/main/docs/use-cases/success-failure-errors.md
         sources:
           - https://github.com/sendgrid/sendgrid-nodejs/blob/main/docs/use-cases/success-failure-errors.md
+      # Added 2026-06-23 (deepen-stream-3, pass 12) — drift mode against @sendgrid/mail@8.1.6.
+      # Source review of node_modules/@sendgrid/mail/src/classes/mail-service.js confirmed send()
+      # accepts a MailDataRequired[] array argument (.d.ts line 35) and dispatches via
+      # `Promise.all(data.map(...))` at line 165. Promise.all rejects on the FIRST failure with no
+      # partial-success result — callers that pass arrays for bulk sending and only handle the
+      # aggregated promise will lose visibility into which messages did/did not send.
+      - id: send-array-batch-no-partial-failure-handling
+        condition: send() called with a MailDataRequired[] array argument and the caller treats the resolved promise as all-or-nothing (no per-item .catch / Promise.allSettled)
+        throws: First per-item rejection bubbles up and aborts the Promise.all, leaving sibling sends in an indeterminate state from the caller's perspective
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        description: |
+          send(data) accepts an array of MailDataRequired and internally uses Promise.all(data.map(item => this.send(item))). Promise.all has fail-fast semantics: the first rejection (e.g. a single 400 Bad Request, a single 429 from a per-recipient quota, or a single network blip) settles the aggregate promise as rejected, but the sibling per-item sends continue running in the background and the caller never sees which ones succeeded. A bulk notification job written as `await sgMail.send(messages)` therefore cannot distinguish "1 of 200 failed" from "all 200 failed" — and cannot retry only the failed items.
+        detector: |
+          If sgMail.send() is called with an argument whose type is an array (literal `[...]`, a variable typed `MailDataRequired[]`, or the result of `.map`/`.filter`), and the surrounding code only awaits the single returned promise (no per-item iteration with individual .catch handlers, no Promise.allSettled wrapping the per-item sends)
+        required_handling: |
+          MUST use one of: (a) iterate `for (const msg of messages) { try { await sgMail.send(msg) } catch (e) { ... } }` to get per-item visibility, (b) wrap the per-item sends in `Promise.allSettled(messages.map(m => sgMail.send(m)))` and inspect each result/reason, or (c) use sgMail.sendMultiple() with a single MailDataRequired whose `personalizations` array contains the recipient list — sendMultiple is for the one-message-many-recipients shape, NOT for many-independent-messages.
+        sources:
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/mail/src/classes/mail-service.js
+          - https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/docs/use-cases/sending-multiple-emails-to-multiple-recipients.md
+      # Added 2026-06-23 (deepen-stream-3, pass 12) — drift mode against @sendgrid/mail@8.1.6.
+      # Source review of node_modules/@sendgrid/mail/src/classes/mail-service.js (lines 181-220)
+      # plus node_modules/@sendgrid/helpers/classes/mail.js (24+ `throw new Error(...)` sites)
+      # confirms send() can reject with sync-then-promisified validation errors BEFORE any
+      # HTTP request is made. These are distinct from the API-error path that send-no-try-catch
+      # documents — the existing postcondition's `throws` field cites `error.response.body`,
+      # which is only populated for HTTP errors. Validation errors are bare Error instances
+      # with NO error.response property, so a catch block written defensively around the
+      # `error.response.body` shape will null-deref on these.
+      - id: send-validation-error-no-response-shape
+        condition: send() rejects with a bare Error (no error.response) due to malformed MailDataRequired or a triggered secret rule, but the catch block dereferences error.response.body unconditionally
+        throws: Error('Expecting object for Mail data') / Error('Provide at least one of to, cc or bcc') / Error('Expected each `content` entry to contain a `value` string') / Error("The pattern '...' was found in the Mail content!") / etc. — sync throws from Mail.create() and filterSecrets() are caught at mail-service.js:210 and re-emitted as Promise.reject(error)
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          The standard SendGrid error-handling pattern (and the existing send-no-error-response-check postcondition) assumes the rejection shape is an HTTP ResponseError with error.response.body populated. That assumption holds only for errors raised AFTER the request has been dispatched to /v3/mail/send. Synchronous validation errors thrown by @sendgrid/helpers/classes/mail.js (24+ throw sites including 'Expecting object for Mail data', 'Provide at least one of to, cc or bcc', 'Array of objects expected for `personalizations`', 'String or address object expected for `from`', etc.) and by mail-service.js filterSecrets ('The pattern ... was found in the Mail content!') are caught by the try-block at mail-service.js:181 and re-emitted as `Promise.reject(error)` at mail-service.js:219. These errors have NO error.response property — a catch block that runs `console.error(error.response.body)` will throw TypeError: Cannot read properties of undefined (reading 'body'), masking the original validation failure with a secondary crash and producing useless stack traces in error tracking (Sentry, Datadog, etc.).
+        detector: |
+          If the catch block following an await sgMail.send() / sgMail.sendMultiple() accesses error.response.body, error.response.headers, or any error.response.* property without first guarding with `if (error.response)` or `error.response?.body`
+        required_handling: |
+          MUST guard error.response access with optional chaining or an explicit existence check: `if (error.response) { console.error(error.response.body); } else { console.error(error.message); }`. The SendGrid documentation pattern shows this guard explicitly — it is not optional. Treat any rejection without error.response as a validation/configuration failure (caller's fault, not API's).
+        sources:
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/mail/src/classes/mail-service.js
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/helpers/classes/mail.js
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/docs/use-cases/success-failure-errors.md
   - name: sendMultiple
     import_path: "@sendgrid/mail"
     description: Sends multiple emails in parallel via SendGrid API
@@ -73,6 +128,35 @@ functions:
         source: https://github.com/sendgrid/sendgrid-nodejs/issues/1081
         sources:
           - https://github.com/sendgrid/sendgrid-nodejs/issues/1081
+      # Added 2026-06-23 (deepen-stream-3, pass 12) — drift mode against @sendgrid/mail@8.1.6.
+      # Source review of mail-service.js confirms send() and sendMultiple() accept an optional
+      # node-style callback as the last argument (.d.ts line 35, 40). When a callback is provided,
+      # send() / sendMultiple() STILL return a Promise (the callback is invoked in addition,
+      # not instead). A caller who supplies the callback to "handle errors the old way" but
+      # ignores the returned promise will trigger UnhandledPromiseRejection on every API error
+      # because the rejection still propagates through the returned promise even though the
+      # callback was also called with the error. This is the inverse of the standard
+      # callback-or-promise dichotomy — sgMail does both, always.
+      - id: send-multiple-callback-with-unhandled-promise
+        condition: sendMultiple() or send() invoked with a callback argument but the returned promise is not awaited and has no .catch handler
+        throws: UnhandledPromiseRejection on the returned promise in addition to the callback being invoked with the error — Node 15+ default behavior crashes the process
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: |
+          mail-service.js implements the callback contract by invoking cb(error, result) AND returning a promise. The promise rejection path is independent of the callback path — both fire on error. A caller pattern like `sgMail.sendMultiple(data, (err, result) => { if (err) log(err); });` looks complete to a developer used to traditional Node.js callback APIs, but the unhandled returned promise will cause UnhandledPromiseRejection. Since Node.js 15, unhandled rejections terminate the process by default (unless --unhandled-rejections=warn or process.on('unhandledRejection') is set). This is especially insidious because the callback DOES fire and the error appears handled in logs, but the process crashes anyway with a stack pointing at a different location.
+        detector: |
+          If sgMail.send() or sgMail.sendMultiple() is called with 2 (send) / 3 arguments where the last argument is a function literal or function reference (callback), AND the returned value is not assigned/awaited/chained with .catch (i.e. the call statement is `sgMail.sendX(data, cb);` with no leading `await` and no trailing `.catch`)
+        required_handling: |
+          MUST do one of: (a) use only the Promise pattern with `await sgMail.send(data)` in a try-catch, (b) use only the Promise pattern with `sgMail.send(data).catch(handler)`, or (c) if a callback is required for legacy reasons, also catch the returned promise: `sgMail.send(data, cb).catch(() => {})` — empty .catch is acceptable when the callback already handles the error, because it converts the unhandled-rejection into a no-op.
+        sources:
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/mail/src/classes/mail-service.js
+          - https://nodejs.org/api/process.html#event-unhandledrejection
+          - https://github.com/sendgrid/sendgrid-nodejs/blob/main/docs/use-cases/success-failure-errors.md
   - name: setApiKey
     import_path: "@sendgrid/mail"
     description: Configures SendGrid API key for authentication

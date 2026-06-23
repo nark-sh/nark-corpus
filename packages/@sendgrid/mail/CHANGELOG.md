@@ -3,6 +3,25 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — drift-mode deepen (+3 postconditions)
+
+- **Latest published:** @sendgrid/mail@8.1.6
+- **Profile semver:** `>=7.0.0 <9.0.0` (unchanged — 8.1.6 still in range)
+- **Verdict:** existing 3-function coverage intact; added 3 new postconditions to deepen postcondition density on `send` and `sendMultiple`
+- **New postconditions:**
+  - `send.send-array-batch-no-partial-failure-handling` (warning, SILENT_FAILURE/lost_transaction) — `Promise.all` fails-fast on array input (mail-service.js:165); bulk-notification senders lose per-item visibility
+  - `send.send-validation-error-no-response-shape` (warning, SILENT_FAILURE/service_unavailable) — Mail.create / filterSecrets sync throws (24+ sites in @sendgrid/helpers) become Promise.reject with bare Error (no `error.response`); standard catch pattern null-derefs
+  - `sendMultiple.send-multiple-callback-with-unhandled-promise` (warning, DOWNTIME/service_unavailable) — callback signature AND promise rejection fire on error; legacy callback users still trip UnhandledPromiseRejection
+- **Coverage score:** 3/3 = 1.0 (unchanged; postcondition density deepened, function count unchanged)
+- **Fixtures:** no new fixtures this pass; existing 9 scanner violations still fire (no regressions verified via local scan)
+- **Scanner concerns queued:** 0 — new postconditions are detector-level guidance for future fixture/rule work, not blocking scanner code changes
+- **Pass:** 12
+- **Stream:** deepen-stream-3
+- **Source verification:**
+  - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/mail/src/classes/mail-service.js
+  - https://github.com/sendgrid/sendgrid-nodejs/blob/main/packages/helpers/classes/mail.js
+  - https://nodejs.org/api/process.html#event-unhandledrejection
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @sendgrid/mail@8.1.6
