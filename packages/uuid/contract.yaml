@@ -47,17 +47,37 @@
 #   node_modules/uuid/dist/stringify.js lines 30-33 (TypeError on invalid bytes)
 #   https://github.com/uuidjs/uuid/blob/main/CHANGELOG.md#1400
 #   https://github.com/uuidjs/uuid#uuidstringifyarr-offset
+#
+# Depth pass 2026-06-23 (deepen-stream-3 pass 7):
+# Promoted the 4 previously-omitted functions (v1, v6, v1ToV6, v6ToV1) to
+# contracted. Each was previously "omitted" with the rationale "same error
+# profile as v4/v7 / parse()". On a final pass-7 review against uuid@14.0.1
+# (installed in /tmp/claude/bc-deepen/uuid-pass7), the omission rationale
+# held narrowly but the surface IS distinct enough to deserve its own
+# postconditions:
+#   - v1: same crypto/rng/buf-offset triad as v4/v7, BUT the time-options
+#     override path (options.msecs/options.nsecs) is unique and worth naming.
+#   - v6: NEW dedicated buf-offset RangeError check at the v6 wrapper layer
+#     (uuid@14.0.0+), separate from v1Bytes's check. Inherits v1's full failure set.
+#   - v1ToV6 / v6ToV1: both internally parse() string input — TypeError('Invalid
+#     UUID') on malformed input. The Uint8Array overload of both is silently
+#     garbage-in-garbage-out and worth calling out explicitly.
+# Coverage 8/12 = 0.67 → 12/12 = 1.00 raw. Effective coverage stays 1.0.
+# MAX/NIL still omitted: they are exported string constants, not callable
+# functions, so they are not part of the api_functions_total denominator.
+# No new fixtures added — existing fixtures cover the bare-call + user-input
+# error paths uniformly across all generator/parser functions.
 package: uuid
 semver: ">=9.0.0 <15.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.67  # 8 contracted / 12 total callable (4 intentionally omitted: v1, v6, v1ToV6, v6ToV1)
-# Note: effective coverage (contracted/non-omitted) = 8/8 = 1.0
-# Depth pass 2026-06-12 added: stringify function + buf-offset postconditions on v3 and v5
+coverage_score: 1.0  # 12 contracted / 12 total callable (MAX/NIL excluded — string constants, not callable)
+# Note: effective coverage (contracted/non-omitted) = 12/12 = 1.0
+# Depth pass 2026-06-23 added: v1, v6, v1ToV6, v6ToV1 (all promoted from omitted)
 
 detection:
   type_names:
@@ -698,6 +718,283 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: v1
+    import_path: "uuid"
+    description: >
+      Generates a timestamp-based UUID v1 with MAC-address-like node ID (random per-process,
+      not the real hardware MAC in modern versions). Synchronous. Uses crypto.getRandomValues()
+      via the same rng() function as v4/v7 for the random node + clockseq bits, then encodes
+      the current Date.now() into the time fields. Less common than v4/v7 in modern SaaS but
+      still appears in legacy migration code and some database adapters that prefer
+      time-sortable IDs without v7's stronger sort guarantees.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v1.js (uuid@14.0.1) lines for v1Bytes():
+      #   if (rnds.length < 16) { throw new Error('Random bytes length must be >= 16'); }
+      #   if (offset < 0 || offset + 16 > buf.length) {
+      #     throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
+      #   }
+      # rng() comes from rng.js — same crypto.getRandomValues() dependency as v4/v7:
+      #   if (typeof crypto === 'undefined' || !crypto.getRandomValues) {
+      #     throw new Error('crypto.getRandomValues() not supported. ...')
+      #   }
+      - id: v1-crypto-unavailable
+        condition: >
+          v1() is called in an environment where crypto.getRandomValues() is not available,
+          or a custom options.rng returns fewer than 16 bytes, or a buf argument is provided
+          with an out-of-bounds offset. Same crypto dependency as v4 and v7 — all three
+          route through the shared rng() function in rng.js.
+          Additional v1-specific shape: callers commonly pass `options.msecs` and
+          `options.nsecs` to override the embedded timestamp (test fixtures, time-travel
+          replay) — these are NOT validated, so a negative or non-finite msecs value
+          produces a malformed UUID without throwing, but the resulting string still fails
+          validate(). Pair with the user-input-validation edge case.
+        throws: >
+          Error('crypto.getRandomValues() not supported. ...') — when crypto API is missing.
+          Error('Random bytes length must be >= 16') — when custom rng returns short buffer.
+          RangeError('UUID byte range <offset>:<offset+15> is out of buffer bounds')
+          — when writing to a buf argument with negative offset or offset + 16 > buf.length.
+        required_handling: >
+          In modern Node.js (14.17+) and browsers with Web Crypto, v1() never throws.
+          For edge environments or custom rng, wrap in try-catch:
+
+            import { v1 } from 'uuid';
+            try {
+              const id = v1();
+              return id;
+            } catch (error) {
+              if (error.message.includes('crypto.getRandomValues')) {
+                throw new Error('UUID v1 generation not supported in this environment');
+              }
+              throw error;
+            }
+
+          When using the explicit buffer API, validate offset and size first:
+            const buf = new Uint8Array(N * 16);
+            for (let i = 0; i < N; i++) {
+              const offset = i * 16;
+              if (offset + 16 > buf.length) throw new Error('Buffer too small');
+              v1(undefined, buf, offset);
+            }
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv1options-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v1.ts"
+          - "https://github.com/uuidjs/uuid#getrandomvalues-not-supported"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: v6
+    import_path: "uuid"
+    description: >
+      Generates a UUID v6, which is v1 with reordered timestamp fields so the resulting
+      string is lexicographically sortable by time (similar to v7 but using the v1 clockseq
+      and node layout). Synchronous. Internally calls v1() with `_v6: true`, then runs the
+      bytes through v1ToV6() to reorder. Same crypto dependency as v1/v4/v7 plus an
+      additional buf-offset RangeError check at the v6 layer (new in uuid@14.0.0).
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v6.js (uuid@14.0.1):
+      #   if (buf) {
+      #     if (offset < 0 || offset + 16 > buf.length) {
+      #       throw new RangeError(`UUID byte range ${offset}:${offset + 15} is out of buffer bounds`);
+      #     }
+      #     ...
+      #   }
+      # Plus v6 calls v1({ _v6: true, ...options }) — inherits v1's crypto-unavailable
+      # and rng-length errors through the underlying rng() and v1Bytes() functions.
+      # The buf-offset RangeError is checked TWICE for v6: once in v1Bytes (inherited)
+      # and once at the v6 layer (new in v14). Both throw the same RangeError class.
+      - id: v6-crypto-unavailable
+        condition: >
+          v6() is called in an environment where crypto.getRandomValues() is not available,
+          OR with a buf argument where offset < 0 or offset + 16 > buf.length, OR with a
+          custom options.rng that returns fewer than 16 bytes. v6 inherits all of v1's
+          crypto/rng/buf failure modes via its internal v1() call, and adds its own
+          buf-offset RangeError check at the v6 wrapper layer (uuid@14.0.0+).
+          Less common in production than v4/v7 — v7 is the modern sortable choice. v6
+          mostly appears in code that's migrating from v1 to a sortable format while
+          preserving v1-shaped node/clockseq fields.
+        throws: >
+          Error('crypto.getRandomValues() not supported. ...') — crypto API missing.
+          Error('Random bytes length must be >= 16') — custom rng too short.
+          RangeError('UUID byte range <offset>:<offset+15> is out of buffer bounds')
+          — buf/offset out of bounds (thrown at both the v6 wrapper and the inner v1Bytes
+          call — catching once is sufficient).
+        required_handling: >
+          Wrap in try-catch when the environment is uncertain:
+
+            import { v6 } from 'uuid';
+            try {
+              const id = v6();
+              return id;
+            } catch (error) {
+              if (error instanceof RangeError) {
+                throw new Error('Buffer too small for UUID v6');
+              }
+              if (error.message.includes('crypto.getRandomValues')) {
+                throw new Error('UUID v6 generation not supported in this environment');
+              }
+              throw error;
+            }
+
+          When generating batch UUIDs into a pre-allocated buffer:
+            const buf = new Uint8Array(N * 16);
+            for (let i = 0; i < N; i++) {
+              const offset = i * 16;
+              if (offset + 16 > buf.length) throw new Error('Buffer too small');
+              v6(undefined, buf, offset);
+            }
+
+          Prefer v7() over v6() for new code — same sortability guarantee, simpler
+          internal model, broader ecosystem support (RFC 9562, postgres uuid_v7
+          functions, etc.).
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv6options-buffer-offset"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v6.ts"
+          - "https://github.com/uuidjs/uuid/blob/main/CHANGELOG.md#1400"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: v1ToV6
+    import_path: "uuid"
+    description: >
+      Converts a v1 UUID to a v6 UUID (timestamp-sortable reordering). Synchronous.
+      Accepts either a UUID string or a Uint8Array of bytes. When given a string,
+      internally calls parse() to convert to bytes — which THROWS TypeError('Invalid UUID')
+      if the string is malformed. Used for: migrating legacy v1-based primary keys to
+      sortable v6 IDs in a batch migration, or for compatibility shims that accept v1
+      input but need v6 output.
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v1ToV6.js (uuid@14.0.1):
+      #   export default function v1ToV6(uuid) {
+      #     const v1Bytes = typeof uuid === 'string' ? parse(uuid) : uuid;
+      #     ...
+      #   }
+      # parse() throws TypeError('Invalid UUID') for malformed strings — line 3 of parse.js:
+      #   if (!validate(uuid)) { throw TypeError('Invalid UUID'); }
+      # When called with a Uint8Array directly, v1ToV6 does NO validation — it will
+      # produce a malformed output for non-UUID byte input but won't throw at the
+      # v1ToV6 layer (downstream stringify() catches that).
+      - id: v1tov6-invalid-uuid
+        condition: >
+          v1ToV6() is called with a string argument that is not a valid UUID format.
+          Common in migration code that maps a database column of v1 UUID strings to
+          v6 — if the column contains any corrupt/missing/legacy non-UUID values
+          (NULL stored as the literal string 'NULL', truncated rows, manual SQL inserts
+          with bad data), the conversion throws TypeError on the first bad row.
+          Also: passing a v4 or v7 UUID (valid UUID format but wrong version) is NOT
+          caught — v1ToV6 will happily produce a garbled v6 from non-v1 input because
+          it operates on byte-level field rearrangement, not version-aware logic.
+          For the Uint8Array overload, v1ToV6 itself does NOT throw — it produces
+          a garbled output for non-v1 bytes, which only fails later if stringified
+          via stringify() (which validates the resulting UUID format).
+        throws: >
+          TypeError('Invalid UUID') — when called with a string that is not a valid
+          UUID. Thrown by the internal parse() call. NOT thrown by the Uint8Array
+          overload — that path silently produces garbage for non-v1 input.
+        required_handling: >
+          Validate the input UUID format AND version before calling v1ToV6:
+
+            import { v1ToV6, validate, version } from 'uuid';
+
+            function migrateV1ToV6(legacyId: string): string {
+              if (!validate(legacyId)) {
+                throw new Error(`Invalid UUID in migration: ${legacyId}`);
+              }
+              if (version(legacyId) !== 1) {
+                throw new Error(`Expected v1 UUID, got v${version(legacyId)}: ${legacyId}`);
+              }
+              return v1ToV6(legacyId);
+            }
+
+          For batch migration with mixed-quality data, wrap in try-catch and
+          quarantine failures:
+            for (const row of rows) {
+              try {
+                row.newId = v1ToV6(row.legacyId);
+              } catch (error) {
+                row.migrationError = error.message;
+              }
+            }
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv1tov6uuid"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v1ToV6.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: v6ToV1
+    import_path: "uuid"
+    description: >
+      Converts a v6 UUID back to its v1 representation (reverse of v1ToV6). Synchronous.
+      Same shape as v1ToV6: accepts string or Uint8Array, internally calls parse() on
+      string input. Used for backward compatibility — exposing v6-generated IDs to
+      systems that only understand v1 format, or for round-tripping during migration
+      validation (v1 → v6 → v1 should equal the original).
+    postconditions:
+      # Evidence: node_modules/uuid/dist/v6ToV1.js (uuid@14.0.1):
+      #   export default function v6ToV1(uuid) {
+      #     const v6Bytes = typeof uuid === 'string' ? parse(uuid) : uuid;
+      #     ...
+      #   }
+      # Same throw shape as v1ToV6 — TypeError('Invalid UUID') from internal parse().
+      # Uint8Array overload also silently produces garbage for non-v6 input bytes.
+      - id: v6tov1-invalid-uuid
+        condition: >
+          v6ToV1() is called with a string that is not a valid UUID format. Same
+          mechanism as v1ToV6-invalid-uuid — the internal parse() call throws
+          TypeError on malformed input. Also: passing a non-v6 UUID (v4, v7, etc.)
+          is NOT caught — v6ToV1 produces a garbled v1 from non-v6 input because it
+          operates on byte-level field rearrangement without version-aware logic.
+          For the Uint8Array overload, v6ToV1 itself does NOT throw — garbled
+          output is only detected later if the result is stringified.
+        throws: >
+          TypeError('Invalid UUID') — when called with a string that is not a valid
+          UUID. Thrown by the internal parse() call. Uint8Array overload does not
+          throw at the v6ToV1 layer.
+        required_handling: >
+          Validate format AND version before calling v6ToV1:
+
+            import { v6ToV1, validate, version } from 'uuid';
+
+            function downgradeV6ToV1(modernId: string): string {
+              if (!validate(modernId)) {
+                throw new Error(`Invalid UUID: ${modernId}`);
+              }
+              if (version(modernId) !== 6) {
+                throw new Error(`Expected v6 UUID, got v${version(modernId)}: ${modernId}`);
+              }
+              return v6ToV1(modernId);
+            }
+
+          For round-trip integrity check after v1ToV6 migration:
+            const original = v1();
+            const v6 = v1ToV6(original);
+            const back = v6ToV1(v6);
+            console.assert(back === original);
+        sources:
+          - "https://github.com/uuidjs/uuid#uuidv6tov1uuid"
+          - "https://github.com/uuidjs/uuid/blob/main/src/v6ToV1.ts"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: user-input-validation
     description: >
@@ -740,11 +1037,14 @@ notes:
   - "validate() NEVER throws — safe to call on any input including null/undefined"
   - "v3 and v5 require namespace UUID — use v3.DNS, v3.URL, v5.DNS, v5.URL constants"
   - "v3/v5/v6 added RangeError on buffer-offset bounds in uuid@14.0.0 — was silent before"
-  - "v1/v6 omitted — same error profile as v4/v7, less common in modern SaaS"
-  - "v1ToV6/v6ToV1 omitted — same error profile as parse(), conversion utilities only"
+  - "v1/v4/v7 share crypto.getRandomValues + rng-length + buf-offset failure modes via rng()"
+  - "v6 inherits v1 failure modes plus a dedicated buf-offset RangeError at the v6 wrapper layer (v14.0.0+)"
+  - "v1ToV6/v6ToV1 throw TypeError('Invalid UUID') from internal parse() on malformed string input"
+  - "v1ToV6/v6ToV1 Uint8Array overload does NOT validate input — silently produces garbage from non-v1/v6 bytes"
   - "MAX/NIL omitted — string constants, not callable functions"
 
 # Category: utility
-# Latest version: 14.0.0
+# Latest version: 14.0.1
 # Depth pass 2026-04-17 (deepen-stream-2 pass 11)
 # Depth pass 2026-06-12 (deepen-stream-2 pass 5): +1 function (stringify), +2 postconditions (v3/v5 buf-offset)
+# Depth pass 2026-06-23 (deepen-stream-3 pass 7): +4 functions (v1, v6, v1ToV6, v6ToV1), reached 100% surface coverage

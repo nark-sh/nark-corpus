@@ -3,6 +3,28 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepened to 100% surface coverage (deepen-stream-3 pass 7)
+
+- **Latest published:** uuid@14.0.1
+- **Profile semver:** `>=9.0.0 <15.0.0` (unchanged)
+- **Verdict:** +4 functions promoted from omitted to contracted (v1, v6, v1ToV6, v6ToV1)
+- **Postconditions added:**
+  - `v1-crypto-unavailable` — same crypto/rng/buf-offset triad as v4/v7, names the timestamp-options override path
+  - `v6-crypto-unavailable` — inherits v1's failure set + dedicated buf-offset RangeError at the v6 wrapper layer (v14.0.0+)
+  - `v1tov6-invalid-uuid` — TypeError('Invalid UUID') from internal parse() on malformed string input; Uint8Array overload is garbage-in-garbage-out
+  - `v6tov1-invalid-uuid` — symmetric to v1tov6
+- **Coverage:** 8/12 = 0.67 → 12/12 = 1.00 raw (effective stays 1.0). MAX/NIL excluded from denominator (string constants, not callable).
+- **Evidence sources:**
+  - `/tmp/claude/bc-deepen/uuid-pass7/node_modules/uuid/dist/v1.js` (rng/length/range checks)
+  - `/tmp/claude/bc-deepen/uuid-pass7/node_modules/uuid/dist/v6.js` (v6-layer RangeError)
+  - `/tmp/claude/bc-deepen/uuid-pass7/node_modules/uuid/dist/v1ToV6.js` (parse() inheritance)
+  - `/tmp/claude/bc-deepen/uuid-pass7/node_modules/uuid/dist/v6ToV1.js` (parse() inheritance)
+  - https://github.com/uuidjs/uuid#uuidv1options-buffer-offset
+  - https://github.com/uuidjs/uuid#uuidv6options-buffer-offset
+  - https://github.com/uuidjs/uuid#uuidv1tov6uuid
+  - https://github.com/uuidjs/uuid#uuidv6tov1uuid
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 7)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** uuid@14.0.0
