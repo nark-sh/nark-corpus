@@ -241,3 +241,98 @@ export async function transcribeFromUrlNoCatch() {
   });
   return text;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. ToolLoopAgent — v6 Agent class with .generate() / .stream()
+//    Added 2026-06-23 deepen pass against ai@6.0.209.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { ToolLoopAgent, validateUIMessages, createUIMessageStream } from 'ai';
+
+export async function agentGenerateNoCatch(agent: ToolLoopAgent) {
+  // SHOULD_FIRE: agent-api-error — agent.generate() can throw APICallError, no try-catch
+  const result = await agent.generate({ prompt: 'What is the weather?' } as any);
+  return result.text;
+}
+
+export async function agentGenerateWithCatch(agent: ToolLoopAgent) {
+  try {
+    // SHOULD_NOT_FIRE: agent.generate() inside try-catch satisfies the requirement
+    const result = await agent.generate({ prompt: 'What is the weather?' } as any);
+    return result.text;
+  } catch (error) {
+    console.error('Agent generate failed:', error);
+    throw error;
+  }
+}
+
+export async function agentStreamNoCatch(agent: ToolLoopAgent) {
+  // SHOULD_FIRE: agent-api-error — agent.stream() can throw APICallError, no try-catch
+  const result = await agent.stream({ prompt: 'Stream the answer' } as any);
+  return result;
+}
+
+export async function agentStreamWithCatch(agent: ToolLoopAgent) {
+  try {
+    // SHOULD_NOT_FIRE: agent.stream() inside try-catch satisfies the requirement
+    const result = await agent.stream({ prompt: 'Stream the answer' } as any);
+    return result;
+  } catch (error) {
+    console.error('Agent stream failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. validateUIMessages — v6 persistence validator
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function loadAndValidateMessagesNoCatch(persistedMessages: unknown) {
+  // SHOULD_FIRE: validate-ui-messages-type-validation — validateUIMessages throws TypeValidationError, no try-catch
+  const validated = await validateUIMessages({
+    messages: persistedMessages,
+  } as any);
+  return validated;
+}
+
+export async function loadAndValidateMessagesWithCatch(persistedMessages: unknown) {
+  try {
+    // SHOULD_NOT_FIRE: validateUIMessages inside try-catch — proper persistence handling
+    const validated = await validateUIMessages({
+      messages: persistedMessages,
+    } as any);
+    return validated;
+  } catch (error) {
+    // Documented recovery: log + start with empty chat history
+    console.error('Database messages validation failed:', error);
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. createUIMessageStream — v6 server-side SSE stream builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createStreamNoOnError() {
+  // SHOULD_FIRE: create-ui-message-stream-error-leak — no explicit onError handler
+  // leaks server exception details into client error chunks for ai<6.0.207
+  // and is brittle to silently inherit the default for ai>=6.0.207.
+  const stream = createUIMessageStream({
+    execute: async ({ writer }) => {
+      writer.write({ type: 'text-delta', delta: 'hello' } as any);
+    },
+  } as any);
+  return stream;
+}
+
+export async function createStreamWithSafeOnError() {
+  // SHOULD_NOT_FIRE: explicit onError that returns a generic application-controlled
+  // string — safe across all ai versions.
+  const stream = createUIMessageStream({
+    execute: async ({ writer }) => {
+      writer.write({ type: 'text-delta', delta: 'hello' } as any);
+    },
+    onError: () => 'An error occurred while processing your request.',
+  } as any);
+  return stream;
+}

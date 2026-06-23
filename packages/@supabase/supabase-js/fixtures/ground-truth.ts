@@ -223,3 +223,146 @@ async function properFunctionsInvoke() {
   }
   return data;
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// signInWithOtp / verifyOtp — missing error handling (should fire)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function missingSignInWithOtp(email: string) {
+  // SHOULD_FIRE: signin-otp-rate-limit — { error } not checked
+  const { data } = await supabase.auth.signInWithOtp({ email });
+  return data;
+}
+
+async function missingVerifyOtp(email: string, token: string) {
+  // SHOULD_FIRE: verify-otp-invalid-code — { error } not checked
+  const { data } = await supabase.auth.verifyOtp({ email, token, type: 'email' });
+  return data;
+}
+
+async function properSignInWithOtp(email: string) {
+  // SHOULD_NOT_FIRE: error checked, rate-limit code surfaced to user
+  const { data, error } = await supabase.auth.signInWithOtp({ email });
+  if (error) {
+    if (error.code === 'over_email_send_rate_limit') {
+      throw new Error('Too many requests. Try again in a few minutes.');
+    }
+    if (error.code === 'signup_disabled' || error.code === 'otp_disabled') {
+      throw new Error('Passwordless sign-in is not available.');
+    }
+    throw error;
+  }
+  return data;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// getUser / updateUser / refreshSession — missing error handling (should fire)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function missingGetUser() {
+  // SHOULD_FIRE: get-user-session-expired — { error } not checked
+  const { data } = await supabase.auth.getUser();
+  return data.user;
+}
+
+async function missingUpdateUser(password: string) {
+  // SHOULD_FIRE: update-user-weak-password — { error } not checked, no weak-password handling
+  const { data } = await supabase.auth.updateUser({ password });
+  return data;
+}
+
+async function missingRefreshSession() {
+  // SHOULD_FIRE: refresh-session-token-revoked — { error } not checked
+  const { data } = await supabase.auth.refreshSession();
+  return data.session;
+}
+
+async function properGetUser() {
+  // SHOULD_NOT_FIRE: error checked, 401 routes to sign-in
+  const { data, error } = await supabase.auth.getUser();
+  if (error) {
+    if (error.status === 401) {
+      throw new Error('Not authenticated');
+    }
+    throw error;
+  }
+  return data.user;
+}
+
+async function properUpdateUser(password: string, nonce?: string) {
+  // SHOULD_NOT_FIRE: weak_password and reauthentication_needed codes handled
+  const { data, error } = await supabase.auth.updateUser({ password, nonce });
+  if (error) {
+    if (error.code === 'weak_password') {
+      throw new Error(`Password too weak: ${error.message}`);
+    }
+    if (error.code === 'reauthentication_needed') {
+      await supabase.auth.reauthenticate();
+      throw new Error('Please enter the code we just emailed you.');
+    }
+    throw error;
+  }
+  return data;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// exchangeCodeForSession — missing error handling (should fire)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function missingExchangeCode(code: string) {
+  // SHOULD_FIRE: exchange-code-pkce-verifier-missing — { error } not checked
+  const { data } = await supabase.auth.exchangeCodeForSession(code);
+  return data.session;
+}
+
+async function properExchangeCode(code: string) {
+  // SHOULD_NOT_FIRE: error checked, expired-code branch handled
+  const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+  if (error) {
+    if (error.code === 'otp_expired' || error.code === 'flow_state_expired') {
+      throw new Error('This sign-in link expired. Request a new one.');
+    }
+    if (error.name === 'AuthPKCECodeVerifierMissingError') {
+      throw new Error('Open this link in the same browser you started in.');
+    }
+    throw error;
+  }
+  return data.session;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// storage.download / createSignedUrl — missing error handling (should fire)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function missingStorageDownload(path: string) {
+  // SHOULD_FIRE: storage-download-not-found — { error } not checked
+  const { data } = await supabase.storage.from('private-files').download(path);
+  return data;
+}
+
+async function missingCreateSignedUrl(path: string) {
+  // SHOULD_FIRE: storage-signed-url-not-found — { error } not checked
+  const { data } = await supabase.storage.from('private-files').createSignedUrl(path, 3600);
+  return data?.signedUrl;
+}
+
+async function properStorageDownload(path: string) {
+  // SHOULD_NOT_FIRE: error checked, 404 vs 403 collapsed for security
+  const { data, error } = await supabase.storage.from('private-files').download(path);
+  if (error) {
+    // Don't leak the difference between not-found and unauthorized to end users.
+    throw new Error('File unavailable');
+  }
+  return data;
+}
+
+async function properCreateSignedUrl(path: string) {
+  // SHOULD_NOT_FIRE: error checked before returning the signed URL
+  const { data, error } = await supabase.storage
+    .from('private-files')
+    .createSignedUrl(path, 3600);
+  if (error) {
+    throw new Error(`Could not generate signed URL: ${error.message}`);
+  }
+  return data.signedUrl;
+}

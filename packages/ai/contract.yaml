@@ -1,12 +1,12 @@
 package: ai
 semver: ">=2.0.0 <7.0.0"
-contract_version: "2.1.1"
+contract_version: "2.2.0"
 maintainer: "agent-001"
-last_verified: "2026-04-17"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.92  # 11 of 12 async-callable functions covered (experimental_generateVideo intentionally omitted)
+coverage_score: 0.94  # 14 of 15 in-scope async-callable functions covered. 2026-06-23 deepen pass re-enumerated against ai@6.0.209 and added ToolLoopAgent (agent.generate/.stream), validateUIMessages, and createUIMessageStream. Intentionally omitted: experimental_generateVideo (still experimental, mirrors generateImage error model). UI message stream auxiliaries (callCompletionApi, createAgentUIStream, readUIMessageStream, convertFileListToFileUIParts, parsePartialJson, consumeStream) are call-site-thin wrappers whose error contracts collapse to APICallError / TypeValidationError covered upstream — no separate postconditions add net value.
 # FP note (2026-04-17): Violations are frequently reported on:
 # 1. Inner utility/helper functions called from a caller that handles the error.
 #    These are FPs — the postcondition applies to the outermost call site that
@@ -815,3 +815,295 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+
+  # ------------------------------------------------------------------
+  # Deepen pass 2026-06-23 (deepen-stream-2 pass 14)
+  # New v6 surface area: ToolLoopAgent class + UI message stream APIs.
+  # Evidence base:
+  #   - ai@6.0.209 (latest at deepen time, 82 days stale from 2026-04-02)
+  #   - dist/index.d.ts enumeration
+  #   - https://ai-sdk.dev/docs/reference/ai-sdk-errors (canonical error class list)
+  #   - https://ai-sdk.dev/docs/agents/overview (ToolLoopAgent API)
+  #   - https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-message-persistence (validateUIMessages)
+  #   - ai@6.0.207 changelog (security default change: createUIMessageStream + streamText.toUIMessageStream
+  #     now default onError to opaque "An error occurred." string — raw exception details previously leaked
+  #     to client {type:'error', errorText} chunks)
+  # ------------------------------------------------------------------
+
+  - name: ToolLoopAgent
+    import_path: "ai"
+    # New in v6 (renamed from BasicAgent — see ai CHANGELOG entry 61f7b0f).
+    # The Agent class wraps a model + tool set + stop condition loop. Usage:
+    #   const agent = new ToolLoopAgent({ model, tools, stopWhen });
+    #   const result = await agent.generate({ prompt: '...' });
+    #   const stream = await agent.stream({ prompt: '...' });
+    # generate() delegates to generateText; stream() delegates to streamText.
+    # As of ai@6.0.0 the callOptionsSchema is now enforced at runtime (changelog 48f842a)
+    # and throws InvalidArgumentError when the supplied options fail the schema.
+    description: >
+      Agent class that orchestrates an LLM, tool set, and step-counting loop to
+      accomplish multi-step tasks. agent.generate() and agent.stream() are the
+      two async entry points. Both throw the same error hierarchy as generateText
+      and streamText, plus InvalidArgumentError when callOptionsSchema validation
+      fails on the supplied options object.
+
+    postconditions:
+      - id: agent-api-error
+        condition: >
+          ToolLoopAgent.generate() / ToolLoopAgent.stream() throw APICallError
+          (or one of its subclasses) when the underlying provider call fails:
+          401/403 authentication, 429 rate limit, 5xx outage, 400 invalid request.
+          The agent delegates to generateText / streamText so the full provider
+          error surface propagates.
+        throws: "APICallError (from @ai-sdk/provider) with statusCode and isRetryable"
+        required_handling: >
+          Caller MUST wrap agent.generate() / agent.stream() in try-catch. Long-running
+          agent loops magnify the cost of an unhandled provider error: every step
+          burns tokens, and an uncaught error halfway through a 10-step loop loses
+          all prior progress. Use APICallError.isInstance(error) to distinguish from
+          tool-level errors. For 429, honor the Retry-After header before retrying
+          the whole loop.
+        sources:
+          - "https://ai-sdk.dev/docs/agents/overview"
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: agent-invalid-argument
+        condition: >
+          ToolLoopAgent.generate() and .stream() throw InvalidArgumentError when
+          the caller-supplied options fail the agent's callOptionsSchema validation.
+          Added in ai@6.0.0 (changelog 48f842a) — prior versions silently accepted
+          any options shape because the schema was declared but never invoked.
+          Common trigger: drifting client/server contracts on agent options after
+          a model rev.
+        throws: "InvalidArgumentError (AI_InvalidArgumentError from @ai-sdk/provider)"
+        required_handling: >
+          Caller MUST wrap agent.generate() / agent.stream() in try-catch. An
+          unhandled InvalidArgumentError aborts the entire request handler and
+          surfaces as a 500 to the client, when the correct behavior is to return
+          a 400 with a structured validation message so the caller can fix the
+          options shape.
+        sources:
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: agent-no-output-generated
+        condition: >
+          ToolLoopAgent.generate() throws NoOutputGeneratedError when the loop
+          terminates without producing any text or structured output. This can
+          happen if the stop condition trips before the model emits text (e.g.
+          stepCountIs(0) misconfiguration, or a model that returns only tool
+          calls with no final answer).
+        throws: "NoOutputGeneratedError (AI_NoOutputGeneratedError, extends AISDKError)"
+        required_handling: >
+          Caller MUST catch NoOutputGeneratedError and either re-prompt with a
+          stronger system message, return an explicit "no answer" UX state, or
+          fall back to a non-agent generateText call. Treating absent output as
+          empty string causes downstream "why is the assistant silent?" support
+          tickets.
+        sources:
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: agent-missing-tool-results
+        condition: >
+          ToolLoopAgent.generate() / .stream() throw MissingToolResultsError when
+          the loop body emits a tool call but the harness fails to feed back a
+          tool result before the next model step. Most common when a tool's
+          execute callback throws an uncaught error and the caller has not
+          configured experimental_repairToolCall.
+        throws: "MissingToolResultsError (extends AISDKError)"
+        required_handling: >
+          Caller MUST wrap agent.generate() / .stream() in try-catch AND either
+          (a) make every tool.execute() bullet-proof with its own try-catch that
+          returns a structured error result, or (b) configure
+          experimental_repairToolCall to synthesize a tool result when the
+          execute callback throws.
+        sources:
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+          - "https://ai-sdk.dev/docs/agents/overview"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: agent-retry-exhausted
+        condition: >
+          ToolLoopAgent.generate() / .stream() throw RetryError when every retry
+          attempt for transient provider failures (429, 5xx) is exhausted. The
+          underlying generateText / streamText delegation uses maxRetries=2 by
+          default; a long agent loop amplifies this because every step is its
+          own retry budget.
+        throws: "RetryError (extends AISDKError) with reason='maxRetriesExceeded'"
+        required_handling: >
+          Caller MUST catch RetryError. For agent-driven user-facing features,
+          partial step results from the loop are still useful — read them off
+          the agent state and present a "stopped early due to provider issues"
+          UX rather than failing the whole interaction.
+        sources:
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: validateUIMessages
+    import_path: "ai"
+    # New v6 utility. Persistence pattern: load UIMessage[] from a database row,
+    # validate against current schemas + tool definitions before re-injecting
+    # into the chat client. Throws on validation failure.
+    # See ai@6.0.205-ish changelog entries (af580ea, a7f6f81, 9667780) for
+    # multiple bug fixes to this function's validation behavior in 2026.
+    description: >
+      Validates an array of stored UIMessage objects against the current chat
+      configuration: metadata schema, data part schemas, and tool definitions.
+      Throws TypeValidationError if any message does not conform. Returns the
+      validated message array on success. The companion safeValidateUIMessages
+      returns a success/failure result object instead of throwing.
+
+    postconditions:
+      - id: validate-ui-messages-type-validation
+        condition: >
+          validateUIMessages() throws TypeValidationError (AI_TypeValidationError)
+          when any persisted UIMessage fails schema validation. Common triggers:
+          schema migration without a backfill of stored messages, a removed
+          tool whose persisted tool calls are now unknown, an output-error part
+          whose runtime shape drifted from the validator schema (fixed in 6.0.205-ish
+          via changelogs af580ea and 9667780).
+        throws: "TypeValidationError (AI_TypeValidationError) from @ai-sdk/provider"
+        required_handling: >
+          Caller MUST wrap validateUIMessages in try-catch. The documented
+          recommendation (https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-message-persistence)
+          is to log the validation error, then EITHER start the chat with an empty
+          history OR run a one-shot migration that filters incompatible messages.
+          NEVER let the error propagate to the request handler — it will surface
+          as a 500 and lock the user out of the entire chat thread.
+          Prefer safeValidateUIMessages() if branching on success/failure feels
+          cleaner than try-catch.
+        sources:
+          - "https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-message-persistence"
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: createUIMessageStream
+    import_path: "ai"
+    # New v6 server-side streaming primitive used to build SSE responses that
+    # carry UI message chunks. Pair with createUIMessageStreamResponse or
+    # pipeUIMessageStreamToResponse to wire into a Next.js / Express / Hono handler.
+    #
+    # CRITICAL security context: ai@6.0.207 changelog (b4b575a) changed the
+    # default onError handler from `getErrorMessage` (which serialized the raw
+    # error via toString/JSON.stringify into the client error chunk) to a
+    # literal "An error occurred." string. Apps that did NOT pass an explicit
+    # onError handler were leaking server exception details (internal hostnames,
+    # paths, provider request data, validation inputs) into the wire. Apps that
+    # depend on rich error text MUST now pass an explicit onError; apps that
+    # were relying on the documented opaque default are now actually safe.
+    description: >
+      Creates a server-side stream of UI message chunks that downstream callers
+      pipe into an HTTP Response (createUIMessageStreamResponse or
+      pipeUIMessageStreamToResponse). The execute callback runs the underlying
+      generation work; the onError callback transforms thrown errors into
+      client-facing error chunks. Misconfiguration of onError is now a known
+      data-exfiltration vector (CVE-class fix landed in ai@6.0.207).
+
+    postconditions:
+      - id: create-ui-message-stream-error-leak
+        condition: >
+          createUIMessageStream is called WITHOUT an explicit onError handler in
+          an application that runs against ai < 6.0.207, OR with an onError that
+          returns the raw Error object / a JSON.stringify of the error. Either
+          shape allows server-side exception details (stack traces, file paths,
+          API keys leaked into error messages, provider request payloads) to
+          flow into the client-facing { type: 'error', errorText } chunk.
+        throws: >
+          Does not throw at the createUIMessageStream call site — the security
+          failure is data exposure on the wire, not a thrown exception.
+          Functionally equivalent to a thrown error from the perspective of
+          contracting because the postcondition is "caller must explicitly
+          configure error redaction".
+        required_handling: >
+          Caller MUST pass an explicit onError handler that returns ONLY a
+          generic, application-controlled error string (e.g.
+          "An error occurred while processing your request"). Do NOT return
+          error.message, error.toString(), or JSON.stringify(error). For ai
+          versions < 6.0.207, this is mandatory even when the docs would imply
+          a safe default. For ai >= 6.0.207, the default is already safe but
+          relying on the default in shared code paths is brittle — pin the
+          behavior with an explicit handler.
+        sources:
+          - "https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-message-persistence"
+          - "https://github.com/vercel/ai/blob/main/packages/ai/CHANGELOG.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+      - id: create-ui-message-stream-execute-throw
+        condition: >
+          The execute callback passed to createUIMessageStream throws an
+          unhandled error (most often from an inner streamText call hitting a
+          provider 5xx or RetryError). When this happens the stream emits an
+          error chunk via the onError handler and terminates. Callers that
+          await the stream (rather than piping it to a Response) must catch
+          the rethrown error or risk an unhandled promise rejection at the
+          edge.
+        throws: "UIMessageStreamError (AI_UIMessageStreamError) wrapping the underlying error"
+        required_handling: >
+          Caller MUST either (a) pipe the stream to a Response via
+          createUIMessageStreamResponse / pipeUIMessageStreamToResponse and let
+          the framework drive consumption, OR (b) wrap the consumer in
+          try-catch and treat UIMessageStreamError.isInstance(error) as a
+          terminal stream signal. Do not assume the stream "just ends" — a
+          mid-stream failure must be observable to the request handler so the
+          server can emit appropriate logging / metrics.
+        sources:
+          - "https://ai-sdk.dev/docs/reference/ai-sdk-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium

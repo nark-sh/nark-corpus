@@ -2,14 +2,18 @@ package: "@supabase/supabase-js"
 semver: ">=2.0.0 <3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-02"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 # Evidence: 59 violations across 8/34 repos (24%) in scan-supabase-supabase-js-2026-04-02.json
 # Top affected: srizzon/git-city (⭐ 4331), astriaai/headshots-starter (⭐ 4454)
 # Most violated: from (30 violations, 8 repos), select (22 violations, 7 repos)
+# 2026-06-23 deepen pass 11: re-enumerated against supabase-js@2.108.2 — added
+# signInWithOtp, verifyOtp, getUser, updateUser, refreshSession, exchangeCodeForSession,
+# storage.download, storage.createSignedUrl. Auth methods come from GoTrueClient.d.ts;
+# storage methods come from storage-js/dist/index.d.cts.
 evidence_quality: confirmed
-coverage_score: 0.62  # 13/21 callable API functions (post-deepen pass 2026-04-02)
+coverage_score: 0.84  # 21/25 callable API functions (post-deepen pass 11 2026-06-23, +8 this pass)
 
 detection:
   factory_methods:
@@ -913,5 +917,503 @@ functions:
           production_behavior: silent_failure
           visibility: silent
           user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: signInWithOtp
+    import_path: "@supabase/supabase-js"
+    description: >
+      Initiates a passwordless sign-in flow. Sends a magic link email or SMS OTP to
+      the user depending on credentials. Returns { data, error: AuthError | null }.
+      Does NOT throw — returns error in response. The matching call is verifyOtp().
+      Signature confirmed at GoTrueClient.d.ts line 1085 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-signinwithotp
+      # Error codes from @supabase/auth-js error-codes.ts: over_email_send_rate_limit,
+      # over_sms_send_rate_limit, signup_disabled, otp_disabled, captcha_failed.
+      - id: signin-otp-rate-limit
+        condition: "Too many magic link / OTP requests for this email or phone (429)"
+        throws: "AuthApiError with error.code='over_email_send_rate_limit' or 'over_sms_send_rate_limit' and error.status=429"
+        required_handling: >
+          Caller MUST check { error } and inspect error.code.
+          DO NOT retry automatically — repeated requests amplify abuse risk and SMS spend.
+          Show user a clear "Check your inbox/SMS. You can request another link in N minutes."
+          Implement client-side debouncing on the submit button to prevent double-fires.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-signinwithotp"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: signin-otp-signup-disabled
+        condition: >
+          shouldCreateUser is true (default) but the project has signups disabled.
+          User does not exist and cannot be created via passwordless flow.
+        throws: "AuthApiError with error.code='signup_disabled' or 'otp_disabled'"
+        required_handling: >
+          Caller MUST check { error.code } before treating the flow as successful.
+          Redirect the user to a sign-up alternative or show "passwordless login is disabled."
+          DO NOT silently swallow this error — user will wait for an email that never arrives,
+          producing a "did the email get sent?" support ticket.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-signinwithotp"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: signin-otp-network-error
+        condition: "Network failure prevents the OTP request from reaching Supabase Auth"
+        throws: "AuthRetryableFetchError (name='AuthRetryableFetchError')"
+        required_handling: >
+          Caller MUST check { error } on the signInWithOtp response.
+          Show an offline indicator and prompt the user to retry — do NOT auto-retry
+          on a hidden timer (it produces duplicate emails when the network recovers).
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-signinwithotp"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: verifyOtp
+    import_path: "@supabase/supabase-js"
+    description: >
+      Verifies a one-time password (magic-link token, SMS OTP, or email confirmation
+      token) and returns a session. Returns { data: { user, session }, error }.
+      Does NOT throw — returns error in response. The companion to signInWithOtp().
+      Signature confirmed at GoTrueClient.d.ts line 1223 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-verifyotp
+      # Error codes from @supabase/auth-js error-codes.ts: otp_expired, otp_invalid,
+      # token_expired, validation_failed, captcha_failed.
+      - id: verify-otp-token-expired
+        condition: "The magic link or OTP code has expired (default 1 hour for magic links, shorter for SMS)"
+        throws: "AuthApiError with error.code='otp_expired' or 'token_expired' and error.status=401 or 403"
+        required_handling: >
+          Caller MUST check { error.code } and surface a clear "code expired" message.
+          Offer the user a button to request a new code via signInWithOtp().
+          DO NOT auto-trigger a resend — user may have already triggered a second send
+          and is mid-keystroke on the new code.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-verifyotp"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: verify-otp-invalid-code
+        condition: "The OTP code does not match what was sent (user typo or replay attack)"
+        throws: "AuthApiError with error.code='otp_invalid' or 'validation_failed' and error.status=401 or 403"
+        required_handling: >
+          Caller MUST check { error.code } and increment a client-side attempt counter.
+          After N failed attempts (typically 3-5), lock the input and require a resend
+          via signInWithOtp() — protects against brute-force SMS code guessing.
+          Log the failure for security review if attempts cluster from one IP.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-verifyotp"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: getUser
+    import_path: "@supabase/supabase-js"
+    description: >
+      Returns the current user by validating the JWT with the Supabase Auth server.
+      UNLIKE getSession(), this method is SAFE TO USE ON THE SERVER because it
+      verifies the token against the auth server, not just reading from client storage.
+      Returns { data: { user: User | null }, error: AuthError | null }.
+      Signature confirmed at GoTrueClient.d.ts line 1558 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-getuser
+      # Error codes from @supabase/auth-js error-codes.ts: session_expired, bad_jwt,
+      # user_not_found. AuthRetryableFetchError for transient network failures.
+      - id: get-user-session-expired
+        condition: >
+          The user's session has expired or the JWT is no longer valid (revoked,
+          rotated past, or the project's JWT secret was rotated). On the server,
+          this is the canonical signal that the request is unauthenticated.
+        throws: "AuthApiError with error.code='session_expired', 'bad_jwt', or 'user_not_found' and error.status=401"
+        required_handling: >
+          Caller MUST check { error } before treating the user as authenticated.
+          On the server (Next.js Route Handler / middleware / SvelteKit hooks),
+          treat a 401 from getUser() as "not signed in" and return a 401 response
+          or redirect to login. DO NOT trust getSession() result without getUser()
+          validation — the session may be stale.
+          On the client, redirect to /login and clear local auth state.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-getuser"
+          - "https://supabase.com/docs/guides/auth/server-side/nextjs"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: critical
+        evidence_quality: confirmed
+
+      - id: get-user-network-error
+        condition: "Network failure prevents JWT validation with the auth server"
+        throws: "AuthRetryableFetchError (name='AuthRetryableFetchError')"
+        required_handling: >
+          Caller MUST distinguish AuthRetryableFetchError from a real auth failure.
+          A network error is NOT the same as "user is not authenticated" —
+          treating it as such logs users out during transient outages.
+          On the client, retry with exponential backoff (2-3 attempts, jittered).
+          On the server (SSR/middleware), return a 503 to the user rather than 401
+          — instructing the browser the user state is unknown, not invalid.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-getuser"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+    edge_cases:
+      - id: prefer-getuser-on-server
+        description: >
+          Supabase docs explicitly state that getSession() is INSECURE on the server
+          because session data is read from client-controlled storage. For any
+          server-side authorization check (Row Level Security gating, role checks,
+          API auth), use getUser() — it validates the JWT against the auth server.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-getuser"
+          - "https://supabase.com/docs/guides/auth/server-side/nextjs"
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+  - name: updateUser
+    import_path: "@supabase/supabase-js"
+    description: >
+      Updates the currently signed-in user's data (email, password, phone, metadata).
+      Returns { data: { user }, error: AuthError | null }. Email/password changes can
+      require reauthentication via the nonce parameter (secure password change).
+      Signature confirmed at GoTrueClient.d.ts line 1674 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-updateuser
+      # Error codes from @supabase/auth-js error-codes.ts: weak_password,
+      # same_password, email_address_invalid, reauthentication_needed,
+      # over_email_send_rate_limit.
+      - id: update-user-weak-password
+        condition: "New password does not meet the project's password strength requirements"
+        throws: "AuthApiError with error.code='weak_password' and error.status=422"
+        required_handling: >
+          Caller MUST check { error.code } and surface the password requirements UI.
+          Inspect error.weakPassword.reasons (array of strings) to show specific
+          missing criteria — e.g. ['length', 'characters']. DO NOT submit the form
+          again with the same password — it will fail identically.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-updateuser"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: update-user-reauthentication-needed
+        condition: >
+          Project has "Secure password change" enabled and the user's session is
+          older than the reauthentication window (typically 24h). updateUser({ password })
+          requires calling reauthenticate() first to receive a nonce, then passing
+          { password, nonce } to updateUser().
+        throws: "AuthApiError with error.code='reauthentication_needed'"
+        required_handling: >
+          Caller MUST check { error.code === 'reauthentication_needed' } and
+          trigger the reauthentication flow:
+            1. Call supabase.auth.reauthenticate() — sends nonce to user's email/phone
+            2. Collect the nonce from the user
+            3. Re-submit updateUser({ password, nonce })
+          DO NOT silently fail the password update — the user thinks the change
+          succeeded and continues using the old password until the next login fails.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-updateuser"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: update-user-same-password
+        condition: "New password is identical to the user's current password (when same-password rejection is enabled)"
+        throws: "AuthApiError with error.code='same_password'"
+        required_handling: >
+          Caller MUST check { error.code } and show a clear "choose a different password"
+          message. Do NOT auto-retry — there is no transient path to recovery.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-updateuser"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: refreshSession
+    import_path: "@supabase/supabase-js"
+    description: >
+      Returns a new session by exchanging the current refresh token regardless of
+      expiry status. Use to force-rotate tokens before a long operation (uploads,
+      multi-step writes). Returns { data: { user, session }, error }.
+      Signature confirmed at GoTrueClient.d.ts line 1937 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-refreshsession
+      # Error codes from @supabase/auth-js error-codes.ts: refresh_token_not_found,
+      # refresh_token_already_used, session_not_found.
+      - id: refresh-session-token-revoked
+        condition: >
+          The refresh token has already been used (rotation collision), is unknown
+          to the auth server (logged out from another tab), or the user was admin-deleted.
+        throws: "AuthApiError with error.code='refresh_token_not_found' or 'refresh_token_already_used' or 'session_not_found' and error.status=401"
+        required_handling: >
+          Caller MUST check { error } and treat this as a hard sign-out signal.
+          Clear local session state, redirect to /login. DO NOT retry refreshSession() —
+          the refresh token is permanently invalid (single-use semantics with rotation).
+          If the error occurs mid-operation (e.g. before an upload), abort the operation
+          and instruct the user to sign in again before resuming.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-refreshsession"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: refresh-session-network-error
+        condition: "Network failure prevents the refresh request from reaching Supabase Auth"
+        throws: "AuthRetryableFetchError (name='AuthRetryableFetchError')"
+        required_handling: >
+          Caller MUST distinguish AuthRetryableFetchError from token revocation —
+          a network error is transient and safe to retry with exponential backoff.
+          DO NOT log the user out on a single network failure; the existing session
+          may still be valid for the remaining lifetime of the access token.
+          Surface "offline — retrying" indicator to the user rather than redirecting.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-refreshsession"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: exchangeCodeForSession
+    import_path: "@supabase/supabase-js"
+    description: >
+      Exchanges an authorization code received from an OAuth or magic link callback
+      for a Supabase session, using PKCE (Proof Key for Code Exchange). The
+      counterpart to signInWithOAuth({ flowType: 'pkce' }) and signInWithOtp({
+      shouldCreateUser: true }) in PKCE mode. Returns { data: { session }, error }.
+      Signature confirmed at GoTrueClient.d.ts line 827 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/auth-exchangecodeforsession
+      # Error classes: AuthPKCEGrantCodeExchangeError, AuthPKCECodeVerifierMissingError
+      # from @supabase/auth-js/src/lib/errors.ts. Error codes: bad_code_verifier,
+      # pkce_code_verifier_not_found.
+      - id: exchange-code-pkce-verifier-missing
+        condition: >
+          The auth callback was reached but the PKCE code verifier was lost from
+          storage. Common causes: user clicked the magic link in a different browser,
+          cleared cookies/localStorage mid-flow, or the SSR framework didn't persist
+          the verifier across the redirect (e.g. cookies set with insufficient SameSite).
+        throws: "AuthPKCECodeVerifierMissingError (name='AuthPKCECodeVerifierMissingError', error.code='pkce_code_verifier_not_found') or AuthApiError with error.code='bad_code_verifier'"
+        required_handling: >
+          Caller MUST check { error } in the route handler before issuing a session
+          cookie or redirecting. Redirect the user back to /login with a message:
+          "Open this link in the same browser where you started signing in."
+          For Next.js / SvelteKit auth callbacks, ensure verifier storage uses
+          cookies via @supabase/ssr (not localStorage) so the verifier survives
+          the redirect from the email client.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-exchangecodeforsession"
+          - "https://supabase.com/docs/guides/auth/server-side/oauth-with-pkce-flow-for-ssr"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: exchange-code-expired
+        condition: >
+          The authorization code is expired or has already been redeemed
+          (single-use semantics). Magic link codes typically expire after 1 hour.
+        throws: "AuthApiError with error.code='otp_expired' or 'flow_state_expired' and error.status=401 or 403"
+        required_handling: >
+          Caller MUST check { error } in the callback handler before issuing a session.
+          Redirect to /login with a clear "this link expired, request a new one" message.
+          DO NOT silently render the post-login page — user will appear signed-in client-side
+          but every API call will 401, producing a confusing broken state.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-exchangecodeforsession"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: storage.download
+    import_path: "@supabase/supabase-js"
+    description: >
+      Downloads a file from a Supabase Storage bucket. Called as
+      supabase.storage.from('bucket').download('path/file.png').
+      Returns { data: Blob | null, error: StorageApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at storage-js/dist/index.d.cts (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/storage-from-download
+      # StorageApiError class from @supabase/storage-js/src/lib/common/errors.ts.
+      # Status codes confirmed from StorageApiError constructor.
+      - id: storage-download-not-found
+        condition: "The file at the specified path does not exist in the bucket"
+        throws: "StorageApiError with error.status=404 and error.message containing 'Object not found' or 'not_found'"
+        required_handling: >
+          Caller MUST check { error } before treating data as a valid file blob.
+          A null data with no error is also possible — handle both cases.
+          Show user a clear "file not found" message. DO NOT retry — the file
+          will not appear by retrying.
+          For user-uploaded content, verify the database row still references this
+          path (file rows can outlive deleted storage objects).
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-download"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: storage-download-unauthorized
+        condition: >
+          RLS policy denies read access — user is unauthenticated and bucket is private,
+          or user lacks the SELECT policy for this object path.
+        throws: "StorageApiError with error.status=400 or 403 and error.statusCode containing 'Unauthorized' or RLS-policy text"
+        required_handling: >
+          Caller MUST check { error } and distinguish 'not found' from 'unauthorized'.
+          DO NOT leak the difference to end users — a 'file not found' message for
+          both prevents enumeration of private file paths.
+          Log the violation server-side for security review if it's unexpected.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-download"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: storage.createSignedUrl
+    import_path: "@supabase/supabase-js"
+    description: >
+      Generates a time-limited signed URL that grants access to a private file
+      without requiring an authenticated client. Called as
+      supabase.storage.from('bucket').createSignedUrl('path/file.png', expiresIn).
+      Returns { data: { signedUrl, path, token } | null, error: StorageApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at storage-js/dist/index.d.cts line 1202 (supabase-js@2.108.2).
+
+    postconditions:
+      # Evidence: https://supabase.com/docs/reference/javascript/storage-from-createsignedurl
+      # StorageApiError class from @supabase/storage-js/src/lib/common/errors.ts.
+      - id: storage-signed-url-not-found
+        condition: "The file at the specified path does not exist when generating the signed URL"
+        throws: "StorageApiError with error.status=400 or 404 and error.message containing 'Object not found'"
+        required_handling: >
+          Caller MUST check { error } before sharing the signed URL with the requester.
+          DO NOT return a signed URL pointing at a missing object — the recipient
+          gets a confusing 404 at use-time with no actionable error.
+          Surface the missing-file error to the requester immediately so they can
+          re-upload or pick a different file.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-createsignedurl"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: storage-signed-url-unauthorized
+        condition: >
+          The current client lacks permission to sign URLs for this path. Anon clients
+          cannot sign URLs for private bucket objects; only the service role and
+          authenticated users with appropriate RLS policies can.
+        throws: "StorageApiError with error.status=400 or 403 and error.statusCode containing 'Unauthorized'"
+        required_handling: >
+          Caller MUST check { error } before returning the signed URL.
+          Move signed-URL generation to a server-side route (Edge Function, Next.js
+          Route Handler) where you can use the service role key safely — generating
+          on the client with the anon key fails for any private bucket object.
+          DO NOT expose the service role key to the browser to "work around" this.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-createsignedurl"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
           incident_cost_range: high
         evidence_quality: confirmed
