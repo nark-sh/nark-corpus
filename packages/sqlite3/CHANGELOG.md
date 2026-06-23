@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 67% → 71% (effective 100%)
+
+- **Profile:** `packages/sqlite3/contract.yaml`
+- **Functions added:** Statement.each (1 total)
+- **Postconditions added:** 2 (statement-each-completion-error-ignored, statement-each-cursor-not-released)
+- **Functions intentionally omitted this pass:** Statement.each was REMOVED from the omitted list (promoted to contracted). Remaining 6 omissions: Statement.bind (immediate binding error, rare), Statement.reset (documented "never fails"), Statement.all (covered by Statement.run finalize pattern), Statement.map (covered by Database.map shortcut), Database.serialize/parallelize (mode controls, no err on callbacks), Database.wait (callback has no err parameter).
+- **Scanner concerns queued:** 2 (`concern-20260623-sqlite3-deepen-1`, `concern-20260623-sqlite3-deepen-2`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:**
+  - https://github.com/TryGhost/node-sqlite3/wiki/API (Statement#each — quoted: cursor-lock warning + finalize/reset requirement + dual-callback completion shape)
+  - https://raw.githubusercontent.com/TryGhost/node-sqlite3/master/test/each.test.js (confirms Database.each dual-callback pattern that Statement.each inherits)
+  - node_modules/sqlite3/lib/sqlite3.d.ts:91-93 (Statement.each signature)
+- **Gap identified:** Statement.each was previously omitted under "same error profile as Database.each" — that was incorrect. The wiki explicitly documents Statement.each carries the same cursor-lock warning as Statement.get ("can leave the database locked") AND an explicit finalize/reset requirement that Database.each does NOT have (Database.each auto-finalizes the internally-created statement via statement.each().finalize(); Statement.each leaves the cursor open). The dual-callback silent-failure pattern also takes on a distinct cost on Statement.each because swallowed errors leak the cursor lock — surfacing later as SQLITE_BUSY on db.close(). contract_version 1.3.0 → 1.4.0.
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23T21:07Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** sqlite3@6.0.1
