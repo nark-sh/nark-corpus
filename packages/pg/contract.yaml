@@ -2,11 +2,11 @@ package: pg
 semver: ">=8.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83  # contracted_functions / total_async_api_functions (5/6: query, connect, end, release, transaction; omitted: copyFrom/copyTo)
+coverage_score: 0.83  # contracted_functions / total_async_api_functions (5/6: query, connect, end, release, transaction; omitted: copyFrom/copyTo). 2026-06-23 deepen pass added 9 postconditions across query (+4) and connect (+5), deepening behavior coverage against pg@8.22.0.
 
 # CRITICAL SECURITY NOTE:
 # pg has 1 CVE in versions < 7.2.0:
@@ -147,6 +147,112 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+      # Evidence: pg/lib/client.js:632 — `throw new TypeError('Client was passed a null or undefined query')`
+      # Source verified against pg@8.22.0 installed from npm 2026-06-23.
+      - id: null-undefined-query-throws
+        condition: "client.query() or pool.query() called with null/undefined first argument"
+        throws: "TypeError with message 'Client was passed a null or undefined query'"
+        required_handling: >
+          Caller MUST validate that the query string/config is non-null before invoking
+          query(). Common cause: building dynamic SQL from a conditional that may yield
+          undefined (e.g. `const sql = condition ? buildQuery() : undefined; await client.query(sql)`).
+          This is a synchronous TypeError thrown before any Promise resolution — it WILL
+          NOT be caught by `.catch()` on the returned promise if the caller forgot to
+          await inside try/catch. Wrap query() invocations in try/catch when the query
+          source could be undefined.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/lib/client.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg-pool/index.js:436 — `new Error('Passing a function as the first parameter to pool.query is not supported')`
+      # Source verified against pg-pool@latest installed from npm 2026-06-23.
+      - id: pool-query-function-arg-rejects
+        condition: "pool.query() called with a function as the first argument"
+        throws: "Error with message 'Passing a function as the first parameter to pool.query is not supported'"
+        required_handling: >
+          Caller MUST pass a query string or QueryConfig object as the first argument to
+          pool.query() — never a function. Common cause: passing a query-builder factory
+          by reference instead of calling it. Pattern check: `pool.query(buildQuery, ...)`
+          should be `pool.query(buildQuery(), ...)`. The error rejects the returned
+          Promise — must be handled in catch block.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+          - "https://node-postgres.com/apis/pool"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg/lib/client.js:665 — `const error = new Error('Query read timeout')` triggered by setTimeout
+      # when config.query_timeout exceeded. Per-query timeout added in pg@8.13.0
+      # (https://node-postgres.com/announcements — "pg@8.13.0 added the ability to specify
+      # query timeout on a per-query basis"). Source verified against pg@8.22.0.
+      - id: query-read-timeout
+        condition: "Query exceeds query_timeout (per-query or client-level) milliseconds"
+        throws: "Error with message 'Query read timeout'"
+        required_handling: >
+          Caller MUST handle query timeout errors distinctly from connection errors. When
+          query_timeout is configured (on Client config or per-query via QueryConfig),
+          long-running queries that exceed the timeout reject with 'Query read timeout'.
+          DO NOT blindly retry — the query may still be running on the database and a
+          retry can cause duplicate work or duplicate writes. Cancel the query at the
+          PostgreSQL level via pg_cancel_backend() if retry is required. For idempotent
+          read queries, retry with shorter timeout is acceptable.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/lib/client.js"
+          - "https://node-postgres.com/announcements"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: pg-protocol exports DatabaseError class. Re-exported from pg as
+      # `import { DatabaseError } from 'pg'`. All Postgres-level errors (constraint
+      # violations, syntax errors, etc.) are instances of DatabaseError with .code,
+      # .severity, .detail, .hint, .position, .constraint, .table, .column, .dataType,
+      # .schema, .file, .line, .routine. Source verified against pg@8.22.0 types
+      # (@types/pg/index.d.ts:348 — `export { DatabaseError } from "pg-protocol"`).
+      - id: database-error-canonical-type
+        condition: "Postgres server-side error (constraint violation, syntax error, type error, etc.)"
+        throws: "DatabaseError (from 'pg-protocol', re-exported by pg) with .code property containing SQLSTATE"
+        required_handling: >
+          Caller SHOULD use `error instanceof DatabaseError` to distinguish Postgres-level
+          errors from client-side errors (TypeError, network errors). DatabaseError exposes
+          structured fields not available on generic Error: .code (5-char SQLSTATE),
+          .detail, .hint, .position (for syntax errors), .constraint, .table, .column,
+          .schema. Generic `catch (error)` without instance check loses this structured
+          context. Pattern:
+            try { await client.query(...); }
+            catch (err) {
+              if (err instanceof DatabaseError) {
+                // handle by err.code (e.g. '23505' unique violation)
+              } else {
+                // network / type error
+              }
+            }
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-protocol/src/messages.ts"
+          - "https://node-postgres.com/apis/client"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
     edge_cases:
       - id: sql-injection-string-concatenation
         description: >
@@ -262,6 +368,142 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: critical
+
+      # Evidence: pg/lib/client.js:154 — `const err = new Error('Client has already been connected. You cannot reuse a client.')`
+      # Source verified against pg@8.22.0 installed from npm 2026-06-23.
+      - id: client-reuse-after-connect
+        condition: "Client.connect() called a second time on the same Client instance"
+        throws: "Error with message 'Client has already been connected. You cannot reuse a client.'"
+        required_handling: >
+          Caller MUST construct a NEW Client instance for each connection cycle. Calling
+          .connect() twice on the same Client (even after .end()) rejects with this error.
+          Common cause: connection-retry logic that loops on the same client instance after
+          end(). CORRECT pattern: on retry, instantiate `const client = new Client(config)`
+          then await client.connect(). For pooled scenarios, use Pool which manages the
+          Client lifecycle internally.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/lib/client.js"
+          - "https://node-postgres.com/apis/client"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg-pool/index.js:192 — `const err = new Error('Cannot use a pool after calling end on the pool')`
+      # Source verified against pg-pool@latest installed from npm 2026-06-23.
+      - id: pool-connect-after-end
+        condition: "Pool.connect() called after Pool.end() has been initiated"
+        throws: "Error with message 'Cannot use a pool after calling end on the pool'"
+        required_handling: >
+          Caller MUST stop routing new request handlers before calling pool.end(). Pattern:
+          set a `shuttingDown` flag in the SIGTERM/SIGINT handler, reject incoming requests
+          while shuttingDown is true, then call pool.end(). Without this guard, any
+          in-flight request handler that calls pool.connect() during graceful-shutdown
+          drain throws this error and the request fails. This is distinct from the
+          `pool-query-after-end` postcondition on `end` — that one covers pool.query();
+          this one covers pool.connect() specifically.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: pg-pool/index.js:288-303 — onConnect hook (added in pg@8.20.0 per
+      # https://node-postgres.com/announcements) is invoked via this._promiseTry().
+      # If it throws/rejects, the client is removed from the pool, client.end() is
+      # called, and the error is propagated to the pendingItem.callback (i.e. the
+      # pool.connect() promise rejects with the hook's error).
+      # Source verified against pg-pool@latest installed from npm 2026-06-23.
+      - id: pool-onconnect-hook-fails
+        condition: "PoolConfig.onConnect callback throws or rejects during connection setup"
+        throws: "The hook's own error (any Error subclass) rejected from Pool.connect()"
+        required_handling: >
+          Caller MUST handle errors from pool.connect() even when an onConnect hook is
+          configured — a failing hook propagates as a pool.connect() rejection.
+          The onConnect hook is invoked after the underlying TCP connect succeeds but
+          before the client is returned. Common failure modes inside onConnect:
+          (1) a SET command fails (`SET search_path TO ...` with an invalid schema),
+          (2) a session-config query times out,
+          (3) the hook awaits an external service that returns 500.
+          The pool destroys the client on hook failure (client.end()) — partial
+          initialization is not retained. Implement retry logic around pool.connect()
+          calls whose onConnect performs network I/O.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+          - "https://node-postgres.com/announcements"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: pg-pool/index.js:276 — `err = new Error('Connection terminated due to connection timeout', { cause: err })`
+      # This is a DIFFERENT timeout class than 'timeout exceeded when trying to connect'
+      # (line 224, already covered by pool-exhausted postcondition). This one fires
+      # when a NEW client connection (TCP/TLS handshake) takes longer than
+      # connectionTimeoutMillis. The previous postcondition fires when an existing
+      # idle client is unavailable due to pool exhaustion.
+      # Source verified against pg-pool@latest installed from npm 2026-06-23.
+      - id: connection-terminated-during-timeout
+        condition: "TCP/TLS handshake for a new pool client exceeds connectionTimeoutMillis"
+        throws: "Error with message 'Connection terminated due to connection timeout' (with original error attached as .cause)"
+        required_handling: >
+          Caller MUST distinguish this from `pool-exhausted` (which fires when an existing
+          idle client is unavailable). This timeout fires during the actual TCP/TLS
+          handshake when establishing a new connection — typically caused by network
+          latency, firewall delays, or a slow PostgreSQL bootstrap (slow SSL negotiation
+          on PG 17+ direct sslnegotiation). Inspect error.cause for the underlying
+          connect error to diagnose. Treat as a transient error and retry with backoff,
+          but escalate to ops if persistent — usually indicates network/infrastructure
+          issue, not pool sizing.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/packages/pg-pool/index.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: pg/lib/connection-parameters.js:104-112 — sslnegotiation added in
+      # pg@8.22.0 (per https://node-postgres.com/announcements — "pg@8.22.0 added
+      # sslnegotiation=direct support for PostgreSQL 17+"). Constructor validates the
+      # value and throws on invalid combinations:
+      #   line 107: `Invalid sslnegotiation value: "${this.sslnegotiation}". Valid values are "postgres" and "direct".`
+      #   line 111: `sslnegotiation=direct requires SSL to be enabled`
+      # Source verified against pg@8.22.0 installed from npm 2026-06-23.
+      - id: sslnegotiation-direct-requires-ssl
+        condition: "Pool/Client constructed with sslnegotiation: 'direct' but ssl is falsy"
+        throws: "Error with message 'sslnegotiation=direct requires SSL to be enabled' (or 'Invalid sslnegotiation value: ...' for unknown values)"
+        required_handling: >
+          Caller MUST set ssl: true (or an ssl ConnectionOptions object) when using
+          sslnegotiation: 'direct'. Direct SSL negotiation requires TLS — there is no
+          plaintext mode. This is a configuration-time error: the Pool or Client
+          constructor throws synchronously, so the failure occurs at app startup, not
+          on first connect(). When upgrading to pg@8.22.0+ and PostgreSQL 17+ for the
+          faster TLS handshake, audit existing PoolConfig/ClientConfig to ensure ssl
+          is set wherever sslnegotiation is. Equally, 'sslnegotiation' values other
+          than 'postgres' or 'direct' throw a similar Invalid-value error.
+        sources:
+          - "https://github.com/brianc/node-postgres/blob/master/lib/connection-parameters.js"
+          - "https://node-postgres.com/announcements"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
     edge_cases:
       - id: pool-query-for-transactions
