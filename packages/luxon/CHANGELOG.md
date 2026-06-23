@@ -3,6 +3,26 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass 10 (contract_version 1.4.0)
+
+- **API surface (corrected):** 37 callable methods (was 30 — Interval and Duration surfaces under-counted in pass 2)
+- **Contracted before this pass:** 20
+- **Contracted after this pass:** 27 (+7)
+- **Effective coverage:** 27/27 error-contractable = 100%
+- **coverage_score:** 0.67 → 0.73 (denominator grew)
+- **Pass author:** deepen-stream-2
+- **Scanner version used:** nark@3.1.0 (corpus validate only)
+- **New postconditions added (all throw-bearing, all verified empirically on luxon@3.7.2):**
+  - `DateTime.hasSame(other, unit)` — `hassame-invalid-unit` — throws `InvalidUnitError` via `startOf() -> normalizeUnit()` when unit is not a recognized luxon unit string
+  - `Duration.plus(duration)` — `duration-plus-non-duration-throws` — throws `InvalidArgumentError` via `fromDurationLike()` when arg is a string/null/undefined/non-object
+  - `Duration.minus(duration)` — `duration-minus-non-duration-throws` — same throw profile as Duration.plus (delegates to fromDurationLike then plus(negate))
+  - `Duration.set(values)` — `duration-set-invalid-unit` — throws `InvalidUnitError` via `normalizeObject() -> normalizeUnit()` when values object contains an unrecognized unit key
+  - `Interval.length(unit)` — `interval-length-invalid-unit` — throws `InvalidUnitError` via `toDuration().get(unit)` when unit is not recognized (invalid Interval returns NaN, no throw)
+  - `Interval.count(unit)` — `interval-count-invalid-unit` — throws `InvalidUnitError` via `startOf(unit)` when unit is not recognized (invalid Interval returns NaN, no throw)
+  - `Interval.toDuration(unit)` — `interval-toduration-invalid-unit` — throws `InvalidUnitError` via `e.diff(s, unit)` when unit is not recognized (invalid Interval returns Invalid Duration, no throw)
+- **Evidence:** node_modules/luxon@3.7.2/src/{datetime,duration,interval}.js — line numbers cited in contract.yaml header block. Empirical verification harness at `/tmp/claude/test_luxon.mjs`.
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 10)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** luxon@3.7.2
