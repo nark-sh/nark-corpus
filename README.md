@@ -1,3 +1,9 @@
+<p align="center">
+  <!-- Same brand mark as nark/README. Keep them visually identical so users
+       recognize the two packages as one product. -->
+  <img src="./docs/images/nark-logo.svg" alt="nark-corpus" height="100">
+</p>
+
 # nark-corpus
 
 **Contract library for nark — YAML definitions of error handling requirements for 169+ npm packages.**
@@ -10,6 +16,17 @@ A contract is a YAML file that describes:
 - Which functions/methods in a package can fail
 - How they fail (thrown errors, rejected promises, error events)
 - What callers must do to handle those failures
+
+<p align="center">
+  <!-- Syntax-highlighted screenshot of a real contract.yaml.
+       Recommendation: use packages/axios/contract.yaml or
+       packages/@prisma/client/contract.yaml — both are short enough to
+       fit one screen and showcase multiple postconditions.
+       Render via freeze (https://github.com/charmbracelet/freeze) or
+       Carbon (https://carbon.now.sh) with the GitHub Dark theme.
+       Target: 1200-1440px wide @ 2x retina, transparent background. -->
+  <img src="./docs/images/contract-yaml-example.png" alt="A nark contract.yaml file showing the structure of postconditions, triggers, and required error handling" width="720">
+</p>
 
 Example contract for `axios`:
 
@@ -56,6 +73,7 @@ nark-corpus/
 ```
 
 ## Covered Packages (169+)
+
 
 | Category | Packages |
 |----------|----------|
