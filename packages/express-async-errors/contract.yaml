@@ -1,25 +1,25 @@
 package: express-async-errors
 semver: '>=3.0.0 <4.0.0'
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-17'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.82
-# Depth pass 2026-04-17 (deepen-stream-2 pass 3):
-# API surface: 11 Nark profiles (side-effect-only package — no exported functions)
-# Contracted before: 5 (2 preconditions + 3 postconditions)
-# Contracted after: 9 (+4 new postconditions: express-v5-incompatible, esm-not-supported,
-#   param-middleware-patched, bundler-code-splitting-breaks-patch)
+coverage_score: 0.92
+# Depth pass 2026-06-24 (deepen-stream-2 pass 74):
+# API surface: 13 Nark profiles (side-effect-only package — no exported functions; 11 prior + 2 added)
+# Contracted before: 11 (2 preconditions + 7 postconditions + 2 edge_cases)
+# Contracted after: 13 (+2 new postconditions: callback-based-middleware-not-caught, noop-fallback-silent-swallow)
 # Intentionally omitted: 2 (function.length preservation — impl detail, already correct;
-#   async error handler patching — covered by async-error-forwarded)
+#   typescript-no-misused-promises lint — non-runtime concern, not a behavioral contract)
 # Evidence confirmed from:
-#   https://github.com/davidbanham/express-async-errors/blob/master/index.js (source)
+#   https://github.com/davidbanham/express-async-errors/blob/master/index.js (source — wrap() line 14-26, noop fallback line 17)
+#   https://github.com/davidbanham/express-async-errors/issues/46 (multer callback middleware)
 #   https://github.com/davidbanham/express-async-errors/issues/28 (Express 5 incompatibility)
 #   https://github.com/davidbanham/express-async-errors/issues/50 (ESM ReferenceError)
 #   https://github.com/davidbanham/express-async-errors/issues/47 (bundler code-splitting)
-#   node_modules/express-async-errors/index.js — patchRouterParam() confirmed
+#   node_modules/express-async-errors@3.1.1/index.js — patchRouterParam() + noop fallback confirmed
 
 functions:
   - name: require
@@ -276,6 +276,124 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: high
+
+      # Evidence: https://github.com/davidbanham/express-async-errors/issues/46
+      # Root cause: callback-based middleware (e.g. multer.diskStorage's destination/filename
+      # callbacks, busboy event handlers) executes its callbacks SYNCHRONOUSLY outside the
+      # Promise chain that wrap() (index.js line 14-26) monitors. ret.catch() never fires
+      # because the throw happens in a callback function, not inside the wrapped Promise.
+      - id: callback-based-middleware-not-caught
+        condition: >
+          An async route handler invokes callback-based middleware (multer, busboy, formidable,
+          any library that uses Node-style (err, value) callbacks or synchronous storage-engine
+          callbacks) and the user throws inside that callback. The throw happens in a synchronous
+          callback scope OUTSIDE the Promise returned by the wrapped async route handler.
+          express-async-errors only catches rejections from the OUTER Promise (the one returned
+          by the async function), so the thrown error escapes the patched Layer#handle, becomes
+          an uncaughtException, and crashes the Node.js process per default Node behavior.
+        throws: >
+          Uncaught Error at process scope. Node.js default 'uncaughtException' behavior either
+          crashes the process (Node 15+) or emits a warning and continues with corrupted state
+          (older Node versions). The Express error handler is bypassed entirely — the request
+          either hangs until timeout or the entire server crashes.
+        required_handling: >
+          Inside any callback-based middleware, MUST pass errors to next(err) explicitly rather
+          than throwing. express-async-errors does NOT catch throws inside synchronous callback
+          scopes — only rejections from the outer async function's Promise.
+
+            // ❌ WRONG — throw escapes wrap()'s Promise.catch
+            const upload = multer({
+              storage: multer.diskStorage({
+                destination: (req, file, cb) => {
+                  if (!req.user) throw new Error('unauthorized');  // crashes process
+                  cb(null, '/uploads');
+                },
+              }),
+            });
+
+            // ✅ CORRECT — pass error to multer's callback
+            const upload = multer({
+              storage: multer.diskStorage({
+                destination: (req, file, cb) => {
+                  if (!req.user) return cb(new Error('unauthorized'));
+                  cb(null, '/uploads');
+                },
+              }),
+            });
+
+          Alternatively, validate inputs BEFORE invoking callback-based middleware so the throw
+          happens inside the async handler's Promise chain where wrap() can catch it.
+        sources:
+          - https://github.com/davidbanham/express-async-errors/issues/46
+          - https://github.com/davidbanham/express-async-errors/blob/master/index.js
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: node_modules/express-async-errors/index.js line 17:
+      #   const next = (args.length === 5 ? args[2] : last(args)) || noop;
+      # When a wrapped handler is invoked outside Express's normal middleware pipeline
+      # (e.g. directly called in a test, invoked as an event handler, or composed inside
+      # another wrapper that does not forward a next callback), the `|| noop` fallback
+      # silently swallows the async rejection. The Promise.catch on line 18 calls noop(err)
+      # which discards the error.
+      - id: noop-fallback-silent-swallow
+        condition: >
+          A wrapped async handler (one that has been registered via app.get/post/use after
+          require('express-async-errors')) is invoked outside Express's standard router
+          dispatch — for example: called directly inside a unit test without next(), invoked
+          as a Node EventEmitter listener, or composed into another middleware wrapper that
+          does not pass a next callback through. wrap() in index.js falls back to `next = noop`
+          (Function.prototype, line 5) and the resulting `ret.catch(err => next(err))` silently
+          discards every rejection.
+        throws: >
+          Nothing — the rejection is consumed by noop and disappears. No uncaughtException,
+          no unhandledRejection, no Express error handler, no log. Indistinguishable from a
+          successful invocation in monitoring.
+        required_handling: >
+          Do NOT invoke wrapped Express route handlers directly. They are only safe inside
+          Express's router dispatch where Express itself supplies a real next() callback.
+
+            // ❌ WRONG — direct call discards async errors
+            const handler = async (req, res) => {
+              const user = await User.findById(req.params.id);
+              if (!user) throw new Error('not found');  // swallowed by noop fallback
+              res.json(user);
+            };
+            app.get('/users/:id', handler);
+            await handler(fakeReq, fakeRes);  // error vanishes
+
+            // ✅ CORRECT — invoke through supertest or real HTTP request
+            await supertest(app).get('/users/123');
+
+            // ✅ CORRECT for unit testing handler logic — extract pure function
+            async function loadUser(id) {
+              const user = await User.findById(id);
+              if (!user) throw new Error('not found');
+              return user;
+            }
+            app.get('/users/:id', async (req, res) => res.json(await loadUser(req.params.id)));
+            await expect(loadUser('missing')).rejects.toThrow('not found');
+
+          In test code that needs to invoke an Express handler directly, supply a real next
+          callback that records errors:
+
+            let capturedErr;
+            await handler(fakeReq, fakeRes, (err) => { capturedErr = err; });
+            expect(capturedErr).toBeDefined();
+        sources:
+          - https://github.com/davidbanham/express-async-errors/blob/master/index.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
 
     edge_cases:
       - id: require-once

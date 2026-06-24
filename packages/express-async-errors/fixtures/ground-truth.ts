@@ -94,3 +94,72 @@ function wouldFailWithExpressV5(): void {
 function wouldFailInEsm(): void {
   // ESM import would fail — using require() is the only supported form
 }
+
+// ---------------------------------------------------------------------------
+// Added 2026-06-24 (deepen-stream-2 pass 74) — callback-middleware + noop-fallback
+// ---------------------------------------------------------------------------
+
+// SHOULD_FIRE: callback-based-middleware-not-caught
+function multerCallbackThrowEscapes(): void {
+  require('express-async-errors');
+  const app = express();
+  const fakeMulter = { diskStorage: (opts: { destination: (req: express.Request, file: unknown, cb: (e: Error | null, p?: string) => void) => void }) => opts };
+  const storage = fakeMulter.diskStorage({
+    destination: (req, file, cb) => {
+      if (!(req as express.Request & { user?: unknown }).user) throw new Error('unauthorized');
+      cb(null, '/uploads');
+    },
+  });
+  app.post('/upload', async (req: express.Request, res: express.Response) => {
+    void storage;
+    res.json({ ok: true });
+  });
+}
+
+// SHOULD_NOT_FIRE: callback-based-middleware-not-caught
+function multerCallbackPassesErrorToCb(): void {
+  require('express-async-errors');
+  const app = express();
+  const fakeMulter = { diskStorage: (opts: { destination: (req: express.Request, file: unknown, cb: (e: Error | null, p?: string) => void) => void }) => opts };
+  const storage = fakeMulter.diskStorage({
+    destination: (req, file, cb) => {
+      if (!(req as express.Request & { user?: unknown }).user) return cb(new Error('unauthorized'));
+      cb(null, '/uploads');
+    },
+  });
+  app.post('/upload', async (req: express.Request, res: express.Response) => {
+    void storage;
+    res.json({ ok: true });
+  });
+  app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    res.status(500).json({ error: err.message });
+  });
+}
+
+// SHOULD_FIRE: noop-fallback-silent-swallow
+async function invokeWrappedHandlerDirectlyWithoutNext(): Promise<void> {
+  require('express-async-errors');
+  const handler = async (req: express.Request, res: express.Response) => {
+    const user = (req as express.Request & { user?: { id: string } }).user;
+    if (!user) throw new Error('not found');
+    res.json(user);
+  };
+  const fakeReq = {} as express.Request;
+  const fakeRes = { json: () => undefined } as unknown as express.Response;
+  await handler(fakeReq, fakeRes);
+}
+
+// SHOULD_NOT_FIRE: noop-fallback-silent-swallow
+async function invokeWrappedHandlerWithExplicitNext(): Promise<void> {
+  require('express-async-errors');
+  const handler = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const user = (req as express.Request & { user?: { id: string } }).user;
+    if (!user) return next(new Error('not found'));
+    res.json(user);
+  };
+  const fakeReq = {} as express.Request;
+  const fakeRes = { json: () => undefined } as unknown as express.Response;
+  let capturedErr: Error | undefined;
+  await handler(fakeReq, fakeRes, (err) => { capturedErr = err as Error; });
+  void capturedErr;
+}
