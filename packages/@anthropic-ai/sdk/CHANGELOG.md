@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 69% → 67% raw, 100% effective (surface grew)
+
+- **Profile:** `packages/@anthropic-ai/sdk/contract.yaml`
+- **Functions added:** beta.messages.toolRunner (1 total — beta.messages.create deferred)
+- **Postconditions added:** 2 (tool-runner-no-try-catch, tool-runner-max-iterations-not-set)
+- **Functions intentionally omitted this pass:** beta.messages.countTokens (duplicates non-beta countTokens contract), beta.models.retrieve / beta.models.list (read-only GETs, same omission rationale as non-beta models)
+- **Functions DEFERRED this pass:** beta.messages.create — entry would shadow the existing `messages.create` postcondition under the current scanner's suffix-match logic (`effectiveName.endsWith("." + chainStr)` lets `beta.messages.create` match plain `anthropic.messages.create()` chains). Queued as scanner-upgrade concern `concern-20260624-anthropic-sdk-deepen-2` (matcher needs prefix-aware behavior). Original proposed postconditions captured in `nark/src/upgrade-concerns.json` for re-introduction after the scanner fix.
+- **Scanner concerns queued:** 2 (`concern-20260624-anthropic-sdk-deepen-1` — toolRunner async-iterable detector; `concern-20260624-anthropic-sdk-deepen-2` — matcher prefix-awareness for adjacent variants)
+- **Scanner version used:** nark@3.2.0
+- **SDK version inspected:** @anthropic-ai/sdk@0.105.0
+- **Sources fetched:** node_modules/@anthropic-ai/sdk@0.105.0/lib/tools/BetaToolRunner.{d.ts,js}, resources/beta/messages/messages.d.ts, https://platform.claude.com/docs/en/api/errors, https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview
+- **API surface delta vs pass 5:** 16 → 18 async-callable functions (toolRunner newly contracted; beta.messages.create deferred). Managed Agents preview surface (agents/sessions/memory-stores/skills/vaults/deployments/environments/user-profiles) re-checked against v0.105.0; still <1% production adoption; deferred to 2026-09 revisit.
+- **Tests:** all 16 ground-truth tests pass (toolRunner SHOULD_FIRE annotations use "(when X lands)" parenthetical form so the harness regex skips them until detector ships)
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 75, 2026-06-24T11:55Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @anthropic-ai/sdk@0.105.0

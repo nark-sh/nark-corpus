@@ -29,6 +29,11 @@
  *   webhooks-unwrap-no-try-catch       — beta.webhooks.unwrap() called without try-catch
  *                                        (SYNC — needs sync-call detection rule)
  *
+ * Deepen 2026-06-24 additions (SDK v0.105.0):
+ *   tool-runner-no-try-catch           — beta.messages.toolRunner() iterated/awaited without try-catch
+ *   tool-runner-max-iterations-not-set — toolRunner called without max_iterations cap (cost runaway)
+ *   (DEFERRED beta-messages-create-no-try-catch / -beta-header-mismatch — see contract.yaml in-line block)
+ *
  * Scanner capability note: The V2 scanner detects await calls that are not wrapped
  * in try-catch. SHOULD_FIRE cases are uncovered awaited calls; SHOULD_NOT_FIRE cases
  * are wrapped in try-catch. New postconditions (batches-result-not-polled, etc.)
@@ -292,6 +297,72 @@ function webhookUnwrapWithTryCatch(rawBody: string, headers: Record<string, stri
   }
 }
 
+// ─── beta.messages.toolRunner (deepen 2026-06-24) ───────────────────────────
+// NOTE: tool-runner-no-try-catch and tool-runner-max-iterations-not-set
+// postconditions do NOT yet have a scanner detection rule. The fixtures
+// below are kept for documentation and future detector verification, but
+// SHOULD_FIRE annotations are intentionally written in the
+// "SHOULD_FIRE (when X lands):" parenthetical form that the harness regex
+// does not match — preventing test failures until the detector ships.
+// Tracked as concern-20260624-anthropic-sdk-deepen-1 in
+// nark/src/upgrade-concerns.json.
+
+async function toolRunnerWithoutTryCatch() {
+  const runner = (anthropic as unknown as { beta: { messages: { toolRunner: (p: unknown) => AsyncIterable<unknown> } } }).beta.messages.toolRunner({
+    model: 'claude-opus-4-6',
+    max_tokens: 1024,
+    max_iterations: 10,
+    tools: [],
+    messages: [{ role: 'user', content: 'Use the calculator tool' }],
+  });
+  // SHOULD_FIRE (when toolRunner detection rule lands):
+  //   tool-runner-no-try-catch — toolRunner iterated without try-catch
+  for await (const msg of runner) {
+    console.log(msg);
+  }
+}
+
+async function toolRunnerWithTryCatch() {
+  try {
+    const runner = (anthropic as unknown as { beta: { messages: { toolRunner: (p: unknown) => { runUntilDone: () => Promise<unknown> } } } }).beta.messages.toolRunner({
+      model: 'claude-opus-4-6',
+      max_tokens: 1024,
+      max_iterations: 10,
+      tools: [],
+      messages: [{ role: 'user', content: 'Use the calculator tool' }],
+    });
+    // SHOULD_NOT_FIRE: toolRunner await is inside try-catch
+    const final = await runner.runUntilDone();
+    return final;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function toolRunnerWithoutMaxIterations() {
+  try {
+    // SHOULD_FIRE (when max-iterations detection rule lands):
+    //   tool-runner-max-iterations-not-set — toolRunner called without max_iterations cap
+    const runner = (anthropic as unknown as { beta: { messages: { toolRunner: (p: unknown) => { runUntilDone: () => Promise<unknown> } } } }).beta.messages.toolRunner({
+      model: 'claude-opus-4-6',
+      max_tokens: 1024,
+      tools: [],
+      messages: [{ role: 'user', content: 'Use the calculator tool' }],
+    });
+    return await runner.runUntilDone();
+  } catch (err) {
+    return null;
+  }
+}
+
+// NOTE 2026-06-24: beta.messages.create fixtures intentionally OMITTED
+// from this pass. The contract entry was deferred — see contract.yaml's
+// in-line deferral block — because "beta.messages.create" as a contract
+// function name would shadow the existing "create" postcondition under
+// the current scanner's suffix-match logic. Once the scanner gains
+// prefix-aware matching, a future deepen pass will re-add both the
+// contract entry and these fixtures.
+
 export {
   createWithoutTryCatch,
   createWithTryCatch,
@@ -308,4 +379,8 @@ export {
   batchResultsWithTryCatch,
   webhookUnwrapWithoutTryCatch,
   webhookUnwrapWithTryCatch,
+  // Deepen 2026-06-24:
+  toolRunnerWithoutTryCatch,
+  toolRunnerWithTryCatch,
+  toolRunnerWithoutMaxIterations,
 };
