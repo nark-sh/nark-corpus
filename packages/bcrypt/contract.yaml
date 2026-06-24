@@ -2,7 +2,7 @@ package: bcrypt
 semver: '>=5.0.0 <7.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -91,6 +91,38 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Source v6.0.0 lines 108-120: if (typeof data === 'function') { data(new Error('data must be a string or Buffer...')) }
+      # Mirror of the compare-callback-position-swap footgun: the wrong-position function is invoked with an
+      # Error via process.nextTick, the returned value is undefined (no Promise), and the await scope sees
+      # `await bcrypt.hash(...)` resolve to undefined with no catchable rejection.
+      - id: hash-callback-position-swap
+        condition: >-
+          The first or second positional argument to bcrypt.hash() is itself a function (typeof === 'function').
+          Common cause: registration flows refactored from callback to promise style where the cb was left in
+          the data or salt slot, or a helper that intended to return a salt value accidentally returns a
+          function reference.
+        throws: >-
+          Does NOT reject any Promise — none is constructed. bcrypt SYNCHRONOUSLY invokes the mispositioned
+          function with Error('data must be a string or Buffer and salt must either be a salt string or a number
+          of rounds') via process.nextTick. The return value of bcrypt.hash() is undefined; `await bcrypt.hash(fn, 10)`
+          resolves to undefined. The Error reaches the misplaced function but not the await-scope try-catch.
+        required_handling: >
+          Callers MUST validate that data is a string/Buffer BEFORE the call — a try-catch around
+          `await bcrypt.hash(...)` will NOT catch this misuse. In a registration handler, the downstream
+          symptom is that `await bcrypt.hash(plaintext, 10)` returns undefined, which then gets persisted
+          to the user record as a null/undefined password hash. Subsequent login attempts route through
+          bcrypt.compare(plaintext, undefined) and fail with a different error path — the original misuse
+          is invisible at the registration site.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
       - id: success
         condition: Hashing completes successfully
         returns: Promise<string> resolving to the bcrypt hash string (60 characters)
@@ -163,11 +195,14 @@ functions:
       - id: invalid-args
         condition: data or hash is null/undefined, or data is not a string/Buffer, or hash is not a string
         throws: >-
-          Error with message 'data and hash arguments required' or 'data must be a string or Buffer and hash must be a
-          string'
+          Async path (Promise): rejects with Error('data and hash arguments required') if either arg is null/undefined,
+          or Error('data and hash must be strings') for type mismatches (v6.0.0 source line 211 — message differs
+          from compareSync which still emits the longer 'data must be a string or Buffer and hash must be a string'
+          form on line 166).
         required_handling: >
           Caller MUST validate that both arguments are present and of the correct type. Wrap calls in try-catch or use
-          .catch() on the returned Promise.
+          .catch() on the returned Promise. Note: error.message text differs between sync and async paths in v6 —
+          do not assert on exact message text across paths.
         sources:
           - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
         severity: error
@@ -213,6 +248,37 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+      # Evidence: https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+      # Source v6.0.0 lines 179-191: if (typeof data === 'function') { data(new Error('data and hash arguments required')) }
+      # Same shape for hash. The callback IS invoked with an Error — but on the wrong argument, NOT on cb.
+      # The function then returns undefined (no Promise is constructed), so `await bcrypt.compare(fn, hash)` resolves
+      # to `undefined`. There is no rejection to catch in the await scope.
+      - id: compare-callback-position-swap
+        condition: >-
+          The first or second positional argument to bcrypt.compare() is itself a function (typeof === 'function').
+          Common cause: callers refactoring from callback→promise styles who accidentally leave the callback in
+          the data or hash slot, or callers passing an unawaited helper that returns a function.
+        throws: >-
+          Does NOT reject any Promise — none is constructed. Instead, bcrypt SYNCHRONOUSLY invokes the
+          mispositioned function with an Error('data and hash arguments required') via process.nextTick.
+          The return value of bcrypt.compare() in this branch is undefined; `await bcrypt.compare(fn, hash)`
+          resolves to undefined. The Error reaches the misplaced function but not the await-scope try-catch.
+        required_handling: >
+          Callers MUST validate that both positional arguments are strings/Buffers BEFORE the call — a try-catch
+          around `await bcrypt.compare(...)` will NOT catch this misuse. The downstream symptom in an auth check
+          is silent rejection of valid credentials: `if (await bcrypt.compare(plaintext, storedHash))` evaluates
+          the undefined return as falsy, denying access to users whose credentials would otherwise match. The
+          misfired callback's Error lands in whichever scope owns the function value, which is rarely the
+          auth-check scope.
+        sources:
+          - https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
       - id: mismatch
         condition: The plain-text data does not match the hash
         returns: Promise<false> — resolves to boolean false

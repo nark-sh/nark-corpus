@@ -2,6 +2,18 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (depth, not surface)
+
+- **Profile:** `packages/bcrypt/contract.yaml`
+- **Functions added:** none (all 7 callable exports already covered)
+- **Postconditions added:** 2 (`compare.compare-callback-position-swap`, `hash.hash-callback-position-swap`)
+- **Postconditions updated:** 1 (`compare.invalid-args` — fixed drift: v6 async path emits `'data and hash must be strings'`, sync path still emits the longer message; existing `throws` text was the sync message only)
+- **Functions intentionally omitted this pass:** none
+- **Scanner concerns queued:** 0 (the swap-fn footgun requires cross-arg typeof analysis that is out of scope for a routine deepen pass; documented for awareness)
+- **Scanner version used:** nark@(workspace HEAD)
+- **Sources fetched:** `node_modules/bcrypt/bcrypt.js@6.0.0` (lines 108-120 for `hash`, 179-191 for `compare`), `node_modules/bcrypt/promises.js@6.0.0`, https://github.com/kelektiv/node.bcrypt.js/blob/master/bcrypt.js, https://github.com/kelektiv/node.bcrypt.js/blob/master/README.md, `node_modules/bcrypt/CHANGELOG.md@6.0.0`
+- **Verified by:** bc-deepen-contract (pass 32 on 2026-06-24T02:03:51Z, deepen-stream-2)
+- **Notes:** the two new postconditions describe a class of misuse (swap-fn) where the returned value of `bcrypt.hash`/`bcrypt.compare` is `undefined` (no Promise constructed), the Error is invoked on the wrong argument via `process.nextTick`, and a try-catch around `await` does NOT catch the misuse. Auth-check symptom for `compare` is silent rejection of valid credentials; registration symptom for `hash` is a `null`/`undefined` persisted password hash. `npm run validate` passes for all 191 contracts post-edit.
 
 ## 2026-06-18 — re-verified clean
 
