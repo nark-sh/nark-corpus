@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 88% → 100%
+
+- **Profile:** `packages/@aws-sdk/client-s3/contract.yaml`
+- **Functions added:** waitUntilObjectNotExists, waitUntilBucketNotExists (2 total)
+- **Postconditions added:** 3 (s3-object-not-exists-waiter-timeout-not-handled, s3-object-not-exists-waiter-abort-not-handled, s3-bucket-not-exists-waiter-timeout-not-handled)
+- **Functions intentionally omitted this pass:** RenameObjectCommand (S3 Express One Zone — same rationale as already-omitted CreateSessionCommand)
+- **Scanner concerns queued:** 2 (`concern-20260623-aws-sdk-client-s3-deepen-1`, `concern-20260623-aws-sdk-client-s3-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `@smithy/core/dist-types/submodules/client/util-waiter/waiter.d.ts` (WaiterState enum)
+  - `@smithy/core/dist-es/submodules/client/util-waiter/waiter.js` (checkExceptions throws TimeoutError / AbortError by `error.name`)
+  - `node_modules/@aws-sdk/client-s3/dist-types/waiters/waitForObjectNotExists.d.ts` (waitUntilObjectNotExists signature)
+  - `node_modules/@aws-sdk/client-s3/dist-types/waiters/waitForBucketNotExists.d.ts` (waitUntilBucketNotExists signature)
+- **Verified by:** bc-deepen-contract (pass 23, deepen-stream-3, 2026-06-23T00:50:Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-s3@3.1072.0

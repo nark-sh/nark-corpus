@@ -13,6 +13,8 @@
  *   - s3Client.send(RestoreObjectCommand)     postcondition: s3-restore-object-no-try-catch
  *   - waitUntilObjectExists()                 postcondition: s3-waiter-timeout-not-handled
  *   - waitUntilBucketExists()                 postcondition: s3-bucket-waiter-timeout-not-handled
+ *   - waitUntilObjectNotExists()              postcondition: s3-object-not-exists-waiter-timeout-not-handled
+ *   - waitUntilBucketNotExists()              postcondition: s3-bucket-not-exists-waiter-timeout-not-handled
  *
  * Detection path:
  *   - ThrowingFunctionDetector fires send() without try-catch
@@ -29,7 +31,12 @@ import {
   AbortMultipartUploadCommand,
   RestoreObjectCommand,
 } from '@aws-sdk/client-s3';
-import { waitUntilObjectExists, waitUntilBucketExists } from '@aws-sdk/client-s3';
+import {
+  waitUntilObjectExists,
+  waitUntilBucketExists,
+  waitUntilObjectNotExists,
+  waitUntilBucketNotExists,
+} from '@aws-sdk/client-s3';
 
 const s3Client = new S3Client({ region: 'us-east-1' });
 
@@ -216,6 +223,61 @@ export async function waitBucketExistsWithCatch(bucket: string) {
   } catch (error: any) {
     if (error.name === 'TimeoutError') {
       throw new Error(`Bucket ${bucket} did not become accessible within 60 seconds`);
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. waitUntilObjectNotExists — negative waiter, used in delete-then-verify
+// flows. Throws TimeoutError if the object remains visible past maxWaitTime
+// (eventual-consistency lag / cache propagation). Added 2026-06-23.
+// NOTE: s3-object-not-exists-waiter-timeout-not-handled requires scanner rule
+// (queued as scanner concern alongside positive waiters).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function waitObjectNotExistsNoCatch(bucket: string, key: string) {
+  // FUTURE_SHOULD_FIRE: s3-object-not-exists-waiter-timeout-not-handled — no scanner rule yet (queued)
+  // waitUntilObjectNotExists without try-catch throws TimeoutError if object remains visible
+  await waitUntilObjectNotExists({ client: s3Client, maxWaitTime: 30 }, { Bucket: bucket, Key: key });
+}
+
+export async function waitObjectNotExistsWithCatch(bucket: string, key: string) {
+  try {
+    // SHOULD_NOT_FIRE: waitUntilObjectNotExists inside try-catch handles TimeoutError
+    await waitUntilObjectNotExists({ client: s3Client, maxWaitTime: 30 }, { Bucket: bucket, Key: key });
+  } catch (error: any) {
+    if (error.name === 'TimeoutError') {
+      throw new Error(`Object ${key} still visible after 30 seconds — possible eventual-consistency lag`);
+    }
+    if (error.name === 'AbortError') {
+      return; // intentional cancellation, treat as clean exit
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. waitUntilBucketNotExists — negative bucket waiter, used in teardown
+// flows. Throws TimeoutError if bucket remains visible past maxWaitTime
+// (cross-region propagation lag). Added 2026-06-23.
+// NOTE: s3-bucket-not-exists-waiter-timeout-not-handled requires scanner rule
+// (queued as scanner concern alongside positive waiters).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function waitBucketNotExistsNoCatch(bucket: string) {
+  // FUTURE_SHOULD_FIRE: s3-bucket-not-exists-waiter-timeout-not-handled — no scanner rule yet (queued)
+  // waitUntilBucketNotExists without try-catch throws TimeoutError if bucket remains visible
+  await waitUntilBucketNotExists({ client: s3Client, maxWaitTime: 60 }, { Bucket: bucket });
+}
+
+export async function waitBucketNotExistsWithCatch(bucket: string) {
+  try {
+    // SHOULD_NOT_FIRE: waitUntilBucketNotExists inside try-catch handles TimeoutError
+    await waitUntilBucketNotExists({ client: s3Client, maxWaitTime: 60 }, { Bucket: bucket });
+  } catch (error: any) {
+    if (error.name === 'TimeoutError') {
+      throw new Error(`Bucket ${bucket} still visible after 60 seconds — cross-region propagation lag`);
     }
     throw error;
   }

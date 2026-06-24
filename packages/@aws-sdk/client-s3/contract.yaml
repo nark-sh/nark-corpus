@@ -1,12 +1,12 @@
 package: "@aws-sdk/client-s3"
 semver: ^3.0.0
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: 2026-04-06
+last_verified: 2026-06-23
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.88
+coverage_score: 0.91
 functions:
   - name: send
     import_path: "@aws-sdk/client-s3"
@@ -382,6 +382,114 @@ functions:
           end users — fall back silently to Standard tier.
         sources:
           - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/s3/command/RestoreObjectCommand/
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: waitUntilObjectNotExists
+    import_path: "@aws-sdk/client-s3"
+    description: >
+      Polls HeadObjectCommand until the specified S3 object returns NotFound, throws
+      TimeoutError if the object remains visible past maxWaitTime. Used in
+      delete-then-verify flows where downstream consumers must not see the object
+      after a delete (cache invalidation, search index pruning, GDPR deletion
+      confirmation). Symmetric counterpart to waitUntilObjectExists.
+    postconditions:
+      - id: s3-object-not-exists-waiter-timeout-not-handled
+        condition: >
+          waitUntilObjectNotExists() is called without a try-catch block and the
+          object remains visible past maxWaitTime seconds
+        throws: TimeoutError (error.name === 'TimeoutError') from @smithy/util-waiter
+        severity: error
+        description: >
+          waitUntilObjectNotExists() throws TimeoutError (error.name === 'TimeoutError')
+          via @smithy/util-waiter checkExceptions when the object does not disappear
+          within maxWaitTime seconds. Delete-then-verify flows that assume the object
+          "will eventually disappear" crash on unhandled rejection when S3 read-after-write
+          consistency lags or eventual-consistency replication takes longer than expected.
+          Common in GDPR deletion confirmation paths and cache-invalidation flows where
+          stale objects re-appearing is a compliance or correctness failure.
+        required_handling: >
+          MUST wrap waitUntilObjectNotExists in try-catch. Check
+          error.name === 'TimeoutError' to distinguish timeout from other failures.
+          Surface a meaningful error to the caller (e.g. "object still visible after
+          N seconds — manual verification required") rather than propagating the
+          raw TimeoutError. Do not silently swallow — that hides eventual-consistency
+          issues from operators.
+        sources:
+          - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/s3/
+          - https://github.com/smithy-lang/smithy-typescript/blob/main/packages/util-waiter/src/waiter.ts
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: s3-object-not-exists-waiter-abort-not-handled
+        condition: >
+          waitUntilObjectNotExists() is called with an AbortSignal and the signal is
+          triggered before the waiter completes, without try-catch handling AbortError
+        throws: AbortError (error.name === 'AbortError') from @smithy/util-waiter
+        severity: warning
+        description: >
+          waitUntilObjectNotExists() throws AbortError (error.name === 'AbortError')
+          via @smithy/util-waiter checkExceptions when the waiter is cancelled via
+          an AbortController signal before completion. Applications that use
+          AbortController for request cancellation (Lambda timeout signals,
+          user-initiated cancellation in long-running cleanup jobs) must handle
+          this distinct error type separately from TimeoutError — aborts are
+          intentional, timeouts indicate capacity/consistency issues.
+        required_handling: >
+          SHOULD handle AbortError separately from TimeoutError in catch block.
+          AbortError means intentional cancellation (treat as clean cancellation,
+          not a failure). TimeoutError means the object did not disappear in time
+          (treat as eventual-consistency lag — surface to operator).
+        sources:
+          - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/s3/
+          - https://github.com/smithy-lang/smithy-typescript/blob/main/packages/util-waiter/src/waiter.ts
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: waitUntilBucketNotExists
+    import_path: "@aws-sdk/client-s3"
+    description: >
+      Polls HeadBucketCommand until the specified S3 bucket returns NotFound, throws
+      TimeoutError if the bucket remains visible past maxWaitTime. Used in
+      bucket-deletion teardown flows (ephemeral test environments, infrastructure
+      provisioning, multi-region cleanup) to confirm bucket has fully propagated
+      its deletion across all S3 regions before proceeding with downstream steps.
+      Symmetric counterpart to waitUntilBucketExists.
+    postconditions:
+      - id: s3-bucket-not-exists-waiter-timeout-not-handled
+        condition: >
+          waitUntilBucketNotExists() is called without a try-catch block and the
+          bucket remains visible past maxWaitTime seconds
+        throws: TimeoutError (error.name === 'TimeoutError') from @smithy/util-waiter
+        severity: error
+        description: >
+          waitUntilBucketNotExists() throws TimeoutError (error.name === 'TimeoutError')
+          via @smithy/util-waiter checkExceptions when the bucket does not disappear
+          within maxWaitTime seconds. Infrastructure teardown flows that assume bucket
+          deletion is instantaneous crash if eventual-consistency propagation across
+          AWS regions delays the HEAD response from returning NotFound — common in
+          cross-region teardown and tests that immediately recreate a bucket with
+          the same name (will fail with BucketAlreadyExists if old one still propagating).
+        required_handling: >
+          MUST wrap waitUntilBucketNotExists in try-catch. Handle TimeoutError by
+          retrying with increased maxWaitTime or surfacing an operator-visible error.
+          Do not silently swallow — leaked buckets accrue storage costs and may
+          cause naming collisions in CI test runs.
+        sources:
+          - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/s3/
+          - https://github.com/smithy-lang/smithy-typescript/blob/main/packages/util-waiter/src/waiter.ts
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
