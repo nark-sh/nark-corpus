@@ -18,8 +18,10 @@
  *   - Section 3: v4 getObjects (available on index object in v4)
  *   - Section 4: v5 client-direct methods — searchSingleIndex, waitForTask, replaceAllObjects
  *     (v5Client cast to `any` so fixture compiles against v4 or v5 types)
+ *   - Section 5: pass 76 additions — batch, multipleBatch, browse, browseObjects, operationIndex
  *
- * All 11 contracted functions have SHOULD_FIRE + SHOULD_NOT_FIRE coverage.
+ * Pass-76 additions cover the missing data-path SearchClient methods (single + multi-index batch,
+ * browse + browseObjects iterator helper, operationIndex copy/move).
  */
 
 import algoliasearch from 'algoliasearch';
@@ -443,6 +445,116 @@ export async function saveObjectsWithTransformationWithTryCatch(products: Produc
     });
   } catch (err) {
     console.error('saveObjectsWithTransformation failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Pass 76 (2026-06-24): batch / multipleBatch / browse / browseObjects / operationIndex
+//    All v5 client-direct methods — v5Client cast to `any` so fixture compiles against
+//    both v4 and v5 typings. Detection rests on the await_patterns dotted-suffix match
+//    (".batch(", ".multipleBatch(", ".browse(", ".browseObjects(", ".operationIndex(").
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: batch-no-try-catch
+export async function bareBatchNoCatch(actions: any[]) {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; batch-no-try-catch not detected through type erasure; batch throws ApiError/RetryError on 400/402/403/404/429
+  await v5Client.batch({ indexName: 'products', batchWriteParams: { requests: actions } });
+}
+
+export async function batchWithTryCatch(actions: any[]) {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.batch({ indexName: 'products', batchWriteParams: { requests: actions } });
+  } catch (err) {
+    console.error('batch failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: multiplebatch-no-try-catch
+export async function bareMultipleBatchNoCatch(requests: any[]) {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; multiplebatch-no-try-catch not detected through type erasure; multi-index batch fails atomically if any indexName missing
+  await v5Client.multipleBatch({ requests });
+}
+
+export async function multipleBatchWithTryCatch(requests: any[]) {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.multipleBatch({ requests });
+  } catch (err) {
+    console.error('multipleBatch failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: browse-no-try-catch
+export async function bareBrowseNoCatch() {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; browse-no-try-catch not detected through type erasure; requires browse ACL distinct from search ACL
+  const page = await v5Client.browse({ indexName: 'products', browseParams: {} });
+  return page.hits;
+}
+
+export async function browseWithTryCatch() {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    const page = await v5Client.browse({ indexName: 'products', browseParams: {} });
+    return page.hits;
+  } catch (err) {
+    console.error('browse failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: browseobjects-no-try-catch
+export async function bareBrowseObjectsNoCatch() {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; browseobjects-no-try-catch not detected through type erasure; iterator helper, any page failure aborts iteration
+  await v5Client.browseObjects({
+    indexName: 'products',
+    aggregator: (_response: any) => {
+      /* user-supplied callback — throws here propagate */
+    },
+  });
+}
+
+export async function browseObjectsWithTryCatch() {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.browseObjects({
+      indexName: 'products',
+      aggregator: (_response: any) => {
+        /* user-supplied callback */
+      },
+    });
+  } catch (err) {
+    console.error('browseObjects failed:', err);
+    throw err;
+  }
+}
+
+// @expect-violation: operationindex-no-try-catch
+export async function bareOperationIndexNoCatch() {
+  // SHOULD_NOT_FIRE: known false negative — v5Client is `any`; operationindex-no-try-catch not detected through type erasure; COPY of missing source silently creates empty dest
+  await v5Client.operationIndex({
+    indexName: 'products',
+    operationIndexParams: { operation: 'copy', destination: 'products_blue' },
+  });
+}
+
+export async function operationIndexWithTryCatch() {
+  // @expect-clean
+  try {
+    // SHOULD_NOT_FIRE: type erased AND inside try-catch — no violation either way
+    await v5Client.operationIndex({
+      indexName: 'products',
+      operationIndexParams: { operation: 'copy', destination: 'products_blue' },
+    });
+  } catch (err) {
+    console.error('operationIndex failed:', err);
     throw err;
   }
 }

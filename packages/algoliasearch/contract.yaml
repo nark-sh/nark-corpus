@@ -1,27 +1,43 @@
-# Depth pass 2026-04-18 (deepen-stream-2 pass 9):
-# API surface: 23 async-callable functions (v5 SearchClient + Algoliasearch helpers)
-# Contracted before: 15 (coverage_score: 0.65)
-# Contracted after: 20 (+5 this pass: partialUpdateObjects, addOrUpdateObject, indexExists,
-#   waitForAppTask, saveObjectsWithTransformation)
-# Omitted: 3 (searchForHits/searchForFacets — thin wrappers over search(), same error profile;
-#             partialUpdateObjectsWithTransformation/replaceAllObjectsWithTransformation — same
-#             error profile as saveObjectsWithTransformation)
-# Coverage: 20/23 = 0.87 (effective contracted/non-omitted = 20/20 = 1.0)
+# Depth pass 2026-06-24 (deepen-stream-2 pass 76):
+# API surface re-enumerated against @algolia/client-search@5.55.1 dist/node.d.ts (the
+# actual published declaration file). The SearchClient instance exposes ~76 Promise-returning
+# methods total, but the contractually-meaningful surface — i.e. methods a typical Algolia
+# customer calls from app code rather than admin tooling — is the data-path subset of ~28
+# methods. The remaining ~48 methods are admin operations (API key CRUD, user-ID mapping,
+# cluster mgmt, dictionary entries, sources/IP allowlist, custom HTTP passthrough) used by
+# devops / control-plane tooling, not by SaaS request handlers — out-of-scope for the
+# data-path error contract.
+#
+# Data-path surface count: 28 async-callable functions
+# Contracted before pass 76: 20  (coverage_score: 0.87 on 23-method historical count)
+# Contracted after pass 76:  25  (+5 this pass: batch, multipleBatch, browse, browseObjects, operationIndex)
+# Omitted from data-path: 3 (searchForHits/searchForFacets — thin wrappers over search();
+#                            saveObjectsWithTransformation already contracted covers
+#                            partialUpdateObjectsWithTransformation /
+#                            replaceAllObjectsWithTransformation — same configuration-error
+#                            profile)
+# Coverage: 25/28 = 0.89 (effective contracted / non-omitted = 25/25 = 1.0)
+#
 # Evidence sources confirmed from:
+#   @algolia/client-search@5.55.1/dist/node.d.ts — full method signature enumeration (76 Promise methods)
 #   @algolia/client-search/dist/src/searchClient.js — indexExists, waitForAppTask, addOrUpdateObject source
 #   algoliasearch/dist/node.js — saveObjectsWithTransformation configuration error
 #   @algolia/client-common/dist/common.d.ts — error class hierarchy (ApiError, RetryError, AlgoliaError)
+#   https://www.algolia.com/doc/rest-api/search/batch — HTTP error codes confirmed
+#   https://www.algolia.com/doc/rest-api/search/multiple-batch — HTTP error codes confirmed
+#   https://www.algolia.com/doc/rest-api/search/browse — HTTP error codes confirmed
+#   https://www.algolia.com/doc/api-reference/api-methods/copy-index/ — operationIndex constraints
 #   https://www.algolia.com/doc/rest-api/search/add-or-update-object — HTTP error codes confirmed
 #   https://www.algolia.com/doc/rest-api/search/partial-update-object — HTTP error codes confirmed
 package: algoliasearch
 semver: ">=4.0.0 <6.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-18"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.87  # 20 contracted / 23 total async-callable (3 intentionally omitted)
+coverage_score: 0.89  # 25 contracted / 28 data-path async-callable (3 intentionally omitted; ~48 admin methods out of scope)
 
 detection:
   factory_methods:
@@ -55,6 +71,11 @@ detection:
     - ".saveObjectsWithTransformation("
     - ".partialUpdateObjectsWithTransformation("
     - ".replaceAllObjectsWithTransformation("
+    - ".batch("
+    - ".multipleBatch("
+    - ".browse("
+    - ".browseObjects("
+    - ".operationIndex("
 
 functions:
   - name: search
@@ -809,6 +830,241 @@ functions:
         sources:
           - "https://www.algolia.com/doc/guides/sending-and-managing-data/send-and-update-your-data/connectors/push/"
 
+  - name: batch
+    import_path: "algoliasearch"
+    description: >
+      v5 method: Adds, updates, or deletes records in a SINGLE index using a single API request.
+      Actions are applied in the order specified and are equivalent to individual API requests of the
+      same name (addObject, updateObject, partialUpdateObject, deleteObject, etc.). Subject to indexing
+      rate limits. Requires addObject ACL. Distinct from the higher-level saveObjects/deleteObjects
+      helpers — batch() is the raw single-index batch endpoint and does NOT chunk automatically; the
+      caller is responsible for keeping payload size under Algolia's request limits.
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/rest-api/search/batch
+      # Documented HTTP errors: 400 (bad request), 402 (feature not enabled), 403 (missing addObject ACL), 404 (index not found)
+      # Confirmed from @algolia/client-search@5.55.1/dist/node.d.ts line 3496:
+      #   batch({ indexName, batchWriteParams }: BatchProps, requestOptions?: RequestOptions): Promise<BatchResponse>;
+      # JSDoc explicitly states "This operation is subject to indexing rate limits"
+      - id: batch-no-try-catch
+        severity: error
+        condition: >
+          batch() called without surrounding try/catch. Auth failure, malformed batch payload, or rate
+          limit causes the entire batch to fail. Common in custom indexing pipelines that bypass the
+          saveObjects helper to control action ordering (e.g. mixed addObject + deleteObject sequences
+          for atomic-ish reindex flows).
+        throws: >
+          ApiError (status 400) — malformed batch payload (invalid action, missing objectID for
+          delete/partial update actions, payload exceeds Algolia size limits).
+          ApiError (status 402) — feature not enabled on the current Algolia plan.
+          ApiError (status 403) — missing addObject ACL on the API key.
+          ApiError (status 404) — index not found.
+          ApiError (status 429) — indexing rate limit exceeded.
+          RetryError — all Algolia hosts unreachable.
+        required_handling: >
+          Caller MUST wrap in try/catch. Unlike saveObjects/deleteObjects, batch() does NOT chunk —
+          a single oversized request fails atomically. Log the action count and total payload size for
+          debugging. 429 errors indicate the pipeline is exceeding indexing limits; back off and retry
+          with exponential delay rather than re-firing immediately.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/batch"
+
+  - name: multipleBatch
+    import_path: "algoliasearch"
+    description: >
+      v5 method: Adds, updates, or deletes records across MULTIPLE indices using a single API request.
+      Each entry in the request specifies its own indexName, so a single call can write to many indices
+      atomically from the network round-trip standpoint (though each index's writes are still queued
+      independently on the Algolia side). Subject to indexing rate limits. Requires addObject ACL.
+      Used in multi-tenant SaaS apps that maintain per-tenant indices and need to fan out a single
+      domain event (e.g. user update) to every affected index.
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/rest-api/search/multiple-batch
+      # Documented HTTP errors: 400 (bad request), 402 (feature not enabled), 403 (missing addObject ACL), 404 (index not found)
+      # Confirmed from @algolia/client-search@5.55.1/dist/node.d.ts line 3882:
+      #   multipleBatch(batchParams: BatchParams, requestOptions?: RequestOptions): Promise<MultipleBatchResponse>;
+      - id: multiplebatch-no-try-catch
+        severity: error
+        condition: >
+          multipleBatch() called without surrounding try/catch. Failure of the entire multi-index batch
+          (auth failure, any single 404 for a missing target index, malformed request) leaves the
+          caller with no record of which indices were partially written. Common in multi-tenant fan-out
+          flows where a missing tenant index causes the entire batch to fail and ALL tenants lose the
+          update, not just the missing one.
+        throws: >
+          ApiError (status 400) — malformed batch payload across any of the target indices.
+          ApiError (status 402) — feature not enabled on the current Algolia plan.
+          ApiError (status 403) — missing addObject ACL on the API key.
+          ApiError (status 404) — at least one referenced index does not exist; the entire batch fails.
+          ApiError (status 429) — indexing rate limit exceeded.
+          RetryError — all Algolia hosts unreachable.
+        required_handling: >
+          Caller MUST wrap in try/catch. On 404, identify which referenced index is missing (the error
+          message includes the index name) and decide whether to create-on-the-fly or skip. On 429,
+          consider splitting the batch into per-index calls so a single hot index doesn't block writes
+          to cold indices. Log the full list of target indices on every failure — silent failure here
+          means an entire fan-out of tenant indices silently diverged from source of truth.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/multiple-batch"
+
+  - name: browse
+    import_path: "algoliasearch"
+    description: >
+      v5 method: Retrieves records from an index, up to 1,000 per request, returning matching records
+      WITHOUT search ranking. Used to export indices, iterate over all records for migration, or build
+      offline derivatives of the index. Distinct from search() — browse() does not collect analytics,
+      ignores many search-specific parameters, and returns a cursor for pagination. Requires browse
+      ACL (separate from search ACL — a search-only key cannot browse).
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/rest-api/search/browse
+      # Documented HTTP errors: 400 (bad request), 402 (feature not enabled), 403 (missing browse ACL), 404 (index not found)
+      # Confirmed from @algolia/client-search@5.55.1/dist/node.d.ts line 3531:
+      #   browse<T>({ indexName, browseParams }: BrowseProps, requestOptions?: RequestOptions): Promise<BrowseResponse<T>>;
+      # JSDoc: "Required API Key ACLs: browse"
+      - id: browse-no-try-catch
+        severity: error
+        condition: >
+          browse() called without surrounding try/catch. Common in export and migration scripts that
+          assume a long-running operation will complete cleanly. Auth failure (missing browse ACL on
+          the key — distinct from search ACL) and network errors crash mid-export, leaving partial
+          state. Cursor-driven pagination loops that don't handle errors leak into infinite loops or
+          unhandled rejections.
+        throws: >
+          ApiError (status 400) — malformed browse parameters.
+          ApiError (status 402) — feature not enabled on the current Algolia plan.
+          ApiError (status 403) — missing browse ACL on the API key (distinct from search ACL).
+          ApiError (status 404) — index not found.
+          RetryError — all Algolia hosts unreachable.
+        required_handling: >
+          Caller MUST wrap in try/catch. In paginated export loops, persist the last successful cursor
+          to disk or state store so failed exports can resume rather than restart. Document the ACL
+          requirement explicitly — a key with search but not browse will throw 403 at the first call,
+          which is confusing if the developer assumed search-able implies browse-able.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/rest-api/search/browse"
+
+  - name: browseObjects
+    import_path: "algoliasearch"
+    description: >
+      v5 helper: Iteratively calls browse() to retrieve ALL records in an index by following the cursor
+      across pages. Calls the user-supplied aggregator callback after each batch and stops when the
+      validate callback returns true (default: stops when no cursor is returned, i.e. last page).
+      Convenient wrapper around browse() for full-index exports. Any error during ANY page of the
+      iteration propagates — there is no built-in retry across pages.
+
+    postconditions:
+      # Evidence: Confirmed from @algolia/client-search@5.55.1/dist/node.d.ts line 3327:
+      #   browseObjects<T>({ indexName, browseParams, ...browseObjectsOptions }: BrowseOptions<BrowseResponse<T>> & BrowseProps, requestOptions?: RequestOptions | undefined): Promise<BrowseResponse<T>>;
+      # JSDoc: "Helper: Iterate on the browse method of the client to allow aggregating objects of an index."
+      # The helper wraps browse() in a createIterablePromise loop — every page makes a fresh browse() call,
+      # any of which can throw. The aggregator callback is invoked synchronously after each successful page;
+      # if it throws, the iteration rejects with the user's error.
+      - id: browseobjects-no-try-catch
+        severity: error
+        condition: >
+          browseObjects() called without surrounding try/catch. A single page failure (auth flake,
+          transient 5xx, network drop) aborts the entire iteration. The user-supplied aggregator
+          callback is invoked synchronously inside the iteration — if the callback throws, that throw
+          propagates as the iteration's rejection, masking whatever progress the aggregator already made.
+          Common in full-index export and reindex pipelines where the cost of a mid-export failure is
+          a hung migration or partially-written destination.
+        throws: >
+          ApiError (status 400/402/403/404) — same conditions as browse(), but on ANY page of the
+          iteration. A 403 on page 17 of an export looks identical to a 403 on page 1 from the
+          caller's perspective.
+          ApiError (status 429) — indexing/query rate limit exceeded mid-export.
+          RetryError — all Algolia hosts unreachable during any page.
+          User-thrown Error — anything the aggregator callback throws propagates out of browseObjects().
+        required_handling: >
+          Caller MUST wrap in try/catch. For long-running exports, capture the last-seen cursor inside
+          the aggregator so a failed iteration can resume from where it stopped rather than restart at
+          page 1. Defensive: validate the aggregator does not throw on adversarial record shapes —
+          a single malformed record can otherwise abort a 100k-record export.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/libraries/javascript/v5/methods/search/"
+
+  - name: operationIndex
+    import_path: "algoliasearch"
+    description: >
+      v5 method: Copies or moves (renames) an index within the same Algolia application. Resource-intensive
+      operation that can take minutes to complete; subject to indexing rate limits. Existing destination
+      indices are overwritten (except their analytics data). Copy does NOT include enableReRanking, mode,
+      and replicas settings. Cannot copy to a destination index that already has replicas. Requires
+      addObject ACL on the API key. Returns a taskID — the caller should typically follow up with
+      waitForTask() to ensure the operation actually completed before assuming the destination is ready.
+
+    postconditions:
+      # Evidence: https://www.algolia.com/doc/api-reference/api-methods/copy-index/
+      # Confirmed from @algolia/client-search@5.55.1/dist/node.d.ts line 3893:
+      #   operationIndex({ indexName, operationIndexParams }: OperationIndexProps, requestOptions?: RequestOptions): Promise<UpdatedAtResponse>;
+      # JSDoc constraints: "You can't copy to a destination index that already has replicas",
+      #   "Be aware of the size limits", "operation is subject to indexing rate limits"
+      - id: operationindex-no-try-catch
+        severity: error
+        condition: >
+          operationIndex() called without surrounding try/catch. Common in blue/green index swap flows
+          (build new-index, copy old-index settings/rules onto it, atomic swap). A failure mid-copy
+          leaves the destination in a partial state — the destination's records may already be
+          overwritten with zero rows from a missing source while settings remain from the previous
+          contents. The follow-up waitForTask() call also needs error handling (covered by waitForTask
+          postcondition) — but the initial operationIndex() throw is a distinct failure mode.
+        throws: >
+          ApiError (status 400) — invalid operation params, copying to a destination that already has
+          replicas, or attempting to copy disallowed settings (enableReRanking, mode, replicas).
+          ApiError (status 402) — feature not enabled on the current Algolia plan.
+          ApiError (status 403) — missing addObject ACL on the API key.
+          ApiError (status 404) — source index does not exist.
+          ApiError (status 429) — indexing rate limit exceeded.
+          RetryError — all Algolia hosts unreachable.
+          Note: per Algolia docs, MOVE with a missing source index is ignored silently (no throw) —
+          but COPY with a missing source creates an empty destination, which is a distinct silent
+          failure surface the caller should validate after the operation.
+        required_handling: >
+          Caller MUST wrap in try/catch. For blue/green swaps, validate the source index is non-empty
+          BEFORE calling operationIndex(scope=copy) — Algolia silently treats a missing source as a
+          0-record copy. Always pair with waitForTask() and confirm taskID reached "published" before
+          treating the destination as ready. On 400 errors, the error message includes which constraint
+          was violated (replica conflict vs disallowed setting); log it for debugging.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - "https://www.algolia.com/doc/api-reference/api-methods/copy-index/"
+
 notes:
   - "algoliasearch uses throw-based error model — NO result-object pattern (unlike resend)"
   - "v4 errors: plain objects with .name property (not instanceof Error)"
@@ -828,3 +1084,10 @@ notes:
   - "saveObjectsWithTransformation: throws synchronous Error if transformation.region not set at client init"
   - "searchForHits/searchForFacets: thin type-narrowing wrappers over search() — same error profile, omitted"
   - "partialUpdateObjectsWithTransformation/replaceAllObjectsWithTransformation: same error profile as saveObjectsWithTransformation, omitted (duplicate contract)"
+  - "batch: SINGLE-index raw batch endpoint; does NOT chunk — caller responsible for payload size limits"
+  - "multipleBatch: MULTI-index batch endpoint; single 404 for any referenced index fails the entire batch (all-or-nothing)"
+  - "browse: requires browse ACL (distinct from search ACL); search-only key cannot browse — 403 thrown"
+  - "browseObjects: iterates browse() across cursor pages; aggregator callback throws propagate; no built-in cross-page retry"
+  - "operationIndex: COPY with missing source silently creates 0-record destination (no 404); validate source before copy"
+  - "operationIndex: MOVE with missing source is silently ignored per Algolia docs — distinct from COPY behavior"
+  - "Admin surface NOT contracted (out-of-scope for data-path): addApiKey/deleteApiKey/updateApiKey/restoreApiKey/getApiKey/listApiKeys/waitForApiKey, assignUserId/batchAssignUserIds/removeUserId/getUserId/getTopUserIds/listUserIds/searchUserIds/hasPendingMappings, listClusters, getLogs, batchDictionaryEntries/searchDictionaryEntries/getDictionarySettings/setDictionarySettings/getDictionaryLanguages, appendSource/replaceSources/deleteSource/getSources, clearRules/clearSynonyms/deleteRule/deleteSynonym/getRule/getSynonym/saveRule/saveRules/saveSynonym/saveSynonyms/searchRules/searchSynonyms/browseRules/browseSynonyms, customGet/customPost/customPut/customDelete, accountCopyIndex (Node-helper, separate-account migration), clearCache (sync-ish cache reset)"
