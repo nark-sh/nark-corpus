@@ -2,7 +2,7 @@ package: ethers
 semver: ">=6.0.0 <7.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -52,7 +52,7 @@ evidence_quality: confirmed
 #   https://docs.ethers.org/v6/api/wallet/#BaseWallet-signTransaction
 #   https://docs.ethers.org/v6/api/wallet/#BaseWallet-authorize
 #   https://eips.ethereum.org/EIPS/eip-7702
-coverage_score: 0.77  # 20 contracted / 26 total async-callable (11 intentionally omitted)
+coverage_score: 0.85  # 22 contracted / 26 total async-callable (11 intentionally omitted)
 
 detection:
   type_names:
@@ -1376,6 +1376,113 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: Signer.populateAuthorization
+    import_path: "ethers"
+    description: >
+      Prepares an EIP-7702 (Pectra) authorization for signing by populating missing
+      chainId and nonce fields. Sibling to populateTransaction but for type-4
+      (SET_CODE_TX_TYPE) authorization payloads — does NOT touch fee fields or
+      gasLimit because authorizations are bundled into someone else's transaction
+      (the relayer/sponsor). The pre-signing step inside wallet.authorize(): the
+      authorize() implementation calls await this.populateAuthorization(auth)
+      before authorizeSync(). Called directly when callers want to inspect or
+      mutate the fully-populated auth payload before signing — e.g. relayer flows
+      that pre-fetch the chainId and nonce server-side and pass them to the
+      end-user wallet, or session-key flows that need to verify the nonce against
+      a server-side replay-protection record. Available since ethers v6.16.0
+      (EIP-7702 / Pectra). Distinct from authorize() which both populates AND
+      signs; populateAuthorization() only populates.
+    postconditions:
+      # Evidence: lib.esm/providers/abstract-signer.js:172-183 -- async populateAuthorization(_auth):
+      #   const auth = Object.assign({}, _auth);
+      #   if (auth.chainId == null) {
+      #     auth.chainId = (await checkProvider(this, "getNetwork").getNetwork()).chainId;
+      #   }
+      #   if (auth.nonce == null) {
+      #     auth.nonce = await this.getNonce();
+      #   }
+      #   return auth;
+      # Evidence: lib.esm/providers/abstract-signer.js -- checkProvider() throws EthersError
+      #   with code UNSUPPORTED_OPERATION when this.provider is null. The error.operation
+      #   field is set to the second arg ("getNetwork" when chainId missing) or to
+      #   "getTransactionCount" when nonce missing (propagated from getNonce()).
+      # Evidence: https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateAuthorization
+      # Evidence: https://eips.ethereum.org/EIPS/eip-7702
+      - id: populateauthorization-no-provider-for-auto-fill
+        condition: >
+          signer.populateAuthorization({ address: '0x...' }) is called without a try-catch
+          and the Signer has no provider attached, AND either chainId or nonce is omitted
+          from the input. populateAuthorization needs a provider for two distinct reasons:
+          (1) chainId comes from provider.getNetwork() via checkProvider(this, "getNetwork"),
+          (2) nonce comes from this.getNonce() which calls provider.getTransactionCount()
+          via the same checkProvider gate. Both throw EthersError with
+          code='UNSUPPORTED_OPERATION'. Common in offline / cold-wallet flows that
+          construct `new Wallet(pk)` without a provider intending to sign a relayer-
+          supplied auth payload, but accidentally call populateAuthorization to "fill in
+          defaults" instead of passing the pre-populated auth straight to authorizeSync().
+        throws: "EthersError with code UNSUPPORTED_OPERATION (error.code === 'UNSUPPORTED_OPERATION', error.operation === 'getNetwork' or 'getTransactionCount')"
+        required_handling: >
+          Caller MUST wrap signer.populateAuthorization() in try-catch and either
+          (a) attach a provider via signer.connect(provider) or new Wallet(pk, provider)
+          before calling, or (b) pre-populate BOTH chainId and nonce in the input auth
+          object so populateAuthorization is effectively a no-op: `signer.populateAuthorization({
+          address, chainId: knownChainId, nonce: knownNonce })`. For relayer flows where
+          the server already knows chainId and nonce, prefer option (b) and skip the
+          extra RPC roundtrip entirely. Use isError(error, 'UNSUPPORTED_OPERATION') to
+          detect and branch on error.operation to know which field was missing.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateAuthorization"
+          - "https://docs.ethers.org/v6/api/utils/errors/#UnsupportedOperationError"
+          - "https://eips.ethereum.org/EIPS/eip-7702"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: populateauthorization-network-rpc-failure
+        condition: >
+          signer.populateAuthorization(auth) is called without a try-catch on a
+          provider whose underlying RPC endpoint is unreachable, rate-limited, or
+          returns malformed responses for eth_chainId or eth_getTransactionCount.
+          provider.getNetwork() and provider.getTransactionCount() both propagate
+          EthersError with code='NETWORK_ERROR' (transient connectivity), 'SERVER_ERROR'
+          (4xx/5xx from the JSON-RPC endpoint), or 'TIMEOUT' (request exceeded the
+          provider's polling deadline). Unlike no-provider-for-auto-fill (a deployment
+          bug caught at startup), these are runtime failures that surface whenever the
+          upstream RPC is degraded — Infura/Alchemy outages, regional CDN issues, or
+          self-hosted node lag during a chain reorg. Critical in sponsored-gas / Pectra
+          relayer pipelines where each request triggers two RPC calls before the
+          authorization can even be signed.
+        throws: "EthersError with code NETWORK_ERROR, SERVER_ERROR, or TIMEOUT (error.code matches one of three transient-failure ErrorCode values)"
+        required_handling: >
+          Caller MUST wrap signer.populateAuthorization() in try-catch and treat
+          NETWORK_ERROR / SERVER_ERROR / TIMEOUT as transient. Retry with exponential
+          backoff against a SECONDARY provider endpoint (FallbackProvider pattern) or
+          surface a clear "wallet temporarily unavailable" message to the end user.
+          For high-volume relayers, cache the chainId per provider for the lifetime
+          of the process (it never changes for a connected provider) and supply
+          chainId explicitly in the input auth to eliminate one of the two RPC calls.
+          Use isError(error, 'NETWORK_ERROR') and friends to discriminate. Silent
+          swallowing causes EIP-7702 batched transactions to disappear from the
+          relayer queue with no record of why, producing user-visible "funds stuck"
+          incidents that are very hard to debug.
+        sources:
+          - "https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateAuthorization"
+          - "https://docs.ethers.org/v6/api/providers/#FallbackProvider"
+          - "https://docs.ethers.org/v6/api/utils/errors/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+
 edge_cases:
   - id: isError-pattern-required
     description: >
@@ -1410,11 +1517,11 @@ edge_cases:
       incident_cost_range: high
 
 metadata:
-  last_verified: "2026-06-18"
+  last_verified: "2026-06-24"
   evidence_quality: confirmed
-  coverage_score: 0.81
-  # 21 contracted functions / 26 total async-callable (~5 effective non-omitted)
-  # Coverage: 21/26 = 0.81 raw (effective contracted/non-omitted surface = 21/21 = 1.0)
+  coverage_score: 0.85
+  # 22 contracted functions / 26 total async-callable (~4 effective non-omitted)
+  # Coverage: 22/26 = 0.85 raw (effective contracted/non-omitted surface = 22/22 = 1.0)
   # Note: omitted_count drifted between contract.yaml header (11) and deepen-index (13);
   # canonical list is in metadata comment below.
   # Added deepen-stream-1 pass 2: TransactionResponse.wait, provider.estimateGas,
@@ -1434,6 +1541,16 @@ metadata:
   #   network-fee-model-unsupported (UNSUPPORTED_OPERATION — both getGasPrice and
   #   populateTransaction operation variants). Evidence:
   #   lib.esm/providers/abstract-signer.js populateTransaction() assertArgument / assert calls.
+  # Added deepen-stream-2 pass 94 (2026-06-24, ethers@6.17.0): Signer.populateAuthorization
+  #   — the EIP-7702 pre-signing sibling of Signer.populateTransaction. Populates chainId
+  #   and nonce on a type-4 (Pectra) authorization payload before authorizeSync(). Called
+  #   internally by wallet.authorize() and directly in relayer / sponsored-gas / session-key
+  #   flows that need to inspect/mutate the fully-populated auth before signing.
+  #   2 postconditions: no-provider-for-auto-fill (UNSUPPORTED_OPERATION with operation
+  #   ∈ {getNetwork, getTransactionCount}) and network-rpc-failure (NETWORK_ERROR /
+  #   SERVER_ERROR / TIMEOUT propagating from provider.getNetwork() / getTransactionCount()).
+  #   Evidence: lib.esm/providers/abstract-signer.js:172-183 populateAuthorization()
+  #   + checkProvider() gate.
   # Intentionally omitted (11):
   #   provider.getBlock, getTransaction, getTransactionReceipt, getTransactionCount,
   #   getCode, getStorage -- read-only GETs, no distinct error beyond generic SERVER_ERROR

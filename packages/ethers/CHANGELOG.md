@@ -3,6 +3,24 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 81% → 85%
+
+- **Profile:** `packages/ethers/contract.yaml`
+- **Functions added:** Signer.populateAuthorization (1 total)
+- **Postconditions added:** 2 (populateauthorization-no-provider-for-auto-fill, populateauthorization-network-rpc-failure)
+- **Functions intentionally omitted this pass:** none new — previously-omitted list unchanged
+- **Scanner concerns queued:** 2 (`concern-20260624-ethers-deepen-1`, `concern-20260624-ethers-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `lib.esm/providers/abstract-signer.js:172-183` populateAuthorization() — checkProvider + getNonce calls (source-level evidence for both postconditions)
+  - `lib.esm/providers/abstract-signer.js` checkProvider() throws UNSUPPORTED_OPERATION on null provider
+  - https://docs.ethers.org/v6/api/providers/#AbstractSigner-populateAuthorization
+  - https://docs.ethers.org/v6/api/providers/#FallbackProvider
+  - https://docs.ethers.org/v6/api/utils/errors/#UnsupportedOperationError
+  - https://docs.ethers.org/v6/api/utils/errors/
+  - https://eips.ethereum.org/EIPS/eip-7702
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T13:50:10Z, deepen-stream-2 pass 94)
+
 ## 2026-06-18 — deepen pass — coverage 77% → 81%
 
 - **Profile:** `packages/ethers/contract.yaml`

@@ -39,6 +39,8 @@
  *  - populatetransaction-chainid-mismatch (Signer.populateTransaction)
  *  - populatetransaction-mixed-fee-fields (Signer.populateTransaction)
  *  - populatetransaction-network-fee-model-unsupported (Signer.populateTransaction)
+ *  - populateauthorization-no-provider-for-auto-fill (Signer.populateAuthorization, deepen-stream-2 pass 94 on 2026-06-24)
+ *  - populateauthorization-network-rpc-failure (Signer.populateAuthorization, deepen-stream-2 pass 94 on 2026-06-24)
  */
 
 import { ethers, isError, Wallet, ContractFactory, BaseContract, BrowserProvider, JsonRpcProvider } from 'ethers';
@@ -695,6 +697,70 @@ async function relayerPopulateTransactionWithErrorHandling(
       throw new Error(
         `Transaction has inconsistent fields (probably gasPrice + maxFeePerGas) — pick one fee mode`
       );
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// Signer.populateAuthorization — added 2026-06-24 (deepen-stream-2 pass 94)
+// ============================================================
+
+// @expect-violation: populateauthorization-no-provider-for-auto-fill
+// @expect-violation: populateauthorization-network-rpc-failure
+async function populateAuthorizationMissingErrorHandling(
+  signer: ethers.Signer,
+  delegateAddress: string
+) {
+  // No try-catch — EIP-7702 (Pectra) auth pre-fill anti-pattern. Either the
+  // signer has no provider attached (UNSUPPORTED_OPERATION with operation
+  // 'getNetwork' or 'getTransactionCount'), or the upstream RPC is degraded
+  // (NETWORK_ERROR / SERVER_ERROR / TIMEOUT). Both surface as an unhandled
+  // promise rejection that kills the relayer worker mid-batch and produces a
+  // user-visible "funds stuck" incident because the type-4 authorization
+  // never reaches the bundler.
+  const auth = await signer.populateAuthorization({
+    address: delegateAddress,
+    // chainId + nonce intentionally omitted — forces RPC roundtrips
+  });
+  return auth;
+}
+
+// @expect-clean
+async function populateAuthorizationWithErrorHandling(
+  signer: ethers.Signer,
+  delegateAddress: string,
+  knownChainId: bigint,
+  knownNonce: number
+) {
+  try {
+    // Supply chainId + nonce explicitly so populateAuthorization is effectively
+    // a no-op (returns the input unchanged). This is the relayer / sponsored-gas
+    // pattern where the server already knows both fields.
+    const auth = await signer.populateAuthorization({
+      address: delegateAddress,
+      chainId: knownChainId,
+      nonce: knownNonce,
+    });
+    return auth;
+  } catch (error) {
+    if (isError(error, 'UNSUPPORTED_OPERATION')) {
+      const op = (error as { operation?: string }).operation;
+      if (op === 'getNetwork') {
+        throw new Error('Signer has no provider — attach one or supply chainId explicitly');
+      }
+      if (op === 'getTransactionCount') {
+        throw new Error('Signer has no provider — attach one or supply nonce explicitly');
+      }
+      throw new Error('Signer has no provider attached — call signer.connect(provider) first');
+    }
+    if (
+      isError(error, 'NETWORK_ERROR') ||
+      isError(error, 'SERVER_ERROR') ||
+      isError(error, 'TIMEOUT')
+    ) {
+      // Transient — retry against a secondary RPC endpoint (FallbackProvider).
+      throw new Error('EIP-7702 authorization pre-fill failed — RPC degraded, retry with backoff');
     }
     throw error;
   }
