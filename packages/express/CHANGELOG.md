@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 100% → 100% (re-confirmed)
+
+- **Profile:** `packages/express/contract.yaml`
+- **Verified against:** express@5.2.1 (latest published, installed via `npm install express` on 2026-06-23)
+- **Functions added:** none (re-confirmation pass — API surface unchanged since 2026-04-04 pass)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** express.raw, express.text, app.param (rationale unchanged — identical body-parser/raw-body error profile; app.param shares async-middleware-unhandled-rejection semantics)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **API surface re-enumerated from:** node_modules/express@5.2.1/lib/express.js (top-level exports), lib/application.js (app.METHOD, app.use, app.listen, app.param, app.engine, app.route), lib/response.js (res.sendFile, res.download, res.render, res.send/json/jsonp/redirect/sendStatus etc.)
+- **Verdict:** 14 async-relevant API functions enumerated. 11 contracted, 3 intentionally omitted. Effective coverage = 11/11 = 1.0. No new methods introduced in express@5.x that aren't either (a) already contracted or (b) covered by the omission rationale. Express 5 auto-rejection-forwarding is documented in the parent contract notes; the postconditions correctly reflect the Express 4 vs 5 difference. metadata.last_verified bumped to 2026-06-23. No contract.yaml structural changes; no new fixtures; no scanner concerns.
+- **Verified by:** bc-deepen-contract / deepen-stream-3 pass 22 (2026-06-24T00:40:37Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** express@5.2.1
