@@ -18,6 +18,7 @@
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import type { GoogleAIFileManager as FileManagerType, GoogleAICacheManager as CacheManagerType } from '@google/generative-ai/server';
 // Note: GoogleAIFileManager and GoogleAICacheManager are in @google/generative-ai/server
 // but re-exported from the main package in some versions. Using type-only imports for fixtures.
 
@@ -353,3 +354,65 @@ class EmbeddingService {
 }
 
 export const embeddingService = new EmbeddingService();
+
+// ─── 25. GoogleAIFileManager.getFile — bare poll, no try-catch ────────────────
+// @expect-violation: getfile-network-error (scanner detection pending — concern-20260624-google-generative-ai-deepen-1)
+
+export async function pollFileNoCatch(fileManager: FileManagerType, fileName: string) {
+  // SHOULD_NOT_FIRE: getfile-network-error detection rule not yet implemented in scanner (concern queued); contract entry exists for future detection
+  const file = await fileManager.getFile(fileName);
+  return file;
+}
+
+// ─── 26. GoogleAIFileManager.getFile — try-catch present ─────────────────────
+// @expect-clean
+
+export async function pollFileWithCatch(fileManager: FileManagerType, fileName: string) {
+  try {
+    // SHOULD_NOT_FIRE: getFile inside try-catch — getfile-network-error satisfied
+    const file = await fileManager.getFile(fileName);
+    return file;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ─── 27. GoogleAIFileManager.deleteFile — bare cleanup, no try-catch ────────
+// @expect-violation: deletefile-network-error (scanner detection pending — concern-20260624-google-generative-ai-deepen-2)
+
+export async function deleteFileNoCatch(fileManager: FileManagerType, fileName: string) {
+  // SHOULD_NOT_FIRE: deletefile-network-error detection rule not yet implemented in scanner (concern queued); contract entry exists for future detection
+  await fileManager.deleteFile(fileName);
+}
+
+// ─── 28. GoogleAIFileManager.deleteFile — try-catch present ─────────────────
+// @expect-clean
+
+export async function deleteFileWithCatch(fileManager: FileManagerType, fileName: string) {
+  try {
+    // SHOULD_NOT_FIRE: deleteFile inside try-catch — deletefile-network-error satisfied
+    await fileManager.deleteFile(fileName);
+  } catch (err) {
+    // 404 means file already gone — safe to swallow in cleanup
+  }
+}
+
+// ─── 29. GoogleAICacheManager.delete — bare cleanup, no try-catch ────────────
+// @expect-violation: cache-delete-network-error (scanner detection pending — concern-20260624-google-generative-ai-deepen-3)
+
+export async function deleteCacheNoCatch(cacheManager: CacheManagerType, cacheName: string) {
+  // SHOULD_NOT_FIRE: cache-delete-network-error detection rule not yet implemented in scanner (concern queued); contract entry exists for future detection
+  await cacheManager.delete(cacheName);
+}
+
+// ─── 30. GoogleAICacheManager.delete — try-catch present ────────────────────
+// @expect-clean
+
+export async function deleteCacheWithCatch(cacheManager: CacheManagerType, cacheName: string) {
+  try {
+    // SHOULD_NOT_FIRE: cache delete inside try-catch — cache-delete-network-error satisfied
+    await cacheManager.delete(cacheName);
+  } catch (err) {
+    // 404 means cache already expired — safe to swallow
+  }
+}

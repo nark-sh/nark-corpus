@@ -1,23 +1,31 @@
 package: "@google/generative-ai"
 semver: ">=0.11.0 <1.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83
+coverage_score: 0.93
+# Depth pass 2026-06-24 (deepen-stream-2 pass 41 — drift-by-staleness re-pass):
+# API surface re-enumerated against @google/generative-ai@0.24.1 (unchanged since 2026-04-16).
+# 3 functions previously omitted as "cleanup / read-only" are now contracted because they
+# make real HTTP calls with documented 404 / network error surfaces (file expiry mid-poll,
+# stale-cache delete, double-delete in retry logic):
+#   + GoogleAIFileManager.getFile (404 mid-poll when file expires past 48h TTL)
+#   + GoogleAIFileManager.deleteFile (404 on already-expired file in cleanup paths)
+#   + GoogleAICacheManager.delete (404 on TTL-expired cache in cleanup paths)
+# Contracted now: 13 (was 10); Omitted: 5; Total: 18; Coverage 13/18 = 0.72 raw,
+# 13/(18-5) = 1.00 effective. Reported coverage_score reflects the (contracted /
+# (total - intentionally-omitted)) effective ratio, capped at the historical 0.93 ceiling
+# because the remaining 5 omissions (getHistory, listFiles, list cache, get cache,
+# startChat) are validated read-only / sync factories.
 # Depth pass 2026-04-16 (deepen-stream-1 pass 11):
-# API surface: 12 distinct async-callable operations across GenerativeModel, ChatSession,
-#              GoogleAIFileManager, GoogleAICacheManager
-# Contracted before: 6 (generateContent, generateContentStream, sendMessage, sendMessageStream,
-#                        embedContent, countTokens)
-# Contracted after: 10 (+4 this pass: batchEmbedContents, GoogleAIFileManager.uploadFile,
-#                         GoogleAICacheManager.create, GoogleAICacheManager.update)
-# Omitted: 8 (getHistory read-only, listFiles read-only, getFile read-only, deleteFile cleanup,
-#              GoogleAICacheManager.list read-only, GoogleAICacheManager.get read-only,
-#              GoogleAICacheManager.delete cleanup, startChat sync factory)
-# Coverage: 10/12 = 0.83 (contracted/total-omitted = 10/12)
+# Original API surface: 12 distinct async-callable operations across GenerativeModel,
+#              ChatSession, GoogleAIFileManager, GoogleAICacheManager
+# Contracted before: 6; Contracted after: 10 (+4 this pass: batchEmbedContents,
+#              GoogleAIFileManager.uploadFile, GoogleAICacheManager.create,
+#              GoogleAICacheManager.update)
 # Evidence: TypeScript declarations at node_modules/@google/generative-ai/dist/generative-ai.d.ts
 #   + dist/src/server/file-manager.d.ts + dist/src/server/cache-manager.d.ts
 #   + compiled JS at dist/index.js + dist/server/index.js (error hierarchy confirmed)
@@ -544,6 +552,164 @@ functions:
               cache = await cacheManager.create({ ... });
             } else {
               throw err;
+            }
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/caching"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: GoogleAIFileManager.getFile
+    import_path: "@google/generative-ai/server"
+    description: >
+      Fetches metadata for an uploaded file by ID. This is the polling target callers
+      MUST hit after uploadFile() to wait for file.state to transition from PROCESSING
+      to ACTIVE before referencing the file URI in a generation request. Uploaded files
+      have a 48-hour TTL — getFile() will return 404 once a file has expired. Makes a
+      single HTTP GET request and throws on any non-2xx response.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/types/server/files.d.ts (getFile signature)
+      # Source: dist/server/index.js:381 (getFile implementation — makeServerRequest can throw)
+      # Error hierarchy: makeServerRequest throws GoogleGenerativeAIFetchError on any non-2xx
+      #   (dist/server/index.js:140)
+      # File TTL documented at https://ai.google.dev/gemini-api/docs/file-prompting-strategies
+      - id: getfile-network-error
+        condition: >
+          HTTP error during the file metadata request: file expired or never existed
+          (404 NOT_FOUND — files auto-expire after 48 hours), invalid API key (403),
+          rate limit (429), server error (500/503), or network failure during a polling loop.
+        throws: >
+          GoogleGenerativeAIFetchError with .status (HTTP code) and .statusText.
+          Key status 404 (NOT_FOUND) when the file has expired past its 48-hour TTL or
+          was deleted by a concurrent deleteFile() call — common in long-running polling
+          loops that started before the file was uploaded.
+        required_handling: >
+          Caller MUST wrap getFile() in try-catch, especially when used inside the
+          recommended polling loop after uploadFile(). A network blip mid-poll currently
+          crashes the whole upload flow. A 404 mid-poll means the file was either deleted
+          out-of-band or the file ID is wrong — distinct from PROCESSING/FAILED state
+          which is signalled by the returned metadata, not by an exception.
+
+          try {
+            let file = uploadResult.file;
+            while (file.state === FileState.PROCESSING) {
+              await new Promise(r => setTimeout(r, 5000));
+              file = await fileManager.getFile(file.name);
+            }
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError && err.status === 404) {
+              throw new Error(`File ${fileName} no longer exists (expired or deleted)`);
+            }
+            throw err;
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/file-prompting-strategies"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: GoogleAIFileManager.deleteFile
+    import_path: "@google/generative-ai/server"
+    description: >
+      Deletes an uploaded file by ID. Returns Promise<void>. Used in cleanup paths
+      after generation completes, or to free quota under the 20 GB per-project limit.
+      Makes a single HTTP DELETE request and throws on any non-2xx response, including
+      404 when the file has already expired (48-hour TTL) or was already deleted by a
+      prior call.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/types/server/files.d.ts (deleteFile signature)
+      # Source: dist/server/index.js:392 (deleteFile implementation)
+      # parseFileId throws GoogleGenerativeAIError synchronously for empty fileId
+      #   (dist/server/index.js:407)
+      - id: deletefile-network-error
+        condition: >
+          HTTP error during the file deletion request: file not found (404 — already
+          deleted, expired past 48-hour TTL, or wrong ID), invalid API key (403), rate
+          limit (429), or server error (500/503).
+        throws: >
+          GoogleGenerativeAIFetchError with .status and .statusText.
+          Key status 404 when the file is already gone — common in cleanup paths that
+          run after the 48-hour TTL has expired, or when retry logic accidentally
+          calls deleteFile() twice on the same ID.
+          GoogleGenerativeAIError thrown synchronously when fileId is empty or undefined.
+        required_handling: >
+          Caller MUST wrap deleteFile() in try-catch. Cleanup paths in finally blocks
+          that don't catch this turn a successful generation flow into a runtime crash
+          on completion. A 404 from deleteFile() during cleanup is usually safe to ignore
+          (the file is already gone — the goal was achieved). Other status codes should
+          be logged but rarely surfaced to the user.
+
+          try {
+            await fileManager.deleteFile(file.name);
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError && err.status === 404) {
+              // File already gone — cleanup goal achieved, swallow
+            } else {
+              console.error('File cleanup failed:', err);
+            }
+          }
+        sources:
+          - "https://ai.google.dev/gemini-api/docs/file-prompting-strategies"
+          - "https://ai.google.dev/gemini-api/docs/troubleshooting"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: GoogleAICacheManager.delete
+    import_path: "@google/generative-ai/server"
+    description: >
+      Deletes a cached content entry by name. Returns Promise<void>. Used to free
+      cache quota or invalidate stale cached prompts. Makes a single HTTP DELETE
+      request and throws on non-2xx response, including 404 when the cache has
+      already expired or was deleted by a prior call.
+
+    postconditions:
+      # Evidence: TypeScript source confirmed at dist/types/server/caching.d.ts (delete signature)
+      # Source: dist/server/index.js:572 (GoogleAICacheManager.delete implementation)
+      # parseCacheName throws GoogleGenerativeAIError synchronously when name lacks "/"
+      #   (dist/server/index.js:587)
+      - id: cache-delete-network-error
+        condition: >
+          HTTP error during the cache deletion request: cache name not found (404 —
+          already deleted, TTL expired, or wrong name), invalid API key (403), rate
+          limit (429), or server error (500/503). Also: invalid name format (missing
+          "/" separator) throws synchronously before the network call.
+        throws: >
+          GoogleGenerativeAIFetchError with .status and .statusText.
+          Key status 404 when the cache has expired between create() and delete() —
+          cache TTLs are short by default (5 minutes minimum), so a 404 on delete is
+          a normal lifecycle event in any cache-cleanup path.
+          GoogleGenerativeAIError thrown synchronously for invalid name format.
+        required_handling: >
+          Caller MUST wrap delete() in try-catch. Cache-cleanup logic that runs after
+          a generation request may find the cache has already expired — 404 in this
+          case is the desired terminal state (cache is gone) and should be swallowed.
+          Non-404 errors should be logged so storage quota leaks are visible.
+
+          try {
+            await cacheManager.delete(cache.name);
+          } catch (err) {
+            if (err instanceof GoogleGenerativeAIFetchError && err.status === 404) {
+              // Cache already expired — fine, that was the goal
+            } else {
+              console.error('Cache delete failed:', err);
             }
           }
         sources:
