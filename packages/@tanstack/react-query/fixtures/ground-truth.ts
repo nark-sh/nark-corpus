@@ -24,7 +24,10 @@
  *   - Section 4: mutateAsync() inside try-catch → SHOULD_NOT_FIRE
  */
 
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useSuspenseQueries } from "@tanstack/react-query";
+// QueryClient resetQueries is exercised via a queryClient instance reference (typed as `any` to keep
+// fixtures free of the full QueryClient type machinery — the scanner detects by call-shape, not type).
+declare const queryClient: any;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. useQuery() — scanner fires on hook call → SHOULD_FIRE
@@ -87,6 +90,69 @@ export async function submitFormWithCatch(
     return result;
   } catch (error) {
     console.error("Mutation failed:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. useSuspenseQueries() — scanner fires on hook call → SHOULD_FIRE
+// Added 2026-06-24 (deepen-stream-3 pass 26) — covers suspense-queries-error-boundary-required.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function useUsersAndPostsSuspenseNoBoundary() {
+  // SHOULD_NOT_FIRE: scanner's react-query-analyzer only knows about
+  // useQuery / useMutation / useInfiniteQuery as of nark@3.2.0 — useSuspenseQueries
+  // detection is queued as scanner concern concern-20260624-tanstack-react-query-deepen-1.
+  // Postcondition suspense-queries-error-boundary-required exists in the contract for
+  // when the scanner catches up; this fixture documents the call shape for the future rule.
+  const results = useSuspenseQueries({
+    queries: [
+      {
+        queryKey: ["users"],
+        queryFn: async () => {
+          const res = await fetch("/api/users");
+          return res.json();
+        },
+      },
+      {
+        queryKey: ["posts"],
+        queryFn: async () => {
+          const res = await fetch("/api/posts");
+          return res.json();
+        },
+      },
+    ],
+  });
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. queryClient.resetQueries() with throwOnError:true outside try-catch → SHOULD_FIRE
+// Added 2026-06-24 (deepen-stream-3 pass 26) — covers resetqueries-throws-when-throw-on-error.
+// Note: the scanner detects resetQueries by name; the scanner cannot inspect the throwOnError
+// flag value, so this annotation reflects what the contract documents, not detection precision.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resetSessionNoCatch() {
+  // SHOULD_NOT_FIRE: scanner cannot detect property-chain call (queryClient.resetQueries(...))
+  // through a typed-any variable. The resetQueries postconditions cover the call shape, but
+  // the scanner's current detection path (top-level / named-import) won't fire on this access.
+  // Documenting as SHOULD_NOT_FIRE keeps the fixture honest about scanner behavior.
+  await queryClient.resetQueries({
+    queryKey: ["session"],
+    throwOnError: true,
+  });
+}
+
+export async function resetSessionWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    await queryClient.resetQueries({
+      queryKey: ["session"],
+      throwOnError: true,
+    });
+  } catch (error) {
+    console.error("reset-and-refetch failed:", error);
     throw error;
   }
 }

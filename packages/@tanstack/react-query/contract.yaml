@@ -1,12 +1,12 @@
 package: "@tanstack/react-query"
 semver: ">=5.0.0 <6.0.0"
-contract_version: "2.0.0"
+contract_version: "2.1.0"
 maintainer: "behavioral-contracts"
-last_verified: "2026-04-13"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 14 contracted / 14 non-omitted = 100%. Pass 2: corrected total to 21 (was 18), added ensureInfiniteQueryData; usePrefetchQuery/usePrefetchInfiniteQuery correctly classified as intentionally omitted (same never-throws profile as prefetchQuery/prefetchInfiniteQuery). 7 total omissions out of 21 async-callable functions.
+coverage_score: 1.0  # 15 contracted / 15 non-omitted = 100%. Pass 26 (deepen-stream-3, 2026-06-24): verified against v5.101.1; added useSuspenseQueries (Suspense hook variant, throws to ErrorBoundary) and resetQueries (QueryClient.resetQueries — Promise<void> with throwOnError option, same shape as refetchQueries). cancelQueries / prefetchInfiniteQuery / resumePausedMutations / usePrefetchQuery / usePrefetchInfiniteQuery confirmed intentionally omitted (never-throw paths verified in @tanstack/query-core@5.101.1 source). 5 intentional omissions out of 20 async-callable functions.
 
 functions:
   - name: useQuery
@@ -1025,3 +1025,223 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+
+  # Evidence: https://github.com/TanStack/query/blob/main/docs/framework/react/reference/useSuspenseQueries.md
+  # Evidence: node_modules/@tanstack/react-query/build/modern/_tsup-dts-rollup.d.ts line 915 —
+  # declare function useSuspenseQueries(options: {...}, queryClient?: QueryClient): TCombinedResult
+  # Options exclude throwOnError, enabled, placeholderData, suspense — errors always throw to ErrorBoundary.
+  # Added in deepen pass 26 (2026-06-24, deepen-stream-3, verified against @tanstack/react-query@5.101.1).
+  - name: useSuspenseQueries
+    import_path: "@tanstack/react-query"
+    description: >
+      Suspense-enabled variant of useQueries. Runs multiple queries in parallel like
+      useQueries, but suspends the component (throws a Promise) while loading and
+      throws errors to the nearest ErrorBoundary on any query failure. The options
+      type explicitly omits throwOnError, enabled, placeholderData, and suspense —
+      all errors propagate to ErrorBoundary unconditionally. Each result's data is
+      guaranteed to be defined; status is either 'success' or 'error' (never 'pending').
+      Per official docs (useSuspenseQueries.md): "Cancellation does not work."
+
+    postconditions:
+      # Evidence: https://github.com/TanStack/query/blob/main/docs/framework/react/reference/useSuspenseQueries.md
+      # Evidence: https://github.com/TanStack/query/blob/main/docs/framework/react/guides/suspense.md
+      # Type-level proof: UseSuspenseQueriesOptions extends Omit<UseQueriesOptions, 'throwOnError' | 'enabled' | 'placeholderData' | 'suspense'>
+      # The user has no escape hatch — errors ALWAYS throw to the nearest ErrorBoundary.
+      - id: suspense-queries-error-boundary-required
+        condition: "any query in the array throws an error during fetch"
+        throws: "Error thrown by the failing queryFn — propagated to nearest ErrorBoundary (not returned in result)"
+        required_handling: |
+          Unlike useQueries, useSuspenseQueries does NOT return errors in each result's
+          error property. Any single query failure throws to the nearest ErrorBoundary —
+          the entire component subtree unmounts and the fallback renders.
+
+          throwOnError CANNOT be configured (excluded from the options type).
+          You cannot opt out of throw-on-error per-query; the whole array is all-or-nothing.
+
+          Caller MUST:
+          1. Wrap the consuming component in a React ErrorBoundary to catch thrown errors, AND
+          2. Wrap with QueryErrorResetBoundary (or use useQueryErrorResetBoundary) to allow retry.
+
+          Required pattern:
+          ```tsx
+          <QueryErrorResetBoundary>
+            {({ reset }) => (
+              <ErrorBoundary onReset={reset} fallback={<ErrorUI />}>
+                <ComponentUsingSuspenseQueries />
+              </ErrorBoundary>
+            )}
+          </QueryErrorResetBoundary>
+          ```
+
+          Without ErrorBoundary, ANY failing query crashes the component tree —
+          even if the other queries succeeded. There is no partial-success result
+          shape with useSuspenseQueries (unlike useQueries where mixed states are returned).
+        sources:
+          - "https://github.com/TanStack/query/blob/main/docs/framework/react/reference/useSuspenseQueries.md"
+          - "https://github.com/TanStack/query/blob/main/docs/framework/react/guides/suspense.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: useSuspenseQueries.md — "Cancellation does not work"
+      # Identical caveat to useSuspenseQuery; the AbortSignal does not propagate cancel semantics
+      # through suspense-suspended renders, causing in-flight requests to continue after unmount.
+      - id: suspense-queries-cancellation-not-supported
+        condition: "component unmounts while one or more queries are in-flight"
+        throws: "CancelledError does not propagate as expected — cancellation does not work with Suspense hooks"
+        required_handling: |
+          Cancellation via AbortSignal does not function correctly with useSuspenseQueries.
+          In-flight queries continue running after the component unmounts.
+
+          Do not rely on query cancellation patterns when using Suspense variants.
+          If cancellation on unmount is required (e.g., for expensive long-running fetches),
+          use standard useQueries instead and check per-result error/loading states.
+        sources:
+          - "https://github.com/TanStack/query/blob/main/docs/framework/react/reference/useSuspenseQueries.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: useSuspenseQueries.md —
+      # "Keep in mind that the component will only re-mount after all queries have finished loading."
+      # "If a query has gone stale in the time it took for all the queries to complete, it will be fetched again at re-mount."
+      # This is a render-amplification footgun. Recommended mitigation: "set a high enough staleTime"
+      - id: suspense-queries-stale-refetch-cascade
+        condition: "one query in the array takes significantly longer than others to load on initial mount"
+        throws: "N/A — silent re-fetch cascade on re-mount"
+        required_handling: |
+          The component does not re-mount until ALL queries have finished loading.
+          During that window, any query that completed quickly may go stale (staleTime defaults to 0).
+          On re-mount, every stale query refetches automatically — causing a cascade of
+          duplicate requests immediately after Suspense resolves.
+
+          For arrays containing one slow query and several fast ones, set staleTime explicitly:
+          ```tsx
+          useSuspenseQueries({
+            queries: [
+              { queryKey: ['fast-1'], queryFn: fetchFast1, staleTime: 60_000 },
+              { queryKey: ['slow'],   queryFn: fetchSlow,                    },
+              { queryKey: ['fast-2'], queryFn: fetchFast2, staleTime: 60_000 },
+            ],
+          })
+          ```
+
+          Without staleTime, the network traffic doubles on first mount, which causes
+          rate-limit pressure on the slowest endpoint and adds latency to interactive use.
+        sources:
+          - "https://github.com/TanStack/query/blob/main/docs/framework/react/reference/useSuspenseQueries.md"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: https://github.com/TanStack/query/blob/main/docs/reference/QueryClient.md
+  # Evidence: node_modules/@tanstack/query-core/build/modern/queryClient.js lines 126-140 —
+  # resetQueries(filters, options) {
+  #   ...
+  #   return notifyManager.batch(() => {
+  #     queryCache.findAll(filters).forEach((query) => { query.reset(); });
+  #     return this.refetchQueries({ type: "active", ...filters }, options);
+  #   });
+  # }
+  # i.e. resetQueries delegates to refetchQueries → inherits its throwOnError semantics.
+  # Docs (QueryClient.md): "When set to `true`, this method will throw if any of the query refetch tasks fail."
+  # Added in deepen pass 26 (2026-06-24, deepen-stream-3, verified against @tanstack/query-core@5.101.1).
+  - name: resetQueries
+    import_path: "@tanstack/react-query"
+    description: >
+      Imperative QueryClient method that resets matching queries to their initial state
+      (clearing data, error, and status) and then triggers a refetch of active queries.
+      Returns Promise<void>. By default the underlying refetch failures are silently
+      swallowed (.catch(noop) in refetchQueries) — only throws when options.throwOnError
+      is explicitly set to true. Used for "reset to clean state" flows like logout, account
+      switching, or test setup/teardown.
+
+    postconditions:
+      # Evidence: https://github.com/TanStack/query/blob/main/docs/reference/QueryClient.md
+      # Evidence: node_modules/@tanstack/query-core/build/modern/queryClient.js — resetQueries delegates to refetchQueries
+      # Default throwOnError=undefined → refetchQueries' promise.catch(noop) swallows failures.
+      - id: resetqueries-silent-refetch-failure
+        condition: "refetch triggered by reset fails and throwOnError is not set"
+        throws: "No error thrown by default (throwOnError defaults to undefined / false)"
+        required_handling: |
+          By default, resetQueries does NOT throw if the post-reset refetch fails.
+          The reset itself (clearing query state) always succeeds; only the subsequent
+          refetch of active queries can fail, and that failure is silently swallowed
+          unless throwOnError: true is passed.
+
+          For most use cases this is correct behavior — resetting on logout/account-switch
+          should not error even if a background refetch happens to fail. This postcondition
+          documents that fact so suppress-or-fix decisions are auditable.
+
+          If post-reset refetch failure must be surfaced (e.g., for test assertions or
+          explicit "reset and reload" UI), pass throwOnError: true:
+          ```typescript
+          try {
+            await queryClient.resetQueries({
+              queryKey: ['user-data'],
+              throwOnError: true,
+            })
+          } catch (error) {
+            toast.error('Failed to reload after reset')
+          }
+          ```
+        sources:
+          - "https://github.com/TanStack/query/blob/main/docs/reference/QueryClient.md"
+        # Severity: info — same rationale as invalidateQueries-silent-refetch-failure.
+        # resetQueries is fire-and-forget by design; flagging every call would generate FP noise
+        # comparable to the invalidateQueries case (downgraded to info after 512 bulk-scan FPs).
+        severity: info
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: https://github.com/TanStack/query/blob/main/docs/reference/QueryClient.md
+      # "When set to `true`, this method will throw if any of the query refetch tasks fail."
+      # Evidence: queryClient.js refetchQueries body — `if (!fetchOptions.throwOnError) { promise = promise.catch(noop); }`
+      # Inverse: throwOnError=true skips the .catch(noop), so any failed query.fetch() rejects.
+      - id: resetqueries-throws-when-throw-on-error
+        condition: "options.throwOnError is true and any reset-triggered refetch fails"
+        throws: "Error from the failing queryFn — thrown directly (Promise.all rejects with first failure)"
+        required_handling: |
+          When throwOnError: true is passed, resetQueries throws on any refetch failure.
+
+          Caller MUST wrap in try-catch:
+          ```typescript
+          try {
+            await queryClient.resetQueries({
+              queryKey: ['session'],
+              throwOnError: true,
+            })
+          } catch (error) {
+            // Handle: log, toast, fallback navigation, etc.
+            console.error('reset-and-refetch failed:', error)
+          }
+          ```
+
+          Common in test setup/teardown where assertion of clean state is required, or
+          in critical-path flows (e.g., account switch) where stale data after reset
+          would be a security/correctness issue.
+        sources:
+          - "https://github.com/TanStack/query/blob/main/docs/reference/QueryClient.md"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
