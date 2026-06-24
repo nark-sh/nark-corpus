@@ -4,9 +4,9 @@
  * Each call site annotated // SHOULD_FIRE or // SHOULD_NOT_FIRE.
  * Contract postcondition IDs: network-error, http-error-unchecked, abort-error,
  *   fetch-request-timeout-error, fetch-body-timeout-error, fetch-max-size-error,
- *   json-parse-error, json-body-consumed-twice, text-abort-mid-stream,
- *   text-body-consumed-twice, text-converted-missing-encoding-package,
- *   text-converted-body-consumed-twice
+ *   fetch-max-redirect-error, json-parse-error, json-body-consumed-twice,
+ *   text-abort-mid-stream, text-body-consumed-twice,
+ *   text-converted-missing-encoding-package, text-converted-body-consumed-twice
  *
  * Key rules:
  *   - await fetch() without try-catch → SHOULD_FIRE (network-error)
@@ -264,6 +264,37 @@ export async function fetchWithSizeCapAndCatch(url: string) {
     const err = error as { name?: string; type?: string };
     if (err.name === 'FetchError' && err.type === 'max-size') {
       throw new Error(`Response too large: exceeded 1MB limit for ${url}`);
+    }
+    throw error;
+  }
+}
+
+// ─── 17. fetch() with node-fetch { follow } cap, no try-catch ─────────────────
+// @expect-violation: fetch-max-redirect-error
+
+export async function fetchWithFollowCapNoCatch(url: string) {
+  // SHOULD_FIRE: fetch-max-redirect-error — { follow: N } caps redirect chain.
+  // Exceeding the limit rejects fetch() with FetchError type='max-redirect'.
+  // Without try-catch, SSRF/redirect-loop guardrail crashes the caller.
+  // TODO(scanner): fetch-max-redirect-error — no scanner detection rule yet.
+  const response = await (fetch as any)(url, { follow: 5 });
+  if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+  return response.json();
+}
+
+// ─── 18. fetch() with { follow } cap inside try-catch — correct pattern ───────
+// @expect-clean
+
+export async function fetchWithFollowCapAndCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: { follow } guardrail used inside try-catch — max-redirect handled
+    const response = await (fetch as any)(url, { follow: 5 });
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    const err = error as { name?: string; type?: string };
+    if (err.name === 'FetchError' && err.type === 'max-redirect') {
+      throw new Error(`Upstream redirect loop detected at ${url}`);
     }
     throw error;
   }

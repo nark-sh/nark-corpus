@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% -> 100% (effective; +1 postcondition)
+
+- **Profile:** `packages/cross-fetch/contract.yaml`
+- **Functions added:** none (postcondition added to existing `fetch()` function)
+- **Postconditions added:** 1 (`fetch-max-redirect-error`)
+- **Functions intentionally omitted this pass:** none new (existing omissions: `response.arrayBuffer`, `response.blob`, `response.buffer` — same consumeBody error profile as `response.text`)
+- **Scanner concerns queued:** 1 (`concern-20260624-cross-fetch-deepen-1`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** node-fetch v2.7.0 source (lib/index.js lines 1589-1591); https://github.com/node-fetch/node-fetch/blob/2.x/README.md; https://github.com/node-fetch/node-fetch/blob/2.x/ERROR-HANDLING.md
+- **Coverage:** raw 4/7 = 0.57, effective 4/4 = 1.0 (unchanged — added postcondition to existing fetch())
+- **Postconditions total:** 13 -> 14
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 77 on 2026-06-24T12:38Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** cross-fetch@4.1.0
