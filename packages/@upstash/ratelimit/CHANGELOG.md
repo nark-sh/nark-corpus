@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 89% → 89% (re-confirmed-complete)
+
+- **Profile:** `packages/@upstash/ratelimit/contract.yaml`
+- **Functions added:** none (all user-callable async methods already contracted; surface unchanged from 2026-06-18 pass — `node_modules/@upstash/ratelimit/dist/index.d.ts` md5 `f498a3bc6908b566ce4b538f9fe2bf23`, 840 lines, identical to last pass)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** Analytics.record / .series / .getUsage / .getUsageOverTime / .getMostAllowedBlocked — Analytics is still documented "experimental and can change at any time" in `dist/index.d.ts` line 135 (unchanged); fresh corpus grep across 6200+ active repos confirmed zero `import { Analytics } from '@upstash/ratelimit'` adoption (only upstash's own test suite uses it).
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** `node_modules/@upstash/ratelimit/dist/index.d.ts` (840 lines, full Phase 1 re-enumeration); `node_modules/@upstash/ratelimit/package.json` (confirms version 2.0.8 unchanged); corpus-builder grep for Analytics imports.
+- **Effective coverage:** 8/8 user-callable non-experimental async functions = 100% (raw coverage_score 0.89 reflects 8 contracted / 9 total counted; the 1-unit gap remains the rounding artifact from the original 2026-04-13 reconstruction).
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T13:45:23Z)
+
 ## 2026-06-18 — deepen pass — coverage 89% → 89% (re-confirmed-complete)
 
 - **Profile:** `packages/@upstash/ratelimit/contract.yaml`
