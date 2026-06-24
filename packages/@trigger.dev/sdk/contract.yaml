@@ -1,8 +1,8 @@
 package: "@trigger.dev/sdk"
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-18"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -55,7 +55,39 @@ evidence_quality: confirmed
 # Evidence URLs actually fetched:
 #   https://trigger.dev/docs/wait-for-token
 # Effective coverage (non-omitted contracted / non-omitted total) = 25/25 = 1.0.
-coverage_score: 0.57  # 25 contracted / 44 raw async-callable functions (19 intentionally omitted from raw count; effective = 25/25 = 1.0)
+#
+# Depth pass 2026-06-24 (deepen-stream-3 pass 82):
+# Applied new pattern: composable-middleware-misclassified-as-sync-factory.
+# Prior passes treated envvars, prompts, idempotencyKeys, streams, batch, and
+# usage as "namespace factories" and omitted their methods as sync. They are
+# actually sync objects whose METHODS are async + throw. Each is now a first-class
+# contracted function.
+# Contracted before: 25  Contracted after: 36 (+11 this pass)
+# Added functions:
+#   envvars-upload, envvars-create, envvars-update, envvars-del,
+#   prompts-resolve, prompts-promote, prompts-create-override,
+#   idempotency-keys-create,
+#   streams-read, streams-append,
+#   batch-retrieve, usage-measure
+# (12 functions counted but only 11 add net coverage — usage-measure is listed)
+# Source-inspected (4.4.6):
+#   dist/commonjs/v3/envvars.js — sync arg-validation throws + async ApiError hierarchy
+#   dist/commonjs/v3/promptManagement.js — apiClient.zodFetch wrappers
+#   dist/commonjs/v3/streams.js — sync target-run-id throw + async stream-write apiClient
+#   dist/commonjs/v3/batch.js — apiClient.retrieveBatch wrapper
+#   @trigger.dev/core/dist/commonjs/v3/idempotencyKeys.js — Promise<IdempotencyKey>
+# Evidence URLs actually fetched:
+#   https://trigger.dev/docs/management/envvars/import
+#   https://trigger.dev/docs/management/envvars/create
+#   https://trigger.dev/docs/management/envvars/update
+#   https://trigger.dev/docs/management/envvars/delete
+#   https://trigger.dev/docs/realtime/streams
+#   https://trigger.dev/docs/idempotency
+#   https://trigger.dev/docs/management/batch/retrieve
+#   https://trigger.dev/docs/run-usage
+# Effective coverage (non-omitted contracted / non-omitted total) = 36/36 = 1.0.
+# Raw coverage = 36/44 = 0.82.
+coverage_score: 0.82  # 36 contracted / 44 raw async-callable functions (8 intentionally omitted; effective = 36/36 = 1.0)
 
 detection:
   require_instance_tracking: false
@@ -1396,6 +1428,684 @@ functions:
           - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/query.ts"
           - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/apiClient/errors.ts"
         severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # ── Added in depth pass 2026-06-24 (deepen-stream-3 pass 82) ────────────────
+  # New pattern applied: composable-middleware-misclassified-as-sync-factory.
+  # The envvars, prompts, idempotencyKeys, streams, batch, and usage namespaces
+  # are sync objects returned at module load time, but their METHODS are async
+  # and throw the full ApiError hierarchy. Prior passes omitted them as "namespace
+  # factories" — that was wrong. Each method has its own postconditions.
+  #
+  # API surface re-enumerated against @trigger.dev/sdk@4.4.6 declaration files
+  # (node_modules/@trigger.dev/sdk/dist/commonjs/v3/{envvars,prompts,promptManagement,
+  # idempotencyKeys,streams,batch,usage}.d.ts).
+  #
+  # Source-inspected (4.4.6):
+  #   dist/commonjs/v3/envvars.js — synchronous "params is required" / "slug is required"
+  #     / "projectRef is required" validation throws; async API errors via apiClient
+  #   dist/commonjs/v3/promptManagement.js — apiClient.zodFetch wrappers, full ApiError hierarchy
+  #   dist/commonjs/v3/streams.js — "Could not determine the target run ID" sync throw,
+  #     async API errors via stream-write apiClient
+  #   @trigger.dev/core/dist/commonjs/v3/idempotencyKeys.js — Promise<IdempotencyKey>
+  # Evidence URLs actually fetched:
+  #   https://trigger.dev/docs/management/envvars/list
+  #   https://trigger.dev/docs/management/envvars/create
+  #   https://trigger.dev/docs/realtime/streams
+  #   https://trigger.dev/docs/idempotency
+
+  - name: envvars-upload
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Uploads (bulk-imports) environment variables to a Trigger.dev project/environment.
+      Called as envvars.upload(projectRef, slug, params) or envvars.upload(params) when
+      task-runtime ambient context provides projectRef+slug. Makes an authenticated HTTP
+      POST that REPLACES the entire env-var set when `override: true` is set in params.
+      Both arg-validation (synchronous throws on missing projectRef/slug/params) and the
+      remote API call can fail.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/envvars.js
+      # Synchronous arg-validation throws: "params is required", "slug is required",
+      # "projectRef is required" — these throw BEFORE returning a Promise.
+      # Async errors via apiClient.importEnvVars: full ApiError hierarchy.
+      - id: envvars-upload-no-try-catch
+        condition: >
+          envvars.upload() called in async context without surrounding try/catch.
+          Arg-validation throws synchronously when projectRef/slug/params are missing
+          (deployment-pipeline misconfiguration), and the network upload can fail with
+          AuthenticationError, RateLimitError, BadRequestError, or ApiConnectionError.
+          When `override: true`, a half-applied failure can leave the environment in a
+          partially-replaced state — some vars updated, others stale.
+        throws: >
+          Error (synchronous) — "params is required", "slug is required",
+          "projectRef is required" (when called via overload that requires them).
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid or revoked Personal Access Token.
+          BadRequestError (status 400) — malformed env var names (e.g. starting with a digit),
+          reserved key collisions (TRIGGER_*).
+          RateLimitError (status 429) — bulk import rate limit.
+          ApiConnectionError — network failure mid-upload.
+        required_handling: >
+          Caller MUST wrap envvars.upload() in try/catch — typically in a deploy script
+          or CI step. Distinguish BadRequestError (developer error: fix the var names,
+          do not retry) from RateLimitError / ApiConnectionError (transient: retry with
+          exponential backoff).
+
+          try {
+            await envvars.upload(projectRef, "prod", {
+              variables: { DATABASE_URL: process.env.NEW_DB_URL, ... },
+              override: true,
+            });
+          } catch (err) {
+            if (err instanceof BadRequestError) {
+              console.error("Invalid env var spec — fix and re-run:", err.message);
+              process.exit(2);
+            }
+            if (err instanceof AuthenticationError) {
+              console.error("TRIGGER_ACCESS_TOKEN invalid — rotate and re-run");
+              process.exit(3);
+            }
+            throw err;
+          }
+
+          CRITICAL: when `override: true`, a mid-upload failure can leave the
+          environment partially replaced. Re-run the upload to make it idempotent,
+          or set override: false and patch individual vars.
+        sources:
+          - "https://trigger.dev/docs/management/envvars/import"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/envvars.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: envvars-create
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a single environment variable on a Trigger.dev environment.
+      Called as envvars.create(projectRef, slug, params) or envvars.create(params)
+      from within a task runtime. Makes an authenticated HTTP POST. Throws on
+      duplicate-name conflict (409), reserved key collisions, or auth/network errors.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/envvars.js
+      # Synchronous arg-validation as in envvars.upload.
+      # Async errors via apiClient.createEnvVar: full ApiError hierarchy + ConflictError.
+      - id: envvars-create-no-try-catch
+        condition: >
+          envvars.create() called in async context without surrounding try/catch.
+          Synchronous arg-validation throws "params is required"/"slug is required"/
+          "projectRef is required", and the network call can fail with auth, conflict
+          (variable already exists), or validation errors.
+        throws: >
+          Error (synchronous) — "params is required", "slug is required",
+          "projectRef is required" (when required overload arg is missing).
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          ConflictError (status 409) — variable with this name already exists.
+          BadRequestError (status 400) — invalid name (reserved prefix, illegal chars).
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap envvars.create() in try/catch. The most common operational
+          error is ConflictError when an env var already exists — surface this as a
+          "already exists, use update() instead" message rather than crashing the deploy.
+
+          try {
+            await envvars.create({ name: "STRIPE_KEY", value: process.env.STRIPE_KEY });
+          } catch (err) {
+            if (err instanceof ConflictError) {
+              await envvars.update("STRIPE_KEY", { value: process.env.STRIPE_KEY });
+              return;
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/envvars/create"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/envvars.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: envvars-update
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Updates an existing environment variable's value. Called as
+      envvars.update(projectRef, slug, name, params) or envvars.update(name, params).
+      Makes an authenticated HTTP PUT. Throws NotFoundError (404) if the env var name
+      doesn't exist — common race with envvars.del or with first-deploy scenarios where
+      the caller mistakenly assumes the var was created.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/envvars.js
+      - id: envvars-update-no-try-catch
+        condition: >
+          envvars.update() called in async context without surrounding try/catch.
+          NotFoundError (404) when the variable doesn't exist, AuthenticationError on
+          bad token, BadRequestError on invalid value (e.g. exceeding size limits).
+        throws: >
+          Error (synchronous) — "params is required", "name is required",
+          "slug is required", "projectRef is required" (missing required overload arg).
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — variable with given name doesn't exist on this
+          environment.
+          BadRequestError (status 400) — value exceeds size limit or invalid format.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap envvars.update() in try/catch. Handle 404 as an opportunity
+          to upsert via create() rather than crashing — common pattern in deploy scripts.
+
+          try {
+            await envvars.update("STRIPE_KEY", { value: process.env.STRIPE_KEY });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              await envvars.create({ name: "STRIPE_KEY", value: process.env.STRIPE_KEY });
+              return;
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/envvars/update"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/envvars.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: envvars-del
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Deletes an environment variable. Called as envvars.del(projectRef, slug, name)
+      or envvars.del(name). Makes an authenticated HTTP DELETE. DESTRUCTIVE — the
+      deleted variable is unavailable to subsequent task runs immediately.
+      A successful response means the value is gone from this environment.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/envvars.js
+      # CAUTION: Idempotent delete — a 404 means "already deleted", which is usually
+      # safe to ignore in deploy scripts but should be logged in audit-trail contexts.
+      - id: envvars-del-no-try-catch
+        condition: >
+          envvars.del() called in async context without surrounding try/catch.
+          NotFoundError (404) means the variable doesn't exist; idempotent delete
+          callers should typically treat this as success, but failing to catch
+          NotFoundError will crash the calling deploy/cleanup script.
+        throws: >
+          Error (synchronous) — "name is required", "slug is required",
+          "projectRef is required" (missing required overload arg).
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — variable doesn't exist (already deleted, or
+          name is misspelled).
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap envvars.del() in try/catch. For idempotent cleanup flows,
+          treat NotFoundError as success and continue. For audit-tracked deletes
+          (compliance/secret-rotation), log NotFoundError to detect drift.
+
+          try {
+            await envvars.del("OLD_STRIPE_KEY");
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              console.log("OLD_STRIPE_KEY already removed — idempotent OK");
+              return;
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/envvars/delete"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/envvars.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: prompts-resolve
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Resolves a prompt template by slug into a ResolvedPrompt at runtime, fetching
+      the current deployed version (or a specific version/label) and applying any
+      active override. Called as prompts.resolve(slug, variables?, options?). Used
+      in AI tasks to get the runtime prompt text. Makes an authenticated HTTP GET
+      to fetch the current prompt definition. CRITICAL: silent fall-back to stale
+      cached prompts is NOT a feature — a failure here means the AI task has no
+      prompt to send to the LLM.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/promptManagement.js
+      # Calls apiClientManager.clientOrThrow() then apiClient.zodFetch on the prompt endpoint.
+      # Same ApiError hierarchy as the rest of the management API.
+      - id: prompts-resolve-no-try-catch
+        condition: >
+          prompts.resolve() called in async context without surrounding try/catch.
+          When the prompt is missing (NotFoundError) or the prompts API is unreachable
+          (ApiConnectionError), the AI task that follows has no prompt and will fail
+          or — worse — send an empty/undefined prompt to the LLM, producing nonsense
+          completions that silently degrade output quality.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — prompt slug doesn't exist, or the requested
+          version/label is missing.
+          BadRequestError (status 400) — missing required variables that the template
+          expects, or invalid variable shape.
+          ApiConnectionError — network failure reaching api.trigger.dev.
+        required_handling: >
+          Caller MUST wrap prompts.resolve() in try/catch. AI pipelines should either
+          fail fast (preferred — emit a clear "prompt not found" error to the operator)
+          or fall back to a pinned in-code prompt with explicit observability marking
+          the fallback. NEVER catch-and-continue with an empty/undefined prompt.
+
+          try {
+            const { compiled } = await prompts.resolve("summarize-email", { tone: "warm" });
+            const completion = await openai.chat.completions.create({
+              model: "gpt-4o",
+              messages: [{ role: "user", content: compiled }],
+            });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              await alertOnCall("Prompt 'summarize-email' missing from Trigger.dev");
+              throw new Error("Cannot proceed without prompt definition");
+            }
+            throw err;
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/promptManagement.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: prompts-promote
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Promotes a code-deployed prompt version to be the current/active version for
+      a given slug. Called as prompts.promote(slug, version). Makes an authenticated
+      HTTP POST. This is a DESTRUCTIVE-IF-UNCHECKED operation — promoting the wrong
+      version (typo, off-by-one) immediately changes which prompt all production
+      tasks resolve to. Throws NotFoundError if slug or version doesn't exist.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/promptManagement.js
+      - id: prompts-promote-no-try-catch
+        condition: >
+          prompts.promote() called in async context without surrounding try/catch.
+          NotFoundError (slug or version missing) or BadRequestError causes unhandled
+          rejection, but more critically — a SUCCESSFUL promote of the wrong version
+          silently swaps the prompt active across all running AI tasks. Catching
+          errors is the minimum; logging the before/after version is recommended.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — slug or version doesn't exist.
+          BadRequestError (status 400) — version is not a number, or is below the
+          minimum allowed.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap prompts.promote() in try/catch AND log the version
+          transition for audit. Promotes are immediately effective — no soft-deploy.
+
+          try {
+            const before = await prompts.list();
+            await prompts.promote("summarize-email", 7);
+            console.log("Promoted summarize-email v? -> v7", { before });
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              console.error("Cannot promote: slug or version missing", err.message);
+            }
+            throw err;
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/promptManagement.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: prompts-create-override
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a prompt override — a dashboard/API edit that takes priority over the
+      currently deployed prompt version. Called as prompts.createOverride(slug, body).
+      Used for fast prompt iteration without redeploying code. Throws ConflictError
+      if an override already exists for the slug (use updateOverride instead).
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/promptManagement.js
+      - id: prompts-create-override-no-try-catch
+        condition: >
+          prompts.createOverride() called in async context without surrounding
+          try/catch. ConflictError when an override already exists, NotFoundError
+          if slug doesn't exist, BadRequestError on malformed body.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — slug doesn't exist.
+          ConflictError (status 409) — override already exists for this slug.
+          BadRequestError (status 400) — malformed override body, missing required fields.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap prompts.createOverride() in try/catch. Most operational
+          callers should attempt create-or-update — handle ConflictError by calling
+          updateOverride.
+
+          try {
+            await prompts.createOverride("summarize-email", { content: newText });
+          } catch (err) {
+            if (err instanceof ConflictError) {
+              await prompts.updateOverride("summarize-email", { content: newText });
+              return;
+            }
+            throw err;
+          }
+        sources:
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/promptManagement.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: idempotency-keys-create
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Creates a deterministic idempotency key derived from the provided key material.
+      Called as idempotencyKeys.create(key, options?). When inside a task, the run ID
+      is mixed into the hash — making the key unique per parent run, which is the
+      whole point of idempotency keys for child triggers. ASYNC — returns
+      Promise<IdempotencyKey>, despite the misleading "key creation" naming.
+      Without try/catch, a crypto failure or hash-context error becomes an unhandled
+      rejection — and child tasks triggered without an idempotency key duplicate on
+      parent-task retry.
+
+    postconditions:
+      # Evidence: source inspection of @trigger.dev/core/dist/commonjs/v3/idempotencyKeys.js (fetched 2026-06-24)
+      # createIdempotencyKey() is async — internally uses Web Crypto SubtleCrypto.digest()
+      # in browser/edge, falls back to node:crypto in node. SubtleCrypto can throw
+      # OperationError on bad inputs; node:crypto throws synchronously.
+      - id: idempotency-keys-create-no-try-catch
+        condition: >
+          idempotencyKeys.create() called in async context without surrounding
+          try/catch. While operational errors are rare, the SDK looks up
+          taskContext.ctx?.run.id internally — a crypto subsystem failure or
+          context-mismatch can reject the promise. More importantly, if the caller
+          treats this as synchronous (forgets the await), the IdempotencyKey is a
+          Promise object passed to .trigger({ idempotencyKey: ... }) and the API
+          rejects with a confusing "key must be a string" error, defeating
+          idempotency entirely and allowing duplicate child runs on parent retry.
+        throws: >
+          OperationError / Error — crypto subsystem failure (edge/browser SubtleCrypto).
+          Synchronous TypeError — when called with non-string non-array input
+          (developer error caught at call site).
+        required_handling: >
+          Always await idempotencyKeys.create() and wrap in try/catch in
+          retry-sensitive paths. The key purpose of this call is to prevent
+          duplicate child runs on parent retry — if creation fails silently and the
+          caller passes an undefined idempotency key, the subsequent retry will
+          trigger a duplicate child task.
+
+          try {
+            const key = await idempotencyKeys.create(["user", userId, "welcome"]);
+            await childTask.trigger(payload, { idempotencyKey: key });
+          } catch (err) {
+            console.error("Idempotency key creation failed — refusing to trigger duplicate", err);
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/idempotency"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/core/src/v3/idempotencyKeys.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: streams-read
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Reads a realtime stream associated with a task run. Called as
+      streams.read(runId) or streams.read(runId, key). Returns
+      Promise<AsyncIterableStream<T>> — the resolved stream MUST be iterated to
+      consume chunks. Throws on auth failures, missing run, or network errors
+      during the initial subscription handshake.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/streams.js
+      # streams.read uses apiClient to open a Server-Sent Events subscription.
+      # Initial handshake can fail with the full ApiError hierarchy.
+      - id: streams-read-no-try-catch
+        condition: >
+          streams.read() called in async context without surrounding try/catch.
+          The initial subscription handshake can fail (auth, network, run-not-found),
+          but more subtly — iteration of the returned AsyncIterableStream can throw
+          mid-stream when the connection drops. Production dashboards that pipe
+          streams to the browser crash silently if the iterator's errors aren't
+          caught.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — runId doesn't exist or has no stream with
+          the given key.
+          ApiConnectionError — initial handshake network failure, OR mid-stream
+          connection drop (surfaced via the iterator's next() rejection).
+        required_handling: >
+          Caller MUST wrap both the subscription AND the iteration loop in try/catch.
+          Mid-stream errors surface only at the for-await level — a try/catch around
+          only streams.read() will miss connection drops.
+
+          try {
+            const stream = await streams.read<Chunk>(runId, "completion");
+            try {
+              for await (const chunk of stream) {
+                process(chunk);
+              }
+            } catch (iterErr) {
+              console.warn("Stream dropped mid-flight:", iterErr);
+              // Optionally: reconnect via streams.read again
+            }
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              return; // Run has no stream — caller may need to wait
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/realtime/streams"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/streams.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: streams-append
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Appends a chunk to a realtime stream from the current task run. Called as
+      streams.append(value) or streams.append(key, value). MUST be called from
+      inside a task — throws synchronously otherwise ("Could not determine the
+      target run ID for the realtime stream"). Used to feed LLM tokens or
+      task-progress updates to a subscribed dashboard.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/streams.js
+      # Throws Error("Could not determine the target run ID...") when called
+      # outside a task without an explicit target. Async write goes through the
+      # apiClient and can hit RateLimitError.
+      - id: streams-append-no-try-catch
+        condition: >
+          streams.append() called outside a task without an explicit `target` option,
+          or called inside a task with a transient API error. The synchronous
+          target-run-id error throws BEFORE returning a Promise — a try/catch is
+          still required because the synchronous throw will reject the surrounding
+          async function. Mid-flight RateLimitError causes partial stream loss —
+          chunks before the error reach the consumer, chunks after do not, but the
+          consumer has no signal that the stream is now truncated.
+        throws: >
+          Error (synchronous) — "Could not determine the target run ID for the
+          realtime stream. Please specify a target run ID using the `target` option
+          or use this function from inside a task."
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          RateLimitError (status 429) — per-run stream-write rate limit.
+          ApiConnectionError — network failure during write.
+        required_handling: >
+          Caller MUST wrap streams.append() in try/catch. For high-throughput LLM
+          streaming use cases, RateLimitError is the dominant failure mode — handle
+          by buffering and retrying after the indicated retry-after delay, NOT by
+          dropping chunks (the consumer dashboard will display partial output).
+
+          for await (const chunk of openaiStream) {
+            try {
+              await streams.append("completion", chunk);
+            } catch (err) {
+              if (err instanceof RateLimitError) {
+                await sleep(err.retryAfterMs);
+                await streams.append("completion", chunk); // single retry
+              } else {
+                throw err;
+              }
+            }
+          }
+        sources:
+          - "https://trigger.dev/docs/realtime/streams"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/streams.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: batch-retrieve
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Retrieves status and per-item results for a previously triggered batch.
+      Called as batch.retrieve(batchId). Makes an authenticated HTTP GET.
+      Returns the batch shape including per-item run statuses and a top-level
+      progress counter. The retrieve itself can fail with the full ApiError
+      hierarchy — but the SUBTLE failure is when retrieve succeeds but the
+      caller doesn't check per-item status and assumes the batch is healthy.
+
+    postconditions:
+      # Evidence: source inspection — @trigger.dev/sdk/dist/commonjs/v3/batch.js
+      # batch.retrieve is a thin wrapper over apiClient.retrieveBatch — same ApiError
+      # hierarchy as runs.retrieve.
+      - id: batch-retrieve-no-try-catch
+        condition: >
+          batch.retrieve() called in async context without surrounding try/catch.
+          NotFoundError (404) when the batch ID doesn't exist or was purged
+          (default 30-day TTL), AuthenticationError on bad token,
+          ApiConnectionError on network failure.
+        throws: >
+          ApiClientMissingError (synchronous) — TRIGGER_SECRET_KEY not set.
+          AuthenticationError (status 401) — invalid token.
+          NotFoundError (status 404) — batchId doesn't exist or has expired.
+          ApiConnectionError — network failure.
+        required_handling: >
+          Caller MUST wrap batch.retrieve() in try/catch. Treat NotFoundError as a
+          terminal "batch unknown" — do not retry. Treat ApiConnectionError as
+          transient and retry with exponential backoff.
+
+          try {
+            const batchInfo = await batch.retrieve(batchId);
+            // CRITICAL: always check per-item status before declaring success
+            const failed = batchInfo.runs.filter(r => r.status !== "COMPLETED");
+            if (failed.length > 0) {
+              console.warn(`${failed.length}/${batchInfo.runs.length} items failed`);
+            }
+          } catch (err) {
+            if (err instanceof NotFoundError) {
+              return null; // batch unknown — surface to caller as "not found"
+            }
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/management/batch/retrieve"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/batch.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: usage-measure
+    import_path: "@trigger.dev/sdk"
+    description: >
+      Measures the compute cost and duration of an async callback. Called as
+      usage.measure(async () => { ... }). Returns Promise<{ result, compute }>.
+      The async callback executes inside an OTEL span — the SDK is responsible for
+      starting and ending the span. If the callback throws, the span is closed
+      with error status and the throw propagates. Without try/catch, a callback
+      throw becomes an unhandled rejection in the parent task.
+
+    postconditions:
+      # Evidence: @trigger.dev/sdk/dist/commonjs/v3/usage.d.ts — measure: <T>(cb: () => Promise<T>) => Promise<{result: T; compute: ComputeUsage}>
+      # The wrapper propagates callback errors after closing the span.
+      - id: usage-measure-no-try-catch
+        condition: >
+          usage.measure() called without try/catch around an inner callback that
+          can throw. The compute span is closed correctly, but the throw bubbles
+          out of measure() and crashes the surrounding task code. Callers writing
+          "I'll handle errors in the callback" are misled — measure() does not
+          catch them, it propagates them.
+        throws: >
+          Whatever the inner callback throws — propagated unchanged after closing
+          the compute span.
+        required_handling: >
+          Caller MUST wrap usage.measure() in try/catch when the inner callback can
+          throw and the task should continue on failure. The compute measurement is
+          still captured even if the callback throws — read it from the error path
+          via a finally block if needed.
+
+          try {
+            const { result, compute } = await usage.measure(async () => {
+              return await expensiveLLMCall();
+            });
+            console.log("LLM call cost", compute.costInCents);
+            return result;
+          } catch (err) {
+            console.error("Measured call failed:", err);
+            throw err;
+          }
+        sources:
+          - "https://trigger.dev/docs/run-usage"
+          - "https://github.com/triggerdotdev/trigger.dev/blob/main/packages/trigger-sdk/src/v3/usage.ts"
+        severity: warning
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception

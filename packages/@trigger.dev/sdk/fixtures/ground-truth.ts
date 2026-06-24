@@ -34,6 +34,20 @@
  *   fortoken-called-outside-task       (wait.forToken called from non-task context)
  *   fortoken-unwrap-timeout-unhandled  (wait.forToken().unwrap() without try-catch)
  *   query-execute-no-try-catch         (query.execute without try-catch)
+ *
+ *   Added 2026-06-24 (deepen-stream-3 pass 82):
+ *   envvars-upload-no-try-catch        (envvars.upload without try-catch)
+ *   envvars-create-no-try-catch        (envvars.create without try-catch)
+ *   envvars-update-no-try-catch        (envvars.update without try-catch)
+ *   envvars-del-no-try-catch           (envvars.del without try-catch)
+ *   prompts-resolve-no-try-catch       (prompts.resolve — silent prompt failure)
+ *   prompts-promote-no-try-catch       (prompts.promote — silent active-version swap)
+ *   prompts-create-override-no-try-catch (prompts.createOverride without try-catch)
+ *   idempotency-keys-create-no-try-catch (idempotencyKeys.create — duplicate-trigger risk)
+ *   streams-read-no-try-catch          (streams.read + iteration not wrapped)
+ *   streams-append-no-try-catch        (streams.append without try-catch)
+ *   batch-retrieve-no-try-catch        (batch.retrieve without try-catch)
+ *   usage-measure-no-try-catch         (usage.measure callback throws unhandled)
  */
 import { tasks, schedules, runs, queues, wait, auth, tags, metadata, SubtaskUnwrapError, NotFoundError } from "@trigger.dev/sdk";
 
@@ -621,4 +635,254 @@ async function gt_queryExecute_safe(): Promise<{ status: number; body: any }> {
     console.error("TRQL query failed:", err);
     return { status: 500, body: "Query failed" };
   }
+}
+
+// ──────────────────────────────────────────────────
+// Added 2026-06-24 (deepen-stream-3 pass 82)
+// composable-middleware-misclassified-as-sync-factory pattern fixtures
+// ──────────────────────────────────────────────────
+
+import { envvars, idempotencyKeys, batch, usage } from "@trigger.dev/sdk";
+
+// envvars.upload — missing try/catch
+async function gt_envvarsUpload_missing(projectRef: string) {
+  // SHOULD_FIRE: envvars-upload-no-try-catch
+  await envvars.upload(projectRef, "prod", {
+    variables: { DATABASE_URL: "postgres://x" },
+    override: true,
+  });
+}
+
+async function gt_envvarsUpload_safe(projectRef: string) {
+  try {
+    // SHOULD_NOT_FIRE: envvars.upload wrapped in try/catch
+    await envvars.upload(projectRef, "prod", {
+      variables: { DATABASE_URL: "postgres://x" },
+      override: true,
+    });
+  } catch (err) {
+    console.error("Env upload failed:", err);
+    throw err;
+  }
+}
+
+// envvars.create — missing try/catch
+async function gt_envvarsCreate_missing() {
+  // SHOULD_FIRE: envvars-create-no-try-catch
+  await envvars.create({ name: "STRIPE_KEY", value: "sk_test" });
+}
+
+async function gt_envvarsCreate_safe() {
+  try {
+    // SHOULD_NOT_FIRE: envvars.create handles ConflictError fallback
+    await envvars.create({ name: "STRIPE_KEY", value: "sk_test" });
+  } catch (err) {
+    if ((err as any)?.status === 409) {
+      await envvars.update("STRIPE_KEY", { value: "sk_test" });
+      return;
+    }
+    throw err;
+  }
+}
+
+// envvars.update — missing try/catch
+async function gt_envvarsUpdate_missing() {
+  // SHOULD_FIRE: envvars-update-no-try-catch
+  await envvars.update("STRIPE_KEY", { value: "sk_new" });
+}
+
+async function gt_envvarsUpdate_safe() {
+  try {
+    // SHOULD_NOT_FIRE: envvars.update wrapped
+    await envvars.update("STRIPE_KEY", { value: "sk_new" });
+  } catch (err) {
+    console.error("Update failed:", err);
+    throw err;
+  }
+}
+
+// envvars.del — missing try/catch
+async function gt_envvarsDel_missing() {
+  // SHOULD_FIRE: envvars-del-no-try-catch
+  await envvars.del("OLD_KEY");
+}
+
+async function gt_envvarsDel_safe() {
+  try {
+    // SHOULD_NOT_FIRE: envvars.del idempotent-safe wrap
+    await envvars.del("OLD_KEY");
+  } catch (err) {
+    if ((err as any)?.status === 404) return;
+    throw err;
+  }
+}
+
+// prompts.resolve — missing try/catch (silent prompt failure)
+async function gt_promptsResolve_missing() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  // SHOULD_FIRE: prompts-resolve-no-try-catch
+  const resolved = await prompts.resolve("summarize-email", { tone: "warm" });
+  return resolved;
+}
+
+async function gt_promptsResolve_safe() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  try {
+    // SHOULD_NOT_FIRE: prompts.resolve wrapped — fails fast on missing prompt
+    const resolved = await prompts.resolve("summarize-email", { tone: "warm" });
+    return resolved;
+  } catch (err) {
+    console.error("Prompt resolve failed — refusing to send empty prompt to LLM:", err);
+    throw err;
+  }
+}
+
+// prompts.promote — missing try/catch
+async function gt_promptsPromote_missing() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  // SHOULD_FIRE: prompts-promote-no-try-catch
+  await prompts.promote("summarize-email", 7);
+}
+
+async function gt_promptsPromote_safe() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  try {
+    // SHOULD_NOT_FIRE: prompts.promote with audit logging
+    await prompts.promote("summarize-email", 7);
+    console.log("Promoted summarize-email v7");
+  } catch (err) {
+    console.error("Promote failed:", err);
+    throw err;
+  }
+}
+
+// prompts.createOverride — missing try/catch
+async function gt_promptsCreateOverride_missing() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  // SHOULD_FIRE: prompts-create-override-no-try-catch
+  await prompts.createOverride("summarize-email", { content: "New text" } as any);
+}
+
+async function gt_promptsCreateOverride_safe() {
+  const { prompts } = await import("@trigger.dev/sdk");
+  try {
+    // SHOULD_NOT_FIRE: prompts.createOverride with conflict fallback
+    await prompts.createOverride("summarize-email", { content: "New text" } as any);
+  } catch (err) {
+    if ((err as any)?.status === 409) {
+      await prompts.updateOverride("summarize-email", { content: "New text" } as any);
+      return;
+    }
+    throw err;
+  }
+}
+
+// idempotencyKeys.create — missing try/catch
+async function gt_idempotencyKeysCreate_missing(userId: string) {
+  // SHOULD_FIRE: idempotency-keys-create-no-try-catch
+  const key = await idempotencyKeys.create(["user", userId, "welcome"]);
+  return key;
+}
+
+async function gt_idempotencyKeysCreate_safe(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: idempotencyKeys.create wrapped to prevent duplicate child trigger
+    const key = await idempotencyKeys.create(["user", userId, "welcome"]);
+    return key;
+  } catch (err) {
+    console.error("Idempotency key creation failed — refusing duplicate trigger:", err);
+    throw err;
+  }
+}
+
+// streams.read — missing try/catch
+async function gt_streamsRead_missing(runId: string) {
+  const { streams } = await import("@trigger.dev/sdk");
+  // SHOULD_FIRE: streams-read-no-try-catch
+  const stream = await streams.read<any>(runId, "completion");
+  for await (const chunk of stream) {
+    console.log(chunk);
+  }
+}
+
+async function gt_streamsRead_safe(runId: string) {
+  const { streams } = await import("@trigger.dev/sdk");
+  try {
+    // SHOULD_NOT_FIRE: streams.read wrapped + iteration wrapped
+    const stream = await streams.read<any>(runId, "completion");
+    try {
+      for await (const chunk of stream) {
+        console.log(chunk);
+      }
+    } catch (iterErr) {
+      console.warn("Stream dropped mid-flight:", iterErr);
+    }
+  } catch (err) {
+    if ((err as any)?.status === 404) return;
+    throw err;
+  }
+}
+
+// streams.append — missing try/catch
+async function gt_streamsAppend_missing() {
+  const { streams } = await import("@trigger.dev/sdk");
+  // SHOULD_FIRE: streams-append-no-try-catch
+  await streams.append("completion", "chunk-data");
+}
+
+async function gt_streamsAppend_safe() {
+  const { streams } = await import("@trigger.dev/sdk");
+  try {
+    // SHOULD_NOT_FIRE: streams.append wrapped with rate-limit retry
+    await streams.append("completion", "chunk-data");
+  } catch (err) {
+    console.warn("Append failed:", err);
+  }
+}
+
+// batch.retrieve — missing try/catch
+async function gt_batchRetrieve_missing(batchId: string) {
+  // SHOULD_FIRE: batch-retrieve-no-try-catch
+  const info = await batch.retrieve(batchId);
+  return info;
+}
+
+async function gt_batchRetrieve_safe(batchId: string) {
+  try {
+    // SHOULD_NOT_FIRE: batch.retrieve wrapped with NotFoundError handling
+    const info = await batch.retrieve(batchId);
+    return info;
+  } catch (err) {
+    if ((err as any)?.status === 404) return null;
+    throw err;
+  }
+}
+
+// usage.measure — callback throws without outer try/catch
+async function gt_usageMeasure_missing() {
+  // SHOULD_FIRE: usage-measure-no-try-catch
+  const { result, compute } = await usage.measure(async () => {
+    return await expensiveLLMCall();
+  });
+  console.log("cost", compute.costInCents);
+  return result;
+}
+
+async function gt_usageMeasure_safe() {
+  try {
+    // SHOULD_NOT_FIRE: usage.measure wrapped
+    const { result, compute } = await usage.measure(async () => {
+      return await expensiveLLMCall();
+    });
+    console.log("cost", compute.costInCents);
+    return result;
+  } catch (err) {
+    console.error("Measured call failed:", err);
+    throw err;
+  }
+}
+
+// Stub for the helper used in usage.measure fixtures
+async function expensiveLLMCall(): Promise<string> {
+  return "llm-output";
 }
