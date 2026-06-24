@@ -21,6 +21,8 @@
  *   batch-update-no-try-catch              (function: batchUpdate — depth pass 2026-04-16 stream-2)
  *   timeline-create-no-try-catch           (function: timeline.eventsApi.create — depth pass 2026-04-16 stream-2)
  *   oauth-tokens-create-no-try-catch       (function: oauth.tokensApi.create — depth pass 2026-04-16 stream-2)
+ *   api-request-no-try-catch               (function: Client.apiRequest — depth pass 2026-06-24 stream-2 pass 55)
+ *   api-request-response-status-unchecked  (function: Client.apiRequest — depth pass 2026-06-24 stream-2 pass 55)
  */
 import * as hubspot from "@hubspot/api-client";
 
@@ -453,6 +455,70 @@ async function gt_oauth_tokens_create_safe() {
     }
     if (e.code === 400 && e.body?.error === "invalid_client") {
       throw new Error("Invalid clientId or clientSecret");
+    }
+    throw e;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 14. Client.apiRequest — depth pass 2026-06-24 (stream-2 pass 55)
+// Unique vs codegen apis: does NOT throw on 4xx/5xx — returns raw Response.
+// ──────────────────────────────────────────────────
+
+// @expect-violation: api-request-no-try-catch
+// Note: api-request-response-status-unchecked detection not yet implemented — see
+//       concern-20260624-hubspot-api-client-deepen-10 in nark/src/upgrade-concerns.json
+async function gt_api_request_missing_both() {
+  // SHOULD_FIRE: api-request-no-try-catch — escape-hatch call with no error handling
+  const response = await client.apiRequest({
+    method: "GET",
+    path: "/crm/v3/objects/contacts",
+  });
+  // future SHOULD_FIRE: api-request-response-status-unchecked — parsing body without .ok check
+  const json = await response.json();
+  return json;
+}
+
+// @expect-violation: api-request-no-try-catch
+// Note: api-request-response-status-unchecked detection not yet implemented
+async function gt_api_request_upload_missing() {
+  const formData = new FormData();
+  formData.append("folderPath", "/");
+  formData.append("options", JSON.stringify({ access: "PUBLIC_INDEXABLE" }));
+  // SHOULD_FIRE: api-request-no-try-catch — upload escape hatch no try-catch
+  const response = await client.apiRequest({
+    method: "POST",
+    path: "/filemanager/api/v3/files/upload",
+    body: formData as any,
+    defaultJson: false,
+  });
+  // future SHOULD_FIRE: api-request-response-status-unchecked — no response.ok inspection before returning response
+  return response;
+}
+
+// @expect-clean
+async function gt_api_request_safe() {
+  // SHOULD_NOT_FIRE: both try/catch present AND response.ok checked before parsing
+  try {
+    const response = await client.apiRequest({
+      method: "GET",
+      path: "/crm/v3/objects/contacts",
+    });
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({}));
+      throw new Error(
+        `HubSpot request failed: ${response.status} ${response.statusText} — ${(errorBody as any)?.message ?? ""}`,
+      );
+    }
+    const data = await response.json();
+    return data;
+  } catch (e: any) {
+    // FetchError from node-fetch on transport failures (ENOTFOUND / ECONNRESET / request-timeout)
+    if (e?.type === "request-timeout") {
+      throw new Error("HubSpot apiRequest timed out — caller decides retry policy");
+    }
+    if (e?.code === "ENOTFOUND" || e?.code === "ECONNRESET") {
+      throw new Error(`HubSpot apiRequest network failure: ${e.code}`);
     }
     throw e;
   }

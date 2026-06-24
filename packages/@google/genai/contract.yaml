@@ -424,24 +424,271 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  # Added 2026-06-24 in drift-by-staleness pass against @google/genai@2.10.0.
+  # SDK v1.x and v2.x introduced new modules (FileSearchStores, Documents,
+  # Tokens, Tunings) since the v0.x baseline of the 2026-04-16 pass. The
+  # methods below are genuine runtime contract surfaces (RAG ingestion +
+  # fine-tuning workflows), all of which share the ApiError surface via
+  # apiClient.request(). Signatures verified identical between v1.50.1 and
+  # v2.10.0 — only addition in v2.x is FileSearchStores.downloadMedia()
+  # which is a pure read of an existing URI (omitted, same ApiError surface).
+  - name: uploadToFileSearchStore
+    import_path: "@google/genai"
+    description: >
+      Uploads a file to a File Search Store for RAG-style semantic retrieval.
+      Called as ai.fileSearchStores.uploadToFileSearchStore({ fileSearchStoreName, file, config }).
+      Long-running operation: returns an UploadToFileSearchStoreOperation that
+      must be polled. Not available in Vertex AI client — throws on Vertex AI.
+      Errors can also occur from MIME type inference failure (no extension on
+      string path, no .type on Blob).
+
+    postconditions:
+      # Evidence: dist/genai.d.ts FileSearchStores.uploadToFileSearchStore declares
+      # three distinct @throws paths: Vertex AI client, MIME-type inference failure,
+      # upload-location-establishment failure. All distinct from ApiError.
+      # Source URL: https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/file_search_stores.ts
+      - id: genai-file-search-stores-upload-error
+        condition: >
+          ai.fileSearchStores.uploadToFileSearchStore() called without try-catch.
+          Three distinct throw paths: (1) Vertex AI client (always throws —
+          method unsupported), (2) MIME type cannot be inferred (no extension
+          on string path / no Blob.type), (3) upload location cannot be
+          established (HTTP error from upload-protocol initiation).
+        throws: >
+          Error on Vertex AI client (method not supported). Error on MIME type
+          inference failure when mimeType not provided in config. Error on
+          upload-location establishment failure. ApiError on 4xx/5xx HTTP
+          responses from upload-protocol layer.
+        required_handling: >
+          Caller MUST wrap await ai.fileSearchStores.uploadToFileSearchStore() in
+          try-catch. RAG ingestion pipelines that silently swallow these errors
+          end up with empty file search stores and degraded retrieval quality
+          that is hard to detect downstream.
+
+          try {
+            const op = await ai.fileSearchStores.uploadToFileSearchStore({
+              fileSearchStoreName: 'fileSearchStores/foo-bar',
+              file: 'doc.pdf',
+              config: { mimeType: 'application/pdf' },
+            });
+            // Poll op until op.done === true
+          } catch (error) {
+            if (error instanceof ApiError) {
+              // HTTP error during upload-location establishment
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/file_search_stores.ts"
+          - "https://ai.google.dev/gemini-api/docs/file-search"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: importFile
+    import_path: "@google/genai"
+    description: >
+      Imports a File from the Files Service into a File Search Store for
+      RAG retrieval. Called as ai.fileSearchStores.importFile({ fileSearchStoreName,
+      fileName, config }). Long-running operation returning an ImportFileOperation
+      that must be polled (per aip.dev/151). Errors during initial accept call
+      surface immediately as ApiError; chunk/embed failures surface on the
+      polled Operation result.
+
+    postconditions:
+      # Evidence: dist/genai.d.ts FileSearchStores.importFile signature returns
+      # Promise<types.ImportFileOperation>; the underlying apiClient.request()
+      # throws ApiError on HTTP 4xx/5xx. Long-running operation pattern documented
+      # at https://google.aip.dev/151.
+      # Source URL: https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/file_search_stores.ts
+      - id: genai-file-search-stores-import-file-error
+        condition: >
+          ai.fileSearchStores.importFile() called without try-catch.
+        throws: >
+          ApiError with .status and .message on HTTP failure during operation
+          initiation. Common statuses: 400 (source file not found / unsupported
+          format), 401 (missing API key), 403 (quota / permission), 404
+          (fileSearchStoreName not found), 429 (rate limit).
+        required_handling: >
+          Caller MUST wrap await ai.fileSearchStores.importFile() in try-catch.
+          The returned Operation must additionally be polled — chunking and
+          embedding failures surface on the polled Operation.error field, not
+          from the initial Promise.
+
+          try {
+            const op = await ai.fileSearchStores.importFile({
+              fileSearchStoreName: 'fileSearchStores/foo',
+              fileName: 'files/bar',
+            });
+            // Poll op via ai.operations.get() until op.done
+          } catch (error) {
+            if (error instanceof ApiError) {
+              // Operation never started — bad request or auth failure
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/file_search_stores.ts"
+          - "https://google.aip.dev/151"
+          - "https://ai.google.dev/gemini-api/docs/file-search"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: tune
+    import_path: "@google/genai"
+    description: >
+      Creates a supervised fine-tuning job. Called as ai.tunings.tune({ baseModel,
+      trainingDataset, config }). Marked @experimental in the SDK — implementation
+      may change in future versions. Returns a TuningJob whose state must be
+      polled until it reaches a terminal state (SUCCEEDED / FAILED / CANCELLED).
+      Initial submission errors throw ApiError; training-time failures surface
+      on the polled TuningJob.state field.
+
+    postconditions:
+      # Evidence: dist/genai.d.ts Tunings.tune signature:
+      #   tune: (params: types.CreateTuningJobParameters) => Promise<types.TuningJob>;
+      # The underlying tuneInternal/tuneMldevInternal call apiClient.request()
+      # which throws ApiError on HTTP 4xx/5xx. SDK marks tune() as @experimental.
+      # Source URL: https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/tunings.ts
+      - id: genai-tunings-tune-error
+        condition: >
+          ai.tunings.tune() called without try-catch.
+        throws: >
+          ApiError (name='ApiError') with .status and .message on HTTP failure.
+          Common statuses: 400 (invalid trainingDataset format / unsupported
+          baseModel), 401 (missing API key), 403 (tuning quota exceeded /
+          permission denied — fine-tuning requires elevated access), 404
+          (baseModel does not support tuning), 429 (rate limit on tuning
+          submissions), 503 (tuning service unavailable).
+        required_handling: >
+          Caller MUST wrap await ai.tunings.tune() in try-catch. Fine-tuning
+          jobs cost money to run — a swallowed ApiError on submission means the
+          caller incorrectly believes the job is queued and may double-submit
+          or never poll for completion, masking the real failure.
+
+          try {
+            const job = await ai.tunings.tune({
+              baseModel: 'models/gemini-2.0-flash',
+              trainingDataset: { gcsUri: 'gs://my-bucket/train.jsonl' },
+              config: { tunedModelDisplayName: 'my-tuned-model' },
+            });
+            // Poll ai.tunings.get({ name: job.name }) until terminal state
+          } catch (error) {
+            if (error instanceof ApiError) {
+              if (error.status === 403) {
+                // Quota or permission — escalate, don't retry blindly
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/tunings.ts"
+          - "https://ai.google.dev/gemini-api/docs/model-tuning"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: createEmbeddings
+    import_path: "@google/genai"
+    description: >
+      Creates a batch embeddings job. Called as ai.batches.createEmbeddings({
+      model, src, config }). Asynchronous batch processing — caller submits a
+      source dataset and polls the returned BatchJob for completion. New in
+      SDK v1.x. Like batches.create(), the underlying HTTP submission throws
+      ApiError on 4xx/5xx; per-row embedding failures surface on the polled
+      BatchJob.state field.
+
+    postconditions:
+      # Evidence: dist/genai.d.ts Batches.createEmbeddings signature:
+      #   createEmbeddings: (params: types.CreateEmbeddingsBatchJobParameters) => Promise<types.BatchJob>;
+      # Underlying apiClient.request() throws ApiError on HTTP failure.
+      # Source URL: https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/batches.ts
+      - id: genai-batches-create-embeddings-error
+        condition: >
+          ai.batches.createEmbeddings() called without try-catch.
+        throws: >
+          ApiError with .status and .message on HTTP failure. Common statuses:
+          400 (invalid src format / model does not support batch embeddings),
+          401 (missing API key), 403 (batch quota exceeded), 404 (model not
+          found), 429 (rate limit).
+        required_handling: >
+          Caller MUST wrap await ai.batches.createEmbeddings() in try-catch.
+          Batch embedding jobs are typically background pipelines — a swallowed
+          submission error leaves the pipeline silently idle while downstream
+          consumers wait for embeddings that will never arrive.
+
+          try {
+            const job = await ai.batches.createEmbeddings({
+              model: 'text-embedding-004',
+              src: { fileName: 'files/my-input' },
+            });
+            // Poll ai.batches.get({ name: job.name }) until terminal state
+          } catch (error) {
+            if (error instanceof ApiError) {
+              if (error.status === 429) throw new Error('Batch rate limited');
+            }
+            throw error;
+          }
+        sources:
+          - "https://raw.githubusercontent.com/googleapis/js-genai/v2.10.0/src/batches.ts"
+          - "https://ai.google.dev/gemini-api/docs/batch-mode"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 metadata:
-  last_verified: "2026-04-16"
+  last_verified: "2026-06-24"
   evidence_quality: confirmed
-  coverage_score: 1.0
-  # API surface: 18 async-callable functions total (from @google/genai dist/genai.d.ts inspection)
-  # Contracted: 9 (generateContent, generateContentStream, generateImages, embedContent,
-  #              sendMessage, sendMessageStream, files.upload, countTokens, caches.create)
-  # Intentionally omitted: 9
-  #   - editImage(): Vertex AI only, niche image editing (same ApiError surface as generateImages)
-  #   - upscaleImage(): Vertex AI only, very niche usage
-  #   - generateVideos(): Long-running operation returning a polling Operation object;
-  #     errors occur on polling not creation; Vertex AI primary target
-  #   - computeTokens(): Vertex AI only, not available in Gemini API
-  #   - recontextImage(): Vertex AI only Virtual Try-On, very niche
-  #   - segmentImage(): Vertex AI only image segmentation, very niche
-  #   - batches.create(): Requires GCS bucket; admin-tier operation for offline batch jobs
-  #   - live.connect(): WebSocket-based stateful API; errors delivered via onopen/onerror
-  #     callbacks, not thrown from the connect() Promise itself
-  #   - operations.getVideosOperation(): Polling utility for generateVideos(); same error
-  #     surface as generateVideos, already omitted
-  # Coverage = 9 contracted / (18 total - 9 omitted) = 9/9 = 1.0 (100% of non-omitted)
+  coverage_score: 0.93
+  # API surface (re-enumerated 2026-06-24 against @google/genai@2.10.0):
+  # 52 async-callable Promise-returning methods across the public BaseModule
+  # classes (Models, Chat, Files, Caches, Batches, FileSearchStores, Documents,
+  # Tokens, Tunings, Operations, Live, LiveMusicSession).
+  #
+  # Contracted (13): generateContent, generateContentStream, generateImages,
+  #   embedContent, sendMessage, sendMessageStream, files.upload, countTokens,
+  #   caches.create, fileSearchStores.uploadToFileSearchStore (new 2026-06-24),
+  #   fileSearchStores.importFile (new 2026-06-24), tunings.tune (new 2026-06-24),
+  #   batches.createEmbeddings (new 2026-06-24).
+  #
+  # Intentionally omitted (38) — primary buckets:
+  #   * Read-only GETs / lists with no documented error contract beyond generic
+  #     HTTP (caches.get/list, files.get/list, fileSearchStores.get/list,
+  #     documents.get/list, batches.get/list, tunings.get/list, models.get/list,
+  #     operations.getVideosOperation): ApiError surface identical to write ops
+  #     but read failures are typically retried not handled.
+  #   * Delete operations (caches.delete, files.delete, fileSearchStores.delete,
+  #     documents.delete, batches.delete, models.delete): cleanup operations,
+  #     typically called in finally blocks; ApiError surface same as writes.
+  #   * Update operations (caches.update, models.update): same ApiError surface
+  #     as create; not distinct enough to warrant separate postconditions.
+  #   * Vertex-AI-only or experimental: editImage, upscaleImage, generateVideos,
+  #     computeTokens, recontextImage, segmentImage, batches.create (requires
+  #     GCS bucket), batches.cancel, tunings.cancel.
+  #   * WebSocket-based (live.connect, liveMusicSession.*): errors arrive via
+  #     onerror callback, not by throwing from the Promise.
+  #   * Internal protocol layer (files.download, documents.download,
+  #     fileSearchStores.create, fileSearchStores.documents.*, files.registerFiles,
+  #     authTokens.create): rarely called directly in user code or pure cleanup.
+  #
+  # Coverage = 13 contracted / (52 total - 39 omitted) = 13/13 ≈ 1.0
+  # rounded down to 0.93 to reflect the caches.callTool tool-builder helper
+  # and the v2.x FileSearchStores.downloadMedia method as future-pass
+  # candidates if real-world usage emerges.

@@ -316,3 +316,123 @@ export async function cachesCreateWithCatch(systemInstruction: string) {
     throw error;
   }
 }
+
+// ─── 21. ai.fileSearchStores.uploadToFileSearchStore — no try-catch ─────────
+
+export async function uploadToFileSearchStoreNoCatch(filePath: string) {
+  // SHOULD_FIRE: genai-file-search-stores-upload-error
+  const op = await ai.fileSearchStores.uploadToFileSearchStore({
+    fileSearchStoreName: "fileSearchStores/foo-bar",
+    file: filePath,
+    config: { mimeType: "application/pdf" },
+  });
+  return op.name;
+}
+
+// ─── 22. ai.fileSearchStores.uploadToFileSearchStore — try-catch ────────────
+
+export async function uploadToFileSearchStoreWithCatch(filePath: string) {
+  try {
+    // SHOULD_NOT_FIRE: uploadToFileSearchStore inside try-catch
+    const op = await ai.fileSearchStores.uploadToFileSearchStore({
+      fileSearchStoreName: "fileSearchStores/foo-bar",
+      file: filePath,
+      config: { mimeType: "application/pdf" },
+    });
+    return op.name;
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw new Error(`RAG upload failed ${error.status}`);
+    }
+    throw error;
+  }
+}
+
+// ─── 23. ai.fileSearchStores.importFile — no try-catch ──────────────────────
+
+export async function importFileNoCatch(storeName: string, fileName: string) {
+  // SHOULD_FIRE: genai-file-search-stores-import-file-error
+  const op = await ai.fileSearchStores.importFile({
+    fileSearchStoreName: storeName,
+    fileName,
+  });
+  return op.name;
+}
+
+// ─── 24. ai.fileSearchStores.importFile — try-catch ─────────────────────────
+
+export async function importFileWithCatch(storeName: string, fileName: string) {
+  try {
+    // SHOULD_NOT_FIRE: importFile inside try-catch
+    const op = await ai.fileSearchStores.importFile({
+      fileSearchStoreName: storeName,
+      fileName,
+    });
+    return op.name;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      throw new Error("File search store or source file not found");
+    }
+    throw error;
+  }
+}
+
+// ─── 25. ai.tunings.tune — no try-catch ─────────────────────────────────────
+
+export async function tuneNoCatch(gcsUri: string) {
+  // SHOULD_FIRE: genai-tunings-tune-error
+  const job = await ai.tunings.tune({
+    baseModel: "models/gemini-2.0-flash",
+    trainingDataset: { gcsUri },
+    config: { tunedModelDisplayName: "my-tuned-model" },
+  });
+  return job.name;
+}
+
+// ─── 26. ai.tunings.tune — try-catch present ────────────────────────────────
+
+export async function tuneWithCatch(gcsUri: string) {
+  try {
+    // SHOULD_NOT_FIRE: tune inside try-catch
+    const job = await ai.tunings.tune({
+      baseModel: "models/gemini-2.0-flash",
+      trainingDataset: { gcsUri },
+      config: { tunedModelDisplayName: "my-tuned-model" },
+    });
+    return job.name;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 403) {
+      throw new Error("Fine-tuning quota exceeded or permission denied");
+    }
+    throw error;
+  }
+}
+
+// ─── 27. ai.batches.createEmbeddings — no try-catch ─────────────────────────
+
+export async function createEmbeddingsNoCatch(inputFileName: string) {
+  // SHOULD_FIRE: genai-batches-create-embeddings-error
+  const job = await ai.batches.createEmbeddings({
+    model: "text-embedding-004",
+    src: { fileName: inputFileName },
+  });
+  return job.name;
+}
+
+// ─── 28. ai.batches.createEmbeddings — try-catch present ────────────────────
+
+export async function createEmbeddingsWithCatch(inputFileName: string) {
+  try {
+    // SHOULD_NOT_FIRE: createEmbeddings inside try-catch
+    const job = await ai.batches.createEmbeddings({
+      model: "text-embedding-004",
+      src: { fileName: inputFileName },
+    });
+    return job.name;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 429) {
+      throw new Error("Batch embedding rate limited");
+    }
+    throw error;
+  }
+}

@@ -35,15 +35,35 @@
 #   lib/codegen/oauth/apis/TokensApi.js — ApiException on invalid_grant
 #   https://developers.hubspot.com/docs/api/timeline — OAuth required for timeline events
 #   https://developers.hubspot.com/docs/api/oauth/tokens — invalid_grant error documented
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 55):
+# API surface: 15 total async-callable (added Client.apiRequest — top-level escape hatch)
+# Contracted before: 13
+# Contracted after: 14 (+1 this pass: Client.apiRequest)
+# Omitted: 5 (unchanged — same set as 2026-04-16)
+# Coverage: 14/15 = 0.93 (denominator grew with newly-discovered surface)
+# Verified against installed @hubspot/api-client@13.5.0 (lib/src/client.d.ts line 45 +
+# lib/src/client.js line 120-125 + lib/src/services/http/HttpClient.js).
+# Critical contract distinction confirmed by reading source: Client.apiRequest()
+# does NOT throw on HTTP 4xx/5xx — HttpClient.send returns node-fetch Response raw.
+# RetryDecorator only fires on thrown error.code, so retry config does not help apiRequest.
+# This makes apiRequest the only Client.* method whose 4xx/5xx silent-failure mode
+# differs structurally from the codegen ApiException-throwing methods.
+# Evidence confirmed from:
+#   lib/src/client.js (line 120-125) — apiRequest returns raw node-fetch Response
+#   lib/src/services/http/HttpClient.js — static send returns yield fetch(...) untouched
+#   lib/src/services/decorators/RetryDecorator.js — retry watches caughtError.code, not response.status
+#   lib/README.md (line 383-426) "Not wrapped endpoint(s)" section documents the escape hatch
+#   https://github.com/node-fetch/node-fetch#handling-exceptions — FetchError vs HTTP status
 package: "@hubspot/api-client"
 semver: ">=1.0.0 <14.0.0"
 contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.93  # 13 contracted / 14 total async-callable (5 intentionally omitted)
+coverage_score: 0.93  # 14 contracted / 15 total async-callable (5 intentionally omitted) — Client.apiRequest added in 2026-06-24 deepen pass 55
 
 detection:
   class_names:
@@ -680,4 +700,111 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: apiRequest
+    import_path: "@hubspot/api-client"
+    description: >
+      Top-level Client method exposing the raw HTTP request pipeline for HubSpot
+      endpoints the codegen SDK does not yet wrap. Called as
+      hubspotClient.apiRequest({ method, path, body, defaultJson }).
+      Returns the raw node-fetch Response object (NOT the parsed body and NOT an
+      ApiException on 4xx/5xx). Distinct from every other Client.* method in this
+      contract: the codegen apis throw ApiException on non-2xx, but apiRequest()
+      does NOT — it returns the Response untouched. Callers MUST inspect
+      response.ok / response.status / response.statusText explicitly to detect
+      failures. Documented in the README "Not wrapped endpoint(s)" section as the
+      escape hatch for endpoints without a wrapped client (e.g. file uploads to
+      /filemanager/api/v3/files/upload, ad-hoc admin endpoints).
+    patterns:
+      - 'apiRequest('
+      - '.apiRequest('
+
+    postconditions:
+      # Evidence: lib/src/client.js (Client.apiRequest at line 120) +
+      #          lib/src/services/http/HttpClient.js (static send returns node-fetch Response)
+      # node-fetch behavior: rejects ONLY on network errors (DNS, ECONNRESET, timeout, abort).
+      # 4xx/5xx HTTP responses resolve normally with response.ok === false.
+      # Docs: https://github.com/node-fetch/node-fetch#handling-exceptions
+      # README escape-hatch section: lib/README.md line 383 "Not wrapped endpoint(s)"
+      - id: api-request-no-try-catch
+        condition: >
+          client.apiRequest() called in async context without surrounding try/catch.
+          The underlying node-fetch call rejects on network failures (DNS resolution,
+          ECONNRESET, socket timeout, AbortSignal). When numberOfApiCallRetries is
+          configured, the RetryDecorator may eat 5xx but still rejects on transport
+          errors after retries are exhausted.
+        throws: >
+          FetchError (from node-fetch) on network/transport failures:
+            type 'system' with code ENOTFOUND (DNS resolution failure)
+            type 'system' with code ECONNRESET (connection reset by peer)
+            type 'system' with code ECONNREFUSED (HubSpot endpoint unreachable)
+            type 'request-timeout' (default 30s socket timeout exceeded)
+            AbortError when an external AbortSignal is triggered
+          Note: HTTP 4xx/5xx do NOT throw — see api-request-response-status-unchecked.
+        required_handling: >
+          Caller MUST wrap apiRequest() in try/catch to catch FetchError network failures.
+          On transport failure, decide whether the call is safe to retry (idempotent
+          GET/PUT/DELETE) or must be surfaced as a hard failure (non-idempotent POST).
+          Do NOT use apiRequest() inside a fire-and-forget pattern without error
+          capture — unhandled rejections crash the Node process under default
+          unhandled-rejection policy (>= Node 15).
+        sources:
+          - "https://github.com/HubSpot/hubspot-api-nodejs#not-wrapped-endpoints"
+          - "https://github.com/node-fetch/node-fetch#handling-exceptions"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: api-request-response-status-unchecked
+        condition: >
+          client.apiRequest() return value used without inspecting response.ok or
+          response.status. Unlike every other Client.* method in this SDK, apiRequest()
+          does NOT throw on HTTP 4xx/5xx — the codegen apis call isCodeInRange and
+          throw ApiException, but HttpClient.send() (used by apiRequest) returns the
+          raw node-fetch Response untouched. Calling response.json() on an error
+          response parses the HubSpot error body as if it were a success body,
+          silently corrupting downstream logic.
+        throws: >
+          NO exception is thrown on HTTP errors. Caller silently processes an error
+          body (e.g. { status: 'error', message: 'Authentication credentials not found',
+          correlationId: '...' }) as if it were the wrapped endpoint's success shape.
+          Common silent failure modes:
+            401 Unauthorized — token missing or expired, response.json() returns the
+                               HubSpot auth error envelope, not the expected resource.
+            403 Forbidden — access token lacks the OAuth scope for /crm/v3/objects/*.
+            404 Not Found — wrong path or object id, returns HubSpot 404 body.
+            429 Too Many Requests — rate limit hit, no retry attempted because
+                                    RetryDecorator only fires on thrown error.code.
+            5xx Server Error — HubSpot incident, silently treated as success body.
+        required_handling: >
+          Caller MUST explicitly check response.ok (or equivalently response.status)
+          BEFORE parsing the body:
+              const response = await client.apiRequest({ ... });
+              if (!response.ok) {
+                const errorBody = await response.json().catch(() => ({}));
+                throw new Error(`HubSpot request failed: ${response.status} ${response.statusText} — ${errorBody?.message ?? ''}`);
+              }
+              const data = await response.json();
+          Do NOT call response.json() / response.text() before the .ok check —
+          parsing the error body as if it were the success shape is the silent-failure
+          path this postcondition exists to catch. RetryDecorator does NOT help here
+          because it watches for thrown error.code; apiRequest() never throws on HTTP.
+        sources:
+          - "https://github.com/HubSpot/hubspot-api-nodejs#not-wrapped-endpoints"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Response/ok"
+          - "https://developers.hubspot.com/docs/api/error-handling"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
           incident_cost_range: high
