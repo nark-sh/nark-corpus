@@ -11,6 +11,10 @@
  *   file-async-unsupported-type         — JSZipObject.async() with unsupported output type
  *   generate-node-stream-no-error-listener — generateNodeStream() without .on('error') listener
  *   generate-node-stream-unsupported-env   — generateNodeStream() in unsupported environment
+ *   file-node-stream-no-error-listener     — JSZipObject.nodeStream() without .on('error') listener
+ *   file-node-stream-unsupported-type      — JSZipObject.nodeStream(non-nodebuffer) sync throw
+ *   generate-internal-stream-no-error-listener            — generateInternalStream() on('data')/on('end') without on('error')
+ *   generate-internal-stream-accumulate-unhandled-rejection — generateInternalStream().accumulate() without try-catch
  */
 import JSZip from 'jszip';
 
@@ -166,6 +170,67 @@ function streamZipToResponse(zip: JSZip, res: any): void {
     .pipe(res);
 }
 
+// JSZipObject.nodeStream() — single-file streaming without error listener
+function streamSingleFileWithoutErrorListener(zip: JSZip, outputPath: string): void {
+  const fs = require('fs');
+  const entry = zip.files['large.bin'];
+  // SHOULD_FIRE: file-node-stream-no-error-listener
+  entry.nodeStream('nodebuffer').pipe(fs.createWriteStream(outputPath));
+}
+
+// JSZipObject.nodeStream() with proper error listener — correct pattern
+function streamSingleFileWithErrorListener(zip: JSZip, outputPath: string): void {
+  const fs = require('fs');
+  const entry = zip.files['large.bin'];
+  // SHOULD_NOT_FIRE: nodeStream has error listener registered before pipe
+  entry.nodeStream('nodebuffer')
+    .on('error', (err: Error) => console.error('Entry decode error:', err))
+    .pipe(fs.createWriteStream(outputPath));
+}
+
+// JSZipObject.nodeStream() with non-nodebuffer type — sync throw without try-catch
+function streamSingleFileUnsupportedType(zip: JSZip): NodeJS.ReadableStream {
+  const entry = zip.files['large.bin'];
+  // SHOULD_FIRE: file-node-stream-unsupported-type
+  return entry.nodeStream('blob' as any);
+}
+
+// generateInternalStream() event-listener pattern WITHOUT on('error') — missing error handling
+function generateInternalStream_withoutErrorListener(zip: JSZip): void {
+  // SHOULD_FIRE: generate-internal-stream-no-error-listener
+  zip.generateInternalStream({ type: 'uint8array', streamFiles: true })
+    .on('data', (chunk: any) => { void chunk; })
+    .on('end', () => { /* done */ });
+}
+
+// generateInternalStream() event-listener pattern WITH on('error') — proper handling
+// Note: scanner does not yet detect .on('error') as proper handling for generateInternalStream.
+// Scanner concern queued: concern-20260624-jszip-deepen-3
+function generateInternalStream_withErrorListener(zip: JSZip): void {
+  // SHOULD_FIRE: generate-internal-stream-no-error-listener — scanner does not yet detect .on('error') as proper handling
+  zip.generateInternalStream({ type: 'uint8array', streamFiles: true })
+    .on('data', (chunk: any) => { void chunk; })
+    .on('end', () => { /* done */ })
+    .on('error', (err: Error) => console.error('Zip stream error:', err));
+}
+
+// generateInternalStream().accumulate() without try-catch — unhandled rejection
+async function generateInternalStream_accumulateWithoutTryCatch(zip: JSZip): Promise<Uint8Array> {
+  // SHOULD_FIRE: generate-internal-stream-accumulate-unhandled-rejection
+  return await zip.generateInternalStream({ type: 'uint8array' }).accumulate();
+}
+
+// generateInternalStream().accumulate() with try-catch — proper handling
+async function generateInternalStream_accumulateWithTryCatch(zip: JSZip): Promise<Uint8Array | null> {
+  try {
+    // SHOULD_NOT_FIRE: accumulate() promise awaited inside try-catch
+    return await zip.generateInternalStream({ type: 'uint8array' }).accumulate();
+  } catch (err) {
+    console.error('Zip generation failed:', err);
+    return null;
+  }
+}
+
 export {
   loadAsync_withTryCatch,
   loadAsync_withoutTryCatch,
@@ -182,4 +247,11 @@ export {
   generateNodeStream_withErrorListener,
   generateNodeStream_withTryCatch,
   streamZipToResponse,
+  streamSingleFileWithoutErrorListener,
+  streamSingleFileWithErrorListener,
+  streamSingleFileUnsupportedType,
+  generateInternalStream_withoutErrorListener,
+  generateInternalStream_withErrorListener,
+  generateInternalStream_accumulateWithoutTryCatch,
+  generateInternalStream_accumulateWithTryCatch,
 };

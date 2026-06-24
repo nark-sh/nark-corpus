@@ -1,12 +1,12 @@
 package: jszip
 semver: ">=3.8.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80  # 4 contracted functions / 5 total async-callable functions (1 omitted: JSZipStreamHelper.accumulate - covered by JSZipObject.async contract)
+coverage_score: 0.86  # 6 contracted functions / 7 total async-callable functions (1 omitted: JSZipStreamHelper.accumulate - transitively covered by JSZipObject.async and generateInternalStream contracts)
 
 detection:
   type_names:
@@ -209,6 +209,199 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  - name: nodeStream
+    import_path: "jszip"
+    description: >
+      Returns a Node.js Streams3 Readable stream for a single file entry in a loaded
+      zip archive. Called on a JSZipObject (zip.files['filename.bin']) to stream
+      individual file contents as nodebuffer chunks without buffering the entire
+      file in memory. Internally delegates to internalStream(type).toNodejsStream().
+      Only 'nodebuffer' type is supported. Distinct from generateNodeStream() (which
+      streams the ENTIRE zip) — nodeStream() streams ONE file entry.
+    patterns:
+      - '.nodeStream('
+      - 'nodeStream("nodebuffer"'
+    postconditions:
+      # Evidence: confirmed from jszip source lib/zipObject.js line 84-86, lib/stream/StreamHelper.js
+      # toNodejsStream() lines 197-210, and lib/nodejs/NodejsStreamOutputAdapter.js. Errors from
+      # DEFLATE decompression of a single file entry are forwarded via stream 'error' event.
+      # Source refs: https://github.com/Stuk/jszip/blob/master/lib/zipObject.js
+      #              https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js
+      #              https://github.com/Stuk/jszip/blob/master/lib/nodejs/NodejsStreamOutputAdapter.js
+      # Official docs: https://stuk.github.io/jszip/documentation/api_zipobject/node_stream.html
+      - id: file-node-stream-no-error-listener
+        condition: >
+          zip.files['name'].nodeStream() called without registering an 'error' event
+          listener on the returned ReadableStream, and/or without calling .pipe() to
+          a writable stream that handles errors. DEFLATE decompression of a single
+          file entry can fail mid-stream (corrupted entry, malformed DEFLATE data,
+          CRC32 mismatch), emitting an 'error' event on the readable stream. Per
+          Node.js EventEmitter semantics, an unhandled 'error' event causes an
+          uncaught exception that crashes the process.
+        throws: >
+          Error emitted via stream 'error' event (not thrown — does NOT reject a
+          Promise). Error message describes the decompression failure
+          ('invalid block type', 'invalid stored block lengths', CRC32 mismatch).
+          If no 'error' listener is registered on the returned stream, Node.js
+          throws an unhandled exception and terminates the process.
+        required_handling: >
+          Caller MUST register an 'error' event listener on the stream returned by
+          zip.file('name').nodeStream() before piping. When piping, also handle
+          errors on the writable stream. The common pattern:
+            zip.files['large.bin'].nodeStream()
+              .on('error', (err) => console.error('Entry decode error:', err))
+              .pipe(outputStream)
+              .on('finish', () => console.log('Done'));
+          Note: using .pipe() does NOT automatically propagate stream errors. Both
+          the readable and writable streams must have separate error handlers.
+          This is critical when streaming user-uploaded zip entries to HTTP
+          responses — an uncaught decode error kills the entire server process.
+        sources:
+          - "https://stuk.github.io/jszip/documentation/api_zipobject/node_stream.html"
+          - "https://github.com/Stuk/jszip/blob/master/lib/zipObject.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/nodejs/NodejsStreamOutputAdapter.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: file-node-stream-unsupported-type
+        condition: >
+          zip.files['name'].nodeStream(type) called with type other than 'nodebuffer'
+          (e.g. 'blob', 'uint8array', 'arraybuffer'). The internal toNodejsStream()
+          check rejects non-nodebuffer types synchronously per lib/stream/StreamHelper.js
+          line 199-205: "throw new Error(this._outputType + ' is not supported by
+          this method')". Also throws synchronously via utils.checkSupport('nodestream')
+          when readable-stream support is unavailable (browser environments).
+        throws: >
+          Error thrown synchronously (not via stream): '<type> is not supported by
+          this method' when a non-nodebuffer type is passed.
+          Error thrown synchronously: 'nodestream is not supported by this platform'
+          when the runtime lacks readable-stream support.
+        required_handling: >
+          Use nodeStream() only with the default 'nodebuffer' type (or no type
+          argument) in Node.js server environments. If the type is dynamic or
+          environment-dependent, wrap the call in try-catch to catch the synchronous
+          throw before the stream is constructed. In browser environments, use
+          .async('uint8array') instead.
+        sources:
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/support.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: generateInternalStream
+    import_path: "jszip"
+    description: >
+      Generates the complete zip file as a JSZipStreamHelper — a pausable stream
+      object with on('data'/'end'/'error') event-listener API plus accumulate()
+      (returns Promise) and toNodejsStream() (returns Node.js Readable) helpers.
+      The low-level building block that generateAsync() and generateNodeStream()
+      both wrap internally. Direct use is uncommon but appears in advanced
+      streaming pipelines that need event-by-event control (progress reporting,
+      chunked uploads, backpressure handling).
+    patterns:
+      - '.generateInternalStream('
+      - 'generateInternalStream({'
+    postconditions:
+      # Evidence: confirmed from jszip source lib/object.js lines 316-364 (synchronous
+      # throws caught and forwarded to GenericWorker 'error') and lib/stream/StreamHelper.js
+      # lines 153-175 (event-listener API; data/end/error events). The catch block at
+      # object.js line 359-362 creates a GenericWorker('error') and forwards the
+      # synchronous error, so callers see ALL errors via the 'error' event regardless
+      # of whether they originated synchronously (bad opts.type) or asynchronously
+      # (DEFLATE compression failure).
+      # Official docs: https://stuk.github.io/jszip/documentation/api_jszip/generate_internal_stream.html
+      # Official docs: https://stuk.github.io/jszip/documentation/api_streamhelper.html
+      - id: generate-internal-stream-no-error-listener
+        condition: >
+          zip.generateInternalStream(options) called with the event-listener pattern
+          (.on('data', ...).on('end', ...)) WITHOUT registering an .on('error', ...)
+          handler. Per Node.js EventEmitter semantics emulated by JSZipStreamHelper,
+          unhandled 'error' events bubble up as uncaught exceptions. ALL errors
+          flow through the 'error' event (per lib/object.js line 359-362): synchronous
+          option-validation errors ('No output type specified', unsupported platform
+          types) are caught and re-emitted as stream errors, identical to async
+          DEFLATE compression failures mid-stream.
+        throws: >
+          Error emitted via 'error' event on the returned JSZipStreamHelper. Error
+          message describes the cause: 'No output type specified', '<type> is not
+          supported by this platform', or DEFLATE compression failure
+          ('invalid block type', 'invalid stored block lengths').
+          If the caller uses the on('data')/on('end') pattern WITHOUT on('error'),
+          unhandled errors cause uncaught exceptions per EventEmitter semantics.
+        required_handling: >
+          Caller MUST register an .on('error', ...) handler on the StreamHelper
+          before consuming with on('data')/on('end'). The recommended pattern:
+            zip.generateInternalStream({ type: 'uint8array', streamFiles: true })
+              .on('data', (chunk, meta) => uploadChunk(chunk))
+              .on('end', () => finalize())
+              .on('error', (err) => console.error('Zip stream error:', err));
+          Alternatively, callers using .accumulate() get a Promise that REJECTS on
+          error — handle via try/await/catch or .catch(). Alternatively, callers
+          using .toNodejsStream() get a Node.js Readable with the same
+          on('error') requirement as generateNodeStream().
+        sources:
+          - "https://stuk.github.io/jszip/documentation/api_jszip/generate_internal_stream.html"
+          - "https://stuk.github.io/jszip/documentation/api_streamhelper.html"
+          - "https://github.com/Stuk/jszip/blob/master/lib/object.js"
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: generate-internal-stream-accumulate-unhandled-rejection
+        condition: >
+          zip.generateInternalStream(options).accumulate() called without await,
+          try-catch around the await, or .catch() on the returned Promise. The
+          accumulate() helper reads the stream end-to-end and resolves with the
+          full content OR rejects on stream 'error' event. Unhandled promise
+          rejections degrade to UnhandledPromiseRejection warnings in newer
+          Node.js and silent data loss in older runtimes.
+        throws: >
+          Promise rejects with Error describing the underlying failure: option
+          validation errors caught synchronously and re-emitted ('No output type
+          specified', unsupported platform), or DEFLATE compression failures.
+          The rejection includes the same error messages as the on('error') path
+          since both flow from the same GenericWorker('error') emission.
+        required_handling: >
+          Caller MUST wrap accumulate() with try-catch around await OR attach a
+          .catch() handler:
+            try {
+              const buffer = await zip.generateInternalStream({ type: 'nodebuffer' })
+                .accumulate();
+              return buffer;
+            } catch (err) {
+              console.error('Zip generation failed:', err);
+              throw err;
+            }
+          For most callers, generateAsync() is the simpler API (Promise<output>
+          directly) and should be preferred over generateInternalStream().accumulate()
+          unless progress reporting via the updateCallback is required.
+        sources:
+          - "https://stuk.github.io/jszip/documentation/api_streamhelper.html"
+          - "https://github.com/Stuk/jszip/blob/master/lib/stream/StreamHelper.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
 # CVE notes:
 # CVE-2022-48285 (CVSS 6.9): Path traversal via loadAsync in jszip < 3.8.0. Fixed in 3.8.0.
