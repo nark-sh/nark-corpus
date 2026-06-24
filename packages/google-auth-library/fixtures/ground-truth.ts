@@ -348,3 +348,57 @@ export async function impersonatedFetchIdTokenWithCatch(audience: string) {
     throw error;
   }
 }
+
+// ─── 23. OAuth2Client.revokeToken — bare call, no try-catch ──────────────────
+
+// @expect-violation: revoke-token-unprotected
+export async function revokeTokenNoCatch(client: OAuth2Client, token: string) {
+  // SHOULD_FIRE: revoke-token-unprotected
+  await client.revokeToken(token);
+}
+
+// @expect-clean
+export async function revokeTokenWithCatch(client: OAuth2Client, token: string) {
+  try {
+    await client.revokeToken(token);
+  } catch (error) {
+    console.error('Token revoke failed (likely already invalid):', error);
+  }
+}
+
+// ─── 24. OAuth2Client.revokeCredentials — bare call, no try-catch ────────────
+
+// @expect-violation: revoke-credentials-unprotected
+export async function revokeCredentialsNoCatch(client: OAuth2Client) {
+  // SHOULD_FIRE: revoke-credentials-unprotected
+  await client.revokeCredentials();
+}
+
+// @expect-clean
+export async function revokeCredentialsWithCatch(client: OAuth2Client) {
+  try {
+    await client.revokeCredentials();
+  } catch (error) {
+    console.error('Credential revoke failed:', error);
+  }
+}
+
+// ─── 25. Impersonated.sign — bare call, no try-catch ─────────────────────────
+
+// @expect-violation: impersonated-sign-unprotected
+export async function impersonatedSignNoCatch(blobToSign: string) {
+  // SHOULD_FIRE: impersonated-sign-unprotected
+  const result = await impersonatedClient.sign(blobToSign);
+  return result;
+}
+
+// @expect-clean
+export async function impersonatedSignWithCatch(blobToSign: string) {
+  try {
+    const result = await impersonatedClient.sign(blobToSign);
+    return result;
+  } catch (error) {
+    console.error('Impersonated signBlob failed:', error);
+    throw error;
+  }
+}

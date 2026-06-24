@@ -2,7 +2,7 @@ package: google-auth-library
 semver: ">=8.0.0 <11.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -624,13 +624,168 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: OAuth2Client.revokeToken
+    import_path: "google-auth-library"
+    description: >
+      Revokes an OAuth2 access or refresh token by POSTing to Google's OAuth2
+      revoke endpoint (oauth2.googleapis.com/revoke). Used in logout flows and
+      when rotating credentials. Returns a GaxiosPromise — throws GaxiosError
+      on network failure, on 400 invalid_token when the token is already
+      invalid/expired/never-existed, and on 5xx Google outages.
+
+    postconditions:
+      # Evidence: oauth2client.js lines 411-426 — returns this.transporter.request(opts) directly.
+      # No internal try-catch. Any HTTP non-2xx surfaces as GaxiosError with the
+      # response body { error: 'invalid_token', error_description: ... } attached.
+      # Common in logout middleware where the route already destroyed the session,
+      # leaving an uncaught error to crash the response after cookies were cleared.
+      - id: revoke-token-unprotected
+        condition: >
+          Async call to client.revokeToken(token) is not wrapped in a try-catch.
+          Throws GaxiosError on: (1) 400 invalid_token when the token was already
+          revoked, expired, or never valid (extremely common during logout retries);
+          (2) network failure to oauth2.googleapis.com; (3) 5xx Google OAuth outage.
+        throws: GaxiosError
+        required_handling: >
+          Caller MUST wrap await client.revokeToken(token) in a try-catch block.
+          Treat 400 invalid_token as a no-op (the token is already gone — logout
+          succeeded). Network/5xx errors are retryable but the user's session is
+          typically already cleared client-side, so silent-fail-and-log is
+          acceptable. Uncaught errors here crash the logout route AFTER the
+          session has been destroyed, producing a 500 response that confuses
+          frontends expecting a clean redirect.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html"
+          - "https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: OAuth2Client.revokeCredentials
+    import_path: "google-auth-library"
+    description: >
+      Revokes the currently-loaded access token and clears local credentials.
+      Wrapper around revokeToken that pulls the access token from
+      this.credentials. Throws synchronously-via-promise with Error('No access
+      token to revoke.') when no credentials are loaded, plus all the
+      GaxiosError modes inherited from revokeToken.
+
+    postconditions:
+      # Evidence: oauth2client.js lines 427-443 — revokeCredentialsAsync().
+      # The credentials are cleared (this.credentials = {}) BEFORE the network call,
+      # so a failed revoke leaves the client in a half-state: local creds gone,
+      # server-side token still valid. The 'No access token to revoke.' Error is
+      # a plain Error, not GaxiosError — caller must handle both shapes.
+      - id: revoke-credentials-unprotected
+        condition: >
+          Async call to client.revokeCredentials() is not wrapped in a try-catch.
+          Throws Error('No access token to revoke.') when credentials.access_token
+          is missing — common when revokeCredentials() is called twice or after
+          a manual setCredentials({}). Also throws GaxiosError for all the modes
+          listed in revokeToken (invalid_token, network, 5xx).
+        throws: "Error | GaxiosError"
+        required_handling: >
+          Caller MUST wrap await client.revokeCredentials() in a try-catch.
+          Distinguish Error('No access token to revoke.') (programmer error,
+          treat as no-op) from GaxiosError (network/revocation failure, may
+          warrant retry). Critically, local credentials are CLEARED before the
+          network call, so a thrown error leaves the client unable to retry on
+          the same token. If logout-and-revoke must be atomic, capture the
+          token first via getAccessToken() then call revokeToken(token)
+          directly so a failure leaves credentials intact for retry.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/OAuth2Client.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: Impersonated.sign
+    import_path: "google-auth-library"
+    description: >
+      Signs an arbitrary blob using the impersonated service account's signing
+      key via the IAM Credentials signBlob endpoint
+      (iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/...:signBlob).
+      Used for generating signed URLs for GCS, signed JWTs for service-to-service
+      auth, and any flow requiring a service-account signature without holding
+      the private key locally. Makes two network calls — sourceClient
+      getAccessToken() and then the IAM signBlob POST. Unlike refreshToken(),
+      sign() does NOT wrap errors with the 'unable to impersonate' prefix;
+      raw GaxiosError surfaces directly.
+
+    postconditions:
+      # Evidence: impersonated.js lines 102-117 — sign() implementation:
+      #   await this.sourceClient.getAccessToken()  [throws if source token fails]
+      #   await this.sourceClient.request(POST iamcredentials.googleapis.com/v1/.../signBlob)
+      # No try-catch wrapper around the request call (refreshToken HAS one that
+      # reformats errors — sign() does not).
+      # Common IAM errors per signBlob docs:
+      #   - 403 PERMISSION_DENIED: source SA lacks roles/iam.serviceAccountTokenCreator
+      #     on target SA
+      #   - 404 NOT_FOUND: targetPrincipal SA does not exist
+      #   - 400 INVALID_ARGUMENT: blobToSign too large (>64KB) or empty
+      #   - 429 RESOURCE_EXHAUSTED: IAM signBlob quota exceeded (60 req/min default)
+      - id: impersonated-sign-unprotected
+        condition: >
+          Async call to impersonatedClient.sign(blobToSign) is not wrapped in a
+          try-catch. Two failure layers: (1) source credential failure throws
+          GaxiosError from sourceClient.getAccessToken(); (2) IAM signBlob POST
+          throws GaxiosError with status 403 PERMISSION_DENIED (missing
+          roles/iam.serviceAccountTokenCreator), 404 NOT_FOUND (target SA missing),
+          400 INVALID_ARGUMENT (blob >64KB or empty), or 429 RESOURCE_EXHAUSTED
+          (IAM signBlob quota: default 60 req/min per project).
+        throws: GaxiosError
+        required_handling: >
+          Caller MUST wrap await impersonatedClient.sign(blob) in a try-catch.
+          Inspect error.response.data.error.status to distinguish IAM error
+          categories. PERMISSION_DENIED requires granting the source service
+          account roles/iam.serviceAccountTokenCreator on the target SA — this
+          is the most common production-time failure and surfaces only when
+          IAM has been misconfigured. RESOURCE_EXHAUSTED on 429 should
+          trigger exponential backoff (default IAM signBlob quota is 60/min
+          and is easily hit by high-throughput signed-URL generators). Commonly
+          used in signed-URL generation for GCS uploads — an uncaught error
+          here breaks file uploads for every user.
+        sources:
+          - "https://googleapis.dev/nodejs/google-auth-library/latest/classes/Impersonated.html"
+          - "https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/signBlob"
+          - "https://cloud.google.com/iam/quotas"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 metadata:
-  last_verified: "2026-04-16"
+  last_verified: "2026-06-24"
   evidence_quality: confirmed
-  coverage_score: 0.79
-  # 15 contracted functions / 19 total async-callable (4 intentionally omitted)
-  # Added this pass (deepen-stream-2 pass 12): GoogleAuth.fromStream, GoogleAuth.getCredentials,
-  #   Impersonated.fetchIdToken (3 new functions; total expanded from 16→19)
-  # Omitted: revokeToken, revokeCredentials (cleanup paths, same GaxiosError profile),
-  #          getFederatedSignonCerts/getIapPublicKeys (internal auth infra),
-  #          getRequestHeaders/authorizeRequest/request/fetch (pass-through wrappers)
+  coverage_score: 0.95
+  # 18 contracted functions / 19 total async-callable (1 intentionally omitted)
+  # Added this pass (deepen-stream-3 pass 36, drift-mode): OAuth2Client.revokeToken,
+  #   OAuth2Client.revokeCredentials, Impersonated.sign (3 new functions).
+  # Source: google-auth-library@10.7.0 build/src — oauth2client.js lines 411-443
+  #   and impersonated.js lines 102-117. revokeToken/revokeCredentials previously
+  #   omitted as "cleanup paths, same GaxiosError profile" but real-world risk is
+  #   logout-route crash AFTER session destruction (visible to user as 500).
+  #   Impersonated.sign distinct from fetchIdToken — different IAM endpoint
+  #   (signBlob vs generateIdToken) with different quota and error semantics,
+  #   and no 'unable to impersonate' message-rewrap wrapper.
+  # Omitted: getFederatedSignonCerts/getIapPublicKeys (internal auth infra,
+  #          called transitively by verifyIdToken),
+  #          getRequestHeaders/authorizeRequest/request/fetch (pass-through wrappers
+  #          that delegate to the underlying OAuth2Client/GoogleAuth methods already
+  #          covered above — postconditions there cover these surfaces transitively).
+  # Pass 12 (deepen-stream-2, 2026-04-16) added: GoogleAuth.fromStream,
+  #   GoogleAuth.getCredentials, Impersonated.fetchIdToken.
