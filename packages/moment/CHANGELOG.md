@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 83% → 83% (no-op refresh)
+
+- **Profile:** `packages/moment/contract.yaml`
+- **Functions added:** none — moment 2.30.1 d.ts re-enumerated, no new async surface, no new error-bearing functions since 2026-04-16
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** diff, toDate, valueOf (NaN propagation already covered by format/toISOString contracts — unchanged)
+- **Scanner concerns queued:** 0 (no new functions)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** node_modules/moment/moment.d.ts @ 2.30.1 (top-level + namespace exports verified)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 46 on 2026-06-24)
+- **Notes:** moment is sync-only (no Promise/async in d.ts); existing 15 functions cover all error-bearing surface (NaN propagation, CVE-2022-24785 path traversal, CVE-2022-31129 ReDoS, invalid-date string returns). Parity-gap audit: add/subtract pair covered; min/max pair covered; defineLocale/updateLocale pair covered; format/toISOString/fromNow invalid-output trio covered. Re-verification only — no contract changes.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** moment@2.30.1
