@@ -121,3 +121,66 @@ export async function deleteByTagWithCatch(tag: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. cloudinary.uploader.remove_all_tags() — without try-catch  (added 2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function removeAllTagsNoCatch(publicIds: string[]) {
+  // SHOULD_FIRE: remove-all-tags-missing-error-handling — remove_all_tags() rejects on auth (401), permission (403), bad public_id format (400). No try-catch.
+  const result = await cloudinary.uploader.remove_all_tags(publicIds);
+  return result;
+}
+
+export async function removeAllTagsWithCatch(publicIds: string[]) {
+  try {
+    // SHOULD_NOT_FIRE: remove_all_tags() inside try-catch satisfies error handling
+    const result = await cloudinary.uploader.remove_all_tags(publicIds);
+    return result;
+  } catch (err) {
+    console.error('Remove all tags failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. cloudinary.uploader.create_archive() — without try-catch  (added 2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createArchiveNoCatch(tag: string) {
+  // SHOULD_FIRE: create-archive-missing-error-handling — create_archive() rejects on bad params (400), auth (401), permission (403), rate limit (420). No try-catch.
+  const result = await cloudinary.uploader.create_archive({ tags: [tag], target_format: 'zip' });
+  return result;
+}
+
+export async function createArchiveWithCatch(tag: string) {
+  try {
+    // SHOULD_NOT_FIRE: create_archive() inside try-catch satisfies error handling
+    const result = await cloudinary.uploader.create_archive({ tags: [tag], target_format: 'zip' });
+    return result;
+  } catch (err) {
+    console.error('Archive generation failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. cloudinary.api.create_folder() — without try-catch  (added 2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createFolderNoCatch(path: string) {
+  // SHOULD_FIRE: create-folder-missing-error-handling — create_folder() rejects on 401 (auth), 409 (already exists), 400 (bad path), 420 (rate limit). No try-catch.
+  const result = await cloudinary.api.create_folder(path);
+  return result;
+}
+
+export async function createFolderWithCatch(path: string) {
+  try {
+    // SHOULD_NOT_FIRE: create_folder() inside try-catch satisfies error handling
+    const result = await cloudinary.api.create_folder(path);
+    return result;
+  } catch (err) {
+    console.error('Folder creation failed:', err);
+    throw err;
+  }
+}

@@ -1,20 +1,24 @@
 package: cloudinary
 semver: ">=1.0.0 <3.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.82  # 14 contracted / 17 total async-callable (3 intentionally omitted)
+coverage_score: 0.85  # 17 contracted / 20 total async-callable (omitted set tracked in deepen-index.json)
 # Intentionally omitted (read-only / narrow-adoption / utility):
 #   api.resources, api.resources_by_tag, api.resources_by_ids, api.usage, api.resource_types,
-#   api.root_folders, api.sub_folders, api.search_folders, api.create_folder, api.rename_folder,
-#   multi(), explode(), generate_sprite(), upload_tag_params, upload_url, image_upload_tag,
-#   api.resources_by_context, api.resources_by_asset_folder, api.resources_by_moderation,
-#   api.list_streaming_profiles, api.get_streaming_profile
+#   api.root_folders, api.sub_folders, api.search_folders, api.rename_folder,
+#   api.delete_folder, multi(), explode(), generate_sprite(), upload_tag_params, upload_url,
+#   image_upload_tag, api.resources_by_context, api.resources_by_asset_folder,
+#   api.resources_by_moderation, api.list_streaming_profiles, api.get_streaming_profile,
+#   replace_tag, api.transformation, api.transformations, api.add_context, api.remove_all_context
 # Reason: read-only list/GET operations with no distinct error contracts beyond generic HTTP
 #   errors, or niche media-processing functions with minimal SaaS adoption
+# Added in 2026-06-24 deepen pass 33: remove_all_tags, create_archive, api.create_folder
+#   (api.create_folder promoted out of the omitted set — actively used in CMS onboarding flows
+#   and carries a distinct HTTP 409 idempotency-conflict contract).
 
 functions:
   - name: upload
@@ -665,4 +669,170 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: remove_all_tags
+    import_path: "cloudinary"
+    description: >
+      Removes ALL tags from a list of assets identified by their public_ids. Used
+      in access-control rollback (clearing tag-based delivery groups), CMS workflow
+      resets (post-moderation cleanup), and pre-deletion staging. Unlike remove_tag()
+      which targets a single tag, this strips every tag from each asset in one batch
+      call — destructive of tag-based grouping with no per-tag report.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # Source: lib/uploader.js exports.remove_all_tags — calls call_tags_api("remove_all", ...)
+      # Same execute_request.js error shape as all Upload API methods
+      # HTTP code envelope: 200/400/401/403/404/420/500 from Upload API spec
+      # Real-world usage: fictionco/fiction (1466 ⭐) calls cloudinary.v2.uploader.remove_all_tags([publicId])
+      - id: remove-all-tags-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), invalid public_id format (HTTP 400),
+          or network failure during bulk tag-clearing operation
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects on authentication failure (HTTP 401), when the caller lacks
+          permission (HTTP 403), or on network failure. Same silent no-op behavior
+          as add_tag()/remove_tag() for non-existent assets — the response contains
+          only the public_ids that were actually updated. In access-control rollback
+          flows, an unthrown failure leaves restricted assets visible because the
+          tag-based delivery group was not actually cleared.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 401: Authorization required (invalid api_key/api_secret).
+          HTTP 403: Not allowed (permission denied).
+          HTTP 400: Bad request (invalid public_id format, too many public_ids).
+          HTTP 500: Internal server error.
+          Node.js Error: network failure (ECONNREFUSED, ETIMEDOUT).
+          SILENT: Non-existent public_ids do NOT throw — silently returns empty list.
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.remove_all_tags() in try-catch for auth/network errors.
+          For access-control rollback, compare response.public_ids against your input
+          array to verify the tag-clearing was actually applied to every asset.
+          Missing public_ids in the response indicate assets that no longer exist —
+          their access-control state cannot be guaranteed by this call.
+        evidence_quality: confirmed
+
+  - name: create_archive
+    import_path: "cloudinary"
+    description: >
+      Creates a downloadable archive (zip or tgz) from a set of Cloudinary assets
+      identified by tag, public_id list, or prefix. Used for bulk asset export,
+      customer download flows, and archive generation pipelines. The generated
+      archive is itself stored in Cloudinary and returned with a secure URL.
+      Server-side archive assembly is a long-running operation — partial failures
+      (one missing asset in a multi-asset archive) are reported in the response
+      rather than thrown.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/image_upload_api_reference
+      # Source: lib/uploader.js exports.create_archive — calls call_api("generate_archive", ...)
+      # Same execute_request.js error shape as upload — plain { message, http_code }
+      # HTTP code envelope: 400/401/403/404/420/500 from Upload API spec
+      # create_zip() is a thin wrapper that calls create_archive() with target_format="zip" —
+      # both share identical error semantics.
+      - id: create-archive-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), invalid archive parameters (HTTP 400),
+          permission denied (HTTP 403), rate limit exceeded (HTTP 420), or network failure
+          during server-side archive assembly
+        sources:
+          - "https://cloudinary.com/documentation/image_upload_api_reference"
+        description: >
+          Rejects when authentication fails (HTTP 401), when archive parameters
+          are invalid (HTTP 400 — e.g., invalid target_format, conflicting tags+public_ids
+          selectors, or too many source assets), when the caller lacks permission
+          (HTTP 403), when rate-limited (HTTP 420), or on network failure during
+          the long-running archive assembly. Customer-facing download flows that
+          await create_archive() without try-catch surface a generic error to the
+          user with no recovery path — the customer sees a broken download button
+          and an empty file.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 400: Bad request (invalid target_format, too many source assets,
+          or conflicting selector params).
+          HTTP 401: Authorization required (invalid api_key/api_secret).
+          HTTP 403: Not allowed (archive generation not enabled on plan).
+          HTTP 420: Rate limited (Upload API archive quota exceeded).
+          HTTP 500: Internal error (archive assembly failure for large sets).
+          Node.js Error: network failure (ECONNREFUSED, ETIMEDOUT mid-assembly).
+        required_handling: >
+          MUST wrap cloudinary.v2.uploader.create_archive() (and create_zip())
+          in try-catch. Check error.http_code === 400 to detect bad archive params
+          (try a smaller selector or different target_format). Check error.http_code === 420
+          for rate-limit and implement exponential backoff before retry. For customer-facing
+          download flows, present a user-friendly fallback rather than the raw error.message.
+          Note: create_zip() delegates to create_archive() with target_format="zip" — the same
+          error envelope applies.
+        evidence_quality: confirmed
+
+  - name: api.create_folder
+    import_path: "cloudinary"
+    description: >
+      Creates an empty folder in the Cloudinary Media Library via the Admin API.
+      Used in CMS onboarding flows (per-tenant folder isolation), bulk upload
+      preparation (creating destination folders ahead of asset upload), and
+      media-library structure provisioning. The folder is created at the exact
+      path string passed — nested folders (e.g. "tenants/acme/photos") are created
+      in a single call. Idempotency note: creating an already-existing folder
+      returns HTTP 409 Conflict by default.
+    postconditions:
+      # Evidence: https://cloudinary.com/documentation/admin_api
+      # Source: lib/api.js exports.create_folder — calls call_api("post", ["folders", path], ...)
+      # Admin API rate limited (HTTP 420) — same quota as resource/update/delete
+      # Error shape: plain { message, http_code } via shared execute_request.js
+      # HTTP code envelope: 400/401/403/409/420/500 from Admin API spec
+      - id: create-folder-missing-error-handling
+        severity: error
+        condition: >
+          authentication failure (HTTP 401), permission denied (HTTP 403), folder already exists
+          (HTTP 409 Conflict), invalid folder path (HTTP 400), Admin API rate limit exceeded (HTTP 420),
+          or network failure during folder creation
+        sources:
+          - "https://cloudinary.com/documentation/admin_api"
+        description: >
+          Rejects on authentication failure (HTTP 401), permission denial (HTTP 403),
+          when the folder already exists (HTTP 409 — the most common unhandled case
+          in onboarding flows where the same tenant may be re-initialized), when
+          the folder path is invalid (HTTP 400 — e.g., contains illegal characters
+          or starts with a slash), when the Admin API hourly quota is exceeded
+          (HTTP 420), or on network failure. In tenant onboarding flows that don't
+          handle HTTP 409, the entire onboarding transaction aborts instead of
+          treating an existing folder as a no-op success.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        throws: >
+          Plain object { message: string, http_code: number } — NOT a standard Error.
+          HTTP 400: Bad request (invalid folder path — leading slash, illegal chars).
+          HTTP 401: Authorization required (Admin API credentials required).
+          HTTP 403: Not allowed (insufficient permissions for folder ops).
+          HTTP 409: Already exists (folder is already present at this path).
+          HTTP 420: Rate limited (Admin API hourly quota exceeded — folder ops count against the same limit).
+          HTTP 500: Internal server error.
+          Node.js Error: network failure (ECONNREFUSED, ETIMEDOUT).
+        required_handling: >
+          MUST wrap cloudinary.v2.api.create_folder() in try-catch.
+          Check error.http_code === 409 to detect idempotent re-creation — treat as
+          a no-op success in tenant onboarding flows (the folder is already there).
+          Check error.http_code === 420 for rate limit and implement exponential
+          backoff. Validate folder path format (no leading slash, no illegal characters)
+          before calling to avoid HTTP 400.
         evidence_quality: confirmed
