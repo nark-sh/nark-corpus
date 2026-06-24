@@ -1222,3 +1222,70 @@ async function chatkitSessionsCancelWithErrorHandling(sessionId: string) {
     throw err;
   }
 }
+
+// ─── images.edit (non-streaming) ──────────────────────────────────────────────
+
+async function imagesEditMissingErrorHandling(file: any, prompt: string) {
+  // SHOULD_FIRE: images-edit-authentication-error — images.edit() throws AuthenticationError on 401, no try-catch
+  const result = await openai.images.edit({ image: file, prompt });
+  return result;
+}
+
+async function imagesEditWithErrorHandling(file: any, prompt: string) {
+  try {
+    // SHOULD_NOT_FIRE: images.edit inside try-catch handles AuthenticationError + BadRequestError
+    const result = await openai.images.edit({ image: file, prompt });
+    return result;
+  } catch (err) {
+    if (err instanceof OpenAI.AuthenticationError) throw new Error('Auth failed');
+    if (err instanceof OpenAI.BadRequestError) throw new Error('Content policy violation');
+    throw err;
+  }
+}
+
+// ─── images.edit (streaming) ──────────────────────────────────────────────────
+
+async function imagesEditStreamMissingErrorHandling(file: any, prompt: string) {
+  // SHOULD_FIRE: images-edit-stream-mid-stream-api-error — streaming for-await without try-catch lets mid-stream APIError throw uncaught
+  const stream = await openai.images.edit({ image: file, prompt, stream: true });
+  for await (const event of stream) {
+    if (event.type === 'image_edit.partial_image') {
+      // update UI
+    }
+  }
+}
+
+async function imagesEditStreamWithErrorHandling(file: any, prompt: string) {
+  const stream = await openai.images.edit({ image: file, prompt, stream: true });
+  let completed = false;
+  try {
+    // SHOULD_NOT_FIRE: for-await wrapped in try-catch + explicit completed flag handles mid-stream APIError and silent-abort
+    for await (const event of stream) {
+      if (event.type === 'image_edit.completed') completed = true;
+    }
+  } catch (err) {
+    if (err instanceof OpenAI.APIError) {
+      // surface to user, mark incomplete
+    }
+    throw err;
+  }
+  if (!completed) {
+    // aborted or interrupted — do not commit result
+  }
+}
+
+async function imagesEditStreamAbortNotChecked(file: any, prompt: string) {
+  const stream = await openai.images.edit({ image: file, prompt, stream: true });
+  try {
+    // SHOULD_FIRE: images-edit-stream-abort-silent-termination — for-await exits silently on abort with no completion check
+    for await (const event of stream) {
+      if (event.type === 'image_edit.partial_image') {
+        // update UI
+      }
+    }
+    // No completion flag check — aborted edits look identical to successful edits
+  } catch (err) {
+    if (err instanceof OpenAI.APIError) throw err;
+    throw err;
+  }
+}

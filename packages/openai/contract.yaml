@@ -1,8 +1,8 @@
 package: openai
 semver: ">=4.0.0 <7.0.0"
-contract_version: "1.4.0"
+contract_version: "1.5.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # deepen-stream-1 pass 10
+last_verified: "2026-06-24"  # deepen-stream-2 pass 39 (drift-by-staleness; openai-node@6.34.0 -> @6.44.0)
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -30,7 +30,21 @@ evidence_quality: confirmed
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/parser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/lib/ResponsesParser.ts
 #   https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts
-coverage_score: 0.80  # 35 contracted / 44 total async-callable functions (20 intentionally omitted)
+coverage_score: 0.82  # 36 contracted / 44 total async-callable functions (19 intentionally omitted; images.edit promoted out of omitted-list in pass 39)
+# Depth pass 2026-06-24 (deepen-stream-2 pass 39, drift-by-staleness):
+# Re-inspected openai-node@6.44.0 (was @6.34.0 at last pass). API surface unchanged at 44
+# async-callable functions. Contracted +1: images.edit (4 postconditions covering auth,
+# content-policy, mid-stream APIError, and silent-abort-termination for the streaming variant).
+# Rationale for revisit: the 2026-04-16 pass omitted images.edit() as "same error surface as
+# generate, rarely used." That assessment was correct for the non-streaming path but missed
+# that openai-node 6.x exposes a stream:true variant of images.edit() that returns
+# Stream<ImageEditStreamEvent>. The streaming variant has the same SSE error contract as
+# core/streaming.js: mid-stream provider errors throw APIError synchronously inside the
+# for-await loop; AbortController cancellation exits the iterator silently with no completed
+# event. SaaS apps that integrate inline image editing in chat UIs (a documented use case
+# for GPT Image models gpt-image-1.5 / gpt-image-1-mini / chatgpt-image-latest) call the
+# streaming variant for partial_image preview UX — this is a real runtime path.
+# Coverage delta: 0.80 -> 0.82 (35 -> 36 contracted / 44 total).
 # Depth pass 2026-04-16 (deepen-stream-1 pass 10):
 # Expanded coverage from 32→35 contracted functions (+3 this pass).
 # API surface unchanged: still 44 total async-callable functions.
@@ -2986,4 +3000,182 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+        evidence_quality: confirmed
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # images.edit()  (via openai.images.edit())
+  # Evidence sources:
+  #   node_modules/openai@6.44.0/resources/images.d.ts
+  #     edit(body: ImageEditParamsStreaming): APIPromise<Stream<ImageEditStreamEvent>>
+  #     edit(body: ImageEditParamsNonStreaming): APIPromise<ImagesResponse>
+  #   node_modules/openai@6.44.0/resources/images.js  (POST /images/edits, stream flag from body)
+  #   node_modules/openai@6.44.0/core/streaming.js  (Stream.fromSSEResponse)
+  #     - line 50:  throw new APIError(undefined, data.error, undefined, response.headers)  -- on SSE 'error' event
+  #     - line 66:  throw new APIError(undefined, data.error, data.message, undefined)      -- on SSE 'error' event (raw path)
+  #     - line 75:  if (isAbortError(e)) return;                                            -- abort exits silently
+  #     - line 82:  if (!done) controller.abort();                                          -- early break aborts request
+  # API docs: https://platform.openai.com/docs/api-reference/images/createEdit
+  # Surface: edit() supports GPT Image models (gpt-image-1.5, gpt-image-1, gpt-image-1-mini,
+  # chatgpt-image-latest) and dall-e-2. Streaming was added to the openai-node SDK after
+  # the 2026-04-16 deepen pass (now a documented variant in 6.44.0). The streaming variant
+  # produces partial_image events and a completed event; on any provider-side error the
+  # SSE stream emits an 'error' event that core/streaming.js converts into a synchronous
+  # APIError throw inside the for-await loop.
+  # Pass 39 rationale: the 2026-04-16 deepen omitted images.edit as "same error surface as
+  # generate, rarely used." That was correct for the non-streaming path. The streaming
+  # variant is new and has the distinct premature-termination + abort + mid-stream APIError
+  # contract that chat.completions.create({stream:true}) and chat.completions.stream() carry.
+  # Edit-streaming is a real runtime path because GPT Image models stream partial images
+  # for UX preview; SaaS apps that integrate inline image editing in chat UIs use it.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: images.edit
+    import_path: "openai"
+    description: >
+      Edits or extends an image given one or more source images and a prompt via
+      openai.images.edit(). Supports GPT Image models and dall-e-2. With stream:true
+      returns Stream<ImageEditStreamEvent> that emits partial_image events as the image
+      is generated; without it returns Promise<ImagesResponse>. The streaming variant has
+      the same SSE error contract as core/streaming.js — mid-stream provider errors are
+      converted to APIError throws inside the for-await loop, and abort() / early break
+      exits the iterator silently without throwing.
+
+    postconditions:
+      # Evidence: AuthenticationError class hierarchy in openai-node/src/core/error.ts (status 401).
+      # Same as images.generate — included here for completeness so edit() can be enforced
+      # symmetrically without callers having to look at the generate() entry.
+      - id: images-edit-authentication-error
+        condition: "Invalid or missing API key (401) when calling openai.images.edit()."
+        throws: "AuthenticationError with status 401"
+        required_handling: >
+          Caller MUST NOT retry with the same API key. Image-editing endpoints are
+          frequently called from background processing queues where auth failures
+          silently halt the queue. Alert operations team — this is a configuration error.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+          - "https://platform.openai.com/docs/api-reference/images/createEdit"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      # Evidence: content_policy_violation is documented in the Images API guide and
+      # surfaces as BadRequestError (HTTP 400) with code 'content_policy_violation'.
+      # Same surface as images.generate — image editing is subject to the same content
+      # filtering pipeline (DALL-E 2 and GPT Image models both reject prompts and source
+      # images that violate policy).
+      - id: images-edit-content-policy-violation
+        condition: >
+          The source image, mask, or prompt violates OpenAI content policy.
+          Image editing is subject to the same content filter as generation; surfaces
+          as BadRequestError (HTTP 400) with content_policy_violation.
+        throws: "BadRequestError with content_policy_violation"
+        required_handling: >
+          DO NOT retry with the same source image or prompt. Return a user-friendly
+          content-policy error. Log occurrences for compliance monitoring. For
+          user-uploaded images that fail, surface the rejection to the user immediately
+          instead of silently dropping the edit request.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+          - "https://platform.openai.com/docs/guides/images/usage-policies"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: core/streaming.js Stream.fromSSEResponse() lines 49-50 and 65-66 — when
+      # the SSE event payload carries a `data.error` (or sse.event === 'error' on the
+      # raw path), the iterator throws new APIError(...) synchronously inside the
+      # for-await loop. This is distinct from the initial POST /images/edits succeeding:
+      # the connection opens, partial_image events stream, and then an error event
+      # mid-stream throws APIError. Callers iterating without a try/catch around the
+      # for-await get an uncaught rejection.
+      - id: images-edit-stream-mid-stream-api-error
+        condition: >
+          openai.images.edit({stream: true}) returns Stream<ImageEditStreamEvent>.
+          During iteration, the SSE channel can emit an 'error' event mid-stream
+          (provider-side failure after partial_image events have been delivered).
+          core/streaming.js converts this into a synchronous APIError throw inside
+          the for-await loop. Callers that iterate the stream without wrapping the
+          loop in try/catch get an uncaught Promise rejection that crashes the request
+          handler — silently in serverless runtimes, loudly in process-level error
+          handlers.
+        throws: "APIError (constructed inline via new APIError(undefined, data.error, ...))"
+        required_handling: >
+          Caller MUST wrap the for-await loop in try/catch when iterating the stream.
+          Partial images already delivered to the client UI must be marked as incomplete
+          on error so the user sees a clear failure state instead of a half-rendered image.
+          Pattern:
+            const stream = await openai.images.edit({ image, prompt, stream: true });
+            try {
+              for await (const event of stream) {
+                if (event.type === 'image_edit.partial_image') { /* update UI */ }
+                if (event.type === 'image_edit.completed') { /* finalize */ }
+              }
+            } catch (err) {
+              if (err instanceof OpenAI.APIError) { /* surface to user, mark incomplete */ }
+              throw err;
+            }
+          DO NOT swallow the error silently — partial_image deliveries already streamed
+          to the client must be invalidated, otherwise the user sees a stuck preview.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/streaming.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: core/streaming.js lines 73-78 and 121-124 — the for-await loop's
+      # try/catch checks isAbortError(e) and returns instead of throwing. lines 80-82
+      # confirm the finally block calls controller.abort() if the loop exits without
+      # done=true (i.e. caller `break`s early). Net effect: if the user cancels the
+      # AbortController, the stream silently terminates without an error; callers that
+      # only check for an APIError throw to detect "edit failed" will see a clean
+      # iterator exit and may believe the edit completed successfully when it was
+      # actually cancelled.
+      - id: images-edit-stream-abort-silent-termination
+        condition: >
+          openai.images.edit({stream: true}) iteration exits silently when the
+          underlying AbortController is aborted (user navigated away, server-side
+          request timeout, or explicit stream.controller.abort()). The for-await
+          loop does NOT throw — it returns cleanly without ever emitting an
+          image_edit.completed event. Callers that assume "no throw = success"
+          treat aborted edits as completed and may commit a partial or empty image
+          to user-facing state.
+        throws: ""
+        returns: "Silent iterator exit — no APIError, no completed event"
+        required_handling: >
+          Caller MUST track completion explicitly — do NOT infer success from the
+          absence of a throw. Pattern:
+            let completed = false;
+            try {
+              for await (const event of stream) {
+                if (event.type === 'image_edit.completed') completed = true;
+              }
+            } catch (err) { /* APIError or network */ }
+            if (!completed) { /* aborted or interrupted — DO NOT commit result */ }
+          For server-side handlers: check req.signal.aborted (or the equivalent for
+          your framework) after the loop and roll back any partial state if true.
+        sources:
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/streaming.ts"
+          - "https://raw.githubusercontent.com/openai/openai-node/refs/heads/master/src/core/error.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
         evidence_quality: confirmed
