@@ -3,6 +3,27 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 81% -> 83%
+
+- **Profile:** `packages/firebase/contract.yaml`
+- **Functions added:** applyActionCode, getRedirectResult, signInWithCustomToken, uploadString, getMetadata (5 total)
+- **Postconditions added:** 5 (apply-action-code-error, redirect-result-error, custom-token-error, upload-string-error, get-metadata-error)
+- **Functions intentionally omitted this pass:** unchanged from prior pass — SMS-flow functions (phone-number niche), getDocFromServer/getDocsFromServer (duplicate error contract), fetchSignInMethodsForEmail (deprecated), validatePassword (optional policy enforcement)
+- **Scanner concerns queued:** 0 — all 5 new postconditions use the existing "bare-await on firebase auth/storage import without try-catch" detection rule; scanner verified 5/5 SHOULD_FIRE fixtures fire, 5/5 SHOULD_NOT_FIRE try-catch wrappers do not fire
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `@firebase/auth/dist/auth-public.d.ts` (signatures: applyActionCode, getRedirectResult, signInWithCustomToken — installed firebase@12.15.0)
+  - `@firebase/auth/dist/index.webworker.js` (AuthErrorCode enum: EXPIRED_OOB_CODE, INVALID_OOB_CODE, ACCOUNT_EXISTS_WITH_DIFFERENT_CREDENTIAL, CREDENTIAL_ALREADY_IN_USE, INVALID_CUSTOM_TOKEN, CREDENTIAL_MISMATCH, USER_DISABLED)
+  - `@firebase/storage/dist/storage-public.d.ts` (signatures: uploadString, getMetadata)
+  - `@firebase/storage/dist/index.cjs.js` (StorageErrorCode enum: OBJECT_NOT_FOUND, UNAUTHORIZED, QUOTA_EXCEEDED, RETRY_LIMIT_EXCEEDED, UNAUTHORIZED_APP, INVALID_URL)
+  - https://firebase.google.com/docs/reference/js/auth.md#applyactioncode
+  - https://firebase.google.com/docs/reference/js/auth.md#getredirectresult
+  - https://firebase.google.com/docs/reference/js/auth.md#signinwithcustomtoken
+  - https://firebase.google.com/docs/reference/js/storage.md#uploadstring
+  - https://firebase.google.com/docs/reference/js/storage.md#getmetadata
+  - https://firebase.google.com/docs/storage/web/handle-errors
+- **Verified by:** bc-deepen-contract (pass 54 on 2026-06-24T08:04:30Z, deepen-stream-3)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** firebase@12.15.0

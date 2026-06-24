@@ -8,12 +8,13 @@ package: firebase
 semver: ">=9.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.81  # 30 contracted / ~37 total async-callable (after intentional omissions)
-# effective_coverage: 0.81 — 30/37 non-omitted functions contracted (+10 this pass)
+coverage_score: 0.83  # 35 contracted / 42 total async-callable (after intentional omissions)
+# effective_coverage: 0.83 — 35/42 considered functions contracted (+5 this pass: applyActionCode,
+#   getRedirectResult, signInWithCustomToken, uploadString, getMetadata)
 # intentionally omitted (~7): signInWithPhoneNumber/linkWithPhoneNumber/updatePhoneNumber (SMS-only niche),
 #   getDocFromServer/getDocsFromServer (same errors as getDoc/getDocs, already contracted),
 #   fetchSignInMethodsForEmail (deprecated), validatePassword (optional policy enforcement)
@@ -1491,6 +1492,291 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: high
 
+  - name: applyActionCode
+    import_path: "firebase"
+    description: >
+      Applies a Firebase Auth out-of-band (OOB) action code — used to complete email
+      verification, password reset confirmation, and email change confirmation flows.
+      Called from the page the user lands on after clicking an action link in an email.
+      Throws FirebaseError on expired, invalid, used, or revoked codes.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth-public.d.ts — applyActionCode(auth, oobCode): Promise<void>
+      # Error codes confirmed from @firebase/auth/dist/index.webworker.js — AuthErrorCode enum:
+      # EXPIRED_OOB_CODE='auth/expired-action-code', INVALID_OOB_CODE='auth/invalid-action-code',
+      # USER_DISABLED='auth/user-disabled', USER_DELETED='auth/user-not-found'.
+      - id: apply-action-code-error
+        condition: >
+          applyActionCode(auth, oobCode) called without try-catch. Action code is expired,
+          invalid (malformed or already used), or the associated user has been disabled or deleted.
+        throws: >
+          FirebaseError with code property. Common codes: auth/expired-action-code (code has
+          passed its TTL — Firebase action codes expire after ~1 hour by default),
+          auth/invalid-action-code (code is malformed, used a second time, or revoked),
+          auth/user-disabled (the user account associated with the code was disabled by an admin),
+          auth/user-not-found (the user account associated with the code was deleted between
+          email send and link click).
+        required_handling: >
+          Caller MUST wrap await applyActionCode() in try-catch. Action codes commonly fail in
+          production — users click email links hours later, paste codes into the wrong tab,
+          or retry already-applied codes. Unhandled rejection breaks the verification flow
+          and leaves the user staring at a generic error page.
+
+          try {
+            await applyActionCode(auth, oobCode);
+            return { verified: true };
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/expired-action-code') {
+                return { error: 'This verification link has expired. Please request a new one.' };
+              }
+              if (error.code === 'auth/invalid-action-code') {
+                return { error: 'This verification link is no longer valid. It may have already been used.' };
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#applyactioncode"
+          - "https://firebase.google.com/docs/auth/web/manage-users#send_a_password_reset_email"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: getRedirectResult
+    import_path: "firebase"
+    description: >
+      Returns the UserCredential from a redirect-based sign-in flow (signInWithRedirect,
+      linkWithRedirect, reauthenticateWithRedirect). Called on page load after Firebase
+      redirects back from the OAuth provider. Returns null if no redirect operation is pending.
+      Throws on credential conflicts, account collisions, and provider rejections.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth-public.d.ts — getRedirectResult(auth, resolver?): Promise<UserCredential | null>
+      # AuthErrorCode hierarchy confirmed from @firebase/auth/dist/index.webworker.js:
+      # ACCOUNT_EXISTS_WITH_DIFFERENT_CREDENTIAL='auth/account-exists-with-different-credential',
+      # CREDENTIAL_ALREADY_IN_USE='auth/credential-already-in-use',
+      # POPUP_CLOSED_BY_USER='auth/popup-closed-by-user' (redirect equivalents apply).
+      - id: redirect-result-error
+        condition: >
+          getRedirectResult(auth) called without try-catch on the post-redirect page. OAuth
+          provider rejected the sign-in, an account already exists with the same email under
+          a different provider, or the credential is already linked to another user.
+        throws: >
+          FirebaseError with code property. Common codes: auth/account-exists-with-different-credential
+          (the email returned by the provider is already linked to another sign-in method —
+          common when a user signs up with Google then tries to sign in with Apple using the same
+          email), auth/credential-already-in-use (linkWithRedirect: this provider credential is
+          already linked to a different Firebase user — must merge or unlink first),
+          auth/web-storage-unsupported (browser blocks sessionStorage — third-party cookies disabled,
+          Safari ITP, incognito mode), auth/operation-not-supported-in-this-environment
+          (called from a non-browser environment), auth/network-request-failed (network error
+          during token exchange), auth/internal-error (Firebase Auth backend issue).
+        required_handling: >
+          Caller MUST wrap await getRedirectResult() in try-catch. This is the FIRST thing
+          that runs after a successful OAuth redirect — an unhandled rejection here means
+          the user lands on a broken page with no recovery path. Web storage errors are
+          especially common in Safari and incognito sessions.
+
+          try {
+            const result = await getRedirectResult(auth);
+            if (result) {
+              return { user: result.user };
+            }
+            return { user: null };
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/account-exists-with-different-credential') {
+                return { error: 'An account with this email exists. Sign in with your original provider.' };
+              }
+              if (error.code === 'auth/web-storage-unsupported') {
+                return { error: 'Your browser blocks the storage needed to sign in. Try a different browser or enable third-party cookies.' };
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#getredirectresult"
+          - "https://firebase.google.com/docs/auth/web/redirect-best-practices"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: signInWithCustomToken
+    import_path: "firebase"
+    description: >
+      Signs a user in using a custom JWT minted by the application's backend via the Firebase
+      Admin SDK. Used to bridge external identity providers (SSO, legacy auth systems) into
+      Firebase Auth. Throws on malformed tokens, wrong audience, expired tokens, or disabled accounts.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/auth-public.d.ts — signInWithCustomToken(auth, customToken): Promise<UserCredential>
+      # AuthErrorCode codes confirmed from @firebase/auth/dist/index.webworker.js:
+      # INVALID_CUSTOM_TOKEN='auth/invalid-custom-token' ("The custom token format is incorrect"),
+      # CREDENTIAL_MISMATCH='auth/custom-token-mismatch' ("The custom token corresponds to a
+      # different audience"), USER_DISABLED='auth/user-disabled'.
+      - id: custom-token-error
+        condition: >
+          signInWithCustomToken(auth, token) called without try-catch. Custom token is malformed,
+          expired, signed by a different Firebase project (wrong audience), or the user account
+          was disabled.
+        throws: >
+          FirebaseError with code property. Common codes: auth/invalid-custom-token (token is
+          not a valid Firebase custom token — usually missing claims, wrong format, or expired),
+          auth/custom-token-mismatch (token was signed for a different Firebase project — common
+          when staging tokens leak into production or vice versa), auth/user-disabled (the
+          target uid is disabled in the Firebase console), auth/network-request-failed
+          (network issue during token verification).
+        required_handling: >
+          Caller MUST wrap await signInWithCustomToken() in try-catch. Custom token sign-in is
+          the bridge between a backend auth system and Firebase — failures here lock users out
+          of every Firebase feature (Firestore, Storage, Functions). Token-mismatch errors are
+          especially insidious because they only surface in production when env vars get swapped.
+
+          try {
+            const credential = await signInWithCustomToken(auth, customToken);
+            return { user: credential.user };
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/invalid-custom-token' || error.code === 'auth/custom-token-mismatch') {
+                console.error('Custom token rejected — check backend token minting:', error.code);
+                throw new Error('Authentication failed. Please contact support.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth.md#signinwithcustomtoken"
+          - "https://firebase.google.com/docs/auth/admin/create-custom-tokens"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: uploadString
+    import_path: "firebase"
+    description: >
+      Uploads a string (raw text, base64, base64url, or data_url) to Firebase Storage.
+      Commonly used for serialized JSON, canvas-derived data URIs (screenshots, signatures),
+      and small text artifacts. Throws StorageError on permission denial, quota exhaustion,
+      or invalid format.
+
+    postconditions:
+      # Evidence: @firebase/storage/dist/storage-public.d.ts — uploadString(ref, value, format?, metadata?): Promise<UploadResult>
+      # StorageErrorCode confirmed from @firebase/storage/dist/index.cjs.js:
+      # OBJECT_NOT_FOUND='storage/object-not-found', UNAUTHORIZED='storage/unauthorized',
+      # QUOTA_EXCEEDED='storage/quota-exceeded', RETRY_LIMIT_EXCEEDED='storage/retry-limit-exceeded',
+      # UNAUTHORIZED_APP='storage/unauthorized-app', INVALID_URL='storage/invalid-url'.
+      - id: upload-string-error
+        condition: >
+          uploadString(ref, value, format) called without try-catch. Storage security rules
+          deny the upload, the bucket quota is exhausted, the network drops mid-upload, or
+          the string format is invalid for the declared format type.
+        throws: >
+          StorageError (extends FirebaseError) with code property. Common codes:
+          storage/unauthorized (security rules deny write — common when uid in path doesn't
+          match auth.uid), storage/quota-exceeded (bucket free-tier quota exhausted),
+          storage/retry-limit-exceeded (network failed all retries — slow connection or
+          backend issue), storage/unauthorized-app (App Check failure — common during
+          development), storage/invalid-format (string isn't valid for the declared format,
+          e.g. malformed base64 or data URL with wrong MIME).
+        required_handling: >
+          Caller MUST wrap await uploadString() in try-catch. Upload failures must be
+          distinguished from success — silently treating a rejection as success leaves
+          downstream features (avatar display, document export) referencing nonexistent
+          objects.
+
+          try {
+            const snapshot = await uploadString(ref, dataUrl, 'data_url');
+            return { path: snapshot.ref.fullPath };
+          } catch (error) {
+            if (error instanceof StorageError) {
+              if (error.code === 'storage/unauthorized') {
+                throw new Error('You do not have permission to upload here.');
+              }
+              if (error.code === 'storage/quota-exceeded') {
+                throw new Error('Storage quota exceeded. Please contact support.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/storage.md#uploadstring"
+          - "https://firebase.google.com/docs/storage/web/handle-errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: getMetadata
+    import_path: "firebase"
+    description: >
+      Retrieves the metadata (size, contentType, customMetadata, timeCreated, etc.) for a
+      Firebase Storage object. Commonly used to validate object existence before download,
+      check content types before display, and read custom metadata set during upload.
+      Throws StorageError on missing objects, permission denial, or network failure.
+
+    postconditions:
+      # Evidence: @firebase/storage/dist/storage-public.d.ts — getMetadata(ref): Promise<FullMetadata>
+      # StorageErrorCode confirmed from @firebase/storage/dist/index.cjs.js:
+      # OBJECT_NOT_FOUND='storage/object-not-found' ("Object '${path}' does not exist."),
+      # UNAUTHORIZED='storage/unauthorized' ("User does not have permission to access '${path}'.").
+      - id: get-metadata-error
+        condition: >
+          getMetadata(ref) called without try-catch. Object does not exist at the referenced
+          path, the user lacks read permission per Storage rules, or the network request fails.
+        throws: >
+          StorageError (extends FirebaseError) with code property. Common codes:
+          storage/object-not-found (no object at this path — common when checking for
+          optional artifacts like profile photos before display), storage/unauthorized
+          (Storage rules deny read access — typical when the path encodes a uid different
+          from auth.uid), storage/retry-limit-exceeded (network failure exhausted retries),
+          storage/unauthorized-app (App Check rejected the request).
+        required_handling: >
+          Caller MUST wrap await getMetadata() in try-catch. storage/object-not-found is the
+          expected path for "does this file exist?" probes — swallowing rejections silently
+          can mask permission errors as missing-file errors and vice versa, leading to
+          mysteriously broken features.
+
+          try {
+            const metadata = await getMetadata(ref);
+            return metadata;
+          } catch (error) {
+            if (error instanceof StorageError) {
+              if (error.code === 'storage/object-not-found') {
+                return null;
+              }
+              if (error.code === 'storage/unauthorized') {
+                throw new Error('You do not have permission to view this file.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/storage.md#getmetadata"
+          - "https://firebase.google.com/docs/storage/web/file-metadata"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "All functions imported from firebase/auth and firebase/firestore sub-modules"
   - "Subpath imports (firebase/auth) are normalized to 'firebase' by the analyzer"
@@ -1505,3 +1791,4 @@ notes:
   - "FirestoreErrorCode type confirmed from @firebase/firestore/dist/index.d.ts"
   - "FunctionsErrorCode type confirmed from @firebase/functions/dist/functions-public.d.ts"
   - "Depth pass 2026-04-17 (deepen-stream-2 pass 3): added 9 functions: signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, writeBatch.commit, getCountFromServer, deleteObject, httpsCallable. Coverage: 20→30 contracted (0.54→0.81 of ~37 total async-callable)."
+  - "Depth pass 2026-06-24 (deepen-stream-3 pass 54): re-verified API surface against firebase@12.15.0 (latest, semver >=9.0.0 still satisfied). Added 5 functions: applyActionCode (email/password-reset OOB code application — auth/expired-action-code, auth/invalid-action-code), getRedirectResult (post-OAuth-redirect credential exchange — auth/account-exists-with-different-credential, auth/web-storage-unsupported), signInWithCustomToken (backend-minted JWT bridge — auth/invalid-custom-token, auth/custom-token-mismatch), uploadString (text/base64/data_url storage upload — storage/unauthorized, storage/quota-exceeded), getMetadata (storage object metadata read — storage/object-not-found, storage/unauthorized). Coverage: 30→35 contracted (0.81→0.83 of 42 considered async-callable). Error codes confirmed by reading installed @firebase/auth/dist/index.webworker.js and @firebase/storage/dist/index.cjs.js."

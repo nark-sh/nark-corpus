@@ -31,10 +31,17 @@
  *   count-from-server-error                              (getCountFromServer)
  *   delete-object-error                                  (deleteObject)
  *   functions-call-unauthenticated-or-permission-denied  (httpsCallable — no detector yet)
+ *
+ * Added in depth pass 2026-06-24 (deepen-stream-3 pass 54):
+ *   apply-action-code-error    (applyActionCode)
+ *   redirect-result-error      (getRedirectResult)
+ *   custom-token-error         (signInWithCustomToken)
+ *   upload-string-error        (uploadString)
+ *   get-metadata-error         (getMetadata)
  */
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset, signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, EmailAuthProvider } from 'firebase/auth';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset, signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, EmailAuthProvider, applyActionCode, getRedirectResult, signInWithCustomToken } from 'firebase/auth';
 import { getDocs, addDoc, setDoc, updateDoc, deleteDoc, getDoc, runTransaction, collection, doc, getFirestore, query, where, writeBatch, getCountFromServer } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject, uploadString, getMetadata } from 'firebase/storage';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 
 declare const GoogleAuthProvider: any;
@@ -605,5 +612,99 @@ async function gt_httpsCallable_proper(email: string, orgId: string) {
     // SHOULD_NOT_FIRE: httpsCallable result called inside try-catch
     const result = await sendInvite({ email, organizationId: orgId });
     return result.data;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 31. applyActionCode (added 2026-06-24 — deepen-stream-3 pass 54)
+// ──────────────────────────────────────────────
+
+async function gt_applyActionCode_missing(oobCode: string) {
+  // SHOULD_FIRE: apply-action-code-error
+  await applyActionCode(auth, oobCode);
+  return { verified: true };
+}
+
+async function gt_applyActionCode_proper(oobCode: string) {
+  try {
+    // SHOULD_NOT_FIRE: applyActionCode inside try-catch
+    await applyActionCode(auth, oobCode);
+    return { verified: true };
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 32. getRedirectResult (added 2026-06-24)
+// ──────────────────────────────────────────────
+
+async function gt_getRedirectResult_missing() {
+  // SHOULD_FIRE: redirect-result-error
+  const result = await getRedirectResult(auth);
+  return result;
+}
+
+async function gt_getRedirectResult_proper() {
+  try {
+    // SHOULD_NOT_FIRE: getRedirectResult inside try-catch
+    const result = await getRedirectResult(auth);
+    return result;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 33. signInWithCustomToken (added 2026-06-24)
+// ──────────────────────────────────────────────
+
+async function gt_signInWithCustomToken_missing(customToken: string) {
+  // SHOULD_FIRE: custom-token-error
+  const credential = await signInWithCustomToken(auth, customToken);
+  return credential.user;
+}
+
+async function gt_signInWithCustomToken_proper(customToken: string) {
+  try {
+    // SHOULD_NOT_FIRE: signInWithCustomToken inside try-catch
+    const credential = await signInWithCustomToken(auth, customToken);
+    return credential.user;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 34. uploadString (added 2026-06-24)
+// ──────────────────────────────────────────────
+
+async function gt_uploadString_missing(path: string, dataUrl: string) {
+  const storageRef = ref(storage, path);
+  // SHOULD_FIRE: upload-string-error
+  const snapshot = await uploadString(storageRef, dataUrl, 'data_url');
+  return snapshot.ref.fullPath;
+}
+
+async function gt_uploadString_proper(path: string, dataUrl: string) {
+  const storageRef = ref(storage, path);
+  try {
+    // SHOULD_NOT_FIRE: uploadString inside try-catch
+    const snapshot = await uploadString(storageRef, dataUrl, 'data_url');
+    return snapshot.ref.fullPath;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 35. getMetadata (added 2026-06-24)
+// ──────────────────────────────────────────────
+
+async function gt_getMetadata_missing(path: string) {
+  const storageRef = ref(storage, path);
+  // SHOULD_FIRE: get-metadata-error
+  const metadata = await getMetadata(storageRef);
+  return metadata;
+}
+
+async function gt_getMetadata_proper(path: string) {
+  const storageRef = ref(storage, path);
+  try {
+    // SHOULD_NOT_FIRE: getMetadata inside try-catch
+    const metadata = await getMetadata(storageRef);
+    return metadata;
   } catch (error) { throw error; }
 }
