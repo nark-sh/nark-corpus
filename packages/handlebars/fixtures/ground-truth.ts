@@ -6,6 +6,7 @@
  *
  * Contracted functions:
  *   - Handlebars.compile(template)               postcondition: invalid-template-syntax
+ *                                                 postcondition: compile-invalid-input-type
  *   - TemplateDelegate(context, options?)         postcondition: template-execution-partial-not-found
  *                                                 postcondition: template-execution-strict-undefined-variable
  *                                                 postcondition: template-execution-prototype-access-silent-failure
@@ -63,6 +64,27 @@ export function renderUserTemplateSafe(userTemplate: string, data: Record<string
     return template(data);
   } catch (error) {
     console.error("Template render failed:", error);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2b. compile() — input from external source that may return null/undefined
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function compileTemplateFromFileNoCatch(maybeTemplate: string | null | undefined) {
+  // SHOULD_FIRE: compile-invalid-input-type — compile() throws when input is null/undefined/non-string
+  const template = Handlebars.compile(maybeTemplate as any);
+  return template;
+}
+
+export function compileTemplateFromFileSafe(maybeTemplate: string | null | undefined) {
+  try {
+    // SHOULD_NOT_FIRE: compile() inside try-catch handles invalid input type
+    const template = Handlebars.compile(maybeTemplate as any);
+    return template;
+  } catch (error) {
+    console.error("Template input invalid:", error);
     return null;
   }
 }
