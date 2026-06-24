@@ -1,12 +1,12 @@
 package: mongodb
 semver: ">=5.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.84
+coverage_score: 0.91
 # Depth pass 2026-04-17 (deepen-stream-2 pass 13):
 # API surface: ~36 async-callable functions in Collection, Db, MongoClient, ClientSession
 # Contracted before: 23; Contracted after: 28 (+5 this pass)
@@ -1252,6 +1252,322 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: high
+
+  - name: bulkWrite
+    import_path: "mongodb"
+    description: >
+      MongoClient-level (cross-collection) bulk write. Introduced in node-mongodb-native v6.x
+      and required on the wire by MongoDB server 8.0+. Distinct from Collection.bulkWrite
+      (which is per-collection) — MongoClient.bulkWrite accepts a heterogeneous list of
+      ClientBulkWriteModel entries each tagged with their own namespace, executing them in
+      one atomic-ish admin/$cmd round trip. Used when an application must atomically write
+      to multiple collections (e.g. multi-tenant ledger updates, outbox publication,
+      cross-collection denormalization).
+    postconditions:
+      # Evidence: confirmed from mongodb@7.3.0 source
+      # node_modules/mongodb/src/mongo_client.ts (async bulkWrite)
+      # node_modules/mongodb/src/operations/client_bulk_write/executor.ts (ClientBulkWriteExecutor)
+      # node_modules/mongodb/src/error.ts (MongoClientBulkWriteError, MongoClientBulkWriteExecutionError, MongoClientBulkWriteCursorError)
+      # Wire-level requirement: MongoDB server 8.0+ (the bulkWrite admin command does not exist on older servers).
+      - id: clientbulkwrite-execution-error
+        condition: >
+          MongoClient.bulkWrite() is called against a MongoDB server version older than 8.0,
+          OR the bulkWrite admin command is unavailable for the connection's wire version,
+          OR autoEncryption is configured on the MongoClient (FLE/CSFLE+MongoClient.bulkWrite
+          is explicitly unsupported in 7.x — `throw new MongoInvalidArgumentError('MongoClient
+          bulkWrite does not currently support automatic encryption.')` is unconditional when
+          autoEncrypter is present), OR an empty models array is passed (`throw new
+          MongoClientBulkWriteExecutionError('No client bulk write models were provided.')`),
+          OR an unacknowledged write concern (w:0) is combined with `verboseResults: true` or
+          `ordered: true` (both raise MongoInvalidArgumentError synchronously).
+        throws: >
+          MongoClientBulkWriteExecutionError (extends MongoRuntimeError) — pre-flight argument
+          / configuration failure before any server round trip. MongoInvalidArgumentError —
+          autoEncryption-unsupported or unacknowledged-but-verbose configuration. These rejections
+          happen synchronously in the async function body so callers without try-catch hit an
+          unhandled rejection.
+        required_handling: >
+          Caller MUST wrap MongoClient.bulkWrite in try-catch. The most common production
+          failure mode for this API in 2026 is calling it against a MongoDB Atlas cluster
+          still on the 7.0 LTS line — the call rejects with a server-side "Unknown command:
+          'bulkWrite'" error, not the Collection.bulkWrite fallback developers may expect.
+          Detect this case and either downgrade to per-collection Collection.bulkWrite loops
+          or surface a deployment-level error: do not retry blindly. Pattern:
+            try {
+              const result = await client.bulkWrite([
+                { namespace: 'app.orders', name: 'insertOne', document: order },
+                { namespace: 'app.outbox', name: 'insertOne', document: event }
+              ]);
+            } catch (error) {
+              if (error instanceof MongoClientBulkWriteExecutionError) {
+                // empty models / autoEncryption / w:0 misconfiguration — caller bug
+                throw error;
+              }
+              if (error instanceof MongoServerError && /Unknown command/.test(error.message)) {
+                // Server < 8.0 — fall back to per-collection bulkWrite
+                return await fallbackPerCollection(...);
+              }
+              throw error;
+            }
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/bulkWrite/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/mongo_client.ts"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/client_bulk_write/executor.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: clientbulkwrite-partial-failure-not-inspected
+        condition: >
+          MongoClient.bulkWrite() throws MongoClientBulkWriteError mid-batch. Unlike a
+          straightforward rejection, this error carries three structured fields with
+          partial-success data: writeConcernErrors (Document[]), writeErrors (Map<number,
+          ClientBulkWriteError>), and partialResult?: ClientBulkWriteResult. The driver
+          will have already split the user's models list into multiple admin/$cmd round
+          trips when the payload exceeds maxMessageSizeBytes — partial failures across
+          batches are the norm at scale, not the exception.
+        throws: >
+          MongoClientBulkWriteError (extends MongoServerError) with writeErrors map keyed by
+          the user's models[] index and a partialResult holding the successful writes.
+          Confirmed from error.ts class definition + executor.ts results_merger.
+        required_handling: >
+          Caller MUST destructure partialResult and writeErrors when catching
+          MongoClientBulkWriteError. A naive `catch (error) { logger.error(error.message);
+          throw error; }` discards the partial-success information — the application then
+          either double-applies the successful writes on retry (causing duplicate-key
+          collisions on insertOne models) or silently drops them entirely. The fix is to
+          treat the success indices in partialResult as committed and retry only the
+          writeErrors-indexed entries with idempotency keys:
+            try {
+              await client.bulkWrite(models);
+            } catch (error) {
+              if (error instanceof MongoClientBulkWriteError) {
+                const succeeded = error.partialResult; // may be undefined if zero ops landed
+                for (const [index, writeError] of error.writeErrors) {
+                  console.error('Op failed:', models[index], writeError);
+                }
+                // Retry only error.writeErrors entries, not the full models array
+                throw new PartialBulkWriteError(error.partialResult, error.writeErrors);
+              }
+              throw error;
+            }
+        sources:
+          - "https://www.mongodb.com/docs/manual/reference/command/bulkWrite/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/error.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+      - id: clientbulkwrite-cursor-exhaustion-error
+        condition: >
+          The MongoClient.bulkWrite executor opens a ClientBulkWriteCursor per command batch
+          and exhausts it to merge results. If cursor exhaustion fails (network drop between
+          first batch and getMore, server-side cursor timeout, connection pool exhaustion),
+          MongoClientBulkWriteCursorError is thrown. The cursor framework partially commits
+          early batches before the failure — the server-side state is "some writes applied,
+          some unknown".
+        throws: >
+          MongoClientBulkWriteCursorError (extends MongoRuntimeError). Confirmed from
+          error.ts class definition. The error message names the underlying cursor failure
+          but does NOT carry a partialResult — unlike MongoClientBulkWriteError, the cursor
+          variant indicates the bulk write reached an indeterminate state mid-stream.
+        required_handling: >
+          Caller MUST distinguish MongoClientBulkWriteCursorError from MongoClientBulkWriteError.
+          The cursor variant means "we got some confirmations and then lost the stream" — do
+          NOT retry the entire models[] array as if the operation never started. Idempotency
+          keys on insertOne models become mandatory; for update/replace models, write a
+          reconciliation pass that checks the target documents' state before retrying. In
+          high-throughput pipelines, prefer ordered:false to localize the damage to specific
+          indices when the cursor disconnects:
+            try {
+              await client.bulkWrite(models, { ordered: false });
+            } catch (error) {
+              if (error instanceof MongoClientBulkWriteCursorError) {
+                // Indeterminate state — reconcile target documents instead of replaying
+                await reconcileFromTargetDocs(models);
+                throw error;
+              }
+              if (error instanceof MongoClientBulkWriteError) {
+                // Determinate partial-success — use partialResult + writeErrors
+                throw new PartialBulkWriteError(error.partialResult, error.writeErrors);
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/error.ts"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/operations/client_bulk_write/executor.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: critical
+
+  - name: GridFSBucket.delete
+    import_path: "mongodb"
+    description: >
+      Removes a file (entry in the files collection plus all chunks in the chunks collection)
+      from a GridFS bucket by ObjectId. The GridFSBucket class is constructed synchronously
+      (`new GridFSBucket(db, options)`) and is a classic example of the sync-factory-with-
+      async-methods pattern: the constructor itself does no I/O, but delete()/rename()/drop()
+      are all Promise-returning methods that hit the underlying collections. Used for file
+      lifecycle in GridFS-backed CDN, attachment, and large-document storage.
+    postconditions:
+      # Evidence: confirmed from mongodb@7.3.0 source
+      # node_modules/mongodb/src/gridfs/index.ts — async delete(id, options): Promise<void>
+      # Internal calls: this.s._filesCollection.deleteOne + this.s._chunksCollection.deleteMany
+      # Throws MongoRuntimeError if deletedCount === 0 (file not found in files collection)
+      - id: gridfs-delete-file-not-found
+        condition: >
+          The provided ObjectId does not match any document in the bucket's files collection.
+          GridFSBucket.delete() considers a missing file an error, NOT an idempotent no-op:
+          after deleting orphaned chunks the implementation throws MongoRuntimeError with
+          message `File not found for id <id>`. This catches developers by surprise because
+          comparable APIs (Collection.deleteOne, dropIfExists) treat absence as success.
+        throws: >
+          MongoRuntimeError with message containing `File not found for id`. Confirmed from
+          gridfs/index.ts: `throw new MongoRuntimeError(File not found for id ${id})` after
+          chunks cleanup. Driver TODO(NODE-3483) tracks renaming this to a more specific
+          MongoGridFSFileNotFoundError — until then, message-matching is the only way to
+          distinguish file-not-found from a real I/O failure.
+        required_handling: >
+          Caller MUST catch MongoRuntimeError and decide whether to treat file-not-found as
+          a success (idempotent delete) or a failure (audit-required state). In file-lifecycle
+          workflows where the delete is the result of a user action (e.g. "delete attachment"),
+          missing-file usually IS the desired final state and the throw should be swallowed.
+          In garbage-collection or migration code, missing-file may indicate a previous
+          incomplete run and must be logged:
+            try {
+              await bucket.delete(fileId);
+            } catch (error) {
+              if (error instanceof MongoRuntimeError && /File not found/.test(error.message)) {
+                // Idempotent path: file already gone — fine for user-initiated delete
+                return;
+              }
+              throw error;
+            }
+          Do NOT use a bare `try {} catch {}` to silently swallow all errors here — chunks
+          collection deletion failures (network, write concern) also surface as thrown errors
+          and must propagate.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/gridfs/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/gridfs/index.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: gridfs-delete-orphaned-chunks-on-files-failure
+        condition: >
+          Implementation order: GridFSBucket.delete() first calls _filesCollection.deleteOne
+          then _chunksCollection.deleteMany. If the files-collection delete succeeds but the
+          chunks-collection delete fails (write concern not met on replica set, network drop
+          mid-call, write conflict), the file metadata is gone but the storage chunks remain
+          orphaned in the chunks collection. The Promise rejects with the underlying
+          MongoServerError/MongoNetworkError from deleteMany, but the partial deletion is
+          NOT rolled back — there is no transaction.
+        throws: >
+          MongoServerError or MongoNetworkError from the chunks collection deleteMany call,
+          or MongoOperationTimeoutError if timeoutMS elapses between the two collection
+          operations. Confirmed from gridfs/index.ts source — the chunks deletion is
+          unconditional after the files deletion and any error from it propagates unchanged.
+        required_handling: >
+          Caller MUST wrap GridFSBucket.delete in try-catch AND have an orphan-chunks
+          reconciliation strategy. When the files-collection delete succeeded but chunks
+          delete failed, the bucket is in an inconsistent state: a periodic GC job must
+          scan the chunks collection for files_id values with no matching files document
+          and clean them up. Pattern:
+            try {
+              await bucket.delete(fileId);
+            } catch (error) {
+              // We do not know whether files-side succeeded — re-checking files-collection
+              // tells us which half of the operation completed
+              const stillExists = await bucket.find({ _id: fileId }).hasNext();
+              if (!stillExists) {
+                // files-side succeeded, chunks-side failed — enqueue orphan cleanup
+                await orphanChunkQueue.enqueue(fileId);
+              }
+              throw error;
+            }
+          For high-volume buckets, run a daily orphan-chunks sweep regardless of error
+          handling at call sites — single-app catches will inevitably be missed.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/gridfs/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/gridfs/index.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: GridFSBucket.rename
+    import_path: "mongodb"
+    description: >
+      Renames the GridFS file with the given ObjectId by updating the `filename` field in
+      the bucket's files collection. The chunks collection is not touched. Called on a
+      GridFSBucket instance constructed synchronously via `new GridFSBucket(db, options)`
+      — another instance of the sync-factory-with-async-methods pattern.
+    postconditions:
+      # Evidence: confirmed from mongodb@7.3.0 source
+      # node_modules/mongodb/src/gridfs/index.ts — async rename(id, filename, options): Promise<void>
+      # Implementation: this.s._filesCollection.updateOne({_id: id}, {$set: {filename}}, options)
+      # if matchedCount === 0 throw new MongoRuntimeError(File with id ${id} not found)
+      - id: gridfs-rename-file-not-found
+        condition: >
+          The provided ObjectId does not match any document in the bucket's files collection.
+          GridFSBucket.rename() throws MongoRuntimeError when matchedCount === 0 from the
+          underlying updateOne. Common in workflows where a file is renamed shortly after a
+          concurrent delete, or where the caller assumes the file exists from a stale cache.
+        throws: >
+          MongoRuntimeError with message containing `File with id <id> not found`. Confirmed
+          from gridfs/index.ts: `throw new MongoRuntimeError(File with id ${id} not found)`
+          after the updateOne returns matchedCount === 0. Like GridFSBucket.delete, this is
+          NOT a specific MongoGridFSFileNotFoundError yet — message-matching is required.
+        required_handling: >
+          Caller MUST catch MongoRuntimeError. Unlike delete(), missing-file on rename almost
+          never represents the desired end state — surface it as an explicit error to the
+          caller rather than swallowing:
+            try {
+              await bucket.rename(fileId, newFilename);
+            } catch (error) {
+              if (error instanceof MongoRuntimeError && /File with id .* not found/.test(error.message)) {
+                throw new ApplicationError('FILE_GONE', `Cannot rename: file ${fileId} no longer exists`);
+              }
+              throw error;
+            }
+          Network errors from updateOne (MongoNetworkError, MongoServerSelectionError) and
+          server errors (write concern, validation) propagate unchanged — they are
+          retryable in a way that file-not-found is not.
+        sources:
+          - "https://www.mongodb.com/docs/manual/core/gridfs/"
+          - "https://github.com/mongodb/node-mongodb-native/blob/main/src/gridfs/index.ts"
+        evidence_quality: confirmed
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
 
 # Common edge cases and production bugs
 edge_cases:

@@ -401,3 +401,91 @@ export async function renameWithCatch(users: Collection) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. MongoClient.bulkWrite() — top-level (cross-collection) bulkWrite, v7+
+//     Added deepen-stream-2 pass 65 (2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: clientbulkwrite-execution-error
+// @expect-violation: clientbulkwrite-partial-failure-not-inspected
+// @expect-violation: clientbulkwrite-cursor-exhaustion-error
+export async function clientBulkWriteNoCatch(client: MongoClient) {
+  // SHOULD_FIRE: clientbulkwrite-execution-error — MongoClient.bulkWrite() without try-catch
+  const result = await client.bulkWrite([
+    { namespace: 'app.orders', name: 'insertOne', document: { id: 1 } },
+    { namespace: 'app.outbox', name: 'insertOne', document: { event: 'order.created' } }
+  ] as any);
+  return result;
+}
+
+// @expect-clean
+export async function clientBulkWriteWithCatch(client: MongoClient) {
+  try {
+    // SHOULD_NOT_FIRE: MongoClient.bulkWrite inside try-catch with partialResult handling
+    const result = await client.bulkWrite([
+      { namespace: 'app.orders', name: 'insertOne', document: { id: 1 } }
+    ] as any);
+    return result;
+  } catch (err: any) {
+    if (err?.name === 'MongoClientBulkWriteError') {
+      // Capture partialResult + writeErrors for reconciliation
+      console.error('Partial bulk write:', err.partialResult, err.writeErrors);
+    }
+    if (err?.name === 'MongoClientBulkWriteCursorError') {
+      // Indeterminate state — reconcile target documents
+      throw new Error('Bulk write cursor disconnected — manual reconciliation required');
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. GridFSBucket.delete() — sync constructor returning object with async methods
+//     Added deepen-stream-2 pass 65 (2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: gridfs-delete-file-not-found
+// @expect-violation: gridfs-delete-orphaned-chunks-on-files-failure
+export async function gridfsDeleteNoCatch(bucket: any, fileId: any) {
+  // SHOULD_FIRE: gridfs-delete-file-not-found — GridFSBucket.delete() throws MongoRuntimeError when file missing, no try-catch
+  await bucket.delete(fileId);
+}
+
+// @expect-clean
+export async function gridfsDeleteWithCatch(bucket: any, fileId: any) {
+  try {
+    // SHOULD_NOT_FIRE: GridFSBucket.delete inside try-catch with file-not-found discrimination
+    await bucket.delete(fileId);
+  } catch (err: any) {
+    if (/File not found/.test(err?.message || '')) {
+      // Idempotent: file already gone — acceptable for user-initiated delete
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. GridFSBucket.rename() — sync constructor, async method, throws on missing file
+//     Added deepen-stream-2 pass 65 (2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: gridfs-rename-file-not-found
+export async function gridfsRenameNoCatch(bucket: any, fileId: any) {
+  // SHOULD_FIRE: gridfs-rename-file-not-found — GridFSBucket.rename() throws MongoRuntimeError when file missing, no try-catch
+  await bucket.rename(fileId, 'newname.bin');
+}
+
+// @expect-clean
+export async function gridfsRenameWithCatch(bucket: any, fileId: any) {
+  try {
+    // SHOULD_NOT_FIRE: GridFSBucket.rename inside try-catch
+    await bucket.rename(fileId, 'newname.bin');
+  } catch (err: any) {
+    if (/File with id .* not found/.test(err?.message || '')) {
+      throw new Error(`FILE_GONE: cannot rename ${fileId}`);
+    }
+    throw err;
+  }
+}
