@@ -174,3 +174,114 @@ async function resolveSettingsUnfilteredDefaultMode(): Promise<string | undefine
     return undefined;
   }
 }
+
+// ---- session-inspection fixtures (added 2026-06-24 deepen pass) ----
+import {
+  listSessions,
+  getSessionInfo,
+  getSessionMessages,
+  listSubagents,
+  getSubagentMessages,
+} from '@anthropic-ai/claude-agent-sdk';
+
+async function listSessionsMissingTryCatch(store: any): Promise<unknown> {
+  // SHOULD_FIRE: list-sessions-store-method-missing — sessionStore may lack listSessions method; no try/catch
+  return await listSessions({ sessionStore: store, dir: process.cwd() });
+}
+
+async function listSessionsWithFeatureDetect(store: any): Promise<unknown> {
+  if (typeof store.listSessions === 'function') {
+    try {
+      // SHOULD_NOT_FIRE: feature-detect plus try/catch — store-missing path handled
+      return await listSessions({ sessionStore: store, dir: process.cwd() });
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function listSessionsEmptyUnchecked(): Promise<string> {
+  // NOTE: list-sessions-empty-result-unchecked is contracted but requires a
+  //       flow-sensitive detector that checks whether the returned array is
+  //       guarded before being indexed. Queued as concern-20260624-claude-agent-sdk-deepen-1.
+  //       Until that detector lands, this fixture documents the violating pattern
+  //       but does not assert a scanner hit.
+  const sessions = await listSessions({ limit: 1 });
+  return (sessions as any)[0].sessionId;
+}
+
+async function getSessionInfoUndefinedUnchecked(sessionId: string): Promise<string> {
+  // NOTE: get-session-info-undefined-unchecked is contracted but requires a
+  //       flow-sensitive detector that checks whether the returned value is
+  //       guarded against undefined before property access. Queued as
+  //       concern-20260624-claude-agent-sdk-deepen-2.
+  const info = await getSessionInfo(sessionId);
+  return (info as any).summary;
+}
+
+async function getSessionInfoWithStoreNoTryCatch(sessionId: string, store: any): Promise<unknown> {
+  // SHOULD_FIRE: get-session-info-store-load-failure — sessionStore.load() may reject; no try/catch
+  return await getSessionInfo(sessionId, { sessionStore: store });
+}
+
+async function getSessionInfoStoreWithRetry(sessionId: string, store: any): Promise<unknown> {
+  try {
+    // SHOULD_NOT_FIRE: try/catch around store-backed lookup distinguishes transient vs absent
+    const info = await getSessionInfo(sessionId, { sessionStore: store });
+    return info ?? null;
+  } catch (err) {
+    console.error('Session lookup failed (transient):', err);
+    throw err;
+  }
+}
+
+async function getSessionMessagesEmptyVsThrownUnchecked(sessionId: string): Promise<unknown[]> {
+  // SHOULD_FIRE: get-session-messages-empty-vs-thrown — corrupted JSONL can throw; no try/catch
+  return await getSessionMessages(sessionId, { limit: 100 });
+}
+
+async function getSessionMessagesWithCorruptionGuard(sessionId: string): Promise<unknown[]> {
+  try {
+    // SHOULD_NOT_FIRE: try/catch around transcript read distinguishes empty vs unreadable
+    return await getSessionMessages(sessionId, { limit: 100 });
+  } catch (err) {
+    console.error('Session transcript unreadable:', err);
+    throw err;
+  }
+}
+
+async function listSubagentsStoreMissingNoTryCatch(sessionId: string, store: any): Promise<string[]> {
+  // SHOULD_FIRE: list-subagents-store-method-missing — sessionStore may lack listSubagents; no try/catch
+  return await listSubagents(sessionId, { sessionStore: store });
+}
+
+async function listSubagentsWithFeatureDetect(sessionId: string, store: any): Promise<string[]> {
+  try {
+    // SHOULD_NOT_FIRE: try/catch around the store-backed listing
+    return await listSubagents(sessionId, { sessionStore: store });
+  } catch {
+    return [];
+  }
+}
+
+async function getSubagentMessagesEmptyVsThrownUnchecked(
+  sessionId: string,
+  agentId: string,
+): Promise<unknown[]> {
+  // SHOULD_FIRE: get-subagent-messages-empty-vs-thrown — corrupted JSONL can throw; no try/catch
+  return await getSubagentMessages(sessionId, agentId);
+}
+
+async function getSubagentMessagesWithCorruptionGuard(
+  sessionId: string,
+  agentId: string,
+): Promise<unknown[]> {
+  try {
+    // SHOULD_NOT_FIRE: try/catch around subagent transcript read
+    return await getSubagentMessages(sessionId, agentId);
+  } catch (err) {
+    console.error('Subagent transcript unreadable:', err);
+    throw err;
+  }
+}

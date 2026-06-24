@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 75% → 85%
+
+- **Profile:** `packages/@anthropic-ai/claude-agent-sdk/contract.yaml`
+- **Functions added:** listSessions, getSessionInfo, getSessionMessages, listSubagents, getSubagentMessages (5 total)
+- **Postconditions added:** 7
+- **Functions intentionally omitted this pass:** createSdkMcpServer (sync constructor), filterEscalatingDefaultMode (sync pure transform), foldSessionSummary (sync pure transform)
+- **Scanner concerns queued:** 7 (`concern-20260624-claude-agent-sdk-deepen-1` through `-7`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T12:04:00Z)
+- **Surface delta:** v0.3.174 → v0.3.187 added the session-inspection family (listSessions, getSessionInfo, getSessionMessages, listSubagents, getSubagentMessages) and dropped the unstable_v2_prompt / unstable_v2_createSession exports. Existing v2-related postconditions retained because semver range `>=0.1.0` still covers older callers.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @anthropic-ai/claude-agent-sdk@0.3.181

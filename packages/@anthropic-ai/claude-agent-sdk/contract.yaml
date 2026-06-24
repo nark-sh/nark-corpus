@@ -1,15 +1,15 @@
 package: "@anthropic-ai/claude-agent-sdk"
 semver: ">=0.1.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"  # deepen-stream-2 pass: added deleteSession + importSessionToStore + resolveSettings (v0.3.174 surface)
+last_verified: "2026-06-24"  # deepen-stream-2 pass: added listSessions + getSessionInfo + getSessionMessages + listSubagents + getSubagentMessages (v0.3.187 surface)
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75  # 12 contracted / 16 total async-callable (4 omitted read-only) — +3 this pass (deleteSession, importSessionToStore, resolveSettings)
-# effective_coverage: 1.00 — 12/12 non-omitted functions contracted
+coverage_score: 0.85  # 17 contracted / 20 total async-callable (3 omitted read-only) — +5 this pass (listSessions, getSessionInfo, getSessionMessages, listSubagents, getSubagentMessages)
+# effective_coverage: 1.00 — 17/17 non-omitted functions contracted
 # V2 SDKSession methods (send/stream) treated as variants of SDKSession interface, subsumed by unstable_v2_prompt contract
-# Surface grew from 13 (v0.2.91) → 16 (v0.3.174) — Anthropic added deleteSession, importSessionToStore, resolveSettings, bridge module (skipped — @alpha, narrow adoption), assistant module (skipped — @alpha)
+# Surface grew from 16 (v0.3.174) → 20 (v0.3.187) — Anthropic added the session inspection family (listSessions/getSessionInfo/getSessionMessages/listSubagents/getSubagentMessages) and removed the unstable_v2_prompt + unstable_v2_createSession exports (the V2 API was promoted/refactored). Existing v2 postconditions are retained because semver range >=0.1.0 still covers callers on older versions where those exports exist.
 
 description: >
   SDK for building AI agents with Claude Code's capabilities.
@@ -810,3 +810,349 @@ functions:
           #  ('bypassPermissions', 'auto', 'acceptEdits') from repo-committed files;
           #  pass the result through filterEscalatingDefaultMode before acting on defaultMode."
           - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.174/sdk.d.ts
+
+  - name: listSessions
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Lists session metadata across one project directory or all projects.
+      Returns SDKSessionInfo[] sorted by lastModified descending. Supports
+      pagination via `limit` and `offset`. When `dir` is inside a git repo,
+      sessions from all worktrees are included by default (toggle with
+      `includeWorktrees: false`). When `sessionStore` is provided, the
+      function delegates to `store.listSessions(projectKey)` — and REQUIRES
+      that the store implement `listSessions` (otherwise throws). On the
+      local-filesystem path, missing directories return an empty array
+      rather than throwing.
+    patterns:
+      - 'listSessions('
+      - 'await listSessions('
+    postconditions:
+      # Evidence: sdk.d.ts line 893 — listSessions(_options?): Promise<SDKSessionInfo[]>
+      # Evidence: sdk.d.ts JSDoc (line 919-924) — "Requires store.listSessions to be defined"
+      # Evidence: sdk.mjs — SessionStore.listSessions optional method; calling it when undefined throws
+      - id: list-sessions-store-method-missing
+        condition: >
+          listSessions() is called with a `sessionStore` option but the
+          provided store does NOT implement the optional `listSessions(projectKey)`
+          method. The SessionStore interface declares `listSessions?` as
+          optional — many partial implementations (especially append-only
+          or WORM stores) omit it. Without the method, listSessions() rejects
+          with a TypeError or "store does not support listing" error.
+        throws: TypeError ("store.listSessions is not a function") | Error (store-specific "not supported")
+        required_handling: >
+          Either feature-detect the store before calling, or wrap the call
+          in try/catch:
+            if (typeof store.listSessions === 'function') {
+              const sessions = await listSessions({ sessionStore: store, dir: cwd });
+            } else {
+              // Fall back to filesystem path or surface a clear error
+              const sessions = await listSessions({ dir: cwd });
+            }
+          Or:
+            try {
+              const sessions = await listSessions({ sessionStore: store });
+            } catch (err) {
+              if (err instanceof TypeError && err.message.includes('listSessions')) {
+                // store does not support listing — degrade gracefully
+                return [];
+              }
+              throw err;
+            }
+          Without this guard, swapping in a partial SessionStore implementation
+          (common during migration from local FS to a remote backend) crashes
+          every list-sessions call with an unhandled rejection.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        sources:
+          # Evidence: sdk.d.ts line 919-924 — "Requires store.listSessions to be defined"
+          # Evidence: sdk.d.ts SessionStore interface — listSessions is marked optional (?)
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+      - id: list-sessions-empty-result-unchecked
+        condition: >
+          listSessions() returns an empty array when the project directory
+          contains no session files, when the cwd doesn't match the
+          encoded-project-key the SDK derives, or when the
+          `~/.claude/projects/` root doesn't exist yet. Callers that index
+          the result directly (`sessions[0].sessionId`, `sessions.length > 0`
+          short-circuit removed) read undefined silently. This commonly
+          breaks "resume last session" UX where the caller assumes at least
+          one session exists.
+        throws: "No throw — silent empty-result. Caller reading sessions[0].sessionId throws TypeError downstream."
+        required_handling: >
+          Always check the length before indexing, and provide a fallback
+          for the empty case:
+            const sessions = await listSessions({ dir: cwd, limit: 1 });
+            if (sessions.length === 0) {
+              // Start a fresh session instead of resuming
+              return startFreshSession();
+            }
+            const latest = sessions[0];
+          A "resume last session" CLI that crashes on first-run (no sessions
+          yet) instead of starting fresh is a common reported bug.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts JSDoc (line 873-892) — pagination + sorted return; no throw on empty
+          # Evidence: sdk.mjs — local-filesystem path returns [] when projects/<encoded>/ is missing
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+  - name: getSessionInfo
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Reads metadata for a single session by ID. Unlike listSessions, only
+      touches the single session file. Returns undefined if the session
+      file is not found, is a sidechain session, or has no extractable
+      summary. With `sessionStore`, delegates to `store.load(key)` — a
+      throwing store implementation propagates the error. Without a store,
+      filesystem read errors propagate (EACCES, EISDIR, etc.) — only ENOENT
+      is converted to undefined.
+    patterns:
+      - 'getSessionInfo('
+      - 'await getSessionInfo('
+    postconditions:
+      # Evidence: sdk.d.ts line 659-668 — getSessionInfo JSDoc + signature
+      # Evidence: sdk.d.ts JSDoc: "Returns undefined if the session file is not found..."
+      # Evidence: sdk.mjs — wraps ENOENT into undefined; rethrows other fs errors
+      - id: get-session-info-undefined-unchecked
+        condition: >
+          getSessionInfo() is called and the returned value is dereferenced
+          directly without a null/undefined check. Per the JSDoc, undefined
+          is returned in three cases: (1) session file not found, (2)
+          session is a sidechain session, (3) no extractable summary. Code
+          like `(await getSessionInfo(id)).summary` throws TypeError
+          ("Cannot read properties of undefined") at runtime.
+        throws: "TypeError (downstream) — reading a property of undefined"
+        required_handling: >
+          Always guard the result before accessing fields:
+            const info = await getSessionInfo(sessionId, { dir: projectDir });
+            if (!info) {
+              // Session missing, sidechain, or no summary — fall back
+              return null;
+            }
+            return info.summary;
+          Or use optional chaining:
+            const summary = (await getSessionInfo(sessionId))?.summary;
+          Treating undefined as "session unavailable" is the documented contract.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts line 659-668 — getSessionInfo JSDoc explicitly notes undefined return cases
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+      - id: get-session-info-store-load-failure
+        condition: >
+          getSessionInfo() is called with a `sessionStore` option and the
+          store's `load(key)` rejects. Reasons include: network failure
+          (remote store), auth/quota error, corrupted entry, store-specific
+          schema-version mismatch. The SDK does not catch — the rejection
+          propagates to the caller. Treating this as benign (like the
+          undefined ENOENT case) is incorrect: a store load failure means
+          the session MAY exist but cannot currently be read.
+        throws: Error (whatever SessionStore.load() implementation throws — network, auth, etc.)
+        required_handling: >
+          Wrap in try/catch and distinguish "not found" (undefined) from
+          "could not load" (thrown):
+            try {
+              const info = await getSessionInfo(sessionId, { sessionStore: store });
+              if (!info) {
+                // Truly absent — start fresh
+                return null;
+              }
+              return info;
+            } catch (err) {
+              // Transient store failure — retry, don't start fresh
+              console.error('Session lookup failed (transient):', err);
+              throw err;
+            }
+          Conflating "store unreachable" with "session deleted" silently
+          discards user history when callers fall back to "start fresh"
+          on any error.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        sources:
+          # Evidence: sdk.d.ts SessionStore.load signature — Promise<SessionStoreEntry[] | null>
+          # Evidence: sdk.d.ts GetSessionInfoOptions.sessionStore — @alpha; load failures propagate
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+  - name: getSessionMessages
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Reads a session's conversation messages from its JSONL transcript
+      file. Builds the conversation chain via parentUuid links and returns
+      user/assistant messages in chronological order. Returns an empty
+      array if the session is not found. Set `includeSystemMessages: true`
+      to include system messages (compact boundaries, informational notices).
+      With `sessionStore`, delegates to `store.load(key)` — load failures
+      propagate just as in getSessionInfo. Supports pagination via `limit`
+      and `offset`.
+    patterns:
+      - 'getSessionMessages('
+      - 'await getSessionMessages('
+    postconditions:
+      # Evidence: sdk.d.ts line 686-698 — getSessionMessages JSDoc + signature
+      # Evidence: sdk.d.ts JSDoc: "Array of messages, or empty array if session not found"
+      - id: get-session-messages-empty-vs-thrown
+        condition: >
+          getSessionMessages() returns an empty array when the session file
+          is missing on disk, OR throws when the underlying transcript is
+          corrupted (malformed JSON line, unparseable timestamp) or when a
+          configured `sessionStore.load()` rejects. Callers that assume
+          "empty means no messages" without a try/catch swallow corruption
+          errors as crashes instead of distinguishing "no history" from
+          "history unreadable."
+        throws: Error (corrupted JSONL line, store load failure) | Returns [] (session not found, sidechain)
+        required_handling: >
+          Wrap in try/catch and treat empty-array as the only successful
+          "no history" signal:
+            try {
+              const messages = await getSessionMessages(sessionId, {
+                dir: projectDir,
+                limit: 100,
+              });
+              if (messages.length === 0) {
+                // Session truly empty / missing — fall back
+                return [];
+              }
+              return messages;
+            } catch (err) {
+              // Corruption or store failure — DO NOT pretend the session is empty
+              console.error('Session transcript unreadable:', err);
+              throw err;
+            }
+          Treating a thrown error as "no messages" silently discards real
+          user history in a UI — far worse than surfacing the error.
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        sources:
+          # Evidence: sdk.d.ts line 686-698 — getSessionMessages JSDoc explicitly returns empty array on not-found
+          # Evidence: sdk.mjs — JSON.parse on each transcript line throws on malformed data
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+  - name: listSubagents
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Lists subagent IDs for a given session by scanning the subagents
+      directory at `~/.claude/projects/<dir>/<sessionId>/subagents/`.
+      Returns an empty array if none found or if the directory does not
+      exist. With `sessionStore`, delegates to `store.listSubagents(key)`
+      — like listSessions, throws if the store does not implement the
+      optional method.
+    patterns:
+      - 'listSubagents('
+      - 'await listSubagents('
+    postconditions:
+      # Evidence: sdk.d.ts line 928-937 — listSubagents JSDoc + signature
+      # Evidence: sdk.d.ts SessionStore.listSubagents — optional method; missing means TypeError
+      - id: list-subagents-store-method-missing
+        condition: >
+          listSubagents() is called with a `sessionStore` that does NOT
+          implement the optional `listSubagents` method. Same failure mode
+          as list-sessions-store-method-missing: TypeError when the SDK
+          invokes the undefined method. Common during incremental migration
+          from local FS to a remote-backed SessionStore.
+        throws: TypeError ("store.listSubagents is not a function")
+        required_handling: >
+          Feature-detect or wrap in try/catch:
+            try {
+              const ids = await listSubagents(sessionId, {
+                dir: projectDir,
+                sessionStore: store,
+              });
+            } catch (err) {
+              if (err instanceof TypeError && err.message.includes('listSubagents')) {
+                // Store lacks subagent support — return empty / fall back
+                return [];
+              }
+              throw err;
+            }
+          Without this guard, a subagent-inspection UI panel renders blank
+          and prints an unhandled-rejection in the console.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts SessionStore interface — listSubagents is marked optional
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
+
+  - name: getSubagentMessages
+    import_path: "@anthropic-ai/claude-agent-sdk"
+    description: >
+      Reads a subagent's conversation messages from its JSONL transcript
+      file at `~/.claude/projects/<dir>/<sessionId>/subagents/agent-<agentId>.jsonl`.
+      Builds the conversation chain via parentUuid links and returns
+      user/assistant messages in chronological order. Returns an empty
+      array if the session or subagent is not found. With `sessionStore`,
+      delegates to the store and propagates store errors. Supports
+      pagination via `limit` and `offset`.
+    patterns:
+      - 'getSubagentMessages('
+      - 'await getSubagentMessages('
+    postconditions:
+      # Evidence: sdk.d.ts line 725-735 — getSubagentMessages JSDoc + signature
+      # Evidence: sdk.d.ts JSDoc: "Array of user/assistant messages, or empty array if not found"
+      - id: get-subagent-messages-empty-vs-thrown
+        condition: >
+          getSubagentMessages() returns an empty array when the subagent
+          transcript is missing, OR throws on corrupted JSONL / store load
+          failure (same dual-mode error contract as getSessionMessages).
+          Callers that read `messages.length === 0` without a try/catch
+          silently swallow real corruption as "no history."
+        throws: Error (corrupted JSONL line, store load failure) | Returns [] (subagent not found)
+        required_handling: >
+          Wrap in try/catch and treat empty-array as the only successful
+          "no history" signal:
+            try {
+              const messages = await getSubagentMessages(sessionId, agentId, {
+                dir: projectDir,
+              });
+              if (messages.length === 0) {
+                return [];
+              }
+              return messages;
+            } catch (err) {
+              console.error('Subagent transcript unreadable:', err);
+              throw err;
+            }
+          Subagent transcripts are often inspected in debugging UIs;
+          conflating "missing" with "unreadable" hides corruption bugs
+          from the developer.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+        sources:
+          # Evidence: sdk.d.ts line 725-735 — getSubagentMessages JSDoc explicitly returns empty array on not-found
+          - https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.187/sdk.d.ts
