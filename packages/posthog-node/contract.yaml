@@ -3,24 +3,31 @@
 # reloadFeatureFlags() catches errors internally via .catch() in loadFeatureFlags() — it does NOT propagate errors to the caller.
 # waitForLocalEvaluationReady() returns false on timeout (does not throw) — does not need try-catch.
 # The async network methods that CAN throw: getFeatureFlag, isFeatureEnabled, getAllFlags, getAllFlagsAndPayloads,
-#   getFeatureFlagPayload, getFeatureFlagResult, flush, shutdown, getRemoteConfigPayload.
+#   getFeatureFlagPayload, getFeatureFlagResult, flush, shutdown, getRemoteConfigPayload, evaluateFlags.
 # PostHog SDK v5+ uses PostHogFetchHttpError and PostHogFetchNetworkError from @posthog/core for network errors.
 # Feature flag methods also return FeatureFlagError enum values in error state rather than throwing in some paths.
 # Local evaluation (with personal API key) still makes an initial network call to fetch flag definitions.
+# Drift pass 2026-06-24 (deepen-stream-2 pass 68): posthog-node@5.38.4 added evaluateFlags() as the canonical
+#   replacement for getFeatureFlag/isFeatureEnabled/getFeatureFlagPayload (all now @deprecated). evaluateFlags()
+#   consolidates flag evaluation into a single /flags request and returns a FeatureFlagEvaluations snapshot.
+#   The deprecated methods still ship — the new contract function is additive, not replacing existing entries.
 package: posthog-node
 semver: ">=3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
 coverage_score: 1.0
-# Coverage calculation: 9 contracted / 9 non-omitted (17 total - 8 intentionally omitted = 9) = 1.0
-# Previously contracted (4): getFeatureFlag, isFeatureEnabled, getAllFlags, shutdown
-# Added this pass (5): getAllFlagsAndPayloads, getFeatureFlagPayload, getFeatureFlagResult, flush, getRemoteConfigPayload
+# Coverage calculation: 10 contracted / 10 non-omitted (18 total - 8 intentionally omitted = 10) = 1.0
+# Previously contracted (4 original + 5 pass-11): getFeatureFlag, isFeatureEnabled, getAllFlags, shutdown,
+#   getAllFlagsAndPayloads, getFeatureFlagPayload, getFeatureFlagResult, flush, getRemoteConfigPayload
+# Added pass 68 (1): evaluateFlags (drift — posthog-node@5.38.4 canonical replacement)
 # Intentionally omitted (8): reloadFeatureFlags, waitForLocalEvaluationReady, captureImmediate,
 #   identifyImmediate, aliasImmediate, captureExceptionImmediate, enable, disable
+# Drift-mode notes: fetch() is marked @internal in client.d.ts — omit. prepareEventMessage() is undocumented
+#   and lacks JSDoc/error semantics — omit. _shutdown() is the underscore-prefixed private impl of shutdown().
 
 functions:
   - name: getFeatureFlag
@@ -447,6 +454,97 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+
+  - name: evaluateFlags
+    import_path: "posthog-node"
+    description: >
+      Canonical (v5.38+) flag evaluation method. Consolidates getFeatureFlag,
+      isFeatureEnabled, getFeatureFlagPayload, and getFeatureFlagResult into a
+      single /flags request that returns a FeatureFlagEvaluations snapshot.
+      Internally calls super.getFeatureFlagDetailsStateless() — same underlying
+      network path as the @deprecated single-flag methods. Throws on auth,
+      network, and quota errors. The deprecated single-flag methods emit a
+      one-shot console deprecation warning recommending evaluateFlags as the
+      replacement (client.js lines 445, 455, 484).
+
+    postconditions:
+      # Evidence: posthog-node@5.38.4 dist/client.d.ts lines 810-811, dist/client.js lines 559-668
+      # The implementation guards two error-free paths (no distinctId, client disabled — returns empty
+      # FeatureFlagEvaluations) but then calls super.getFeatureFlagDetailsStateless() which propagates
+      # PostHogFetchHttpError / PostHogFetchNetworkError on auth/network/quota failures.
+      # Documented at: https://posthog.com/docs/libraries/node (5.38+ flag evaluation)
+      # Source: /private/tmp/claude/bc-deepen/posthog-node/node_modules/posthog-node/dist/client.js:559-668
+      - id: evaluate-flags-network-error
+        condition: >
+          Network failure, DNS resolution failure, PostHog API unreachable,
+          /flags endpoint timeout, or server-side 5xx error while fetching
+          the consolidated flag evaluation response.
+        throws: >
+          PostHogFetchHttpError or PostHogFetchNetworkError (from @posthog/core).
+          Identical error surface to getFeatureFlag/getAllFlags — evaluateFlags
+          shares the same underlying getFeatureFlagDetailsStateless() path.
+        required_handling: >
+          Caller MUST wrap in try-catch (or use .catch()). evaluateFlags() is the
+          canonical flag-eval entry point in PostHog v5.38+; failing to handle the
+          rejection crashes the request handler that called it (since the typical
+          pattern is to await evaluateFlags() early in a handler, then branch on
+          flags.isEnabled() throughout).
+
+          Minimum handling:
+            try {
+              const flags = await posthog.evaluateFlags(userId);
+              if (flags.isEnabled('new-dashboard')) {
+                renderNewDashboard();
+              }
+            } catch (err) {
+              console.error('Feature flag evaluation failed:', err);
+              // Fall back to defaults — render conservative UI
+            }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: client.js line 615 sets quotaLimited = details.quotaLimited?.includes('feature_flags')
+      # The returned snapshot carries quotaLimited as a property — flags resolve to defaults silently
+      # when the project exceeds its feature-flag quota. Callers checking flags.isEnabled() on a
+      # quota-limited snapshot get the default-disabled answer without knowing the quota fired.
+      - id: evaluate-flags-quota-limited-silent
+        condition: >
+          PostHog project has exceeded its feature-flag quota — the /flags response
+          comes back with quotaLimited: ['feature_flags'] and the snapshot's
+          flags.isEnabled() returns the default-disabled answer for every flag.
+          No exception is thrown — the failure is silent.
+        throws: >
+          Nothing — the call succeeds and returns a FeatureFlagEvaluations snapshot
+          whose .quotaLimited property is true. Callers that branch on
+          flags.isEnabled() without checking quotaLimited get the wrong answer.
+        required_handling: >
+          Callers SHOULD check the returned snapshot's quotaLimited flag before
+          trusting flag values. Alternatively, treat all flag evaluations as
+          potentially default-only in production code (defensive branching).
+
+          Defensive handling:
+            const flags = await posthog.evaluateFlags(userId);
+            if (flags.quotaLimited) {
+              // Log + alert — flag evaluation is degraded; UI is showing defaults.
+              logger.warn('PostHog flag quota exceeded — flags returning defaults');
+            }
+            if (flags.isEnabled('new-dashboard')) { ... }
+        sources:
+          - "https://posthog.com/docs/libraries/node"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
 
 intentionally_omitted:
   - name: reloadFeatureFlags

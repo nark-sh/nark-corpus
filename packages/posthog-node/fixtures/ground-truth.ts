@@ -16,6 +16,8 @@
  *   - shutdown: postcondition shutdown-timeout-error — warning, try-catch recommended
  *   - getRemoteConfigPayload: postconditions get-remote-config-missing-personal-api-key
  *                             and get-remote-config-network-error — requires try-catch
+ *   - evaluateFlags: postconditions evaluate-flags-network-error and
+ *                    evaluate-flags-quota-limited-silent — requires try-catch (v5.38+ canonical)
  *
  * Fire-and-forget methods (capture, identify, alias, groupIdentify, captureImmediate,
  * identifyImmediate, aliasImmediate) are intentionally NOT contracted — they never
@@ -299,4 +301,37 @@ export async function waitForLocalEvaluationReadyNoCatch() {
   // SHOULD_NOT_FIRE: waitForLocalEvaluationReady returns false on timeout (not throw)
   const ready = await posthog.waitForLocalEvaluationReady(5000);
   return ready;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. evaluateFlags — canonical v5.38+ replacement for getFeatureFlag et al
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: evaluate-flags-network-error
+export async function evaluateFlagsNoCatch() {
+  // SHOULD_FIRE: evaluate-flags-network-error — evaluateFlags makes a /flags network call and can reject without try-catch
+  const flags = await posthog.evaluateFlags(userId);
+  if (flags.isEnabled('new-dashboard')) {
+    return 'new';
+  }
+  return 'old';
+}
+
+// @expect-violation: evaluate-flags-network-error
+export async function evaluateFlagsOptionsNoCatch() {
+  // SHOULD_FIRE: evaluate-flags-network-error — options-only overload uses same network path, can reject
+  const flags = await posthog.evaluateFlags({ flagKeys: ['new-dashboard', 'checkout-flow'] });
+  return flags.isEnabled('checkout-flow');
+}
+
+// @expect-clean
+export async function evaluateFlagsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch handles PostHogFetchHttpError/PostHogFetchNetworkError
+    const flags = await posthog.evaluateFlags(userId);
+    return flags.isEnabled('new-dashboard') ? 'new' : 'old';
+  } catch (err) {
+    console.error('Feature flag evaluation failed:', err);
+    return 'old';
+  }
 }
