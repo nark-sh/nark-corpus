@@ -16,16 +16,21 @@
  *   RTDB (new 2026-04-13 pass 14): setRules
  *   Remote Config (new 2026-04-13): getTemplate, publishTemplate
  *   Storage (new 2026-04-13 pass 14): getDownloadURL
+ *   Data Connect (new 2026-06-24 pass 42): executeGraphql (v14+)
+ *   Phone Number Verification (new 2026-06-24 pass 42): verifyToken (v14+)
  *
  * Detection note: namespace API (admin.auth()) and stored instances are fully detected.
  * Modular getAuth().verifyIdToken() pattern is not currently detected (analyzer limitation).
  * Modular getFirestore().collection().get() and getDatabase().ref().once() ARE detected.
  * Remote Config: getRemoteConfig() modular API used. Detection requires factory_method tracking.
+ * Data Connect / Phone Number Verification use the same modular getXxx() factory pattern.
  */
 
 import * as admin from 'firebase-admin';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getDatabase } from 'firebase-admin/database';
+import { getDataConnect } from 'firebase-admin/data-connect';
+import { getPhoneNumberVerification } from 'firebase-admin/phone-number-verification';
 
 // ──────────────────────────────────────────────
 // 1. verifyIdToken — namespace API
@@ -738,6 +743,65 @@ async function gt_getDownloadURL_proper(filePath: string) {
       throw new Error(
         'File has no download token. Upload via Firebase SDK or add token metadata manually.'
       );
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 30. Data Connect — executeGraphql — added 2026-06-24 depth pass 42 (deepen-stream-3)
+// ──────────────────────────────────────────────
+
+// @expect-violation: data-connect-invalid-argument
+// @expect-violation: data-connect-permission-denied
+// @expect-violation: data-connect-network-error
+// @expect-violation: data-connect-query-error
+async function gt_executeGraphql_missing(query: string) {
+  const dc = getDataConnect({ connector: 'main', location: 'us-central1', serviceId: 'svc' });
+  // SHOULD_FIRE: data-connect-invalid-argument
+  const result = await dc.executeGraphql(query);
+  return result;
+}
+
+// @expect-clean
+async function gt_executeGraphql_proper(query: string) {
+  try {
+    const dc = getDataConnect({ connector: 'main', location: 'us-central1', serviceId: 'svc' });
+    // SHOULD_NOT_FIRE: executeGraphql inside try-catch
+    const result = await dc.executeGraphql(query);
+    return result;
+  } catch (error) {
+    if ((error as any).code === 'data-connect/permission-denied') {
+      throw new Error('Data Connect permission denied — check service-account roles.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 31. Phone Number Verification — verifyToken — added 2026-06-24 depth pass 42 (deepen-stream-3)
+// ──────────────────────────────────────────────
+
+// @expect-violation: phone-verify-token-invalid
+// @expect-violation: phone-verify-token-expired
+// @expect-violation: phone-verify-project-or-network-error
+async function gt_verifyToken_missing(jwt: string) {
+  const pnv = getPhoneNumberVerification();
+  // SHOULD_FIRE: phone-verify-token-invalid
+  const decoded = await pnv.verifyToken(jwt);
+  return decoded;
+}
+
+// @expect-clean
+async function gt_verifyToken_proper(jwt: string) {
+  try {
+    const pnv = getPhoneNumberVerification();
+    // SHOULD_NOT_FIRE: verifyToken inside try-catch
+    const decoded = await pnv.verifyToken(jwt);
+    return decoded;
+  } catch (error) {
+    if ((error as any).code === 'phone-number-verification/expired-token') {
+      throw new Error('Phone verification token expired — restart phone-verification flow.');
     }
     throw error;
   }

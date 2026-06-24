@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass 42 — coverage 100% → 60%
+
+- **Profile:** `packages/firebase-admin/contract.yaml`
+- **Functions added:** DataConnect.executeGraphql, PhoneNumberVerification.verifyToken (2 total)
+- **Postconditions added:** 7 (4 on executeGraphql, 3 on verifyToken)
+- **Functions intentionally omitted this pass:** DataConnect.executeGraphqlRead / executeQuery / executeMutation / insert / insertMany / upsert / upsertMany (all share the executeGraphql error profile and are covered by the same await_patterns)
+- **Scanner concerns queued:** 2 (`concern-20260624-firebase-admin-deepen-1`, `concern-20260624-firebase-admin-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `lib/data-connect/data-connect-api-client-internal.js` (firebase-admin@14.0.0 node_modules)
+  - `lib/data-connect/error.d.ts` (firebase-admin@14.0.0 node_modules)
+  - `lib/phone-number-verification/token-verifier.js` (firebase-admin@14.0.0 node_modules)
+  - `lib/phone-number-verification/error.d.ts` (firebase-admin@14.0.0 node_modules)
+  - https://firebase.google.com/docs/data-connect/error-codes
+- **Coverage math correction:** Previous index claimed coverage 1.0 against a stale 68-function total. v14.0.0 added DataConnect (8 distinct callable surface items: 1 contracted, 7 omitted-as-variants) and PhoneNumberVerification (1 method, contracted). True post-pass surface: 46 contracted / 31 omitted / 77 total = 0.60.
+- **Verified by:** bc-deepen-contract (deepen-stream-3, pass 42 on 2026-06-24T05:27:41+00:00)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** firebase-admin@14.0.0

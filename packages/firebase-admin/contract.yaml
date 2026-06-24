@@ -1,8 +1,8 @@
 package: firebase-admin
 semver: ">=11.0.0 <15.0.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -27,11 +27,19 @@ evidence_quality: confirmed
 # Added 9 new function entries covering session cookies, custom tokens,
 # token revocation, password reset, Firestore transactions/batches, and
 # modern messaging APIs (sendEach, subscribeToTopic).
-coverage_score: 1.0
+# Depth pass 2026-06-24 pass 42 (deepen-stream-3, drift-by-staleness mode):
+# v14.0.0 surface — added 2 new function entries:
+#   DataConnect.executeGraphql (Postgres-backed GraphQL, GA in v14)
+#   PhoneNumberVerification.verifyToken (first-class Admin SDK service in v14)
+# New omissions: 7 DataConnect variant methods (executeGraphqlRead, executeQuery,
+#   executeMutation, insert, insertMany, upsert, upsertMany) — they share the
+#   same error profile as executeGraphql and are covered by the same await_patterns.
+# API surface total: 77; contracted: 46; omitted: 31; coverage_score: 0.60
+coverage_score: 0.6
 
 detection:
-  class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck"]
-  type_names: ["Auth", "BaseAuth", "UserRecord", "DecodedIdToken", "Messaging", "Firestore"]
+  class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck", "DataConnect", "PhoneNumberVerification"]
+  type_names: ["Auth", "BaseAuth", "UserRecord", "DecodedIdToken", "Messaging", "Firestore", "DataConnect", "PhoneNumberVerification"]
   factory_methods:
     - "getAuth"
     - "getMessaging"
@@ -39,6 +47,8 @@ detection:
     - "getDatabase"
     - "getAppCheck"
     - "getRemoteConfig"
+    - "getDataConnect"
+    - "getPhoneNumberVerification"
     - "initializeApp"
   require_instance_tracking: true
   import_source: "firebase-admin"
@@ -85,6 +95,13 @@ detection:
     - ".getTemplate("
     - ".publishTemplate("
     - ".validateTemplate("
+    # Data Connect (v14+)
+    - ".executeGraphql("
+    - ".executeGraphqlRead("
+    - ".executeMutation("
+    - ".executeQuery("
+    # Phone Number Verification (v14+)
+    - ".verifyToken("
 
 functions:
   # Authentication Service
@@ -2212,3 +2229,198 @@ functions:
           visibility: visible
           user_experience: lost_data
           incident_cost_range: medium
+
+  # ── Data Connect (added v14.0.0) ────────────────────────────────────────────
+
+  - name: executeGraphql
+    import_path: "firebase-admin/data-connect"
+    description: >
+      Executes an arbitrary GraphQL query or mutation against Firebase Data Connect
+      (the GA Postgres-backed GraphQL service introduced in firebase-admin v14).
+      Runs with admin privileges by default — auth directives in the schema are
+      ignored unless the caller passes an `impersonate` option. Used in server-side
+      workflows: data migrations, scheduled jobs, webhook handlers, and admin tools
+      that need to read or mutate user data without a client session. Network call
+      to a Google Cloud-hosted endpoint, so all of the standard transport failure
+      modes apply, plus Data Connect-specific argument and credential validation.
+
+    postconditions:
+      # Evidence: lib/data-connect/data-connect-api-client-internal.js lines 117-129
+      # validator.isNonEmptyString(query) — throws INVALID_ARGUMENT for empty/non-string query
+      # validator.isNonNullObject(options) — throws INVALID_ARGUMENT for non-object options
+      - id: data-connect-invalid-argument
+        severity: error
+        condition: "GraphQL query is empty, not a string, or options object is malformed"
+        throws: "FirebaseDataConnectError with code 'data-connect/invalid-argument'"
+        required_handling: >
+          Catch this error to surface developer mistakes during query construction.
+          The most common cause is interpolating an undefined variable into the
+          query template (producing an empty string) or passing a non-object as
+          options. Log the query for debugging and return a 400-class error to
+          upstream callers — do NOT retry.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/data-connect/data-connect-api-client-internal.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/data-connect/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: data-connect-api-client-internal.js toFirebaseError() — maps Google Cloud
+      # 401/403 responses to UNAUTHENTICATED / PERMISSION_DENIED FirebaseDataConnectError codes
+      - id: data-connect-permission-denied
+        severity: error
+        condition: >
+          Service account lacks Data Connect access on the target service/connector,
+          or the impersonated auth principal is denied by GraphQL auth directives.
+        throws: "FirebaseDataConnectError with code 'data-connect/permission-denied' or 'data-connect/unauthenticated'"
+        required_handling: >
+          Catch and alert — this indicates either service-account IAM misconfiguration
+          (Data Connect Editor / Admin role missing) or that the impersonated
+          end-user lacks permission for the queried operation. Do NOT retry with the
+          same credentials. For impersonation paths, propagate as 403 to the client.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/data-connect/data-connect-api-client-internal.ts"
+          - "https://firebase.google.com/docs/data-connect/error-codes"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: data-connect-api-client-internal.js makeGqlRequest() — wraps HttpClient
+      # Network failures (ENOTFOUND, ECONNRESET, 5xx) bubble up via toFirebaseError() as INTERNAL/UNKNOWN
+      - id: data-connect-network-error
+        severity: error
+        condition: >
+          Network request to the Data Connect REST endpoint failed (DNS failure,
+          connection reset, gateway timeout, or 5xx response from Google Cloud).
+        throws: "FirebaseDataConnectError with code 'data-connect/internal-error' or 'data-connect/unknown-error'"
+        required_handling: >
+          Catch and implement retry with exponential backoff for transient failures.
+          Distinguish retriable (5xx, ECONNRESET) from non-retriable (4xx) errors by
+          inspecting the wrapped error code. Surface persistent failures as 503 to
+          the upstream caller so SLO alerts fire. Long-running migration scripts
+          MUST checkpoint progress so a transient failure does not require a
+          full restart.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/data-connect/data-connect-api-client-internal.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: data-connect-api-client-internal.js executeGraphqlHelper — server-returned
+      # GraphQL errors (constraint violations, type mismatches) surface via toFirebaseError as QUERY_ERROR
+      - id: data-connect-query-error
+        severity: error
+        condition: >
+          Server rejected the GraphQL operation — typical causes are referenced
+          table/column does not exist, type mismatch, or Postgres constraint
+          violation (unique key, foreign key, not-null) on a mutation.
+        throws: "FirebaseDataConnectError with code 'data-connect/query-error'"
+        required_handling: >
+          Catch and inspect the error message — the server returns the specific
+          GraphQL error detail. Constraint violations are user-recoverable
+          (e.g. surface 'email already exists' to the UI); schema mismatches
+          indicate a developer bug and MUST be alerted. Do NOT retry —
+          re-running the same query produces the same failure.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/data-connect/error.ts"
+          - "https://firebase.google.com/docs/data-connect/error-codes"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  # ── Phone Number Verification (added v14.0.0) ───────────────────────────────
+
+  - name: verifyToken
+    import_path: "firebase-admin/phone-number-verification"
+    description: >
+      Verifies a Firebase Phone Number Verification JWT issued during phone-based
+      auth flows and returns the decoded token (with phone number). Added as a
+      first-class Admin SDK service in firebase-admin v14 — previously this kind
+      of verification was bundled into general Auth flows. Used by server-side
+      session checks and webhook handlers that must trust a phone-verification
+      claim before granting access. Network round-trip to fetch JWKS plus full
+      JWT signature + claim verification.
+
+    postconditions:
+      # Evidence: lib/phone-number-verification/token-verifier.js line 79
+      # Throws INVALID_TOKEN immediately when the first arg is not a string
+      - id: phone-verify-token-invalid
+        severity: error
+        condition: >
+          Token argument is not a string, is malformed (cannot be JWT-decoded),
+          has the wrong issuer, wrong audience (Firebase project ID mismatch),
+          missing/invalid signature, or no matching JWKS key id.
+        throws: "FirebasePhoneNumberVerificationError with code 'phone-number-verification/invalid-token' or '/invalid-argument'"
+        required_handling: >
+          Catch and return 401 Unauthorized to the caller. Treat this as a hostile
+          input — the most common production source is a forged or tampered token,
+          NOT a legitimate user error. Log the verification failure for audit but
+          do not echo the token contents to the client. DO NOT retry — a token
+          that fails signature/issuer verification will never succeed.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/phone-number-verification/token-verifier.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/phone-number-verification/error.ts"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: lib/phone-number-verification/token-verifier.js lines 188-194
+      # mapJwtErrorToAuthError — JwtErrorCode.TOKEN_EXPIRED maps to EXPIRED_TOKEN
+      - id: phone-verify-token-expired
+        severity: error
+        condition: "Phone-verification JWT exp claim is in the past"
+        throws: "FirebasePhoneNumberVerificationError with code 'phone-number-verification/expired-token'"
+        required_handling: >
+          Catch and return 401 Unauthorized. Distinguish expired tokens from
+          invalid ones via error.code — expired tokens are a normal lifecycle
+          event (the user's verification window closed) and the client should
+          be instructed to restart the phone-verification flow, not retry the
+          same token. DO NOT extend the trust window by ignoring the error.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/phone-number-verification/token-verifier.ts"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: token-verifier.js ensureProjectId() lines 90-99 — throws when app has no
+      # project ID configured. Also: JWKS fetch is a network round-trip — transient failures
+      # surface as INVALID_ARGUMENT via mapJwtErrorToAuthError.
+      - id: phone-verify-project-or-network-error
+        severity: error
+        condition: >
+          App was initialized without a project ID (no service-account credential
+          and no GOOGLE_CLOUD_PROJECT env var), or the JWKS endpoint network
+          fetch failed transiently.
+        throws: "FirebasePhoneNumberVerificationError with code 'phone-number-verification/invalid-argument'"
+        required_handling: >
+          Catch and alert — for the project-id case this is a deployment-time
+          misconfiguration that requires fixing the service-account credential
+          or GOOGLE_CLOUD_PROJECT env var. For the JWKS network case, return 503
+          to the caller so SLO alerts fire and clients can retry. DO NOT silently
+          fall back to trusting the unverified token.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/phone-number-verification/token-verifier.ts"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
