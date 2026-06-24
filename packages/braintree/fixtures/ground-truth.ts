@@ -405,3 +405,64 @@ export async function customerDeleteWithCatch(customerId: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. dispute.addTextEvidence
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: dispute-add-text-evidence-no-try-catch
+export async function disputeAddTextEvidenceNoCatch(disputeId: string, content: string) {
+  // SHOULD_FIRE: dispute-add-text-evidence-no-try-catch
+  const result = await gateway.dispute.addTextEvidence(disputeId, { content, category: 'PROOF_OF_FULFILLMENT' });
+  return result;
+}
+
+// @expect-clean
+export async function disputeAddTextEvidenceWithCatch(disputeId: string, content: string) {
+  try {
+    // SHOULD_NOT_FIRE: addTextEvidence inside try-catch
+    const result = await gateway.dispute.addTextEvidence(disputeId, { content, category: 'PROOF_OF_FULFILLMENT' });
+    if (!result.success) {
+      console.error('addTextEvidence rejected:', result.message);
+    }
+    return result;
+  } catch (err: any) {
+    if (err.type === 'notFoundError') {
+      // Dispute no longer in OPEN state — re-fetch and abort cleanly
+      return null;
+    }
+    if (err.name === 'InvalidKeysError') {
+      throw new Error(`Evidence validation failed: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. dispute.addFileEvidence
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: dispute-add-file-evidence-no-try-catch
+export async function disputeAddFileEvidenceNoCatch(disputeId: string, documentId: string) {
+  // SHOULD_FIRE: dispute-add-file-evidence-no-try-catch
+  const result = await gateway.dispute.addFileEvidence(disputeId, { documentId, category: 'PROOF_OF_FULFILLMENT' });
+  return result;
+}
+
+// @expect-clean
+export async function disputeAddFileEvidenceWithCatch(disputeId: string, documentId: string) {
+  try {
+    // SHOULD_NOT_FIRE: addFileEvidence inside try-catch
+    const result = await gateway.dispute.addFileEvidence(disputeId, { documentId, category: 'PROOF_OF_FULFILLMENT' });
+    if (!result.success) {
+      throw new Error(`File evidence rejected: ${result.message}`);
+    }
+    return result;
+  } catch (err: any) {
+    if (err.type === 'notFoundError') {
+      // Re-verify dispute state and documentUpload existence
+      return null;
+    }
+    throw err;
+  }
+}

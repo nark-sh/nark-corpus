@@ -8,11 +8,11 @@ package: braintree
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.79
+coverage_score: 0.82
 
 detection:
   class_names: ["BraintreeGateway"]
@@ -736,6 +736,161 @@ functions:
           incident_label: PAYMENT_RISK
           production_behavior: silent_failure
           visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: addTextEvidence
+    import_path: "braintree"
+    description: >
+      Adds text evidence to an open chargeback dispute. Called as
+      gateway.dispute.addTextEvidence(disputeId, content) or with a request object
+      { content, category?, sequenceNumber? }. Must be called BEFORE dispute.finalize().
+      Text evidence is the primary mechanism for refuting a chargeback (e.g. delivery
+      confirmation, customer email exchanges, terms acceptance).
+
+    postconditions:
+      # Evidence: source confirmed at dispute_gateway.js — POST /disputes/:id/evidence
+      # Three reject paths from source:
+      #   1. NotFoundError — invalid path segment or dispute not found / closed
+      #   2. InvalidKeysError — content null/empty, sequenceNumber not an int,
+      #      category null / non-string / empty
+      #   3. Standard infrastructure errors via createRejectionHandler
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/dispute/add-text-evidence/node
+      - id: dispute-add-text-evidence-no-try-catch
+        condition: >
+          await gateway.dispute.addTextEvidence(disputeId, content) is called without
+          a surrounding try-catch block.
+        throws: >
+          NotFoundError (dispute ID invalid, closed, or already finalized — addEvidence
+          only valid in OPEN state),
+          InvalidKeysError (content is null/empty, sequenceNumber is not a numeric string,
+          category is null / non-string / empty),
+          AuthenticationError, AuthorizationError (missing dispute management permissions),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Also check result.success — Braintree returns
+          result.success=false for soft validation failures (e.g. dispute already finalized
+          server-side, evidence type rejected by the network). An uncaught NotFoundError
+          or InvalidKeysError aborts the evidence collection workflow mid-flow, leaving
+          a partially-submitted dispute that will then lose by default at finalize time.
+
+          try {
+            const result = await gateway.dispute.addTextEvidence(
+              disputeId,
+              { content: 'Delivery confirmation: tracking 1Z999...', category: 'PROOF_OF_FULFILLMENT' }
+            );
+            if (!result.success) {
+              // result.errors — evidence rejected (wrong category, dispute already closed)
+              // Decide whether to retry with a different category or abort
+            }
+          } catch (err) {
+            if (err.type === 'notFoundError') {
+              // Dispute may have transitioned out of OPEN — re-fetch state
+              return;
+            }
+            if (err.name === 'InvalidKeysError') {
+              // Bad input — log and surface validation error to operator
+              throw new Error(`Evidence validation failed: ${err.message}`);
+            }
+            // Infrastructure failure — alert ops, dispute deadline at risk
+            throw err;
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/dispute/add-text-evidence/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+          - "https://developer.paypal.com/braintree/docs/guides/disputes/overview"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: add-text-evidence-result-not-checked
+        condition: >
+          Caller does not inspect result.success on the response from
+          gateway.dispute.addTextEvidence(). A result.success=false response means the
+          evidence was REJECTED by Braintree (wrong category, invalid format, dispute
+          state mismatch) but no exception is thrown — silently dropping the evidence.
+        throws: "Does not throw — silent failure: evidence rejected but caller assumes success"
+        required_handling: >
+          The dual error model (thrown exception + result.success) applies to every
+          addEvidence call. result.success=false with non-empty result.errors must be
+          treated as a hard failure: the evidence did NOT make it onto the dispute
+          and finalize() will submit an empty record. Always inspect result.success
+          and log result.errors.deepErrors() before proceeding to finalize.
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/dispute/add-text-evidence/node"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: addFileEvidence
+    import_path: "braintree"
+    description: >
+      Adds file evidence (image, PDF, receipt scan) to an open chargeback dispute.
+      Called as gateway.dispute.addFileEvidence(disputeId, documentId) or with a request
+      object { documentId, category? }. The documentId must reference a prior
+      gateway.documentUpload.create() call. File evidence is required for many chargeback
+      categories (e.g. signed delivery confirmations, signed terms of service).
+
+    postconditions:
+      # Evidence: source confirmed at dispute_gateway.js
+      # Reject paths from source:
+      #   1. NotFoundError — invalid disputeId path segment, or documentId null/empty/whitespace
+      #   2. Standard infrastructure errors via createRejectionHandler
+      #   3. Result-object failures (server-side validation: file format, size, dispute state)
+      # Docs: https://developer.paypal.com/braintree/docs/reference/request/dispute/add-file-evidence/node
+      - id: dispute-add-file-evidence-no-try-catch
+        condition: >
+          await gateway.dispute.addFileEvidence(disputeId, documentId) is called without
+          a surrounding try-catch block.
+        throws: >
+          NotFoundError (dispute ID invalid / closed, OR documentId is null / empty /
+          whitespace — source throws "document with id 'null' not found"),
+          AuthenticationError, AuthorizationError (missing dispute management permissions),
+          ServerError, GatewayTimeoutError, ServiceUnavailableError.
+        required_handling: >
+          Caller MUST wrap in try-catch. Most-common failure mode in production: a stale
+          documentId reference from a documentUpload that was never fully persisted, OR
+          the dispute transitioned out of OPEN status between fetching it and adding
+          evidence. Both surface as NotFoundError and must be distinguished from
+          infrastructure errors before deciding whether to retry.
+
+          try {
+            const result = await gateway.dispute.addFileEvidence(
+              disputeId,
+              { documentId: uploadId, category: 'PROOF_OF_FULFILLMENT' }
+            );
+            if (!result.success) {
+              // File rejected (wrong category for dispute reason, file too large server-side)
+              throw new Error(`File evidence rejected: ${result.message}`);
+            }
+          } catch (err) {
+            if (err.type === 'notFoundError') {
+              // Re-verify dispute state and documentUpload existence before retry
+              return;
+            }
+            // Infrastructure failure — alert ops, evidence not attached
+            throw err;
+          }
+        sources:
+          - "https://developer.paypal.com/braintree/docs/reference/request/dispute/add-file-evidence/node"
+          - "https://developer.paypal.com/braintree/docs/reference/general/exceptions/node"
+          - "https://developer.paypal.com/braintree/docs/guides/disputes/overview"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
           user_experience: lost_transaction
           incident_cost_range: high
         evidence_quality: confirmed
