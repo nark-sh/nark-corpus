@@ -622,3 +622,173 @@ export async function oauthTokenWithTryCatch(code: string) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 33. dataSources.query() — bare call → SHOULD_FIRE (v5 NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareDataSourceQueryNoCatch(dataSourceId: string) {
+  // SHOULD_FIRE: data-sources-query-object-not-found
+  const result = await notion.dataSources.query({ data_source_id: dataSourceId });
+  return result.results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 34. dataSources.query() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function dataSourceQueryWithTryCatch(dataSourceId: string) {
+  try {
+    // SHOULD_NOT_FIRE: data-sources-query-object-not-found — inside try-catch
+    const result = await notion.dataSources.query({ data_source_id: dataSourceId });
+    return result.results;
+  } catch (error) {
+    console.error('Data source query failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 35. dataSources.create() — bare call → SHOULD_FIRE (v5 NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareDataSourceCreateNoCatch(databaseId: string) {
+  // SHOULD_FIRE: data-sources-create-parent-not-found
+  const ds = await notion.dataSources.create({
+    parent: { type: 'database_id', database_id: databaseId },
+    properties: { Name: { title: {} } },
+  });
+  return ds.id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 36. dataSources.create() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function dataSourceCreateWithTryCatch(databaseId: string) {
+  try {
+    // SHOULD_NOT_FIRE: data-sources-create-parent-not-found — inside try-catch
+    const ds = await notion.dataSources.create({
+      parent: { type: 'database_id', database_id: databaseId },
+      properties: { Name: { title: {} } },
+    });
+    return ds.id;
+  } catch (error) {
+    console.error('Data source create failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 37. pages.move() — bare call → SHOULD_FIRE (v5 NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function barePageMoveNoCatch(pageId: string, targetParentId: string) {
+  // SHOULD_FIRE: pages-move-target-not-found
+  await notion.pages.move({
+    page_id: pageId,
+    parent: { type: 'page_id', page_id: targetParentId },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 38. pages.move() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function pageMoveWithTryCatch(pageId: string, targetParentId: string) {
+  try {
+    // SHOULD_NOT_FIRE: pages-move-target-not-found — inside try-catch
+    await notion.pages.move({
+      page_id: pageId,
+      parent: { type: 'page_id', page_id: targetParentId },
+    });
+  } catch (error) {
+    console.error('Page move failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 39. blocks.update() — bare call → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareBlockUpdateNoCatch(blockId: string) {
+  // SHOULD_FIRE: blocks-update-object-not-found
+  await notion.blocks.update({
+    block_id: blockId,
+    paragraph: {
+      rich_text: [{ type: 'text', text: { content: 'Updated content' } }],
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 40. blocks.update() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function blockUpdateWithTryCatch(blockId: string) {
+  try {
+    // SHOULD_NOT_FIRE: blocks-update-object-not-found — inside try-catch
+    await notion.blocks.update({
+      block_id: blockId,
+      paragraph: {
+        rich_text: [{ type: 'text', text: { content: 'Updated content' } }],
+      },
+    });
+  } catch (error) {
+    console.error('Block update failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 41. comments.update() — bare call → SHOULD_FIRE (v5 NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCommentUpdateNoCatch(commentId: string) {
+  // SHOULD_FIRE: comments-update-not-author
+  await notion.comments.update({
+    comment_id: commentId,
+    rich_text: [{ type: 'text', text: { content: 'Edited comment' } }],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 42. comments.update() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function commentUpdateWithTryCatch(commentId: string) {
+  try {
+    // SHOULD_NOT_FIRE: comments-update-not-author — inside try-catch
+    await notion.comments.update({
+      comment_id: commentId,
+      rich_text: [{ type: 'text', text: { content: 'Edited comment' } }],
+    });
+  } catch (error) {
+    console.error('Comment update failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 43. comments.delete() — bare call → SHOULD_FIRE (v5 NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCommentDeleteNoCatch(commentId: string) {
+  // SHOULD_FIRE: comments-delete-not-author
+  await notion.comments.delete({ comment_id: commentId });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44. comments.delete() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function commentDeleteWithTryCatch(commentId: string) {
+  try {
+    // SHOULD_NOT_FIRE: comments-delete-not-author — inside try-catch
+    await notion.comments.delete({ comment_id: commentId });
+  } catch (error) {
+    console.error('Comment delete failed:', error);
+    throw error;
+  }
+}

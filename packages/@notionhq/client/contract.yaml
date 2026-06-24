@@ -7,7 +7,7 @@ package: "@notionhq/client"
 semver: ">=1.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -36,6 +36,12 @@ detection:
     - ".search("
     - ".comments.create("
     - ".comments.list("
+    - ".comments.update("
+    - ".comments.delete("
+    - ".dataSources.query("
+    - ".dataSources.create("
+    - ".dataSources.update("
+    - ".dataSources.retrieve("
     - ".fileUploads.create("
     - ".fileUploads.send("
     - ".fileUploads.complete("
@@ -1017,6 +1023,527 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: query
+    import_path: "@notionhq/client"
+    namespace: "dataSources"
+    description: >
+      Queries a Notion data source, returning matching page objects. Data sources are
+      the v5 schema layer between databases and rows — in 2025+ integrations this is
+      the primary read path that replaced databases.query() for new code. Returns
+      paginated results filtered by property conditions and ordered by sort criteria.
+      Makes an outbound HTTPS POST request. All errors are thrown.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/query-a-data-source
+      # SDK source: errors.d.ts, Client.d.ts (queryDataSource in api-endpoints)
+      # Drift-mode deepen (pass 49, 2026-06-24): dataSources.query is v5 NEW, did not exist
+      # when this profile was last deepened 2026-04-16 against v1.x. The Notion 2025-09-03
+      # API surface introduced data sources as the row-container layer.
+      - id: data-sources-query-object-not-found
+        condition: >
+          dataSources.query() called when data_source_id refers to a data source that has been
+          deleted, archived with its parent database, or was never shared with the integration.
+          Indistinguishable at the API level from a never-existed ID. Common in workflows that
+          cached data_source_id from earlier sessions.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+          SDK auto-retries rate_limited (429) but NOT object_not_found — error thrown immediately
+          to the caller after the first POST attempt.
+        required_handling: >
+          Caller MUST wrap notion.dataSources.query() in try-catch. Handle ObjectNotFound
+          to return empty results rather than crash when data sources are deleted/unshared:
+            try {
+              const result = await notion.dataSources.query({ data_source_id: id });
+              return result.results;
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return []; // Data source deleted or not shared with integration
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/query-a-data-source"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: data-sources-query-restricted-resource
+        condition: >
+          dataSources.query() called when the integration lacks "read content" capabilities
+          on the parent database, OR when the data source exists but has not been explicitly
+          shared with the integration token via the Notion connection settings. For new
+          v5 integrations that previously worked against a database in v1.x, the data
+          source under the database may require separate sharing.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.dataSources.query() in try-catch. A 403 on dataSources.query()
+          typically indicates the integration needs to be re-shared at the data-source level —
+          v5 connection sharing is finer-grained than v1's database-level sharing.
+        sources:
+          - "https://developers.notion.com/reference/query-a-data-source"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: data-sources-query-database-connection-unavailable
+        condition: >
+          dataSources.query() receives 503 service_unavailable specifically with the
+          database_connection_unavailable error code (a sub-variant of 503 documented for
+          data source queries during "backend datastore timeouts"). Notion documentation
+          recommends narrowing filters and adding exponential backoff. SDK auto-retries
+          503 for GET/DELETE but dataSources.query is POST — NOT auto-retried.
+        throws: >
+          APIResponseError with code ServiceUnavailable (HTTP 503), specifically
+          database_connection_unavailable for query-time backend datastore timeouts.
+        required_handling: >
+          Caller MUST wrap notion.dataSources.query() in try-catch. POST is not auto-retried
+          on 503 — explicit retry with exponential backoff and narrowed filter is required:
+            try {
+              const result = await notion.dataSources.query({ data_source_id, filter });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ServiceUnavailable) {
+                // Narrow filter and retry with backoff
+                console.error('Data source query timed out — narrow filter and retry');
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/query-a-data-source"
+          - "https://developers.notion.com/reference/errors"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: create
+    import_path: "@notionhq/client"
+    namespace: "dataSources"
+    description: >
+      Creates a new data source under an existing Notion database. Data sources are the
+      v5 schema layer — a database can have multiple data sources, each with its own
+      property schema and table view. Used in v5 integrations that programmatically
+      provision multi-view databases. Makes an outbound HTTPS POST request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/create-a-data-source
+      # SDK source: CreateDataSourceParameters in api-endpoints/data-sources.d.ts
+      - id: data-sources-create-parent-not-found
+        condition: >
+          dataSources.create() called with parent.database_id referencing a database that
+          does not exist, was deleted/trashed, or is not accessible to the integration.
+          Data sources require a parent database — they cannot be created at the workspace
+          or page level.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.dataSources.create() in try-catch. Database provisioning
+          flows must handle the parent-database-missing case explicitly — silent failure
+          here leaves a half-provisioned workspace with the database but no schema:
+            try {
+              const ds = await notion.dataSources.create({ parent: { database_id }, properties });
+            } catch (error) {
+              if (isNotionClientError(error)) {
+                console.error('Failed to create data source:', error.code);
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/create-a-data-source"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: data-sources-create-validation-error
+        condition: >
+          dataSources.create() called with invalid property schema — invalid property type
+          names, select/multi_select options exceeding 100 items, missing required title
+          property, or property names exceeding API limits.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400).
+        required_handling: >
+          Caller MUST wrap notion.dataSources.create() in try-catch. Validate property schema
+          structure and option counts before calling to fail fast at the application layer
+          rather than after a network round-trip.
+        sources:
+          - "https://developers.notion.com/reference/create-a-data-source"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: move
+    import_path: "@notionhq/client"
+    namespace: "pages"
+    description: >
+      Moves a page to a new parent — either another page (page_id parent) or a data source
+      (data_source_id parent). Makes an outbound HTTPS POST request. v5 NEW endpoint —
+      added with the data sources API. Used for organizing content programmatically,
+      relocating pages between parents, or migrating pages into data sources.
+
+    postconditions:
+      # Evidence: api-endpoints/pages.d.ts line 531-554 (MovePagePathParameters, MovePageBodyParameters, movePage definition)
+      # Notion docs page returned 404 — the endpoint is in the SDK but not yet documented
+      # at developers.notion.com; relying on SDK source + error catalog at /reference/errors
+      - id: pages-move-target-not-found
+        condition: >
+          pages.move() called with a parent.page_id or parent.data_source_id that does not
+          exist or is not accessible to the integration. Move operations are common in
+          archival/reorganization workflows where the target parent may have been deleted
+          between when the move was queued and when it executes.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404)
+          for missing target parent. May also throw 404 if the page being moved no longer exists.
+        required_handling: >
+          Caller MUST wrap notion.pages.move() in try-catch. Page-organization workflows
+          MUST treat 404 as a recoverable state — the page may need to be re-fetched, or the
+          target parent re-validated, before retrying:
+            try {
+              await notion.pages.move({ page_id, parent: { page_id: targetId } });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                console.error('Move target or source no longer exists:', error.message);
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: pages-move-restricted-resource
+        condition: >
+          pages.move() called when the integration lacks "update content" capabilities on
+          the source page OR "insert content" capabilities on the target parent. Both
+          permissions are required — a 403 here is more ambiguous than on other endpoints
+          because either side of the move can fail.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.pages.move() in try-catch. A 403 on move() requires verifying
+          BOTH the source and target are shared with the integration — the error message does
+          not always distinguish which side failed.
+        sources:
+          - "https://developers.notion.com/reference/errors"
+          - "https://github.com/makenotion/notion-sdk-js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: update
+    import_path: "@notionhq/client"
+    namespace: "blocks"
+    description: >
+      Updates a single block's content. Used to edit paragraph text, change to-do completion
+      state, update heading levels, modify rich-text formatting, and similar per-block edits.
+      PATCH semantics — omitted fields preserve existing data. Makes an outbound HTTPS PATCH
+      request. NOT auto-retried on 500/503 (PATCH is not idempotent in Notion's auto-retry
+      logic, which only retries GET/DELETE on server errors).
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/update-a-block
+      # SDK source: UpdateBlockParameters in Client.d.ts
+      # Drift-mode deepen (pass 49, 2026-06-24): blocks.update was in detection list but had
+      # no dedicated function entry. v5 API surface explicitly documents block update errors.
+      - id: blocks-update-object-not-found
+        condition: >
+          blocks.update() called when block_id refers to a block that has been deleted,
+          is in the trash, or the integration cannot access. Per Notion docs, blocks in trash
+          return 404 on update — distinct from soft-deleted-but-readable pages. Background
+          jobs that update blocks by cached IDs are vulnerable when users delete content.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.blocks.update() in try-catch. In sync flows that update
+          blocks by stored IDs, handle ObjectNotFound to avoid crashing on user-deleted content:
+            try {
+              await notion.blocks.update({ block_id, paragraph: { rich_text: [...] } });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return null; // Block deleted or trashed — skip this update
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: blocks-update-not-retried-on-server-error
+        condition: >
+          blocks.update() (PATCH) receives 500 internal_server_error or 503 service_unavailable.
+          PATCH is NOT auto-retried by the SDK — only GET and DELETE are retried on 500/503.
+          The block update may be partially applied on the server before the error response,
+          leaving the block in an inconsistent state from the application's perspective.
+        throws: >
+          APIResponseError with code InternalServerError (HTTP 500) or ServiceUnavailable (HTTP 503).
+          Unlike GET/DELETE, these are NOT auto-retried for PATCH requests after the SDK's
+          default maxRetries.
+        required_handling: >
+          Caller MUST wrap notion.blocks.update() in try-catch. On 500/503, re-read the block
+          with blocks.retrieve() before retrying to detect whether the update was partially applied:
+            try {
+              await notion.blocks.update({ block_id, ...updates });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  (error.code === APIErrorCode.InternalServerError ||
+                   error.code === APIErrorCode.ServiceUnavailable)) {
+                const current = await notion.blocks.retrieve({ block_id });
+                // Compare current to expected to detect partial apply
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: blocks-update-child-page-or-database
+        condition: >
+          blocks.update() called on a block whose type is "child_page" or "child_database".
+          Per Notion documentation: "Child pages and databases cannot be updated via this
+          endpoint; use the Update page or Update database endpoints instead." Callers that
+          fetch a block list and update each block uniformly will hit this error on child
+          page/db blocks.
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400)
+          with a message indicating the block type cannot be updated via this endpoint.
+        required_handling: >
+          Caller MUST wrap notion.blocks.update() in try-catch. When iterating block children
+          for updates, branch on block type to route child_page → pages.update() and
+          child_database → databases.update():
+            try {
+              if (block.type === 'child_page') {
+                await notion.pages.update({ page_id: block.id, ...pageUpdates });
+              } else if (block.type === 'child_database') {
+                await notion.databases.update({ database_id: block.id, ...dbUpdates });
+              } else {
+                await notion.blocks.update({ block_id: block.id, ...blockUpdates });
+              }
+            } catch (error) {
+              console.error('Block update failed:', error);
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-block"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: update
+    import_path: "@notionhq/client"
+    namespace: "comments"
+    description: >
+      Updates an existing comment's body. v5 NEW endpoint. A connection can ONLY update
+      comments it created — attempting to update another user's or connection's comment
+      returns 404 (not 403, despite the permission-like nature of the restriction).
+      Exactly one of rich_text or markdown must be provided. Makes an outbound HTTPS PATCH request.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/update-a-comment
+      # SDK source: UpdateCommentParameters in Client.d.ts
+      # Drift-mode deepen (pass 49, 2026-06-24): comments.update is v5 NEW.
+      - id: comments-update-not-author
+        condition: >
+          comments.update() called on a comment that was NOT created by this integration's
+          connection. Notion enforces author-only updates and returns 404 (object_not_found)
+          rather than 403 (restricted_resource) — making the error indistinguishable from
+          a genuinely missing comment. Multi-integration workflows that update comments
+          posted by other connections will hit this.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+          Note: 404 is used even when the comment exists but was created by another connection —
+          the API conflates "not found" with "not your comment" to avoid leaking existence.
+        required_handling: >
+          Caller MUST wrap notion.comments.update() in try-catch. Track which connection
+          created each comment locally (e.g. in your DB) to avoid attempting updates on
+          comments the integration cannot modify:
+            try {
+              await notion.comments.update({ comment_id, rich_text: [...] });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                console.error('Comment not found or not authored by this connection');
+                return;
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/update-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: comments-update-validation-error
+        condition: >
+          comments.update() called with invalid body: missing both rich_text and markdown,
+          providing both simultaneously (exactly one is required), rich_text array exceeding
+          100 items, or markdown containing unsupported block-level elements (only inline
+          formatting is allowed in comments).
+        throws: >
+          APIResponseError with code ValidationError (APIErrorCode.ValidationError, HTTP 400).
+        required_handling: >
+          Caller MUST wrap notion.comments.update() in try-catch. Validate exactly-one-of
+          rich_text/markdown and array sizes before calling.
+        sources:
+          - "https://developers.notion.com/reference/update-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: comments-update-missing-capabilities
+        condition: >
+          comments.update() called when the integration lacks "insert comment" capabilities
+          (Notion uses the same capability for comment write operations including update).
+          This is a capability flag in the integration settings — distinct from page/data-source
+          read/write permissions.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.comments.update() in try-catch. A 403 here means the
+          integration was set up without comment-write capabilities — surface this clearly
+          to the developer rather than treating it as a transient error.
+        sources:
+          - "https://developers.notion.com/reference/update-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+  - name: delete
+    import_path: "@notionhq/client"
+    namespace: "comments"
+    description: >
+      Deletes a comment permanently. v5 NEW endpoint. Like comments.update(), a connection
+      can ONLY delete comments it created — attempting to delete another user's or connection's
+      comment returns 404. Makes an outbound HTTPS DELETE request. DELETE is idempotent and
+      auto-retried by the SDK on 500/503, but 404 is NOT retried.
+
+    postconditions:
+      # Evidence: https://developers.notion.com/reference/delete-a-comment
+      # SDK source: DeleteCommentParameters in Client.d.ts
+      # Drift-mode deepen (pass 49, 2026-06-24): comments.delete is v5 NEW.
+      - id: comments-delete-not-author
+        condition: >
+          comments.delete() called on a comment that was NOT created by this integration's
+          connection. Notion enforces author-only deletion. Returns 404 — indistinguishable
+          from a genuinely missing comment. Cleanup workflows that retry deletions across
+          comments from multiple authors will receive 404 on the comments they don't own.
+        throws: >
+          APIResponseError with code ObjectNotFound (APIErrorCode.ObjectNotFound, HTTP 404).
+        required_handling: >
+          Caller MUST wrap notion.comments.delete() in try-catch. In cleanup workflows,
+          treat 404 as success (already-deleted or not-our-comment — both terminal states):
+            try {
+              await notion.comments.delete({ comment_id });
+            } catch (error) {
+              if (APIResponseError.isAPIResponseError(error) &&
+                  error.code === APIErrorCode.ObjectNotFound) {
+                return; // Already deleted or not our comment — treat as success
+              }
+              throw error;
+            }
+        sources:
+          - "https://developers.notion.com/reference/delete-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
+      - id: comments-delete-missing-capabilities
+        condition: >
+          comments.delete() called when the integration lacks "insert comment" capabilities
+          (Notion's comment-write capability covers both create/update/delete). Read-only
+          integrations cannot delete comments even ones they previously created during a
+          prior capability-grant window.
+        throws: >
+          APIResponseError with code RestrictedResource (APIErrorCode.RestrictedResource, HTTP 403).
+        required_handling: >
+          Caller MUST wrap notion.comments.delete() in try-catch. A 403 on delete() typically
+          indicates the integration's comment capability was revoked since the comment was
+          created — log clearly for diagnostic purposes.
+        sources:
+          - "https://developers.notion.com/reference/delete-a-comment"
+          - "https://developers.notion.com/reference/errors"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
 notes:
   - "All Client methods make HTTPS calls to the Notion API — all require try-catch"
   - "SDK auto-retries: rate_limited (429) for all methods; 500/503 for GET/DELETE only"
@@ -1030,3 +1557,7 @@ notes:
   - "fileUploads is a 3-step flow: create() → send() → complete() — errors at any step require full restart"
   - "oauth.token() authorization codes are single-use and expire quickly — always catch errors in OAuth callback handlers"
   - "databases.update() PATCH is NOT auto-retried on 500/503 — schema may be partially applied on server error"
+  - "v5 (2025-09-03) added the data sources API — dataSources.query is the new row-read path"
+  - "comments.update/delete enforce author-only modification — returns 404 (not 403) on others' comments"
+  - "pages.move() can target either page_id or data_source_id parent — both directions are valid in v5"
+  - "blocks.update() rejects child_page/child_database blocks — route those to pages.update / databases.update"
