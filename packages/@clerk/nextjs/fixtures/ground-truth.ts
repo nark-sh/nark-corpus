@@ -176,3 +176,109 @@ export async function proxyHandlerWithMonitoring(request: Request) {
   }
   return response;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. verifyToken() — bare call, no try-catch → SHOULD_FIRE
+//     Added 2026-06-23 (deepen-stream-3 pass 21). verifyToken() throws
+//     TokenVerificationError on expired/invalid/malformed JWT, missing JWKS,
+//     or missing CLERK_SECRET_KEY. Real-world: webhook handlers, edge-runtime
+//     route handlers that validate session tokens outside clerkMiddleware().
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { verifyToken } from '@clerk/nextjs/server';
+
+export async function verifyTokenNoCatch(token: string) {
+  // SHOULD_NOT_FIRE: scanner gap — verify-token-no-error-handling — postcondition queued
+  // in upgrade-concerns.json (concern-20260623-clerk-nextjs-deepen-1). Once the detector
+  // ships, change this annotation to SHOULD_FIRE.
+  // verifyToken throws TokenVerificationError on expired token, invalid signature,
+  // malformed JWT, missing secret/JWK, etc.
+  const payload = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY! });
+  return payload.sub;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. verifyToken() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function verifyTokenWithCatch(token: string) {
+  try {
+    // SHOULD_NOT_FIRE: verify-token-no-error-handling — inside try-catch
+    const payload = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY! });
+    return payload.sub;
+  } catch (err) {
+    // expired tokens are the dominant case — return null userId, not 500
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. verifyToken() — .catch() promise handler → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function verifyTokenPromiseChain(token: string) {
+  // SHOULD_NOT_FIRE: verify-token-no-error-handling — handled via .catch()
+  return verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY! })
+    .then((payload) => payload.sub)
+    .catch(() => null);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. useReverification() — enhanced fetcher called bare → SHOULD_FIRE
+//     Added 2026-06-23 (deepen-stream-3 pass 21). useReverification wraps an
+//     async fetcher. The returned fetcher rejects with ClerkRuntimeError
+//     (code: "reverification_cancelled") when user closes the modal. Without
+//     a try-catch + isReverificationCancelledError branch, payment / sensitive
+//     UIs show generic "Something went wrong" instead of polite retry UX.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { useReverification } from '@clerk/nextjs';
+
+export function ReverificationButtonBare() {
+  // The returned tuple's first element is the enhanced fetcher.
+  const [enhancedFetcher] = useReverification(async () => {
+    const res = await fetch('/api/sensitive-action', { method: 'POST' });
+    return res.json();
+  });
+
+  const handleClick = async () => {
+    // SHOULD_NOT_FIRE: scanner gap — use-reverification-cancel-not-handled —
+    // postcondition queued in upgrade-concerns.json (concern-20260623-clerk-nextjs-deepen-2).
+    // Once the detector ships, change this annotation to SHOULD_FIRE.
+    // The enhanced fetcher rejects with ClerkRuntimeError(code: "reverification_cancelled")
+    // when user closes the modal without completing verification.
+    const result = await enhancedFetcher();
+    return result;
+  };
+
+  return handleClick;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. useReverification() — with isReverificationCancelledError branch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { isReverificationCancelledError } from '@clerk/nextjs/errors';
+
+export function ReverificationButtonWithCancelCheck() {
+  const [enhancedFetcher] = useReverification(async () => {
+    const res = await fetch('/api/sensitive-action', { method: 'POST' });
+    return res.json();
+  });
+
+  const handleClick = async () => {
+    try {
+      // SHOULD_NOT_FIRE: use-reverification-cancel-not-handled — branched on cancel
+      const result = await enhancedFetcher();
+      return result;
+    } catch (err) {
+      if (isReverificationCancelledError(err)) {
+        // user cancelled — show retry, not error
+        return null;
+      }
+      throw err;
+    }
+  };
+
+  return handleClick;
+}

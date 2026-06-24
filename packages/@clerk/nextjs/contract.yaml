@@ -1,12 +1,12 @@
 package: "@clerk/nextjs"
 semver: ">=5.0.0 <7.0.0"
-contract_version: "1.0.1"
+contract_version: "1.0.2"
 maintainer: "corpus-team"
-last_verified: "2026-06-15"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.95
+coverage_score: 1.0
 
 # Detection configuration — tells the scanner how to track instances
 detection:
@@ -37,6 +37,8 @@ detection:
     - ".attemptFirstFactor("
     - "useUser("
     - "clerkClient("
+    - "verifyToken("
+    - "useReverification("
 
 functions:
   # CRITICAL: Server-side authentication
@@ -736,3 +738,143 @@ functions:
           return the response without logging. Flag if no error monitoring is present.
         sources:
           - "https://clerk.com/docs/advanced-usage/using-proxies"
+  # CRITICAL: Async JWT verification — re-exported from @clerk/backend via @clerk/nextjs/server
+  # Evidence: @clerk/backend@2.x dist/chunk-I4B6KCGC.mjs — TokenVerificationError class with
+  # exhaustive reason enum (TokenExpired, TokenInvalid, TokenInvalidSignature, TokenInvalidAlgorithm,
+  # TokenInvalidAuthorizedParties, TokenNotActiveYet, TokenIatInTheFuture, TokenVerificationFailed,
+  # InvalidSecretKey, LocalJWKMissing, RemoteJWKFailedToLoad, RemoteJWKInvalid, RemoteJWKMissing,
+  # JWKFailedToResolve, JWKKidMismatch). Source inspected 2026-06-23 via npm install @clerk/nextjs@^6.
+  # Real-world use: machine-to-machine auth, webhook handlers, edge-runtime JWT validation,
+  # custom auth flows where developers bypass clerkMiddleware() and validate tokens directly.
+  - name: verifyToken
+    import_path: "@clerk/nextjs/server"
+    description: >
+      Verifies a JWT session token against Clerk's JWKS endpoint and returns the decoded
+      JwtPayload. Async — performs a network request to fetch JWKS unless cached or jwtKey
+      is provided. Throws TokenVerificationError on any verification failure (expired token,
+      invalid signature, malformed JWT, missing secret/JWK, audience mismatch, etc.). Used
+      in webhook handlers, machine-to-machine flows, and edge-runtime route handlers that
+      validate session tokens outside of clerkMiddleware().
+    postconditions:
+      # Evidence: TokenVerificationError thrown from 15+ distinct code paths in
+      # @clerk/backend dist/chunk-KDNHJOF3.mjs (confirmed 2026-06-23). Every failure mode
+      # propagates as a thrown TokenVerificationError; success returns a JwtPayload.
+      # Real-world impact: an uncaught throw in a route handler returns a generic 500 to the
+      # client. Unauthenticated requests (the dominant case) flood error monitoring and mask
+      # genuine 500s. Worse — in some Next.js edge configurations, uncaught throws produce
+      # vague "Internal Server Error" messages with no indication that the issue is auth.
+      - id: verify-token-no-error-handling
+        condition: "verifyToken() called without try-catch or .catch() handler"
+        throws: >
+          Throws TokenVerificationError when:
+          - reason="token-expired": JWT exp claim is in the past (HTTP 401 expected)
+          - reason="token-invalid": malformed JWT or wrong header type (HTTP 400)
+          - reason="token-invalid-signature": signature does not match JWKS public key (HTTP 401)
+          - reason="token-invalid-algorithm": JWT alg header is not RS256 or other accepted algorithm
+          - reason="token-invalid-authorized-parties": azp claim missing from authorizedParties list
+          - reason="token-not-active-yet": JWT nbf claim is in the future (clock skew)
+          - reason="token-iat-in-the-future": JWT iat claim is in the future (clock skew)
+          - reason="token-verification-failed": general verification failure (e.g. aud mismatch)
+          - reason="secret-key-invalid": CLERK_SECRET_KEY env var missing or malformed
+          - reason="jwk-remote-failed-to-load": Clerk JWKS endpoint unreachable (network failure)
+          - reason="jwk-remote-missing" / "jwk-kid-mismatch": JWKS missing key for token's kid header
+          Access: error.reason (one of TokenVerificationErrorReason values), error.action
+          (one of TokenVerificationErrorAction values), error.message.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          MUST wrap verifyToken() in try-catch. The dominant case (expired or missing tokens)
+          is a normal unauthenticated request and should return HTTP 401, not 500.
+          Pattern:
+            try {
+              const payload = await verifyToken(token, { secretKey: env.CLERK_SECRET_KEY });
+              // use payload.sub for userId
+            } catch (err) {
+              if (err instanceof TokenVerificationError) {
+                return new Response('Unauthorized', { status: 401 });
+              }
+              throw err; // re-throw unexpected errors
+            }
+          For JWKS network failures (reason: jwk-remote-failed-to-load), implement a retry
+          with exponential backoff — a transient Clerk outage should not 500 the route.
+        detector: >
+          If verifyToken() from @clerk/nextjs/server (or @clerk/backend, since @clerk/nextjs/server
+          re-exports it verbatim) is called without try-catch or .catch() handler, flag violation.
+          Suppress: if the result of verifyToken() is immediately passed to a wrapper that
+          catches TokenVerificationError, or if the caller is inside a route handler that has
+          a try-catch around the entire body.
+        sources:
+          - "https://clerk.com/docs/references/backend/verify-token"
+          - "https://github.com/clerk/javascript/blob/main/packages/backend/src/tokens/verify.ts"
+  # HIGH: useReverification — the enhanced fetcher throws on user cancel
+  # Evidence: @clerk/shared@3.x dist/runtime/error-Dl9xmUf3.mjs (inspected 2026-06-23):
+  #   function isReverificationCancelledError(err) {
+  #     return isClerkRuntimeError(err) && err.code === "reverification_cancelled";
+  #   }
+  # Real-world use: payment flows (subscription create/update), sensitive profile changes
+  # (email change, password reset, MFA enroll), org-admin actions (delete user, transfer
+  # ownership). The reverification flow opens a modal — if the user closes it without
+  # completing verification, the enhanced fetcher rejects with ClerkRuntimeError(code:"reverification_cancelled").
+  - name: useReverification
+    import_path: "@clerk/nextjs"
+    description: >
+      React hook that wraps an async fetcher and re-runs it after the user completes a
+      reverification flow (typically a password or OTP modal). The wrapped fetcher rejects
+      with ClerkRuntimeError(code:"reverification_cancelled") if the user closes the
+      reverification modal without completing it. Used in payment, profile-change, and
+      admin-action flows where Clerk's session-reverification policy is configured.
+    postconditions:
+      # Evidence: error-Dl9xmUf3.mjs (2026-06-23 inspection) — the cancel path rejects
+      # the original fetcher's promise with isReverificationCancelledError → unhandled
+      # rejection in React event handlers becomes a window unhandledrejection event.
+      # Without the check, payment / sensitive-action UIs show generic error toasts
+      # ("Something went wrong") instead of a polite "verification cancelled" message
+      # that lets the user retry. Worse: the optimistic UI may show the action as
+      # completed when it actually never executed.
+      - id: use-reverification-cancel-not-handled
+        condition: "useReverification() wrapped fetcher called without handling isReverificationCancelledError"
+        throws: >
+          The fetcher returned by useReverification() rejects with ClerkRuntimeError where
+          err.code === "reverification_cancelled" when the user closes the reverification
+          modal without completing it. Use isReverificationCancelledError(err) from
+          '@clerk/nextjs/errors' to type-check. Distinct from network or API errors that
+          may also reject from the underlying fetcher.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        required_handling: >
+          SHOULD catch and distinguish reverification cancellation from real errors.
+          Pattern:
+            const [enhancedFetcher] = useReverification(myFetcher);
+            try {
+              const result = await enhancedFetcher();
+              // success path
+            } catch (err) {
+              if (isReverificationCancelledError(err)) {
+                // user cancelled — show retry button, not error toast
+                return;
+              }
+              // genuine error — show error UI
+              showError(err);
+            }
+          Without this distinction, a user who accidentally closes the modal sees a
+          confusing error toast when nothing actually broke. The action also did not
+          execute, so optimistic UI must be reverted.
+        detector: >
+          If useReverification() is destructured and the returned fetcher is called
+          without try-catch or .catch(), or with try-catch but no isReverificationCancelledError
+          branch, flag warning. Common FPs: error boundaries that catch all errors
+          uniformly may be acceptable if they surface the error to the user with a
+          retry mechanism — these are arguably correct handling.
+        sources:
+          - "https://clerk.com/docs/guides/secure/reverification"
+          - "https://clerk.com/docs/references/react/use-reverification"

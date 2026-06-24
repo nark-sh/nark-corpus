@@ -1,6 +1,19 @@
 # CHANGELOG — @clerk/nextjs
 
 All notable verification, deepen, and fork events for this profile. Newest first.
+
+## 2026-06-23 — deepen pass — coverage 95% → 100%
+
+- **Profile:** `packages/@clerk/nextjs/contract.yaml`
+- **Functions added:** verifyToken, useReverification (2 total)
+- **Postconditions added:** 2 (verify-token-no-error-handling, use-reverification-cancel-not-handled)
+- **Functions intentionally omitted this pass:** getAuth (sync), buildClerkProps (sync), createRouteMatcher (sync), createClerkClient / createClerkClientWithOptions (factories — covered via clerkClient instance methods), reverificationErrorResponse / reverificationError (sync builders), keyless server-actions (dev-only ergonomics), invalidateCacheAction (internal), useSession / useOrganization / useEmailLink (resource-handle hooks — async methods on returned resources covered via clerkClient flows), React components (no async I/O surface).
+- **Scanner concerns queued:** 2 (`concern-20260623-clerk-nextjs-deepen-1` for verifyToken, `concern-20260623-clerk-nextjs-deepen-2` for useReverification)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://clerk.com/docs/references/backend/verify-token ; @clerk/backend@2.x dist/chunk-I4B6KCGC.mjs (TokenVerificationErrorReason enum) ; @clerk/backend@2.x dist/chunk-KDNHJOF3.mjs (throw sites) ; @clerk/shared dist/runtime/error-Dl9xmUf3.mjs (isReverificationCancelledError predicate) ; https://clerk.com/docs/guides/secure/reverification ; https://clerk.com/docs/references/react/use-reverification
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23T00:23Z, deepen-stream-3 pass 21)
+- **Multi-version note:** parent profile only. The extending fork `@clerk/nextjs-v7` inherits both new postconditions automatically via `mergeContracts()`. No edit to the fork's contract.yaml required.
+
 ## 2026-06-18 — re-verified (no action; sibling fork covers latest)
 
 - **Latest published:** @clerk/nextjs@7.5.5
