@@ -2,7 +2,7 @@ package: "mailgun.js"
 semver: ">=3.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -495,6 +495,92 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: low
+
+  - name: lists.members.upload
+    import_path: "mailgun.js"
+    description: >
+      Bulk-uploads a CSV file of members into a mailing list. Added in mailgun.js v13.0.0
+      (2026-04-16) — see CHANGELOG entry "Add CSV bulk upload for members of mailing list".
+      Called as mg.lists.members.upload(mailingListAddress, file, subscribed?, upsert?) where
+      file is a MailListMembersUploadData object (CSV file with member rows). Makes a multipart
+      HTTP POST to the Mailgun API and throws on authentication failure (401), list not found
+      (404), malformed CSV payload (400), payload too large (413), rate limit (429), or network
+      errors. This is the highest-throughput subscriber-onboarding entry point — a single call
+      can subscribe (or unsubscribe via subscribed=false) thousands of addresses at once.
+
+    postconditions:
+      # Evidence: mailgun.js v13.0.0 release notes — "Add CSV bulk upload for members of mailing list"
+      # Type declaration: Types/Interfaces/MailingLists/MailingListMembers.d.ts line 10
+      #   upload(mailingListAddress: string, file: MailListMembersUploadData, subscribed?: boolean, upsert?: boolean): Promise<MailListMembersUploadResponse>
+      # Error class: APIError (type: "MailgunAPIError") with { status, message, details }
+      # Confirmed from source: class R extends Error { static isApiError(e) { return "MailgunAPIError" === e?.type } }
+      - id: members-upload-no-try-catch
+        condition: >
+          mg.lists.members.upload() is called without a surrounding try-catch block. Any HTTP
+          error or network failure — authentication failure (401), mailing list not found (404),
+          malformed CSV (400), payload too large (413), rate limit (429), or connection errors —
+          will cause an unhandled promise rejection. Bulk CSV uploads are typically run inside
+          background jobs or admin scripts where an unhandled rejection means the entire batch
+          import silently fails: the operator believes thousands of subscribers were added when
+          in reality zero rows landed.
+        throws: >
+          APIError with { status: 401|404|400|413|429|5xx, type: 'MailgunAPIError', details: string }.
+          For network errors: generic Error with connection message.
+        required_handling: >
+          Caller MUST wrap mg.lists.members.upload() in try-catch. Bulk member upload is the
+          highest-stakes mailing-list operation — a single silent failure can mean an entire
+          campaign list never received messages, or thousands of users were never unsubscribed
+          when they should have been (CAN-SPAM exposure). Distinguish 4xx errors (caller bug,
+          invalid CSV — surface to operator) from 5xx / network errors (transient — retry with
+          backoff).
+
+          Minimum handling:
+            try {
+              const result = await mg.lists.members.upload(listAddress, csvFile, true, true);
+              logger.info('Bulk member upload succeeded', { list: listAddress });
+              return result;
+            } catch (error) {
+              if (error?.type === 'MailgunAPIError') {
+                if (error.status >= 500 || error.status === 429) {
+                  // transient — schedule retry
+                } else {
+                  logger.error('Bulk member upload failed', { status: error.status, details: error.details });
+                }
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/post-lists-list_address-members.csv"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: members-upload-payload-too-large
+        condition: >
+          CSV file exceeds Mailgun's per-request size or row count limit. HTTP 400 or 413
+          from Mailgun. The upload endpoint enforces a server-side cap on rows per CSV (the
+          documented batch ceiling is ~5,000 rows / ~25MB per file).
+        throws: >
+          APIError with { status: 400 | 413, type: 'MailgunAPIError' }.
+        required_handling: >
+          Chunk large CSV imports into batches at or below Mailgun's documented per-file cap.
+          On 413, split the CSV in half and retry each shard; treat the whole upload as failed
+          until every shard succeeds (do not partially confirm a partial import to the operator).
+        sources:
+          - "https://github.com/mailgun/mailgun.js/blob/main/CHANGELOG.md"
+          - "https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/mailing-lists/post-lists-list_address-members.csv"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
 
   - name: suppressions.destroy
     import_path: "mailgun.js"

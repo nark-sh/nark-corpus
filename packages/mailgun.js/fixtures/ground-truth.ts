@@ -459,6 +459,48 @@ async function gt_webhooks_update_safe(mg: IMailgunClient, domain: string): Prom
   }
 }
 
+// ══════════════════════════════════════════════════
+// DEEPENED FUNCTIONS — Added 2026-06-24 (pass 50, drift-by-staleness re-verification)
+// New surface added in mailgun.js v13.0.0 (2026-04-16): CSV bulk member upload
+// ══════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────
+// 15. lists.members.upload — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_list_member_upload_missing(
+  mg: IMailgunClient,
+  listAddress: string,
+  csvFile: { filename: string; data: Buffer },
+): Promise<void> {
+  // SHOULD_FIRE: members-upload-no-try-catch
+  // @expect-violation: members-upload-no-try-catch
+  await mg.lists.members.upload(listAddress, csvFile, true, true);
+}
+
+// @expect-clean
+async function gt_list_member_upload_safe(
+  mg: IMailgunClient,
+  listAddress: string,
+  csvFile: { filename: string; data: Buffer },
+): Promise<unknown> {
+  try {
+    const result = await mg.lists.members.upload(listAddress, csvFile, true, true);
+    console.info('Bulk member upload succeeded', { list: listAddress });
+    return result;
+  } catch (error: unknown) {
+    const apiError = error as { type?: string; status?: number; details?: string };
+    if (apiError?.type === 'MailgunAPIError') {
+      if ((apiError.status ?? 0) >= 500 || apiError.status === 429) {
+        // transient — schedule retry
+      } else {
+        console.error('Bulk member upload failed', { status: apiError.status, details: apiError.details });
+      }
+    }
+    throw error;
+  }
+}
+
 export {
   gt_suppressions_destroy_missing,
   gt_suppressions_destroy_safe,
@@ -476,4 +518,6 @@ export {
   gt_webhooks_create_safe,
   gt_webhooks_update_missing,
   gt_webhooks_update_safe,
+  gt_list_member_upload_missing,
+  gt_list_member_upload_safe,
 };
