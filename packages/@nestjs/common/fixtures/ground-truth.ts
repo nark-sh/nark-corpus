@@ -13,6 +13,8 @@
  *   - parse-enum-invalid-value               (ParseEnumPipe with out-of-enum value)
  *   - parse-file-missing-required            (ParseFilePipe when no file uploaded)
  *   - parse-file-validator-failed            (ParseFilePipe when MaxFileSizeValidator fails)
+ *   - standard-schema-validation-pipe-validation-error
+ *                                            (StandardSchemaValidationPipe when standard schema returns issues)
  */
 
 import {
@@ -240,6 +242,48 @@ async function parseFileWithErrorHandling(file: Express.Multer.File | undefined)
     if (error instanceof BadRequestException) {
       const response = error.getResponse() as any;
       throw new Error(`File upload rejected: ${response.message}`);
+    }
+    throw error;
+  }
+}
+
+// ─── StandardSchemaValidationPipe (added 2026-06-24 deepen pass) ──────────────
+
+// Deep import — StandardSchemaValidationPipe is @publicApi but NOT re-exported
+// from '@nestjs/common's pipes/index.d.ts as of @nestjs/common@11.1.27.
+import { StandardSchemaValidationPipe } from '@nestjs/common/pipes/standard-schema-validation.pipe';
+
+// Minimal Standard Schema (https://github.com/standard-schema/standard-schema)
+// shim — returns issues to force a validation failure in the violation fixture.
+const failingStandardSchema = {
+  '~standard': {
+    version: 1 as const,
+    vendor: 'fixture-vendor',
+    validate: (_value: unknown) => ({
+      issues: [{ message: 'expected positive integer', path: ['count'] }],
+    }),
+  },
+};
+
+// SHOULD_FIRE: standard-schema-validation-pipe-validation-error
+async function standardSchemaValidationMissingErrorHandling() {
+  const pipe = new StandardSchemaValidationPipe();
+  const metadata = { type: 'body', data: 'body', metatype: Object, schema: failingStandardSchema } as any;
+  const result = await pipe.transform({ count: -1 }, metadata);
+  return result;
+}
+
+// @expect-clean
+async function standardSchemaValidationWithErrorHandling() {
+  const pipe = new StandardSchemaValidationPipe();
+  const metadata = { type: 'body', data: 'body', metatype: Object, schema: failingStandardSchema } as any;
+  try {
+    const result = await pipe.transform({ count: -1 }, metadata);
+    return result;
+  } catch (error) {
+    if (error instanceof BadRequestException) {
+      const response = error.getResponse() as any;
+      throw new Error(`Standard schema validation failed: ${response.message}`);
     }
     throw error;
   }

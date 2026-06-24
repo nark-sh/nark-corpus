@@ -1,7 +1,17 @@
 # @nestjs/common — NestJS common package with decorators, pipes, exceptions, and services.
-# Primary async API surface: the 8 built-in pipe transform() methods. All pipes throw
+# Primary async API surface: the 9 built-in pipe transform() methods. All pipes throw
 # BadRequestException (HTTP 400) by default when validation fails. The exceptionFactory
 # option allows overriding the exception type and status code.
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 73, drift re-verification):
+# API surface re-enumerated against @nestjs/common@11.1.27 (was 11.1.19).
+# New async pipe added since 2026-04-17: StandardSchemaValidationPipe (in
+# pipes/standard-schema-validation.pipe.js, marked @publicApi, accessible via
+# deep import; throws BadRequestException by default when standard-schema
+# validation issues are returned). Existing 8 pipe transforms still async,
+# ParseDatePipe and DefaultValuePipe still sync.
+# Contracted before: 8 / Contracted after: 9 (+1 StandardSchemaValidationPipe)
+# Coverage: 9/9 = 1.0 (100%) — was 8/8 = 1.0
 #
 # Depth pass 2026-04-17 (deepen-stream-1 pass 3):
 # API surface: 8 async-callable pipe transform() methods (decorators/Logger/HttpException omitted)
@@ -14,18 +24,19 @@
 #   Logger (synchronous logging), HttpException subclasses (constructors, not async)
 # Coverage: 8/8 = 1.0 (100%)
 # Evidence confirmed from:
-#   @nestjs/common@11.1.19 source: pipes/*.js — exceptionFactory, BadRequestException throw sites
+#   @nestjs/common@11.1.27 source: pipes/*.js — exceptionFactory, BadRequestException throw sites
+#   @nestjs/common@11.1.27 source: pipes/standard-schema-validation.pipe.js (added since 11.1.19)
 #   https://docs.nestjs.com/pipes (built-in pipes section)
 #   https://docs.nestjs.com/techniques/validation (ValidationPipe)
 package: "@nestjs/common"
 semver: ">=10.0.0 <12.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 8 contracted / 8 total async-callable pipe functions (sync methods omitted)
+coverage_score: 1.0  # 9 contracted / 9 total async-callable pipe functions (sync methods omitted)
 description: NestJS common package with built-in pipes, decorators, exceptions, and services
 
 detection:
@@ -42,6 +53,7 @@ detection:
     - ParseFloatPipe
     - ParseEnumPipe
     - ParseFilePipe
+    - StandardSchemaValidationPipe
 
 functions:
   - name: ValidationPipe
@@ -516,6 +528,96 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: StandardSchemaValidationPipe
+    import_path: "@nestjs/common/pipes/standard-schema-validation.pipe"
+    description: >
+      Built-in async pipe (added in @nestjs/common >=11.1.20) that validates incoming
+      values against a Standard Schema (https://github.com/standard-schema/standard-schema)
+      attached to the parameter metadata via @SchemaFor() or equivalent. Conforms to the
+      Standard Schema spec, allowing validation libraries like Zod, Valibot, ArkType,
+      and similar to be used uniformly through a single pipe. Marked @publicApi in
+      source but only accessible via deep import (NOT re-exported from
+      @nestjs/common's pipes/index.d.ts as of 11.1.27 — import directly from
+      '@nestjs/common/pipes/standard-schema-validation.pipe'). Throws via the
+      configured exceptionFactory when the schema's ~standard.validate() method
+      returns a result with .issues populated. The default exceptionFactory
+      constructs new HttpErrorByCode[errorHttpStatusCode](messages), which defaults
+      to BadRequestException (HTTP 400) since errorHttpStatusCode defaults to
+      HttpStatus.BAD_REQUEST.
+
+    postconditions:
+      # Evidence: @nestjs/common@11.1.27 pipes/standard-schema-validation.pipe.js
+      # async transform(value, metadata) {
+      #   const schema = metadata.schema;
+      #   if (!schema || !this.toValidate(metadata)) { return value; }
+      #   this.stripProtoKeys(value);
+      #   const result = await this.validate(value, schema, this.validateOptions);
+      #   if (result.issues) { throw this.exceptionFactory(result.issues); }
+      #   return this.isTransformEnabled ? result.value : value;
+      # }
+      # constructor default: errorHttpStatusCode = HttpStatus.BAD_REQUEST (400)
+      # default exceptionFactory: (issues) => new HttpErrorByCode[errorHttpStatusCode](issues.map(i => i.message))
+      - id: standard-schema-validation-pipe-validation-error
+        condition: >
+          A value passed to StandardSchemaValidationPipe.transform() fails validation
+          against the standard schema attached to the parameter metadata. Common cases:
+          - A Zod / Valibot / ArkType schema reports issues for the input
+            (missing required fields, wrong types, failed refinements)
+          - A custom Standard Schema implementation's ~standard.validate() returns
+            { issues: [...] } instead of { value: T }
+          - The schema returns a Promise that resolves to issues (transform awaits)
+          The pipe awaits validate() and throws synchronously after the await when
+          result.issues is truthy.
+        throws: >
+          BadRequestException (HTTP 400) by default — the default exceptionFactory
+          maps each issue's .message to a string and constructs
+          new HttpErrorByCode[HttpStatus.BAD_REQUEST](messages). When errorHttpStatusCode
+          is customized in the constructor options, the exception class changes (e.g.
+          errorHttpStatusCode: 422 → UnprocessableEntityException). Custom
+          exceptionFactory can return any HttpException subclass or other throwable.
+        required_handling: >
+          When the pipe is registered globally or via @UsePipes(), NestJS's built-in
+          exception handler converts BadRequestException to a 400 HTTP response
+          automatically — no caller try-catch is needed in normal route-handler usage.
+
+          For programmatic / manual usage (calling .transform() directly), wrap the
+          call:
+
+            const pipe = new StandardSchemaValidationPipe();
+            try {
+              const validated = await pipe.transform(payload, metadata);
+              // proceed with validated data
+            } catch (error) {
+              if (error instanceof BadRequestException) {
+                return res.status(400).json(error.getResponse());
+              }
+              throw error;
+            }
+
+          To customize the HTTP status code on validation failure:
+            new StandardSchemaValidationPipe({
+              errorHttpStatusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+            });
+
+          To customize the thrown exception entirely:
+            new StandardSchemaValidationPipe({
+              exceptionFactory: (issues) => new MyDomainValidationError(issues),
+            });
+
+          Note: this pipe is currently only accessible via deep import in 11.1.x:
+            import { StandardSchemaValidationPipe } from '@nestjs/common/pipes/standard-schema-validation.pipe';
+          It is not re-exported from '@nestjs/common'.
+        sources:
+          - "https://github.com/standard-schema/standard-schema"
+          - "https://docs.nestjs.com/pipes"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
   - name: Injectable
     import_path: "@nestjs/common"
     description: "Class decorator for dependency injection. Marks a class as a provider that can be injected into other classes via NestJS DI container."
@@ -585,9 +687,10 @@ edge_cases:
       incident_cost_range: low
 
 # Category: framework
-# Latest version: 11.1.19
+# Latest version: 11.1.27
 # Generated: 2026-02-26
 # Audited: 2026-04-02 — scan-nestjs-common-2026-04-02.json
 # Re-audited: 2026-04-13 — no new violations found, evidence quality confirmed
 # Deepened: 2026-04-17 — full pipe API surface contracted (8 async pipe transform() methods)
+# Deepened: 2026-06-24 — drift re-verification against 11.1.27; +1 StandardSchemaValidationPipe (9 async pipes total)
 # FP check: 0/100 false positives (0% rate)
