@@ -20,6 +20,7 @@
  *   - app.register()                  postconditions: register-errors-deferred-to-ready, register-plugin-timeout
  *   - app.after()                     postcondition: after-error-parameter-unchecked
  *   - app.addHook()                   postconditions: addhook-async-hook-no-try-catch, addhook-onclose-async-unhandled
+ *   - app.route()                     postconditions: route-duplicated-route, route-handler-not-fn, route-method-not-supported (all info severity — startup-time programming errors)
  */
 
 import fastify from 'fastify';
@@ -274,4 +275,56 @@ async function fetchUserData() {
 
 async function processUpload(body: unknown) {
   return body;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. route() imperative registration — startup programming errors (severity:info)
+//     These three postconditions document startup-time programmer errors. The
+//     fixture exists so any future scanner rule has a callsite to anchor to;
+//     SHOULD_NOT_FIRE reflects today's contract severity (info — fail-the-deploy).
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function routeImperativeDuplicate() {
+  const app = fastify();
+
+  // SHOULD_NOT_FIRE: route-duplicated-route
+  app.route({
+    method: 'GET',
+    url: '/users',
+    handler: async (_req, _reply) => ({ ok: true }),
+  });
+
+  // SHOULD_NOT_FIRE: route-duplicated-route
+  app.route({
+    method: 'GET',
+    url: '/users',
+    handler: async (_req, _reply) => ({ ok: false }),
+  });
+
+  await app.listen({ port: 0 });
+}
+
+async function routeImperativeMissingHandler() {
+  const app = fastify();
+
+  // SHOULD_NOT_FIRE: route-handler-not-fn
+  app.route({
+    method: 'POST',
+    url: '/events',
+  } as any);
+
+  await app.listen({ port: 0 });
+}
+
+async function routeImperativeBadMethod() {
+  const app = fastify();
+
+  // SHOULD_NOT_FIRE: route-method-not-supported
+  app.route({
+    method: 'FOO' as any,
+    url: '/legacy',
+    handler: async (_req, _reply) => ({ ok: true }),
+  });
+
+  await app.listen({ port: 0 });
 }

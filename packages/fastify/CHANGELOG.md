@@ -2,6 +2,24 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-24 — deepen pass — coverage 91% → 100%
+
+- **Profile:** `packages/fastify/contract.yaml`
+- **Functions added:** route (1 total)
+- **Postconditions added:** 3 (route-duplicated-route, route-handler-not-fn, route-method-not-supported) — all severity=info, startup-time programming errors
+- **Functions intentionally omitted this pass:** none — the parent profile now covers every non-omitted async-callable on FastifyInstance. The three pre-existing omissions remain: inject (in-process testing harness), `[Symbol.asyncDispose]` (alias for close()), and the WebDAV/all route shorthand verbs (same RouteShorthandMethod signature as `get`, covered by existing get postconditions).
+- **Scanner concerns queued:** 2 (`concern-20260624-fastify-deepen-1` detection rule / no-detector decision for route postconditions, `concern-20260624-fastify-deepen-2` flip SHOULD_NOT_FIRE annotations once a detection rule lands)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://fastify.dev/docs/latest/Reference/Routes/
+  - https://fastify.dev/docs/latest/Reference/Errors/
+  - `node_modules/fastify/types/instance.d.ts` (FastifyInstance.route method signature)
+  - `node_modules/fastify/lib/errors.js:357-438` (FST_ERR_DUPLICATED_ROUTE, FST_ERR_ROUTE_HANDLER_NOT_FN, FST_ERR_ROUTE_MISSING_HANDLER, FST_ERR_ROUTE_DUPLICATED_HANDLER, FST_ERR_ROUTE_METHOD_INVALID, FST_ERR_ROUTE_METHOD_NOT_SUPPORTED registry entries)
+  - `node_modules/fastify/lib/route.js:370` (`throw new FST_ERR_DUPLICATED_ROUTE` after find-my-way duplicate detection)
+  - `node_modules/fastify/lib/route.js normalizeAndValidateMethod()` (FST_ERR_ROUTE_METHOD_INVALID + FST_ERR_ROUTE_METHOD_NOT_SUPPORTED throws)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T14:0X UTC)
+- **Notes:** Severity is `info` (not warning/error) because all three are programmer errors that fail synchronously at startup — same FP-prevention rationale used for the register-* downgrades on 2026-04-21. The contract documents the FST_ERR_* error codes for consumers grounding their own error handlers but does not flag every route() callsite as a runtime concern.
+
 ## 2026-06-18 — deepen pass — coverage 90% → 91%
 
 - **Profile:** `packages/fastify/contract.yaml`

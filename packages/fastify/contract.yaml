@@ -1,12 +1,12 @@
 package: fastify
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.3.0"
+contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-18"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.91  # 10 contracted / 11 total async-callable functions (inject omitted as testing utility). +1 this pass: setNotFoundHandler (deepen-stream-2 pass 15, 2026-06-18 — fastify@5.8.5)
+coverage_score: 1.0  # 11 contracted / 11 total async-callable functions (inject + WebDAV verbs + Symbol.asyncDispose omitted as documented below). +1 this pass: route (deepen-stream-3 pass 84, 2026-06-24 — fastify@5.8.5). Previous: setNotFoundHandler (pass 15, 2026-06-18).
 
 detection:
   factory_methods:
@@ -499,6 +499,86 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: medium
 
+  - name: route
+    import_path: "fastify"
+    description: >
+      Imperative full-route registration. Equivalent in error behavior to the
+      shorthand methods (get/post/put/delete/patch/options/head) for the
+      handler-runtime contract, but exposes distinct startup-time programming
+      errors that the shorthand methods route through their own argument
+      shapes. route() accepts an options object — the validation errors below
+      are thrown synchronously at registration time, not deferred to
+      listen()/ready().
+    postconditions:
+      # Evidence: https://fastify.dev/docs/latest/Reference/Routes/
+      # Error codes confirmed from fastify/lib/errors.js and fastify/lib/route.js
+      - id: route-duplicated-route
+        # Source: fastify/lib/route.js:370 — throw new FST_ERR_DUPLICATED_ROUTE(opts.method, opts.url)
+        # Surfaces when find-my-way's underlying router detects an existing handler
+        # for the same method:url pair. Detected at registration time, not at request time.
+        condition: "route({ method, url }) is called with a method+url pair that was already registered earlier in the same server / plugin scope"
+        throws: "FST_ERR_DUPLICATED_ROUTE — Error: Method '<method>' already declared for route '<url>'. Thrown synchronously by route() at registration time."
+        required_handling: "This is a startup-time programming error — surfaces immediately on next deploy, before listen() returns. Use distinct URLs per method, or register the route under an encapsulated plugin prefix so each scope owns its own route table. Catch is unnecessary for production hot paths; the failure is caught by the startup process manager (systemd, k8s) restart loop."
+        sources:
+          # Fetched: https://fastify.dev/docs/latest/Reference/Errors/
+          - "https://fastify.dev/docs/latest/Reference/Errors/"
+          - "https://fastify.dev/docs/latest/Reference/Routes/"
+        severity: info
+        # Severity = info (not warning/error): this is a startup-only programming error.
+        # If it would fire in production, it already prevented listen() from completing
+        # on the previous deploy. Treating it as a per-callsite warning would flag
+        # every route registration call in normal Fastify apps — same FP shape as
+        # the register() postconditions downgraded 2026-04-21. Kept on the contract
+        # for documentation completeness so consumers can ground the FST_ERR_*
+        # error code in their own error handlers if they choose.
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: route-handler-not-fn
+        # Source: fastify/lib/errors.js:389 — FST_ERR_ROUTE_HANDLER_NOT_FN
+        # Source: fastify/lib/errors.js:395 — FST_ERR_ROUTE_MISSING_HANDLER
+        # Source: fastify/lib/errors.js:384 — FST_ERR_ROUTE_DUPLICATED_HANDLER
+        condition: "route() is called without a handler function in opts.handler, with a non-function handler, or with both opts.handler and opts.method[].handler set"
+        throws: "FST_ERR_ROUTE_HANDLER_NOT_FN — TypeError, OR FST_ERR_ROUTE_MISSING_HANDLER — Error, OR FST_ERR_ROUTE_DUPLICATED_HANDLER — Error. Thrown synchronously by route() at registration time."
+        required_handling: "Pass exactly one handler function via opts.handler. These are programming errors that fail at startup, not in production traffic. No per-callsite try-catch needed — the error fails the deploy."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Errors/"
+          - "https://fastify.dev/docs/latest/Reference/Routes/"
+        severity: info
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: route-method-not-supported
+        # Source: fastify/lib/errors.js:400 — FST_ERR_ROUTE_METHOD_INVALID (typeof method !== 'string')
+        # Source: fastify/lib/errors.js:406 — FST_ERR_ROUTE_METHOD_NOT_SUPPORTED (unknown method)
+        # Source: fastify/lib/route.js normalizeAndValidateMethod() — both throws here
+        # Note: Fastify 5 added addHttpMethod() to register custom non-standard methods;
+        # without that call, only GET/HEAD/TRACE/DELETE/OPTIONS/PATCH/PUT/POST are accepted.
+        condition: "route({ method }) is called with a non-string method (e.g. number, null) or a string that is not a built-in HTTP method and was not registered via addHttpMethod()"
+        throws: "FST_ERR_ROUTE_METHOD_INVALID — TypeError: Provided method is invalid! OR FST_ERR_ROUTE_METHOD_NOT_SUPPORTED — Error: <method> method is not supported. Thrown synchronously by route() at registration time."
+        required_handling: "Use a standard HTTP method or register custom methods via fastify.addHttpMethod() before calling route(). Startup programming error — fails the deploy, not a runtime contract."
+        sources:
+          - "https://fastify.dev/docs/latest/Reference/Errors/"
+          - "https://fastify.dev/docs/latest/Reference/Routes/"
+        severity: info
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 edge_cases:
   - id: error-handler-configuration
     description: "Configure setErrorHandler at app or route level for centralized error handling - prevents inconsistent error responses and provides proper error formatting"
@@ -519,10 +599,11 @@ edge_cases:
 # Deepened: 2026-04-11 — deepen-stream-2 pass 1
 # Deepened: 2026-04-13 — deepen-stream-2 pass 2
 # Deepened: 2026-06-18 — deepen-stream-2 pass 15 (+1 function: setNotFoundHandler, +3 postconditions)
-# Coverage: 10/11 non-omitted async-callable functions = 91% (was 9/10 = 90% before pass 15)
+# Deepened: 2026-06-24 — deepen-stream-3 pass 84 (+1 function: route, +3 postconditions — startup-time programming errors)
+# Coverage: 11/11 non-omitted async-callable functions = 100% (was 10/11 = 91% before pass 84)
 #   Contracted: get (route handlers + handlerTimeout), listen, close, ready, register, after, addHook,
 #               setErrorHandler (3 postconditions), addContentTypeParser (3 postconditions),
-#               setNotFoundHandler (3 postconditions — added pass 15)
+#               setNotFoundHandler (3 postconditions — added pass 15),
+#               route (3 postconditions — added pass 84)
 #   Intentionally omitted: inject (testing utility), all/WebDAV route methods (same error profile as get),
 #                          [Symbol.asyncDispose] (alias for close())
-#   Not yet contracted: route() — same error profile as get, FST_ERR_DUPLICATED_ROUTE is startup-time programming error
