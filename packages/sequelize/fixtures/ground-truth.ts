@@ -29,6 +29,7 @@
  *   - Model.findCreateFind()         postcondition: findcreatefind-validation-error
  *   - instance.restore()             postcondition: instance-restore-not-paranoid
  *   - instance.increment()           postcondition: instance-increment-db-error
+ *   - instance.decrement()           postcondition: instance-decrement-db-error
  *
  * Detection path: Sequelize instance tracked →
  *   ThrowingFunctionDetector fires .authenticate()/.models.User.findAll() →
@@ -597,6 +598,27 @@ export async function instanceIncrementWithCatch() {
     await (post as any).increment('viewCount');
   } catch (err) {
     console.error('instance.increment failed:', err);
+    throw err;
+  }
+}
+
+// ── instance.decrement() ──
+
+export async function instanceDecrementNoCatch() {
+  // SHOULD_NOT_FIRE: scanner gap — instance-decrement-db-error — instance.decrement() throws on DB error. No try-catch.
+  // @expect-violation: instance-decrement-db-error
+  const account = await sequelize.models.Account.findByPk(1);
+  await (account as any).decrement('balance', { by: 10 });
+}
+
+export async function instanceDecrementWithCatch() {
+  // @expect-clean
+  // SHOULD_NOT_FIRE: instance.decrement() inside try-catch
+  try {
+    const account = await sequelize.models.Account.findByPk(1);
+    await (account as any).decrement('balance', { by: 10 });
+  } catch (err) {
+    console.error('instance.decrement failed:', err);
     throw err;
   }
 }

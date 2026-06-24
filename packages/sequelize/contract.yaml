@@ -2,7 +2,7 @@ package: sequelize
 semver: ">=6.28.1"
 contract_version: "2.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -1326,6 +1326,79 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  - name: instance.decrement
+    import_path: "sequelize"
+    description: >
+      Instance method that atomically decrements one or more columns on this specific
+      model instance via a "SET column = column - X" UPDATE. Delegates to the static
+      Model.decrement() under the hood with the instance's primary key as the WHERE
+      clause. Returns the instance (or the original instance in non-PostgreSQL
+      dialects — call reload() to refresh in-memory state). Distinct from static
+      Model.decrement() which can decrement many rows at once via a WHERE clause.
+      Evidence: node_modules/sequelize/types/model.d.ts line 3260 — Promise<this>;
+      typed signature confirmed in installed sequelize@6.37.8.
+    postconditions:
+      # Evidence: https://sequelize.org/docs/v6/core-concepts/model-instances/#incrementing-and-decrementing-integer-values
+      # Source confirmed: instance.decrement() mirrors instance.increment() — delegates to Model.decrement()
+      # with where: this.where(). Same error class hierarchy: DatabaseError, ConnectionError.
+      # Does NOT prevent negative values — that's the caller's responsibility via check constraints.
+      - id: instance-decrement-db-error
+        condition: >
+          Database connection failure or driver error during the UPDATE SQL. The instance
+          already exists in memory — the error comes from the underlying UPDATE query.
+          If the record was deleted between fetch and decrement, no error is thrown —
+          0 rows are affected silently (UPDATE returns affectedRows: 0). Decrement does
+          NOT enforce a floor — values can go negative unless the schema has a CHECK
+          constraint that the database itself rejects.
+        throws: "DatabaseError, ConnectionError — same as Model.decrement() since instance method delegates to static"
+        required_handling: >
+          Caller MUST wrap instance.decrement() in try/catch.
+          Common in inventory/credit/quota systems that debit counters under load.
+          A CHECK constraint violation (e.g. balance >= 0) surfaces as a DatabaseError —
+          catching it is REQUIRED to convert into a domain "insufficient funds" response.
+          Silent 0-row updates (deleted record) are NOT errors — check affectedRows if
+          you need to detect phantom decrements.
+          Example:
+            try {
+              await account.decrement('balance', { by: amount });
+            } catch (error) {
+              if (error instanceof Sequelize.DatabaseError) {
+                // Check constraint violation (e.g. balance < 0) lands here
+                throw new InsufficientFundsError(error.message);
+              }
+              throw error;
+            }
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-instances/#incrementing-and-decrementing-integer-values"
+          - "https://github.com/sequelize/sequelize/blob/main/src/model.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+    edge_cases:
+      - id: instance-decrement-no-floor-check
+        description: >
+          COMMON PRODUCTION BUG: instance.decrement() does NOT prevent values from
+          going below zero. In inventory, credit, quota, or rate-limit counters
+          this leads to negative balances unless either (a) the schema has a CHECK
+          constraint (preferred), or (b) the caller wraps decrement in a transaction
+          that re-reads and validates the post-decrement value. Wrapping in a
+          transaction without re-validation is NOT sufficient — concurrent decrements
+          can still drive the value negative.
+        sources:
+          - "https://sequelize.org/docs/v6/core-concepts/model-instances/#incrementing-and-decrementing-integer-values"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: describe
     import_path: "sequelize"
