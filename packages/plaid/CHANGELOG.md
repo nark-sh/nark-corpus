@@ -3,6 +3,25 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 83% → 85%
+
+- **Profile:** `packages/plaid/contract.yaml`
+- **Functions added:** assetReportCreate, identityVerificationCreate, processorTokenCreate (3 total)
+- **Postconditions added:** 9 (3 per new function)
+- **Functions intentionally omitted this pass:** none new (the 4 institutional read-only methods remain omitted)
+- **Scanner concerns queued:** 3 (`concern-20260624-plaid-deepen-1`, `concern-20260624-plaid-deepen-2`, `concern-20260624-plaid-deepen-3`)
+- **Scanner version used:** nark@3.2.0 (per nark-dev/nark/package.json)
+- **Sources fetched:**
+  - https://plaid.com/docs/api/products/assets/#assetreportcreate
+  - https://plaid.com/docs/errors/asset-report/
+  - https://plaid.com/docs/api/products/identity-verification/#identity_verificationcreate
+  - https://plaid.com/docs/errors/invalid-input/
+  - https://plaid.com/docs/api/processors/#processortokencreate
+  - https://plaid.com/docs/errors/item/
+  - https://plaid.com/docs/errors/rate-limit-exceeded/
+- **Verified by:** bc-deepen-contract (pass 28, deepen-stream-2, 2026-06-24T02:00:00Z)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** plaid@42.2.0

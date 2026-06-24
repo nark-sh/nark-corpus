@@ -2,11 +2,11 @@ package: plaid
 semver: ">=9.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83  # 20 contracted / 24 total async-callable (4 intentionally-omitted: categoriesGet, institutionsGet/Search/GetById)
+coverage_score: 0.85  # 23 contracted / 27 total async-callable (4 intentionally-omitted: categoriesGet, institutionsGet/Search/GetById)
 
 # Official Plaid Node.js/TypeScript SDK — OpenAPI-generated (v9+/v14+).
 # All methods are called on a PlaidApi instance and return AxiosResponse<T>.
@@ -939,3 +939,268 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  - name: assetReportCreate
+    import_path: "plaid"
+    description: >
+      Initiates asynchronous creation of an Asset Report for a set of access tokens.
+      Returns asset_report_token and asset_report_id immediately; the report itself
+      becomes retrievable via /asset_report/get only after a PRODUCT_READY webhook
+      fires (seconds to a minute). Used by lending/mortgage apps (Fannie Mae Day 1
+      Certainty, Freddie Mac LPA AIM). Throws an Axios error with PlaidError payload
+      on API or per-Item failure.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/assets/#assetreportcreate
+      # Evidence: https://plaid.com/docs/errors/asset-report/
+      # Confirmed in dist/api.d.ts (PlaidApi.assetReportCreate, line 72181)
+      - id: asset-report-creation-error
+        condition: >
+          ASSET_REPORT_ERROR (PRODUCT_NOT_ENABLED, NO_AUTH_ACCOUNTS, INVALID_PARENT,
+          DATA_UNAVAILABLE) or per-Item ITEM_ERROR returned as causes[] entries.
+          One access_token in the batch failing surfaces as a top-level error with
+          a non-empty causes[] array — partial reports are NOT created.
+        throws: >
+          Axios error. Access PlaidError via error.response.data. Fields:
+          error_type = 'ASSET_REPORT_ERROR', error_code (e.g. 'PRODUCT_NOT_ENABLED',
+          'NO_AUTH_ACCOUNTS', 'DATA_UNAVAILABLE'), causes[] (per-Item breakdown
+          when multiple access_tokens were passed).
+        required_handling: >
+          Caller MUST wrap in try-catch. Asset Report creation is the gating step
+          for the entire lending verification flow — a silent failure here blocks
+          loan applications. Inspect causes[] when batching multiple Items; you
+          may need to re-link a single Item without aborting the whole report.
+          Do NOT log the full error (request headers contain client_secret).
+        sources:
+          - "https://plaid.com/docs/api/products/assets/#assetreportcreate"
+          - "https://plaid.com/docs/errors/asset-report/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: https://plaid.com/docs/errors/invalid-input/
+      - id: invalid-input-error
+        condition: >
+          INVALID_INPUT when access_token is malformed/expired/revoked, when
+          days_requested exceeds tier maximum (e.g. >730), or when options.user
+          fields are missing required attributes for downstream consumers
+          (Fannie Mae / Freddie Mac require specific user fields).
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_INPUT', error_code (e.g. 'INVALID_ACCESS_TOKEN',
+          'INVALID_FIELD', 'TOO_MANY_VERIFICATION_ATTEMPTS').
+        required_handling: >
+          Caller MUST wrap in try-catch. INVALID_INPUT is a programmer error —
+          fix the request rather than retrying. Validate access_token format and
+          days_requested ceiling client-side before calling.
+        sources:
+          - "https://plaid.com/docs/errors/invalid-input/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: rate-limit-exceeded
+        condition: >
+          RATE_LIMIT_EXCEEDED when Asset Report creation rate exceeds tier limits.
+          Particularly common in batch onboarding flows where hundreds of reports
+          are generated in a short window (lender bulk-uploads, refinance bursts).
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'RATE_LIMIT_EXCEEDED', error_code = 'RATE_LIMIT'.
+        required_handling: >
+          Caller MUST wrap in try-catch and implement exponential backoff with
+          jitter. Asset Report creation is expensive — gate batch jobs at a
+          known-safe RPS. Surface a delay banner to the user, NOT a hard error.
+        sources:
+          - "https://plaid.com/docs/errors/rate-limit-exceeded/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: identityVerificationCreate
+    import_path: "plaid"
+    description: >
+      Starts a new identity verification session for a user against a specified
+      template. Returns the IdentityVerification resource with status (e.g.
+      pending_review, success, failed). Used for Plaid Identity Verification (IDV)
+      product — KYC, document verification, selfie check. Throws an Axios error
+      with PlaidError payload on API or template-config failure.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/products/identity-verification/#identity_verificationcreate
+      # Evidence: https://plaid.com/docs/errors/identity-verification/
+      # Confirmed in dist/api.d.ts (PlaidApi.identityVerificationCreate)
+      - id: invalid-input-error
+        condition: >
+          INVALID_INPUT when template_id is missing/unknown, client_user_id is
+          invalid, or required user fields (e.g. email_address, phone_number) are
+          missing for the chosen template. Common when a template requires SSN
+          but the request omits it.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_INPUT', error_code (e.g. 'INVALID_FIELD',
+          'INVALID_TEMPLATE', 'MISSING_FIELDS').
+        required_handling: >
+          Caller MUST wrap in try-catch. Identity verification is a gating step
+          for account opening — failure here means the user cannot proceed.
+          Validate template requirements server-side and surface a clear
+          actionable error to the user.
+        sources:
+          - "https://plaid.com/docs/api/products/identity-verification/#identity_verificationcreate"
+          - "https://plaid.com/docs/errors/invalid-input/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: idempotent-conflict
+        condition: >
+          INVALID_REQUEST / IDV_INVALID_TEMPLATE_OR_VERSION when the (client_user_id,
+          template_id) pair already has an active verification and is_shareable is
+          false. Plaid blocks duplicate sessions for the same user against the same
+          template to prevent abuse and duplicate billing.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_REQUEST', error_code references the existing
+          identity_verification_id in error_message.
+        required_handling: >
+          Caller MUST wrap in try-catch. On this error, fetch the existing
+          verification via identityVerificationGet using the id surfaced in
+          error_message rather than retrying create. Do NOT show a generic
+          "verification failed" — the user already has a session.
+        sources:
+          - "https://plaid.com/docs/api/products/identity-verification/#identity_verificationcreate"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: api-error
+        condition: >
+          API_ERROR (Plaid-side outage) or INSTITUTION_ERROR (downstream KYC
+          provider unavailable). Document-verification flows depend on third-party
+          OCR/document providers which can have independent outages.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'API_ERROR' or 'INSTITUTION_ERROR'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Implement retry with exponential backoff
+          for API_ERROR (transient). For INSTITUTION_ERROR, allow the user to
+          retry but surface a degraded-state message rather than blocking.
+        sources:
+          - "https://plaid.com/docs/errors/api/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: processorTokenCreate
+    import_path: "plaid"
+    description: >
+      Exchanges an access_token + account_id for a processor_token to share Item
+      data with a downstream payment processor (Dwolla, Stripe, Square, Modern
+      Treasury, etc.). The processor uses the token to debit/credit the linked
+      account. Used by money-movement apps that don't process ACH themselves.
+
+    postconditions:
+      # Evidence: https://plaid.com/docs/api/processors/#processortokencreate
+      # Evidence: https://plaid.com/docs/errors/invalid-input/
+      # Confirmed in dist/api.d.ts (PlaidApi.processorTokenCreate)
+      - id: invalid-account-id
+        condition: >
+          INVALID_INPUT / INVALID_ACCOUNT_ID when account_id does not belong to
+          the Item identified by access_token, or when the account has been
+          closed/removed at the institution. Also fires when processor name is
+          not one of the supported enum values (e.g. typo'd 'stripe' as 'strype').
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'INVALID_INPUT', error_code = 'INVALID_ACCOUNT_ID' or
+          'INVALID_FIELD' for processor enum mismatch.
+        required_handling: >
+          Caller MUST wrap in try-catch. The processor_token is the prerequisite
+          for ANY payment flow — silent failure here means the user clicks "Pay"
+          and nothing happens. Surface a re-link prompt for closed accounts.
+        sources:
+          - "https://plaid.com/docs/api/processors/#processortokencreate"
+          - "https://plaid.com/docs/errors/invalid-input/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: item-login-required
+        condition: >
+          ITEM_ERROR / ITEM_LOGIN_REQUIRED when the user's credentials at the
+          institution have expired/been revoked. processorTokenCreate requires a
+          healthy Item; cannot mint a processor_token from a broken one.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'ITEM_ERROR', error_code = 'ITEM_LOGIN_REQUIRED'.
+        required_handling: >
+          Caller MUST wrap in try-catch. Trigger Link in update mode to refresh
+          credentials, then retry processorTokenCreate. Do NOT proceed with the
+          payment flow against a stale processor_token.
+        sources:
+          - "https://plaid.com/docs/errors/item/"
+          - "https://plaid.com/docs/link/update-mode/"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: rate-limit-exceeded
+        condition: >
+          RATE_LIMIT_EXCEEDED when processor token creation rate exceeds tier
+          limits. Particularly common in batch reconciliation flows where many
+          processor tokens are refreshed in sequence.
+        throws: >
+          Axios error with PlaidError in error.response.data.
+          error_type = 'RATE_LIMIT_EXCEEDED', error_code = 'RATE_LIMIT'.
+        required_handling: >
+          Caller MUST wrap in try-catch and implement exponential backoff.
+          Pace batch processor-token refresh below the documented tier RPS.
+        sources:
+          - "https://plaid.com/docs/errors/rate-limit-exceeded/"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium

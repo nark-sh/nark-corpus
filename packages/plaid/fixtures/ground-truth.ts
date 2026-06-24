@@ -591,3 +591,138 @@ export async function evaluateSignalWithCatch(
     throw new Error(`Signal evaluation failed: ${plaidError?.error_code || 'UNKNOWN'}`);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. assetReportCreate (added in depth pass 2026-06-24 — pass 28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: assetReportCreate.asset-report-creation-error
+// @expect-violation: assetReportCreate.invalid-input-error
+// @expect-violation: assetReportCreate.rate-limit-exceeded
+export async function createAssetReportNoCatch(accessTokens: string[]) {
+  // SHOULD_FIRE: asset-report-creation-error, invalid-input-error, rate-limit-exceeded — no try-catch
+  const response = await plaidClient.assetReportCreate({
+    access_tokens: accessTokens,
+    days_requested: 60,
+    options: {
+      client_report_id: 'report-001',
+      user: {
+        first_name: 'Jane',
+        last_name: 'Doe',
+      },
+    },
+  });
+  return response.data.asset_report_token;
+}
+
+// @expect-clean
+export async function createAssetReportWithCatch(accessTokens: string[]) {
+  try {
+    // SHOULD_NOT_FIRE: assetReportCreate inside try-catch
+    const response = await plaidClient.assetReportCreate({
+      access_tokens: accessTokens,
+      days_requested: 60,
+      options: {
+        client_report_id: 'report-001',
+        user: { first_name: 'Jane', last_name: 'Doe' },
+      },
+    });
+    return response.data.asset_report_token;
+  } catch (error: any) {
+    const plaidError = error.response?.data;
+    if (plaidError?.error_type === 'RATE_LIMIT_EXCEEDED') {
+      throw new Error('Asset report rate limit exceeded — back off and retry');
+    }
+    if (plaidError?.error_type === 'ASSET_REPORT_ERROR') {
+      throw new Error(`Asset report failed: ${plaidError.error_code}`);
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. identityVerificationCreate (added in depth pass 2026-06-24 — pass 28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: identityVerificationCreate.invalid-input-error
+// @expect-violation: identityVerificationCreate.idempotent-conflict
+// @expect-violation: identityVerificationCreate.api-error
+export async function createIdentityVerificationNoCatch(clientUserId: string) {
+  // SHOULD_FIRE: invalid-input-error, idempotent-conflict, api-error — no try-catch
+  const response = await plaidClient.identityVerificationCreate({
+    is_shareable: true,
+    template_id: 'idvtmp_xxx',
+    gave_consent: true,
+    user: {
+      client_user_id: clientUserId,
+      email_address: 'user@example.com',
+    },
+  });
+  return response.data;
+}
+
+// @expect-clean
+export async function createIdentityVerificationWithCatch(clientUserId: string) {
+  try {
+    // SHOULD_NOT_FIRE: identityVerificationCreate inside try-catch
+    const response = await plaidClient.identityVerificationCreate({
+      is_shareable: true,
+      template_id: 'idvtmp_xxx',
+      gave_consent: true,
+      user: { client_user_id: clientUserId, email_address: 'user@example.com' },
+    });
+    return response.data;
+  } catch (error: any) {
+    const plaidError = error.response?.data;
+    if (plaidError?.error_type === 'INVALID_REQUEST') {
+      // Idempotency conflict — fetch existing instead of retrying
+      throw new Error('IDV_EXISTING_SESSION');
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. processorTokenCreate (added in depth pass 2026-06-24 — pass 28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: processorTokenCreate.invalid-account-id
+// @expect-violation: processorTokenCreate.item-login-required
+// @expect-violation: processorTokenCreate.rate-limit-exceeded
+export async function createProcessorTokenNoCatch(
+  accessToken: string,
+  accountId: string,
+) {
+  // SHOULD_FIRE: invalid-account-id, item-login-required, rate-limit-exceeded — no try-catch
+  const response = await plaidClient.processorTokenCreate({
+    access_token: accessToken,
+    account_id: accountId,
+    processor: 'dwolla' as any,
+  });
+  return response.data.processor_token;
+}
+
+// @expect-clean
+export async function createProcessorTokenWithCatch(
+  accessToken: string,
+  accountId: string,
+) {
+  try {
+    // SHOULD_NOT_FIRE: processorTokenCreate inside try-catch
+    const response = await plaidClient.processorTokenCreate({
+      access_token: accessToken,
+      account_id: accountId,
+      processor: 'dwolla' as any,
+    });
+    return response.data.processor_token;
+  } catch (error: any) {
+    const plaidError = error.response?.data;
+    if (plaidError?.error_code === 'ITEM_LOGIN_REQUIRED') {
+      throw new Error('RELINK_REQUIRED');
+    }
+    if (plaidError?.error_code === 'INVALID_ACCOUNT_ID') {
+      throw new Error('Account no longer valid for processor token');
+    }
+    throw error;
+  }
+}
