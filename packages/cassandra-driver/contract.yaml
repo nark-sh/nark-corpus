@@ -2,11 +2,11 @@ package: cassandra-driver
 semver: ">=4.0.0 <5.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.93
+coverage_score: 0.94
 
 detection:
   class_names: ["Client", "Mapper", "ResultSet"]
@@ -27,6 +27,9 @@ detection:
     # Metadata operations
     - ".metadata.getkeyspace("
     - ".metadata.gettable("
+    - ".metadata.getTable("
+    - ".metadata.refreshKeyspaces("
+    - ".metadata.refreshKeyspace("
 
     # Mapper operations
     - ".get("
@@ -34,6 +37,7 @@ detection:
     - ".insert("
     - ".update("
     - ".remove("
+    - ".batch("
 
     # Concurrent operations
     - ".executeConcurrent("
@@ -575,6 +579,160 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: high
+
+  # mapping.Mapper.batch — multi-model atomic batch via the object mapper
+  - name: batch
+    import_path: "cassandra-driver"
+    namespace: "mapping.Mapper"
+    description: >
+      Executes a batch of ModelBatchItem operations atomically (within the same
+      partition) via the object mapper. Each item must be created via
+      modelMapper.batching.{insert,update,remove}(). Promotes the same
+      atomicity guarantees as Client.batch() but with mapper-translated CQL.
+    postconditions:
+      # Evidence: lib/mapping/mapper.js batch() — early-rejects on bad input via
+      # Promise.reject(ArgumentError) and Promise.reject(Error 'Batch items must be
+      # instances of ModelBatchItem'); otherwise delegates to client.batch() and
+      # propagates NoHostAvailableError / ResponseError / OperationTimedOutError.
+      - id: mapper-batch-no-try-catch
+        condition: "mapping.Mapper.batch() called without try-catch"
+        throws: "ArgumentError (empty items), Error (non-ModelBatchItem entries), NoHostAvailableError, OperationTimedOutError, or ResponseError (write_timeout, unavailable, overloaded)"
+        required_handling: >
+          Caller MUST wrap mapper.batch() in try-catch. The Mapper.batch() Promise
+          rejects on three distinct error families:
+          (1) input-shape errors (empty array or non-ModelBatchItem entries)
+              that throw before any network call,
+          (2) cluster errors (NoHostAvailableError, OperationTimedOutError) from
+              the underlying client.batch() call,
+          (3) server-side errors (ResponseError with codes 0x1100 write_timeout,
+              0x1000 unavailable, 0x1001 overloaded).
+          As with Client.batch(), a write_timeout means the batch MAY have been
+          partially applied across partitions — implement idempotent retries or
+          a verification read.
+        sources:
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/features/mapper/"
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/features/batch/"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: mapper-batch-lwt-not-checked
+        condition: "mapping.Mapper.batch() with conditional (LWT) items but result.wasApplied() not checked"
+        throws: "Does not throw — returns Result with wasApplied()=false when the conditional batch was rejected"
+        required_handling: >
+          When a Mapper.batch() contains conditional items (ifNotExists, ifExists,
+          or when conditions), the returned Result reflects the LWT outcome.
+          Callers MUST check result.wasApplied() after the Promise resolves. An
+          un-applied conditional batch resolves successfully but NO writes were
+          performed. Without the check, the caller silently proceeds as if the
+          mutation succeeded.
+        sources:
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/features/mapper/"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  # metadata.Metadata.getTable — schema introspection
+  - name: getTable
+    import_path: "cassandra-driver"
+    namespace: "metadata.Metadata"
+    description: >
+      Retrieves the TableMetadata for a given keyspace/table. Accessed via
+      client.metadata.getTable(). Returns null when the keyspace is not in
+      the loaded schema (does NOT throw on missing keyspace/table). Used by
+      ORM code, migration tools, and admin dashboards to introspect the
+      live schema before issuing queries.
+    postconditions:
+      # Evidence: lib/metadata/index.js _getTable() — throws this._uninitializedError()
+      # when called pre-connect; returns null when keyspaceName is unknown; otherwise
+      # propagates rejections from _schemaParser.getTable (control connection failures).
+      - id: metadata-gettable-no-try-catch
+        condition: "client.metadata.getTable() called without try-catch"
+        throws: "DriverError ('Metadata has not been initialized') when called before client.connect(); NoHostAvailableError on control-connection loss during schema query"
+        required_handling: >
+          Caller MUST wrap metadata.getTable() in try-catch. Two distinct
+          rejection paths exist:
+          (1) calling getTable() before client.connect() resolves rejects with
+              an uninitialized DriverError — common in startup race conditions
+              where introspection runs before the driver has populated the
+              schema cache,
+          (2) control-connection failures while the schema query is in flight
+              propagate as NoHostAvailableError from the underlying
+              _schemaParser.getTable() call.
+        sources:
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/api/module.metadata/class.Metadata/#getTable"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: metadata-gettable-null-not-checked
+        condition: "client.metadata.getTable() result accessed without null check when keyspace/table may not exist"
+        throws: "TypeError: Cannot read properties of null (does not throw from getTable itself)"
+        required_handling: >
+          Caller MUST check if the result is null before accessing properties.
+          getTable() returns null synchronously (resolved Promise<null>) when
+          the keyspace is unknown to the loaded schema metadata — it does NOT
+          throw. Pattern:
+          const t = await client.metadata.getTable(ks, name); if (!t) return null;
+          Without the check, downstream property access (.columns, .partitionKeys)
+          crashes the caller with a misleading TypeError.
+        sources:
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/api/module.metadata/class.Metadata/#getTable"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # metadata.Metadata.refreshKeyspaces — schema reload after DDL
+  - name: refreshKeyspaces
+    import_path: "cassandra-driver"
+    namespace: "metadata.Metadata"
+    description: >
+      Reloads the full keyspace metadata from the cluster. Accessed via
+      client.metadata.refreshKeyspaces(). Typically called after DDL
+      operations (CREATE/ALTER/DROP KEYSPACE/TABLE) so subsequent
+      metadata.getTable / getUdt / getFunction calls see fresh schema. The
+      sister method refreshKeyspace(name) reloads a single keyspace.
+    postconditions:
+      # Evidence: lib/metadata/index.js refreshKeyspaces() — rejects with
+      # uninitialized DriverError pre-connect; delegates to refreshKeyspacesInternal
+      # which awaits _schemaParser.getKeyspaces(waitReconnect) and rethrows any
+      # control-connection failure after logging.
+      - id: metadata-refreshkeyspaces-no-try-catch
+        condition: "client.metadata.refreshKeyspaces() called without try-catch"
+        throws: "DriverError ('Metadata has not been initialized') when called before client.connect(); NoHostAvailableError or ResponseError when the control connection fails while loading schema"
+        required_handling: >
+          Caller MUST wrap metadata.refreshKeyspaces() in try-catch. Schema
+          refresh is performed over the control connection and can fail when
+          the cluster is reachable for queries but the control host is being
+          replaced (common during rolling restarts). Without a catch, a
+          post-DDL refresh that hits a transient control-connection error
+          crashes the migration job mid-run, leaving subsequent metadata reads
+          stale until the next refresh.
+        sources:
+          - "https://docs.datastax.com/en/developer/nodejs-driver/4.6/api/module.metadata/class.Metadata/#refreshKeyspaces"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
 edge_cases:
   - id: prepared-statements

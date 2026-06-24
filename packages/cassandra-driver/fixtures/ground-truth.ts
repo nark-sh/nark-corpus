@@ -314,3 +314,122 @@ export async function executeConcurrentErrorsChecked(params: any[][]) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. mapping.Mapper.batch() — multi-model atomic batch via the object mapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface UserDoc {
+  id: string;
+  name: string;
+}
+
+const typedUserMapper = mapper.forModel<UserDoc>('User');
+
+export async function mapperBatchNoCatch(items: any[]) {
+  // SHOULD_FIRE: batch-failure — scanner correctly detects Mapper.batch() without try-catch but currently attributes it to Client.batch's batch-failure postcondition (shared ".batch(" await_pattern). Concern queued: mapper-vs-client-batch disambiguation needs a namespace-aware detector so this fires as mapper-batch-no-try-catch instead.
+  await mapper.batch(items);
+}
+
+export async function mapperBatchWithCatch(items: any[]) {
+  try {
+    // SHOULD_NOT_FIRE: try-catch present
+    await mapper.batch(items);
+  } catch (error) {
+    console.error('Mapper batch failed:', error);
+    throw error;
+  }
+}
+
+export async function mapperBatchLwtNotChecked(u1: UserDoc, u2: UserDoc) {
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — mapper-batch-lwt-not-checked — conditional batch wasApplied() not checked
+    const result = await mapper.batch([
+      typedUserMapper.batching.insert(u1, { ifNotExists: true }),
+      typedUserMapper.batching.update(u2, { ifExists: true }),
+    ]);
+    return result;
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function mapperBatchLwtChecked(u1: UserDoc, u2: UserDoc) {
+  try {
+    // SHOULD_NOT_FIRE: result.wasApplied() is checked
+    const result = await mapper.batch([
+      typedUserMapper.batching.insert(u1, { ifNotExists: true }),
+      typedUserMapper.batching.update(u2, { ifExists: true }),
+    ]);
+    if (!result.wasApplied()) {
+      throw new Error('Conditional batch was not applied');
+    }
+    return result;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. metadata.Metadata.getTable() — schema introspection
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function metadataGetTableNoCatch() {
+  // SHOULD_FIRE: metadata-gettable-no-try-catch — getTable() without try-catch can throw DriverError pre-connect
+  const t = await client.metadata.getTable('myks', 'users');
+  return t;
+}
+
+export async function metadataGetTableWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: try-catch present
+    const t = await client.metadata.getTable('myks', 'users');
+    return t;
+  } catch (error) {
+    console.error('Metadata getTable failed:', error);
+    throw error;
+  }
+}
+
+export async function metadataGetTableNullNotChecked() {
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — metadata-gettable-null-not-checked — null return on unknown keyspace not checked
+    const t = await client.metadata.getTable('myks', 'users');
+    // Accessing .columns on potentially-null result
+    return (t as any).columns.length;
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function metadataGetTableNullChecked() {
+  try {
+    // SHOULD_NOT_FIRE: null check present before property access
+    const t = await client.metadata.getTable('myks', 'users');
+    if (!t) {
+      return 0;
+    }
+    return (t as any).columns.length;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. metadata.Metadata.refreshKeyspaces() — schema reload after DDL
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function refreshKeyspacesNoCatch() {
+  // SHOULD_FIRE: metadata-refreshkeyspaces-no-try-catch — refreshKeyspaces() without try-catch
+  await client.metadata.refreshKeyspaces();
+}
+
+export async function refreshKeyspacesWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: try-catch present
+    await client.metadata.refreshKeyspaces();
+  } catch (error) {
+    console.error('Schema refresh failed:', error);
+    throw error;
+  }
+}
