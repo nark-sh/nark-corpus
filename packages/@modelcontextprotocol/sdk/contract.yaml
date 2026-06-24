@@ -2,11 +2,11 @@ package: '@modelcontextprotocol/sdk'
 semver: ^1.0.0
 contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-06-18'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.86  # 37 contracted / 43 total async-callable (was 34/43 = 0.79; +3 this pass: takeResult, toArrayAsync, experimental.tasks.requestStream — promoted from omitted + net-new helpers)
+coverage_score: 0.91  # 39 contracted / 43 total async-callable (was 37/43 = 0.86; +2 this pass: OAuthServerProvider.verifyAccessToken, withOAuth — both implementer-contract surfaces previously misclassified as out-of-scope)
 # Pass 1 deepen-stream-2 2026-04-16: +6 functions (WebSocketClientTransport.start, SSEClientTransport.start,
 # SSEServerTransport.handlePostMessage, StdioServerTransport.start, ProxyOAuthServerProvider.exchangeAuthorizationCode,
 # ProxyOAuthServerProvider.exchangeRefreshToken). Coverage: 0.72 → 0.74.
@@ -2697,4 +2697,204 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: high
+
+  - name: OAuthServerProvider.verifyAccessToken
+    import_path: "@modelcontextprotocol/sdk/server/auth/provider.js"
+    description: >
+      Verifies an OAuth access token presented by an MCP client and returns
+      AuthInfo (client_id, scopes, expiresAt, optional extra). Called from
+      requireBearerAuth() middleware on every protected MCP request. The
+      middleware EXPECTS this method to THROW InvalidTokenError when the
+      token is invalid, revoked, or unrecognized — there is no other failure
+      path. If a custom provider implementation silently returns dummy
+      AuthInfo for an invalid token, requireBearerAuth has no recourse: it
+      passes the request through as authenticated. This is the canonical
+      "implementer-contract" surface for the OAuthServerProvider /
+      OAuthTokenVerifier interfaces, and the most security-sensitive method
+      in the SDK's server-side auth surface.
+    postconditions:
+      # Evidence: dist/cjs/server/auth/middleware/bearerAuth.js source:
+      #   const authInfo = await verifier.verifyAccessToken(token);
+      #   // No null/false check — middleware trusts whatever is returned.
+      #   // Subsequent gates only check expiresAt + scopes, not validity itself.
+      # The middleware's catch arm reacts ONLY to thrown InvalidTokenError /
+      # InsufficientScopeError / ServerError / OAuthError. A provider that
+      # returns instead of throws gets the client authenticated.
+      # Source: https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/auth/middleware/bearerAuth.ts
+      - id: verify-access-token-must-throw-on-invalid
+        condition: >
+          A custom OAuthServerProvider.verifyAccessToken(token) implementation
+          does NOT throw InvalidTokenError on tokens it cannot validate.
+          Instead, it returns dummy AuthInfo, returns from a try/catch that
+          swallows the underlying validation error, or resolves with
+          unverified data from a JWT decode without signature check.
+          requireBearerAuth() calls await verifier.verifyAccessToken(token)
+          with no defensive validity gate — it only checks expiresAt and
+          scopes on the returned object. An attacker presenting a crafted
+          or expired token receives a 200 response with full access. This
+          is an authentication-bypass class bug, not a hardening defect.
+        throws: >
+          The contract: verifyAccessToken MUST throw InvalidTokenError
+          (from @modelcontextprotocol/sdk/server/auth/errors.js) for any
+          token that is malformed, expired (if the provider validates this
+          itself), revoked, unknown, or signed by an untrusted key. May
+          also throw InsufficientScopeError, ServerError (upstream auth
+          server unreachable), or any OAuthError subclass — these are
+          handled by the middleware with appropriate HTTP status codes.
+          Throwing a plain Error (not OAuthError) coerces to 500 — also
+          acceptable from a security standpoint (fail-closed).
+        required_handling: >
+          Custom OAuthServerProvider / OAuthTokenVerifier implementations
+          must throw InvalidTokenError on every code path where the token
+          cannot be verified. JWT signature failures, database lookups
+          returning no row, upstream introspection endpoint returning
+          inactive=true — all of these must result in a throw, never a
+          silent return:
+            import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+            class MyTokenVerifier implements OAuthTokenVerifier {
+              async verifyAccessToken(token: string): Promise<AuthInfo> {
+                try {
+                  const decoded = await this.verifyJwt(token);
+                  if (!decoded) {
+                    throw new InvalidTokenError('Token verification failed');
+                  }
+                  if (decoded.revoked) {
+                    throw new InvalidTokenError('Token has been revoked');
+                  }
+                  return {
+                    token,
+                    clientId: decoded.client_id,
+                    scopes: decoded.scope?.split(' ') ?? [],
+                    expiresAt: decoded.exp,
+                  };
+                } catch (err) {
+                  if (err instanceof InvalidTokenError) throw err;
+                  // Never swallow — re-throw as InvalidTokenError
+                  throw new InvalidTokenError(
+                    `Token verification failed: ${(err as Error).message}`
+                  );
+                }
+              }
+            }
+          The middleware translates InvalidTokenError into a 401 response
+          with a WWW-Authenticate header. Returning dummy AuthInfo to
+          "fail open" so logs can capture the request is a critical
+          mistake — the request reaches the protected handler with
+          req.auth populated.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/auth/provider.ts"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/auth/middleware/bearerAuth.ts"
+          - "https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+  - name: withOAuth
+    import_path: "@modelcontextprotocol/sdk/client/middleware.js"
+    description: >
+      Composable fetch middleware factory introduced in v1.x (PR #485,
+      merged 2025-08). withOAuth(provider, baseUrl?) returns a Middleware
+      that wraps a FetchLike function with OAuth-aware behavior: it adds
+      Bearer Authorization on every call, handles 401 responses by
+      re-running the auth() flow, and retries once with a fresh token.
+      The returned function is async and THROWS UnauthorizedError when
+      re-authentication fails or when the response is still 401 after
+      retry. Used by application code that wants OAuth on a plain fetch
+      (not the MCP transport — transports already handle OAuth themselves).
+      Misuse pattern: callers wrap fetch with withOAuth, then await the
+      enhanced fetch without try/catch, treating it like a plain fetch
+      that returns Response on every code path. The hidden throw site is
+      the first 401 response that auth() cannot resolve — UnauthorizedError
+      crashes the await caller with no Response to inspect.
+    postconditions:
+      # Evidence: dist/cjs/client/middleware.js withOAuth() source:
+      #   const withOAuth = (provider, baseUrl) => next => {
+      #     return async (input, init) => {
+      #       ... await provider.tokens() ...
+      #       let response = await makeRequest();
+      #       if (response.status === 401) {
+      #         const result = await auth(provider, {...});
+      #         if (result === 'REDIRECT') throw new UnauthorizedError(...);
+      #         if (result !== 'AUTHORIZED') throw new UnauthorizedError(...);
+      #         response = await makeRequest();
+      #       }
+      #       if (response.status === 401) {
+      #         throw new UnauthorizedError(`Authentication failed for ${url}`);
+      #       }
+      #       return response;
+      #     };
+      #   };
+      # Three throw paths, all UnauthorizedError:
+      #   1. auth() returns 'REDIRECT' (interactive auth required)
+      #   2. auth() returns anything other than 'AUTHORIZED'
+      #   3. Response is still 401 after re-auth retry
+      # PR #485: https://github.com/modelcontextprotocol/typescript-sdk/pull/485
+      - id: with-oauth-enhanced-fetch-must-handle-unauthorized
+        condition: >
+          A fetch pipeline built with withOAuth (typically via
+          applyMiddlewares(withOAuth(provider), ...)) is awaited without
+          try/catch around the resulting enhanced fetch call. The enhanced
+          fetch throws UnauthorizedError on three paths: (a) provider.auth()
+          returns 'REDIRECT' meaning the user must complete interactive
+          authorization, (b) auth() returns any non-'AUTHORIZED' status,
+          (c) the retried request after re-auth still returns 401. Each
+          of these is a genuine auth failure that the caller MUST handle —
+          the enhanced fetch deliberately surfaces these as exceptions
+          instead of returning the 401 Response. Without try/catch, this
+          becomes an unhandled rejection that crashes the worker / Express
+          handler / event loop, and the user receives no actionable error
+          message about the auth failure.
+        throws: >
+          UnauthorizedError (from @modelcontextprotocol/sdk/client/auth.js)
+          with one of three messages: "Authentication requires user
+          authorization - redirect initiated", "Authentication failed with
+          result: <status>", or "Authentication failed for <url>". The
+          original 401 Response is NOT returned — it is discarded.
+          Network-level errors propagate from the underlying fetch
+          unchanged (TypeError on DNS failure, AbortError on timeout).
+        required_handling: >
+          Always wrap the enhanced fetch call in try/catch and branch on
+          UnauthorizedError. For (a) REDIRECT, surface a UI affordance for
+          the user to complete authorization. For (b)/(c), treat as a hard
+          failure — refresh tokens / re-discover endpoints / surface to
+          operator:
+            import { withOAuth, applyMiddlewares } from '@modelcontextprotocol/sdk/client/middleware.js';
+            import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+            const enhanced = applyMiddlewares(
+              withOAuth(provider, 'https://api.example.com')
+            )(fetch);
+            try {
+              const response = await enhanced('https://api.example.com/data');
+              return await response.json();
+            } catch (err) {
+              if (err instanceof UnauthorizedError) {
+                if (err.message.includes('redirect initiated')) {
+                  redirectToAuthorizationUI();
+                  return null;
+                }
+                logger.error('OAuth re-auth failed', { url, err });
+                throw new ApiAuthError('Authentication failed', { cause: err });
+              }
+              throw err;
+            }
+          Note: MCP transports (SSE, StreamableHTTP) handle OAuth
+          internally — withOAuth is for plain fetch calls in application
+          code adjacent to MCP, not for the MCP transport itself.
+        sources:
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/middleware.ts"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/pull/485"
+          - "https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/auth.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
 

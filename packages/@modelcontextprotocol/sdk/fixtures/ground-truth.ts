@@ -70,6 +70,14 @@ import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/webso
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { OAuthTokens, OAuthClientInformationMixed, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
+// v1.27+ composable fetch middleware (added 2026-06-24):
+import { withOAuth, applyMiddlewares } from '@modelcontextprotocol/sdk/client/middleware.js';
+// v1.x server auth provider interface + error types (added 2026-06-24):
+import type { OAuthServerProvider, OAuthTokenVerifier, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { InvalidTokenError, InsufficientScopeError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import type { OAuthClientInformationFull, OAuthTokenRevocationRequest } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { Response as ExpressResponse } from 'express';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Client.connect() — without try-catch
@@ -1141,4 +1149,140 @@ async function gt_elicitInputStream_dropsErrors(
     // 'error' messages silently ignored — caller treats network failure as "user declined"
   }
   return action;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 68. OAuthServerProvider.verifyAccessToken() — implementer silently returns dummy AuthInfo (auth bypass)
+// @expect-violation: verify-access-token-must-throw-on-invalid
+// ─────────────────────────────────────────────────────────────────────────────
+
+class BadVerifierFailOpen implements OAuthTokenVerifier {
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    // ❌ Silently returns dummy AuthInfo when the JWT can't be verified.
+    // requireBearerAuth() has no validity gate — every request passes auth.
+    // SHOULD_FIRE: verify-access-token-must-throw-on-invalid — must throw InvalidTokenError, not return defaults
+    try {
+      return await this.decodeJwt(token);
+    } catch {
+      return {
+        token,
+        clientId: 'unknown',
+        scopes: [],
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      };
+    }
+  }
+  private async decodeJwt(_token: string): Promise<AuthInfo> {
+    throw new Error('jwt verification not implemented');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 69. OAuthServerProvider.verifyAccessToken() — proper InvalidTokenError on failure
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+class GoodVerifierFailClosed implements OAuthTokenVerifier {
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    try {
+      // SHOULD_NOT_FIRE — re-throws as InvalidTokenError on every failure path
+      const decoded = await this.decodeJwt(token);
+      if (!decoded) {
+        throw new InvalidTokenError('Token verification failed');
+      }
+      return decoded;
+    } catch (err) {
+      if (err instanceof InvalidTokenError) throw err;
+      if (err instanceof InsufficientScopeError) throw err;
+      throw new InvalidTokenError(`Token verification failed: ${(err as Error).message}`);
+    }
+  }
+  private async decodeJwt(_token: string): Promise<AuthInfo | null> {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 70. Full OAuthServerProvider implementation — verifyAccessToken fail-open is the
+// security-critical leak even when other methods are correct
+// @expect-violation: verify-access-token-must-throw-on-invalid
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CustomOAuthServerProviderBadVerify implements OAuthServerProvider {
+  clientsStore = { getClient: async (_id: string) => undefined } as any;
+  async authorize(_client: OAuthClientInformationFull, _params: AuthorizationParams, _res: ExpressResponse): Promise<void> {
+    /* delegate to upstream */
+  }
+  async challengeForAuthorizationCode(_client: OAuthClientInformationFull, _code: string): Promise<string> {
+    return 'challenge';
+  }
+  async exchangeAuthorizationCode(_client: OAuthClientInformationFull, _code: string): Promise<OAuthTokens> {
+    return { access_token: 'a', token_type: 'Bearer' };
+  }
+  async exchangeRefreshToken(_client: OAuthClientInformationFull, _rt: string): Promise<OAuthTokens> {
+    return { access_token: 'a', token_type: 'Bearer' };
+  }
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    // ❌ Returns dummy AuthInfo instead of throwing — auth bypass
+    // SHOULD_FIRE: verify-access-token-must-throw-on-invalid — returns instead of throwing
+    return {
+      token,
+      clientId: 'bypass-client',
+      scopes: ['*'],
+      expiresAt: Math.floor(Date.now() / 1000) + 86400,
+    };
+  }
+  async revokeToken(_client: OAuthClientInformationFull, _req: OAuthTokenRevocationRequest): Promise<void> {
+    /* noop */
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 71. withOAuth() enhanced fetch — caller does not handle UnauthorizedError
+// @expect-violation: with-oauth-enhanced-fetch-must-handle-unauthorized
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_withOAuth_noTryCatch(provider: OAuthClientProvider) {
+  const enhanced = applyMiddlewares(withOAuth(provider, 'https://api.example.com'))(fetch);
+  // ❌ No try/catch — enhanced fetch throws UnauthorizedError on 401-after-retry, REDIRECT, or non-AUTHORIZED auth result.
+  // SHOULD_FIRE: with-oauth-enhanced-fetch-must-handle-unauthorized — no try-catch around enhanced fetch
+  const response = await enhanced('https://api.example.com/data');
+  return await response.json();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 72. withOAuth() enhanced fetch — caller handles UnauthorizedError and branches on REDIRECT
+// @expect-clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_withOAuth_withTryCatch(provider: OAuthClientProvider) {
+  const enhanced = applyMiddlewares(withOAuth(provider, 'https://api.example.com'))(fetch);
+  try {
+    // SHOULD_NOT_FIRE — wrapped in try/catch and branches on UnauthorizedError
+    const response = await enhanced('https://api.example.com/data');
+    return await response.json();
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      if (err.message.includes('redirect initiated')) {
+        return null;
+      }
+      console.error('OAuth re-auth failed', err);
+      throw err;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 73. withOAuth() enhanced fetch — bare await assigned to const, no try/catch downstream
+// @expect-violation: with-oauth-enhanced-fetch-must-handle-unauthorized
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function gt_withOAuth_chainedNoTryCatch(provider: OAuthClientProvider, url: string) {
+  const enhanced = applyMiddlewares(withOAuth(provider))(fetch);
+  // ❌ Chained call; UnauthorizedError propagates to caller; no try/catch here.
+  // SHOULD_FIRE: with-oauth-enhanced-fetch-must-handle-unauthorized — bare await, throw escapes
+  const res = await enhanced(url);
+  const body = await res.text();
+  return body.length;
 }

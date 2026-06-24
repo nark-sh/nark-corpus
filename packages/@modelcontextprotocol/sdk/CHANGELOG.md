@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 86% → 91%
+
+- **Profile:** `packages/@modelcontextprotocol/sdk/contract.yaml`
+- **Functions added:** `OAuthServerProvider.verifyAccessToken`, `withOAuth` (2 total)
+- **Postconditions added:** 2 (`verify-access-token-must-throw-on-invalid` — implementer-contract for the server-side OAuth bearer-auth gate; `with-oauth-enhanced-fetch-must-handle-unauthorized` — composable-middleware enhanced-fetch unhandled-UnauthorizedError pattern)
+- **Functions intentionally omitted this pass:** none new — `withOAuth` was promoted out of the prior "sync factory" omission (the factory is sync but the returned Middleware function is async and throws UnauthorizedError)
+- **Scanner concerns queued:** 2 (`concern-20260624-modelcontextprotocol-sdk-deepen-32` for the implementer-contract "interface-method-must-throw" pattern on `OAuthServerProvider.verifyAccessToken`; `concern-20260624-modelcontextprotocol-sdk-deepen-33` for the composable-middleware enhanced-fetch unhandled-UnauthorizedError pattern via `applyMiddlewares(withOAuth(...))(fetch)`)
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:** https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/auth/provider.ts (read inline from installed v1.29.0 dist/cjs/server/auth/provider.d.ts), https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/server/auth/middleware/bearerAuth.ts (read inline from installed v1.29.0 dist/cjs/server/auth/middleware/bearerAuth.js), https://github.com/modelcontextprotocol/typescript-sdk/blob/main/src/client/middleware.ts (read inline from installed v1.29.0 dist/cjs/client/middleware.js), https://github.com/modelcontextprotocol/typescript-sdk/pull/485 (introduced the middleware family, merged 2025-08-18)
+- **Verified by:** bc-deepen-contract (pass 81 on 2026-06-24T13:15:33Z, deepen-stream-3)
+
 ## 2026-06-18 — deepen pass — coverage 79% → 86%
 
 - **Profile:** `packages/@modelcontextprotocol/sdk/contract.yaml`
