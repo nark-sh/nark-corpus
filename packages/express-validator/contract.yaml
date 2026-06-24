@@ -1,12 +1,12 @@
 package: express-validator
 semver: '>=6.0.0 <8.0.0'
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.87
+coverage_score: 0.933
 functions:
   - name: validationResult
     import_path: express-validator
@@ -657,6 +657,73 @@ functions:
         sources:
           - https://express-validator.github.io/docs/api/validation-result#throw
         severity: info
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+  - name: validationResult.withDefaults
+    import_path: express-validator
+    description: >
+      Factory function that returns a custom validationResult() function pre-bound with a default
+      error formatter. The formatter runs for every error when .array() or .mapped() is called on
+      the returned Result. Custom formatters are commonly used to reshape errors into
+      application-specific structures (e.g. { field, message } from the raw ValidationError).
+      The formatter is NOT executed at validationResult() time — it is deferred until
+      .array()/.mapped() is invoked, so exceptions from the formatter surface inside the
+      response-building code path, not the validation middleware.
+    postconditions:
+      # Evidence: https://express-validator.github.io/docs/api/validation-result#withdefaults
+      # Confirmed from source: lib/validation-result.js — withDefaults() wraps `actualOptions.formatter`
+      #   and the formatter is invoked lazily inside Result.array()/Result.mapped().
+      - id: withdefaults-formatter-throws
+        condition: >
+          The custom formatter passed to validationResult.withDefaults() destructures or accesses
+          a property that may be absent on some ValidationError subtypes (e.g. `.path` on
+          AlternativeValidationError / GroupedAlternativeValidationError / UnknownFieldsError),
+          and .array()/.mapped() is called on the returned Result without a try-catch around the
+          response-building code
+        returns: >-
+          The formatter throws when invoked over a non-field-shaped error. The throw propagates
+          out of res.json({ errors: errors.array() }) and is caught by Express's default error
+          handler, which returns a 500 Internal Server Error instead of the intended 400. Stack
+          traces may leak in development mode and the user sees an opaque server error instead
+          of the actual validation feedback. With oneOf()/checkExact() in the route, this turns
+          a legitimate 400 into a misleading 500 on every failing request.
+        required_handling: >
+          The formatter MUST handle every ValidationError subtype safely. Use `error.type` to
+          discriminate (`'field'` | `'alternative'` | `'alternative_grouped'` | `'unknown_fields'`)
+          before reaching for type-specific properties. Pattern: `const field = error.type ===
+          'field' ? error.path : '_' + error.type;`. Alternatively, wrap response-building in
+          try-catch and fall back to a generic 400 if the formatter throws — but discriminating
+          on .type is the canonical fix.
+        sources:
+          - https://express-validator.github.io/docs/api/validation-result#withdefaults
+          - https://express-validator.github.io/docs/api/validation-errors
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      - id: withdefaults-formatter-side-effect
+        condition: >
+          The custom formatter performs side effects (logging, metrics, DB writes) on every
+          error in the result, but the same Result instance is materialized multiple times
+          (e.g. .array() called inside a loop or in both the response and an audit log)
+        returns: >-
+          The formatter runs once per error per .array()/.mapped() call. If the formatter
+          logs to an external sink, the same error is logged N times where N is the number
+          of materializations, inflating log volumes and skewing per-error rate metrics.
+        required_handling: >
+          Keep the formatter pure — return the formatted error, do not log or write inside it.
+          Side effects belong outside .array(), in the response handler, where you control the
+          materialization count.
+        sources:
+          - https://express-validator.github.io/docs/api/validation-result#withdefaults
+        severity: warning
         business_impact:
           incident_label: SILENT_FAILURE
           production_behavior: degraded_service
