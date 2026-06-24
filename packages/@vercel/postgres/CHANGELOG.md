@@ -3,6 +3,22 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepened (pass 89, deepen-stream-2)
+
+- **Verdict:** depth pass, +1 function entry, +2 postconditions
+- **Function added:** `VercelPool` (direct constructor — distinct error semantics from `createPool()` factory)
+- **Postconditions added:**
+  - `pool-connect-callback-form-no-done-call` (on `connect`) — legacy callback overload requires explicit `done()` call on every exit path; missing `done()` is a silent connection leak
+  - `vercelpool-direct-constructor-skips-validation` (on `VercelPool`) — direct `new VercelPool(config)` bypasses `createPool()`'s connection-string + pooled-hostname validation and EdgeRuntime overrides
+- **Coverage:** 9/13 (0.69) → 10/14 (0.71); effective coverage 1.0 (all non-alias surface contracted)
+- **Evidence sources:**
+  - `dist/chunk-7IR77QAQ.js` (local source) — VercelPool constructor lines 123-130, `connect(callback)` override lines 150-153, `createPool()` validation lines 157-180
+  - https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/create-pool.ts
+  - https://node-postgres.com/apis/pool — callback-form contract
+- **Contract version:** 1.1.0 → 1.2.0
+- **Notes:** package remains deprecated (@vercel/postgres@0.10.0); no new API surface expected. Aliases (db, pool.sql, client.sql, client.query) remain intentionally omitted — they share error profile with contracted counterparts.
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @vercel/postgres@0.10.0

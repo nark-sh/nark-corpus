@@ -217,6 +217,73 @@ function getConnectionStringWithValidType(type: 'pool' | 'direct') {
   return postgresConnectionString(type);
 }
 
+// ---------------------------------------------------------------------------
+// pass 89 (deepen-stream-2, 2026-06-24)
+// pool.connect(callback) — callback form must call done() on every exit path
+// new VercelPool(config) — direct constructor skips createPool() validation
+// ---------------------------------------------------------------------------
+
+import { VercelPool } from '@vercel/postgres';
+
+// SHOULD_FIRE: pool-connect-callback-form-no-done-call
+function queryViaCallbackFormLeaksOnError() {
+  const pool = createPool({ connectionString: process.env.POSTGRES_URL! });
+  return new Promise((resolve, reject) => {
+    pool.connect((err: any, client: any, _done: any) => {
+      if (err) return reject(err);
+      client.query('SELECT 1', (queryErr: any, result: any) => {
+        if (queryErr) return reject(queryErr);
+        _done();
+        resolve(result.rows);
+      });
+    });
+  });
+}
+
+// @expect-clean
+function queryViaCallbackFormCallsDoneInEveryBranch() {
+  const pool = createPool({ connectionString: process.env.POSTGRES_URL! });
+  return new Promise((resolve, reject) => {
+    pool.connect((err: any, client: any, done: any) => {
+      if (err) {
+        done();
+        return reject(err);
+      }
+      client.query('SELECT 1', (queryErr: any, result: any) => {
+        done(queryErr);
+        if (queryErr) return reject(queryErr);
+        resolve(result.rows);
+      });
+    });
+  });
+}
+
+// SHOULD_FIRE: vercelpool-direct-constructor-skips-validation
+async function buildDirectPoolWithoutValidation() {
+  const pool = new VercelPool({ connectionString: process.env.POSTGRES_URL ?? '' });
+  const { rows } = await pool.sql`SELECT 1`;
+  return rows;
+}
+
+// @expect-clean
+async function buildDirectPoolWithManualValidation() {
+  const connectionString = process.env.POSTGRES_URL;
+  if (!connectionString) {
+    throw new Error('POSTGRES_URL is required');
+  }
+  if (!connectionString.includes('-pooler.')) {
+    throw new Error('POSTGRES_URL must be a pooled connection string');
+  }
+  try {
+    const pool = new VercelPool({ connectionString });
+    const { rows } = await pool.sql`SELECT 1`;
+    return rows;
+  } catch (error) {
+    console.error('Pool query failed:', error);
+    throw error;
+  }
+}
+
 export {
   queryWithImplicitPoolNoEnv,
   queryWithExplicitConnectionString,
@@ -233,4 +300,8 @@ export {
   useSqlWithEnvVarValidated,
   getConnectionStringWithInvalidType,
   getConnectionStringWithValidType,
+  queryViaCallbackFormLeaksOnError,
+  queryViaCallbackFormCallsDoneInEveryBranch,
+  buildDirectPoolWithoutValidation,
+  buildDirectPoolWithManualValidation,
 };

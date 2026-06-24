@@ -1,26 +1,32 @@
 package: "@vercel/postgres"
 semver: ^0.10.0
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-# Depth pass 2026-06-12 (deepen-stream-1 pass 2):
-# API surface: 13 async-callable operations (5 intentionally omitted)
-# Contracted before: 8 (sql, query, connect, createPool, createClient, pool.end, client.end, client.connect)
-# Contracted after: 9 (+1 this pass: postgresConnectionString)
-# New postconditions: sql-incorrect-template-call, sql-missing-connection-string-on-first-use,
-#   postgresconnectionstring-invalid-type
+# Depth pass 2026-06-24 (deepen-stream-2 pass 89):
+# API surface: 14 async-callable operations (4 intentionally omitted aliases)
+# Contracted before: 9 (sql, query, connect, createPool, createClient, pool.end, client.end, postgresConnectionString)
+# Contracted after: 10 (+1 this pass: VercelPool direct constructor)
+# New postconditions:
+#   - pool-connect-callback-form-no-done-call (on connect function entry)
+#   - vercelpool-direct-constructor-skips-validation (on new VercelPool function entry)
 # Omitted (unchanged): db, pool.sql, client.sql, client.query (same error profile as contracted counterparts)
 # Deprecated package: @vercel/postgres@0.10.0 — no new API surface expected
-# Coverage: 9/13 = 0.69
-# Evidence sources:
+# Coverage: 10/14 = 0.71
+# Evidence sources (this pass):
+#   dist/chunk-7IR77QAQ.js (local source) — VercelPool constructor (lines 123-130),
+#     connect(callback) override (lines 150-153), createPool() validation (lines 157-180)
+#   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/create-pool.ts
+#   https://node-postgres.com/apis/pool — callback-form connect contract
+# Prior pass evidence sources:
 #   dist/chunk-BZ4XJVIW.cjs (local source) — sqlTemplate(), createPool(), createClient()
 #   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/error.ts
 #   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/sql-template.ts
 #   https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/index.ts
-coverage_score: 0.69  # 9 contracted / 13 total async-callable (4 omitted aliases)
+coverage_score: 0.71  # 10 contracted / 14 total async-callable (4 omitted aliases)
 
 detection:
   type_names:
@@ -177,6 +183,171 @@ functions:
         sources:
           - "https://vercel.com/kb/guide/connection-pooling-with-functions"
           - "https://node-postgres.com/features/pooling"
+
+      # Evidence: dist/chunk-7IR77QAQ.js — VercelPool.connect(callback) override at line 150
+      # `connect(callback) { return super.connect(callback); }`
+      # Delegates to node-postgres Pool.connect, which uses the callback-form
+      # contract: (err, client, done) => void. The done() function is the ONLY
+      # way to release the client back to the pool in callback form — there is
+      # no Promise to await, no implicit cleanup. Forgetting to call done() is
+      # a silent connection leak indistinguishable from a slow query.
+      # Source: https://node-postgres.com/apis/pool#poolconnect (callback overload)
+      - id: pool-connect-callback-form-no-done-call
+        condition: >
+          pool.connect() is called with a callback argument (legacy form):
+          pool.connect((err, client, done) => {...}) and the callback body does
+          not call done() on all exit paths (including the error path and any
+          early returns). Unlike the Promise form (where the returned client
+          has a .release() method), the callback form provides done() as the
+          ONLY release mechanism — failing to call it leaks the connection
+          for the lifetime of the pool.
+        throws: >
+          No exception is thrown. The callback returns normally; the client is
+          checked out indefinitely. Subsequent pool.connect() calls eventually
+          stall waiting for a free client when max connections is reached.
+          On Vercel serverless this manifests as request timeouts (504s),
+          not stack-traceable errors.
+        description: >
+          The callback form of pool.connect() exists for backward compatibility
+          with pre-Promise node-postgres. It is rarely the right choice in
+          modern @vercel/postgres code — the Promise form is safer because
+          `await pool.connect()` returns a VercelPoolClient with a .release()
+          method that the developer is more likely to remember (and ESLint
+          rules can enforce). The callback form's done() is easy to miss in
+          error branches.
+        required_handling: >
+          Prefer the Promise form over the callback form:
+
+          // ✅ PROMISE FORM — release() is on the returned client
+          const client = await pool.connect();
+          try {
+            const { rows } = await client.query('SELECT 1');
+            return rows;
+          } finally {
+            client.release();
+          }
+
+          If you MUST use the callback form (e.g. integrating with legacy
+          callback-driven middleware), call done() in every exit path:
+
+          // ✅ CALLBACK FORM — done() in every branch
+          pool.connect((err, client, done) => {
+            if (err) {
+              done();  // MUST be called even on connect error
+              return reject(err);
+            }
+            client.query('SELECT 1', (queryErr, result) => {
+              done(queryErr);  // done(err) releases AND destroys on error
+              if (queryErr) return reject(queryErr);
+              resolve(result.rows);
+            });
+          });
+
+          // ❌ MISSING done() ON ERROR — silent connection leak
+          pool.connect((err, client, done) => {
+            if (err) return reject(err);  // leaked: done() never called
+            client.query('SELECT 1', (queryErr, result) => {
+              if (queryErr) return reject(queryErr);  // leaked again
+              done();
+              resolve(result.rows);
+            });
+          });
+        sources:
+          - "https://node-postgres.com/apis/pool"
+          - "https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/create-pool.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: VercelPool
+    import_path: "@vercel/postgres"
+    description: >
+      Direct constructor for VercelPool. Exported as a class — callers can
+      bypass createPool() and instantiate the pool directly with
+      `new VercelPool(config)`. This skips createPool's validation: empty
+      connection strings are accepted silently (defaulted to "") and the
+      direct-vs-pooled hostname check is not enforced. Failures are deferred
+      from construction time to first query time, making the root cause
+      harder to diagnose. EdgeRuntime overrides for `maxUses` and `max`
+      that createPool() applies are also skipped — direct instantiation
+      under EdgeRuntime gets the raw config without warnings.
+    postconditions:
+      # Evidence: dist/chunk-7IR77QAQ.js lines 123-130 (VercelPool constructor):
+      #   constructor(config) {
+      #     super(config);
+      #     this.Client = VercelClient;
+      #     this.connectionString = config.connectionString ?? "";
+      #   }
+      # The constructor accepts config.connectionString = "" without throwing.
+      # createPool() (lines 157-180) does the validation — direct construction
+      # bypasses it entirely.
+      # Source: https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/create-pool.ts
+      - id: vercelpool-direct-constructor-skips-validation
+        condition: >
+          `new VercelPool(config)` is invoked directly instead of via the
+          createPool() factory. The constructor accepts the config without
+          checking that `config.connectionString` is present, non-empty, or
+          of the pooled (`-pooler.`) form. An empty or wrong-type connection
+          string is silently stored; the first query then fails with a
+          confusing low-level error from @neondatabase/serverless rather than
+          the clear VercelPostgresError that createPool() would throw at
+          construction time.
+        throws: >
+          No exception at construction. First query produces an opaque
+          connection error from the underlying neon driver, often presenting
+          as "fetch failed" or "ECONNREFUSED" rather than the descriptive
+          VercelPostgresError('missing_connection_string') / ('invalid_connection_string')
+          that createPool() raises.
+        description: >
+          The VercelPool class is exported, so TypeScript users can write
+          `new VercelPool({ connectionString: someEnvVar })` without going
+          through createPool(). When someEnvVar is undefined or empty,
+          the pool is constructed successfully but is dead-on-arrival.
+          This pattern shows up in test harnesses, mocks, and DI containers
+          where the factory's environment-coupled validation is undesirable —
+          but the developer rarely re-implements the validation themselves.
+
+          Additionally, EdgeRuntime overrides (maxUses=1, max=10000) are NOT
+          applied for direct construction — under EdgeRuntime, a direct
+          pool will reuse connections in violation of the runtime's
+          stateless contract, causing intermittent query failures across
+          invocations.
+        required_handling: >
+          Prefer createPool() over direct construction in application code:
+
+          // ✅ Factory — validates connection string + applies EdgeRuntime overrides
+          const pool = createPool({ connectionString: process.env.POSTGRES_URL });
+
+          // ❌ Direct constructor — skips validation
+          const pool = new VercelPool({ connectionString: process.env.POSTGRES_URL });
+          // If POSTGRES_URL is undefined, this constructs a dead pool that
+          // fails opaquely on first query.
+
+          If direct construction is required (e.g. for testing), validate the
+          connection string yourself before instantiating:
+
+          if (!config.connectionString) {
+            throw new Error('VercelPool requires a connectionString');
+          }
+          if (!config.connectionString.includes('-pooler.')) {
+            throw new Error('VercelPool requires a pooled connection string');
+          }
+          const pool = new VercelPool(config);
+        sources:
+          - "https://github.com/vercel/storage/blob/vercel-kv-vercel-postgres-archive/packages/postgres/src/create-pool.ts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
   - name: createPool
     import_path: "@vercel/postgres"
@@ -502,3 +673,4 @@ functions:
 # Generated: 2026-02-26
 # Deepened: 2026-04-17 — pass 1 (+5 functions: createPool, createClient, pool.end, client.end, createclient-query-before-connect)
 # Deepened: 2026-06-12 — pass 2 (+1 function: postgresConnectionString; +2 postconditions on sql: sql-incorrect-template-call, sql-missing-connection-string-on-first-use)
+# Deepened: 2026-06-24 — pass 89 (deepen-stream-2) (+1 function: VercelPool direct constructor; +2 postconditions: pool-connect-callback-form-no-done-call on connect, vercelpool-direct-constructor-skips-validation on VercelPool)
