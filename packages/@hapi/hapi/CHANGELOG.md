@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100%
+
+- **Profile:** `packages/@hapi/hapi/contract.yaml`
+- **Functions added:** none (no new async API surface in @hapi/hapi@21.4.9 vs pass 7)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** cache.provision (admin/init-only), states.format / states.parse (rare cookie utilities), events.once (test wait utility)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** node_modules/@hapi/hapi@21.4.9 .d.ts (server.d.ts, auth.d.ts, cache.d.ts, events.d.ts, state.d.ts, methods.d.ts) — no new async-callable server admin functions beyond the 8 already contracted + 4 already omitted.
+- **Verified by:** bc-deepen-contract (pass 87 on 2026-06-24T12:20:47Z)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @hapi/hapi@21.4.9
