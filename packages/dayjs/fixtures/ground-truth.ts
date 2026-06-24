@@ -250,3 +250,41 @@ export function formatUserDate(input: string): string {
   const d = dayjs(input); // has arg — may be invalid
   return d.format('YYYY-MM-DD');
 }
+
+// ============================================================
+// humanize() postconditions (Duration plugin)
+// Added 2026-06-24 (deepen-stream-3, pass 38)
+// ============================================================
+// Duration.humanize() internally calls dayjs().fromNow(), which is added by
+// the relativeTime plugin. If only the duration plugin is extended, humanize
+// throws TypeError: "fromNow is not a function".
+
+// SHOULD_FIRE: humanize-missing-relativetime-plugin
+// Caller assumes duration plugin alone provides humanize, but humanize
+// requires relativeTime plugin too. Throws TypeError at runtime.
+export function durationHumanizeMissingRelativeTime(ms: number): string {
+  // NOTE: No try-catch; relativeTime not extended in this fixture context.
+  const dur = dayjs.duration(ms);
+  return dur.humanize(); // throws TypeError if relativeTime not loaded
+}
+
+// SHOULD_FIRE: humanize-missing-relativetime-plugin
+// Common pattern: trial-period or subscription remaining-time display.
+export function describeTrialRemaining(remainingMs: number): string {
+  const remaining = dayjs.duration(remainingMs);
+  return remaining.humanize(true); // "in 14 days" — but throws if no relativeTime
+}
+
+// @expect-clean
+// Wrap humanize() in try-catch — handles missing-plugin TypeError safely.
+export function durationHumanizeSafe(ms: number): string {
+  try {
+    const dur = dayjs.duration(ms);
+    return dur.humanize();
+  } catch (e) {
+    if (e instanceof TypeError) {
+      return `${Math.round(ms / 1000)}s`;
+    }
+    throw e;
+  }
+}
