@@ -5,8 +5,11 @@
  * Derived from the contract spec, NOT V1 behavior.
  *
  * Contracted functions (from import "sharp"):
- *   - sharp().toFile()   postcondition: tofile-rejects-on-error
- *   - sharp().toBuffer() postcondition: tobuffer-rejects-on-error
+ *   - sharp().toFile()        postcondition: tofile-rejects-on-error
+ *   - sharp().toBuffer()      postcondition: tobuffer-rejects-on-error
+ *   - sharp().metadata()      postcondition: metadata-rejects-on-corrupt-or-unsupported-input
+ *   - sharp().stats()         postcondition: stats-rejects-on-corrupt-or-unsupported-input
+ *   - sharp().toUint8Array()  postcondition: touint8array-rejects-on-error
  *
  * Detection pattern:
  *   - sharp is imported from 'sharp'
@@ -180,5 +183,52 @@ export async function detectBlurryImageWithCatch(inputBuffer: Buffer) {
   } catch (err) {
     console.error('Blur detection failed:', err);
     return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. toUint8Array — zero-copy transferable encoded image (added v0.35.0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function encodeToUint8ArrayNoCatch(inputBuffer: Buffer) {
+  // SHOULD_FIRE: touint8array-rejects-on-error — toUint8Array() shares _pipeline() rejection path with toBuffer/toFile. No try-catch.
+  const { data, info } = await sharp(inputBuffer)
+    .resize(800, 600)
+    .png()
+    .toUint8Array();
+  return { data, info };
+}
+
+export async function encodeToUint8ArrayWithCatch(inputBuffer: Buffer) {
+  try {
+    // SHOULD_NOT_FIRE: toUint8Array inside try-catch satisfies error handling
+    const { data, info } = await sharp(inputBuffer)
+      .resize(800, 600)
+      .png()
+      .toUint8Array();
+    return { data, info };
+  } catch (err) {
+    console.error('Uint8Array encode failed:', err);
+    throw err;
+  }
+}
+
+export async function transferToWorkerNoCatch(inputBuffer: Buffer) {
+  // SHOULD_FIRE: touint8array-rejects-on-error — worker-transfer hot path drops jobs on unhandled rejection. No try-catch.
+  const { data, info } = await sharp(inputBuffer)
+    .webp({ quality: 75 })
+    .toUint8Array();
+  return { data: data.buffer, info };
+}
+
+export async function transferToWorkerWithCatch(inputBuffer: Buffer) {
+  try {
+    // SHOULD_NOT_FIRE: worker-transfer pipeline inside try-catch
+    const { data, info } = await sharp(inputBuffer)
+      .webp({ quality: 75 })
+      .toUint8Array();
+    return { data: data.buffer, info };
+  } catch (err) {
+    throw new Error(`Worker transfer encode failed: ${(err as Error).message}`);
   }
 }
