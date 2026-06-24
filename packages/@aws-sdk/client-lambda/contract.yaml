@@ -37,13 +37,13 @@
 #   Waiter source: node_modules/@aws-sdk/client-lambda/dist-es/waiters/waitForFunctionActiveV2.js
 package: "@aws-sdk/client-lambda"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.82  # 9 contracted / 11 runtime-relevant (2 omitted: InvokeAsyncCommand deprecated, DeleteFunctionCommand admin-only)
+coverage_score: 0.86  # 12 contracted / 14 runtime-relevant (2 omitted: InvokeAsyncCommand deprecated, DeleteFunctionCommand admin-only). Verified against @aws-sdk/client-lambda@3.1075.0.
 
 detection:
   class_names:
@@ -662,6 +662,289 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: send (AddPermissionCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Adds a permission statement to a Lambda function's resource-based policy, granting
+      another AWS account, service, or organization permission to invoke the function or
+      access its versions/aliases. Heavily used in serverless app deployment to wire up
+      API Gateway, S3, SNS, EventBridge, and cross-account invocation. Each call appends
+      a single Sid-keyed statement to the function policy document. The policy document
+      has a hard 20 KB size limit (PolicyLengthExceededException). Lambda enforces a
+      block-public-access guard (PublicPolicyException) when the statement would grant
+      Principal="*" or wildcard org access without a SourceAccount/SourceArn condition.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html
+      # @throws annotation confirmed from dist-types/commands/AddPermissionCommand.d.ts (v3.1075.0):
+      #   InvalidParameterValueException, PolicyLengthExceededException, PreconditionFailedException,
+      #   PublicPolicyException, ResourceConflictException, ResourceNotFoundException, ServiceException, TooManyRequestsException
+      # PolicyLengthExceededException is a 20 KB hard cap on the function policy doc (AWS-documented quota)
+      # PublicPolicyException added 2024 as part of Lambda's block-public-access protection
+      - id: aws-lambda-add-permission-no-error-handling
+        condition: >
+          AddPermissionCommand sent via lambdaClient.send() without try-catch. Throws
+          ResourceConflictException (409) when a statement with the same Sid already exists,
+          ResourceNotFoundException (404) when the Lambda function or alias does not exist,
+          PolicyLengthExceededException (400) when the 20 KB function policy size limit is
+          reached (silent failure mode in deploy scripts that re-add statements on every run),
+          PublicPolicyException (400) when the statement would grant public access without
+          a SourceAccount/SourceArn condition (security guardrail),
+          PreconditionFailedException (412) on RevisionId mismatch,
+          InvalidParameterValueException (400) for malformed Principal or Action,
+          TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (409, Sid already exists —
+          idempotency signal in deploy automation), PolicyLengthExceededException (400, 20 KB
+          policy doc cap exceeded — caller must delete old statements via RemovePermissionCommand),
+          PublicPolicyException (400, would grant public access — must add SourceAccount/SourceArn
+          condition), ResourceNotFoundException (404), PreconditionFailedException (412, RevisionId
+          race), InvalidParameterValueException (400, malformed Principal/Action),
+          TooManyRequestsException (429, throttled). Network errors throw SdkClientError.
+        required_handling: >
+          Wrap in try-catch. Handle ResourceConflictException as idempotency signal (statement
+          with same Sid already exists — safe to continue in deploy automation). Treat
+          PolicyLengthExceededException as a critical operational alert — the function policy
+          must be cleaned up (delete unused Sids via RemovePermissionCommand) before any new
+          permission can be added. Treat PublicPolicyException as a security guardrail —
+          DO NOT bypass by removing the SourceAccount condition; refactor the call to scope
+          access correctly.
+
+          try {
+            await lambdaClient.send(new AddPermissionCommand({
+              FunctionName: functionName,
+              StatementId: `apigw-${routeId}`,
+              Action: 'lambda:InvokeFunction',
+              Principal: 'apigateway.amazonaws.com',
+              SourceArn: apiGwArn,
+            }));
+          } catch (error: any) {
+            if (error.name === 'ResourceConflictException') {
+              // Statement Sid already exists — idempotent, safe to continue
+            } else if (error.name === 'PolicyLengthExceededException') {
+              throw new Error(`Lambda function policy on ${functionName} hit 20 KB cap — clean up unused Sids before adding new permissions`);
+            } else if (error.name === 'PublicPolicyException') {
+              throw new Error(`Refusing to grant public access to ${functionName} without SourceAccount/SourceArn condition`);
+            } else if (error.name === 'PreconditionFailedException') {
+              throw new Error(`AddPermission race condition on ${functionName} — RevisionId mismatch`);
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/access-control-resource-based.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html
+      # PolicyLengthExceededException is documented at https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html
+      # The 20 KB Lambda function policy size limit is a hard AWS-enforced quota
+      - id: aws-lambda-add-permission-policy-length-exceeded
+        condition: >
+          AddPermissionCommand catch block does not specifically handle
+          PolicyLengthExceededException. This is a silent operational failure — once the
+          function policy doc reaches 20 KB, EVERY subsequent AddPermissionCommand call fails
+          identically. Deploy scripts that idempotently re-add statements on every run will
+          start failing across all environments simultaneously with no surface signal beyond
+          the catch-all error log. The policy must be manually cleaned up via
+          RemovePermissionCommand calls — the AddPermission API itself cannot resolve the
+          condition.
+        throws: >
+          PolicyLengthExceededException (HTTP 400) with message "The statement you provided
+          exceeds the function-policy size limit." error.name is "PolicyLengthExceededException",
+          $fault is "client".
+        required_handling: >
+          Catch error.name === 'PolicyLengthExceededException' specifically and emit a
+          high-severity alert that includes the function name. The caller must enumerate
+          existing Sids via GetPolicyCommand and remove orphaned statements via
+          RemovePermissionCommand before retrying:
+
+          try {
+            await lambdaClient.send(new AddPermissionCommand({
+              FunctionName: fn, StatementId: sid, Action: action, Principal: principal,
+            }));
+          } catch (error: any) {
+            if (error.name === 'PolicyLengthExceededException') {
+              const policy = await lambdaClient.send(new GetPolicyCommand({ FunctionName: fn }));
+              // Caller must inspect and prune orphaned Sids before retry
+              throw new Error(`Lambda policy on ${fn} at 20 KB cap; ${policy.Policy?.length} bytes — prune Sids and retry`);
+            }
+            throw error;
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: send (PublishVersionCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Publishes a new immutable version of a Lambda function from $LATEST. Used in
+      blue/green deployment workflows and alias-based traffic shifting. After publish,
+      the version goes through Pending state while VPC/EFS/SnapStart resources are
+      provisioned. Callers must use waitUntilPublishedVersionActive before shifting
+      traffic via UpdateAliasCommand. Each account has a per-function published version
+      count limit (FunctionVersionsPerCapacityProviderLimitExceededException added in
+      v3.1075.0 for the new capacity provider feature) and a 75 GB account-wide code
+      storage quota (CodeStorageExceededException).
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_PublishVersion.html
+      # @throws annotation confirmed from dist-types/commands/PublishVersionCommand.d.ts (v3.1075.0):
+      #   CodeStorageExceededException, FunctionVersionsPerCapacityProviderLimitExceededException,
+      #   InvalidParameterValueException, PreconditionFailedException, ResourceConflictException,
+      #   ResourceNotFoundException, ServiceException, TooManyRequestsException
+      # FunctionVersionsPerCapacityProviderLimitExceededException is new in v3.1075.0 (capacity provider feature)
+      - id: aws-lambda-publish-version-no-error-handling
+        condition: >
+          PublishVersionCommand sent via lambdaClient.send() without try-catch. Throws
+          CodeStorageExceededException (400) when the 75 GB account-wide Lambda code storage
+          quota is exceeded (silent rollout failure — deploys succeed for early functions
+          and start failing once the quota is hit),
+          FunctionVersionsPerCapacityProviderLimitExceededException (400) when the per-capacity-provider
+          version count limit is reached (new in 2026 capacity provider feature),
+          ResourceConflictException (409) when another update is in progress (the publish must
+          wait for waitUntilFunctionUpdated to complete first),
+          PreconditionFailedException (412) when RevisionId or CodeSha256 parameter does not
+          match the current $LATEST (caller's expected code is stale),
+          ResourceNotFoundException (404) when the function does not exist,
+          InvalidParameterValueException (400) for bad Description/RevisionId,
+          TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: CodeStorageExceededException (400, 75 GB quota),
+          FunctionVersionsPerCapacityProviderLimitExceededException (400, capacity provider
+          version cap), ResourceConflictException (409, update in progress),
+          PreconditionFailedException (412, RevisionId/CodeSha256 mismatch — caller's $LATEST
+          is stale), ResourceNotFoundException (404), InvalidParameterValueException (400),
+          TooManyRequestsException (429). Network errors throw SdkClientError.
+        required_handling: >
+          Wrap in try-catch. Treat CodeStorageExceededException as a deploy-pipeline-stop
+          condition — no new versions can be published until old versions are deleted via
+          DeleteFunctionCommand with Qualifier. Treat PreconditionFailedException as a stale-
+          $LATEST signal — re-fetch via GetFunctionCommand before retrying. Always chain a
+          waitUntilPublishedVersionActive after publish before shifting traffic:
+
+          try {
+            const published = await lambdaClient.send(new PublishVersionCommand({
+              FunctionName: functionName,
+              Description: 'v2.0.0 release',
+              RevisionId: currentRevisionId,
+            }));
+            await waitUntilPublishedVersionActive(
+              { client: lambdaClient, maxWaitTime: 300 },
+              { FunctionName: functionName, Qualifier: published.Version }
+            );
+          } catch (error: any) {
+            if (error.name === 'CodeStorageExceededException') {
+              throw new Error('Lambda 75 GB code storage quota exceeded — delete old versions before publishing');
+            } else if (error.name === 'FunctionVersionsPerCapacityProviderLimitExceededException') {
+              throw new Error(`Capacity provider version limit reached for ${functionName} — delete old versions`);
+            } else if (error.name === 'PreconditionFailedException') {
+              throw new Error(`Publish race condition on ${functionName} — $LATEST has been updated since RevisionId was fetched`);
+            } else if (error.name === 'ResourceConflictException') {
+              throw new Error(`Publish failed — concurrent UpdateFunctionCode in progress on ${functionName}`);
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_PublishVersion.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: send (CreateFunctionUrlConfigCommand)
+    import_path: "@aws-sdk/client-lambda"
+    description: >
+      Creates a Function URL configuration for a Lambda function — a dedicated HTTPS
+      endpoint (https://<url-id>.lambda-url.<region>.on.aws) that invokes the function
+      without API Gateway. Used in SaaS apps to expose webhook receivers, OAuth
+      callback handlers, and lightweight HTTPS endpoints with minimal infra. The
+      AuthType parameter is security-critical — AuthType="NONE" exposes the function
+      publicly to the internet. Each function alias can have at most one Function URL
+      (ResourceConflictException if one already exists). The Cors configuration is
+      attached at creation; subsequent CORS changes require UpdateFunctionUrlConfigCommand.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunctionUrlConfig.html
+      # @throws annotation confirmed from dist-types/commands/CreateFunctionUrlConfigCommand.d.ts (v3.1075.0):
+      #   InvalidParameterValueException, ResourceConflictException, ResourceNotFoundException,
+      #   ServiceException, TooManyRequestsException
+      # AuthType="NONE" exposes the function publicly — caller must understand the security implication
+      - id: aws-lambda-function-url-no-error-handling
+        condition: >
+          CreateFunctionUrlConfigCommand sent via lambdaClient.send() without try-catch.
+          Throws ResourceConflictException (409) when a Function URL config already exists
+          for the function/alias (only ONE Function URL per function-or-alias is allowed —
+          repeated calls in deploy automation always fail),
+          ResourceNotFoundException (404) when the function or alias does not exist,
+          InvalidParameterValueException (400) for invalid AuthType / Cors config (e.g.
+          AllowOrigins=["*"] combined with AllowCredentials=true is rejected),
+          TooManyRequestsException (429) on throttling.
+        throws: >
+          LambdaServiceException subclasses: ResourceConflictException (409, Function URL
+          already exists — use UpdateFunctionUrlConfigCommand instead), ResourceNotFoundException
+          (404, function/alias not found), InvalidParameterValueException (400, bad AuthType
+          or Cors config), TooManyRequestsException (429, throttled). Network errors throw
+          SdkClientError.
+        required_handling: >
+          Wrap in try-catch. Treat ResourceConflictException as idempotency signal in deploy
+          automation (Function URL already exists — switch to UpdateFunctionUrlConfigCommand).
+          When using AuthType="NONE", explicitly log/audit the public exposure so security
+          reviews can catch it:
+
+          if (authType === 'NONE') {
+            console.warn(`SECURITY: creating PUBLIC Function URL for ${functionName} (no AWS_IAM auth)`);
+          }
+          try {
+            await lambdaClient.send(new CreateFunctionUrlConfigCommand({
+              FunctionName: functionName,
+              AuthType: authType,
+              Cors: { AllowOrigins: ['https://app.example.com'], AllowMethods: ['POST'] },
+            }));
+          } catch (error: any) {
+            if (error.name === 'ResourceConflictException') {
+              // Function URL already exists — switch to update
+              await lambdaClient.send(new UpdateFunctionUrlConfigCommand({
+                FunctionName: functionName,
+                AuthType: authType,
+              }));
+            } else if (error.name === 'ResourceNotFoundException') {
+              throw new Error(`Function ${functionName} not found — create it before adding a Function URL`);
+            } else if (error.name === 'InvalidParameterValueException') {
+              throw new Error(`Invalid Function URL config for ${functionName}: ${error.message}`);
+            } else {
+              throw error;
+            }
+          }
+        sources:
+          - "https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunctionUrlConfig.html"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/lambda/"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
   - "error.name contains the specific AWS error code (e.g., 'ResourceNotFoundException', 'TooManyRequestsException')"
@@ -677,4 +960,8 @@ notes:
   - "PreconditionFailedException (412): RevisionId mismatch — use GetFunction to fetch current RevisionId before retrying concurrent deployments"
   - "CreateEventSourceMappingCommand: ResourceConflictException is idempotency signal — mapping already exists, safe to continue"
   - "waitUntilPublishedVersionActive: use after PublishVersionCommand in blue/green deploys before shifting traffic via UpdateAlias"
+  - "AddPermissionCommand: PolicyLengthExceededException (20 KB function policy cap) is a silent operational failure mode in deploy automation that re-adds statements on every run; alert and prune Sids via RemovePermissionCommand"
+  - "AddPermissionCommand: PublicPolicyException is a security guardrail — adding Principal=\"*\" or org-wildcard access requires a SourceAccount/SourceArn condition"
+  - "PublishVersionCommand: FunctionVersionsPerCapacityProviderLimitExceededException is new in 2026 capacity provider feature — separate from the 75 GB account code storage quota"
+  - "CreateFunctionUrlConfigCommand: AuthType=NONE exposes the function publicly to the internet — always log/audit; ResourceConflictException (only one Function URL per function/alias) is idempotency signal in deploy automation"
   - "Coverage: 9 contracted functions out of 11 runtime-relevant. Omitted: InvokeAsyncCommand (deprecated), DeleteFunctionCommand (admin-only)."

@@ -17,6 +17,10 @@
  *   aws-lambda-update-config-no-error-handling        (UpdateFunctionConfigurationCommand — no try-catch)
  *   aws-lambda-published-version-waiter-no-error-handling (waitUntilPublishedVersionActive — no try-catch)
  *   aws-lambda-event-source-mapping-no-error-handling (CreateEventSourceMappingCommand — no try-catch)
+ *   aws-lambda-add-permission-no-error-handling       (AddPermissionCommand — no try-catch)
+ *   aws-lambda-add-permission-policy-length-exceeded  (AddPermissionCommand — PolicyLengthExceededException not handled)
+ *   aws-lambda-publish-version-no-error-handling      (PublishVersionCommand — no try-catch)
+ *   aws-lambda-function-url-no-error-handling         (CreateFunctionUrlConfigCommand — no try-catch)
  */
 import {
   LambdaClient,
@@ -27,6 +31,11 @@ import {
   CreateFunctionCommand,
   CreateEventSourceMappingCommand,
   DeleteFunctionCommand,
+  AddPermissionCommand,
+  PublishVersionCommand,
+  CreateFunctionUrlConfigCommand,
+  UpdateFunctionUrlConfigCommand,
+  GetPolicyCommand,
   LambdaServiceException,
 } from '@aws-sdk/client-lambda';
 import {
@@ -452,6 +461,173 @@ async function gt_create_event_source_mapping_safe(functionName: string, sqsQueu
       console.info(`Event source mapping already exists for ${functionName}`);
     } else if (error.name === 'ResourceNotFoundException') {
       throw new Error(`Function ${functionName} or event source ${sqsQueueArn} not found`);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 12. AddPermissionCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_add_permission_missing(functionName: string, apiGwArn: string, routeId: string) {
+  // SHOULD_FIRE: aws-lambda-add-permission-no-error-handling
+  await lambdaClient.send(new AddPermissionCommand({
+    FunctionName: functionName,
+    StatementId: `apigw-${routeId}`,
+    Action: 'lambda:InvokeFunction',
+    Principal: 'apigateway.amazonaws.com',
+    SourceArn: apiGwArn,
+  }));
+}
+
+// 12. AddPermissionCommand — with try/catch handling all named exceptions (SHOULD_NOT_FIRE)
+async function gt_add_permission_safe(functionName: string, apiGwArn: string, routeId: string) {
+  try {
+    // SHOULD_NOT_FIRE: AddPermissionCommand has try-catch with named branches
+    await lambdaClient.send(new AddPermissionCommand({
+      FunctionName: functionName,
+      StatementId: `apigw-${routeId}`,
+      Action: 'lambda:InvokeFunction',
+      Principal: 'apigateway.amazonaws.com',
+      SourceArn: apiGwArn,
+    }));
+  } catch (error: any) {
+    if (error.name === 'ResourceConflictException') {
+      // Statement Sid already exists — idempotent, safe to continue
+      console.info(`Permission ${routeId} already exists on ${functionName}`);
+    } else if (error.name === 'PolicyLengthExceededException') {
+      throw new Error(`Lambda function policy on ${functionName} hit 20 KB cap — clean up unused Sids before adding new permissions`);
+    } else if (error.name === 'PublicPolicyException') {
+      throw new Error(`Refusing to grant public access to ${functionName} without SourceAccount/SourceArn condition`);
+    } else if (error.name === 'PreconditionFailedException') {
+      throw new Error(`AddPermission race condition on ${functionName} — RevisionId mismatch`);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 13. AddPermissionCommand — generic catch swallows PolicyLengthExceededException (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// Postcondition `aws-lambda-add-permission-policy-length-exceeded` has no scanner detector yet —
+// concern queued in scanner upgrade-concerns.json. Fixture documents the violation pattern
+// but does NOT carry SHOULD_FIRE until detection lands.
+async function gt_add_permission_policy_length_unchecked(functionName: string, sid: string) {
+  try {
+    await lambdaClient.send(new AddPermissionCommand({
+      FunctionName: functionName,
+      StatementId: sid,
+      Action: 'lambda:InvokeFunction',
+      Principal: 's3.amazonaws.com',
+    }));
+  } catch (error: any) {
+    // Generic catch — does not differentiate PolicyLengthExceededException; deploy silently fails forever
+    console.error('AddPermission failed:', error.message);
+  }
+}
+
+// 13. AddPermissionCommand — specifically handles PolicyLengthExceededException (SHOULD_NOT_FIRE)
+async function gt_add_permission_policy_length_handled(functionName: string, sid: string) {
+  try {
+    // SHOULD_NOT_FIRE: PolicyLengthExceededException is explicitly branched
+    await lambdaClient.send(new AddPermissionCommand({
+      FunctionName: functionName,
+      StatementId: sid,
+      Action: 'lambda:InvokeFunction',
+      Principal: 's3.amazonaws.com',
+    }));
+  } catch (error: any) {
+    if (error.name === 'PolicyLengthExceededException') {
+      const policy = await lambdaClient.send(new GetPolicyCommand({ FunctionName: functionName }));
+      throw new Error(`Lambda policy on ${functionName} at 20 KB cap; ${policy.Policy?.length} bytes — prune Sids and retry`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 14. PublishVersionCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_publish_version_missing(functionName: string, currentRevisionId: string) {
+  // SHOULD_FIRE: aws-lambda-publish-version-no-error-handling
+  const published = await lambdaClient.send(new PublishVersionCommand({
+    FunctionName: functionName,
+    Description: 'v2.0.0 release',
+    RevisionId: currentRevisionId,
+  }));
+  return published.Version;
+}
+
+// 14. PublishVersionCommand — with try/catch + waitUntilPublishedVersionActive (SHOULD_NOT_FIRE)
+async function gt_publish_version_safe(functionName: string, currentRevisionId: string) {
+  try {
+    // SHOULD_NOT_FIRE: PublishVersionCommand has try-catch with named branches
+    const published = await lambdaClient.send(new PublishVersionCommand({
+      FunctionName: functionName,
+      Description: 'v2.0.0 release',
+      RevisionId: currentRevisionId,
+    }));
+    await waitUntilPublishedVersionActive(
+      { client: lambdaClient, maxWaitTime: 300 },
+      { FunctionName: functionName, Qualifier: published.Version }
+    );
+    return published.Version;
+  } catch (error: any) {
+    if (error.name === 'CodeStorageExceededException') {
+      throw new Error('Lambda 75 GB code storage quota exceeded — delete old versions before publishing');
+    } else if (error.name === 'FunctionVersionsPerCapacityProviderLimitExceededException') {
+      throw new Error(`Capacity provider version limit reached for ${functionName} — delete old versions`);
+    } else if (error.name === 'PreconditionFailedException') {
+      throw new Error(`Publish race condition on ${functionName} — $LATEST has been updated since RevisionId was fetched`);
+    } else if (error.name === 'ResourceConflictException') {
+      throw new Error(`Publish failed — concurrent UpdateFunctionCode in progress on ${functionName}`);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 15. CreateFunctionUrlConfigCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_create_function_url_missing(functionName: string) {
+  // SHOULD_FIRE: aws-lambda-function-url-no-error-handling
+  await lambdaClient.send(new CreateFunctionUrlConfigCommand({
+    FunctionName: functionName,
+    AuthType: 'AWS_IAM',
+    Cors: { AllowOrigins: ['https://app.example.com'], AllowMethods: ['POST'] },
+  }));
+}
+
+// 15. CreateFunctionUrlConfigCommand — with try/catch + idempotency fallback (SHOULD_NOT_FIRE)
+async function gt_create_function_url_safe(functionName: string, authType: 'AWS_IAM' | 'NONE') {
+  if (authType === 'NONE') {
+    console.warn(`SECURITY: creating PUBLIC Function URL for ${functionName} (no AWS_IAM auth)`);
+  }
+  try {
+    // SHOULD_NOT_FIRE: CreateFunctionUrlConfigCommand has try-catch with named branches
+    await lambdaClient.send(new CreateFunctionUrlConfigCommand({
+      FunctionName: functionName,
+      AuthType: authType,
+      Cors: { AllowOrigins: ['https://app.example.com'], AllowMethods: ['POST'] },
+    }));
+  } catch (error: any) {
+    if (error.name === 'ResourceConflictException') {
+      // Function URL already exists — switch to update
+      await lambdaClient.send(new UpdateFunctionUrlConfigCommand({
+        FunctionName: functionName,
+        AuthType: authType,
+      }));
+    } else if (error.name === 'ResourceNotFoundException') {
+      throw new Error(`Function ${functionName} not found — create it before adding a Function URL`);
+    } else if (error.name === 'InvalidParameterValueException') {
+      throw new Error(`Invalid Function URL config for ${functionName}: ${error.message}`);
     } else {
       throw error;
     }

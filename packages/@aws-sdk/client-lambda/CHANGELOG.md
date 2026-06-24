@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 82% → 86%
+
+- **Profile:** `packages/@aws-sdk/client-lambda/contract.yaml`
+- **Package version verified against:** @aws-sdk/client-lambda@3.1075.0
+- **Functions added:** send (AddPermissionCommand), send (PublishVersionCommand), send (CreateFunctionUrlConfigCommand) (3 total)
+- **Postconditions added:** 5 (aws-lambda-add-permission-no-error-handling, aws-lambda-add-permission-policy-length-exceeded, aws-lambda-publish-version-no-error-handling, aws-lambda-function-url-no-error-handling; AddPermission carries 2 postconditions)
+- **Functions intentionally omitted this pass:** InvokeAsyncCommand (deprecated legacy async API), DeleteFunctionCommand (admin-only destructive op). 70+ other command paths covered by the generic send postcondition.
+- **Scanner concerns queued:** 4 (`concern-20260624-aws-sdk-client-lambda-deepen-9` AddPermission generic, `-10` AddPermission PolicyLengthExceededException specific, `-11` PublishVersion generic, `-12` CreateFunctionUrlConfig generic)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html, https://docs.aws.amazon.com/lambda/latest/api/API_PublishVersion.html, https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunctionUrlConfig.html, https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html, https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html, @aws-sdk/client-lambda@3.1075.0 TypeScript declarations (dist-types/commands/*Command.d.ts @throws annotations)
+- **Verified by:** bc-deepen-contract (pass 34, deepen-stream-3, 2026-06-24T03:32:49Z)
+- **Notes:** Re-deepen of a profile last deepened 2026-04-16. The contract correctly treats most of the 86-command SDK surface via the generic `aws-lambda-service-error` rule on `lambdaClient.send()`. This pass adds command-specific postconditions for 3 commands whose throw set is materially distinct from the generic rule: AddPermission (PolicyLengthExceededException is silent operational failure; PublicPolicyException is security guardrail), PublishVersion (CodeStorageExceededException is silent rollout-wide failure; FunctionVersionsPerCapacityProviderLimitExceededException is new in v3.1075.0), CreateFunctionUrlConfig (AuthType=NONE is security-critical public exposure literal). All 24 existing ground-truth tests pass after additions.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-lambda@3.1072.0
