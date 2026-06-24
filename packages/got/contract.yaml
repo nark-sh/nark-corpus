@@ -1,8 +1,8 @@
 package: got
 semver: ">=12.0.0"
-contract_version: "2.1.0"
+contract_version: "2.2.0"
 maintainer: corpus-team
-last_verified: "2026-04-11"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -690,6 +690,269 @@ functions:
         required_handling: Caller MUST wrap in try-catch.
         sources:
           - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: dist/source/create.js line 228:
+  #   got.paginate.all = (async (url, options) => Array.fromAsync(paginateEach(url, options)));
+  # Evidence: dist/source/types.d.ts (GotPaginate.all returns Promise<T[]>)
+  # Evidence: documentation/4-pagination.md (got.paginate.all example calling await on Promise)
+  # Surfaced by deepen pass 2026-06-23 (pass 27): paginate.all() is a distinct Promise-returning
+  # API surface that the prior `paginate` entry mentioned in prose but did not contract independently.
+  # The implementation is a thin Array.fromAsync wrapper over the same paginateEach async iterator,
+  # so all error modes propagate identically to the for-await-of loop case, but the surface presents
+  # as a single awaitable Promise rather than an iterator \u2014 callers MUST wrap the await, not a loop.
+  - name: paginate.all
+    import_path: got
+    description: >
+      Returns a Promise<T[]> that resolves to all paginated items collected into an array.
+      Internally an `async (url, options) => Array.fromAsync(paginateEach(url, options))` wrapper \u2014
+      it consumes the same paginateEach async iterator that got.paginate() uses, but eagerly drains
+      it into a flat array. All error modes from the underlying got() requests (HTTP, network, timeout,
+      parse, abort) propagate through Array.fromAsync to the returned Promise as a rejection \u2014
+      iteration stops at the first failing page and the partial results collected so far are discarded.
+    postconditions:
+      - id: paginate-all-http-error
+        condition: >
+          Any paginated request receives a non-2xx/3xx response and throwHttpErrors is true (default).
+          Iteration halts immediately and the Promise rejects \u2014 already-collected pages are NOT
+          returned to the caller.
+        throws: HTTPError from the failing request, propagated through Array.fromAsync
+        required_handling: >
+          Caller MUST wrap `await got.paginate.all(...)` in try-catch or attach .catch().
+          On rejection, treat the entire result set as missing (no partial array is exposed).
+          Inspect error.response.statusCode to distinguish client vs server failures.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/4-pagination.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: paginate-all-network-error
+        condition: >
+          Any paginated request fails with a network error (DNS, ECONNREFUSED, ECONNRESET, timeout,
+          etc.) after the configured retry budget is exhausted. Iteration halts and the Promise
+          rejects with the final error.
+        throws: RequestError or subclass (TimeoutError, ReadError, etc.) propagated through Array.fromAsync
+        required_handling: >
+          Caller MUST wrap `await got.paginate.all(...)` in try-catch. The Promise rejects exactly
+          once per call site \u2014 there is no per-page error callback. Discard the entire result set
+          on rejection.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/4-pagination.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: dist/source/create.js lines 232-237:
+  #   got.stream = ((url, options) => makeRequest(url, options, defaults.options, true));
+  #   for (const method of aliases) {
+  #     got[method] = ((url, options) => got(url, { ...options, method }));
+  #     got.stream[method] = ((url, options) => makeRequest(url, { ...options, method }, defaults.options, true));
+  #   }
+  # Evidence: dist/source/types.d.ts (GotStream = GotStreamFunction & Record<HTTPAlias, GotStreamFunction>)
+  # Evidence: documentation/3-streams.md (got.stream.get/post/put/patch/delete shortcuts, error event semantics)
+  # Surfaced by deepen pass 2026-06-23 (pass 27): the existing `stream` function entry covered the
+  # default got.stream(url) call shape but not the six HTTP-method-aliased variants exposed via
+  # Record<HTTPAlias, GotStreamFunction>. The aliases share the exact stream-error-event contract
+  # (errors emit on the 'error' event, NOT as Promise rejections), so a single shared postcondition
+  # covers all six aliases \u2014 but the surface is distinct because callers reach for got.stream.post(url, opts)
+  # and never await it, so try-catch on the call site silently misses every failure.
+  - name: stream.get
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut. got.stream.get(url) === got.stream(url, { method: 'GET' }).
+      Returns a Duplex stream \u2014 NOT a Promise. Errors emit as 'error' events on the stream. Wrapping
+      the call in try-catch does NOT catch failures. Caller MUST attach stream.on('error', handler)
+      or use stream.pipeline() for proper error propagation. Same six aliases (get/post/put/patch/head/delete)
+      share this contract \u2014 patterns are detected per-call-site regardless of method alias.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error occurs during the request: network failure, timeout, HTTP error (when
+          throwHttpErrors is true, default), read error, or upload error. The returned Duplex
+          stream emits the error as an 'error' event \u2014 it does NOT reject any Promise (the
+          shortcut does not return one).
+        throws: >
+          RequestError (or subclass \u2014 HTTPError, TimeoutError, ReadError, UploadError) emitted
+          as the argument to an 'error' event listener attached to the returned stream. Without
+          an error listener, Node.js raises 'Uncaught Error' and crashes the process.
+        required_handling: >
+          Caller MUST attach an 'error' event listener directly to the stream returned from
+          got.stream.<method>() \u2014 stream.on('error', handler) or stream.once('error', handler).
+          Using try-catch around got.stream.get(url) catches NOTHING because the shortcut
+          returns synchronously before any I/O happens. When piping to a destination, use
+          Node's stream.pipeline() (or attach the error listener on the got stream itself,
+          not just the destination \u2014 the destination's 'error' event fires only for its own
+          write errors, not upstream request errors).
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/documentation/8-errors.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+    edge_cases:
+      - id: stream-alias-post-hangs-without-body
+        description: >
+          Unlike got.post() (which auto-ends), got.stream.post(url) returns a Writable that
+          hangs indefinitely until you call stream.end() or pipe a body into it. Same applies
+          to put, patch, and delete. This is per the official docs: "While got.post('...')
+          resolves, got.stream.post('...') will hang indefinitely until a body is provided."
+          This is not directly an error mode but a common gotcha that produces silent timeouts
+          downstream \u2014 callers attaching only an 'error' listener will see no error fire because
+          no I/O completes.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: stream.post
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut for POST requests. Returns a Writable stream
+      that hangs until a body is provided via .end() or pipe(). Shares the stream-alias-error-event
+      contract with get/put/patch/head/delete. Errors emit as 'error' events, NOT Promise rejections.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error during the request (network, timeout, HTTPError when throwHttpErrors=true,
+          ReadError, UploadError on a body stream). Emitted as an 'error' event on the returned
+          Duplex stream.
+        throws: RequestError or subclass \u2014 emitted on stream 'error' event, NOT a Promise rejection.
+        required_handling: >
+          Caller MUST attach stream.on('error', handler). try-catch around the got.stream.post() call
+          itself catches nothing. When piping a request body in, attach the listener on the got stream
+          before piping; use stream.pipeline() for the full pipe chain.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stream.put
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut for PUT requests. Same shape and error semantics
+      as got.stream.post() \u2014 returns a Writable, hangs without a body, errors emit on 'error' events.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error during the request (network, timeout, HTTPError when throwHttpErrors=true,
+          ReadError, UploadError). Emitted on the stream's 'error' event.
+        throws: RequestError or subclass \u2014 emitted on stream 'error' event, NOT a Promise rejection.
+        required_handling: >
+          Caller MUST attach stream.on('error', handler). try-catch on the synchronous call site
+          catches nothing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stream.patch
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut for PATCH requests. Same shape and error semantics
+      as got.stream.post() \u2014 returns a Writable, hangs without a body, errors emit on 'error' events.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error during the request (network, timeout, HTTPError when throwHttpErrors=true,
+          ReadError, UploadError). Emitted on the stream's 'error' event.
+        throws: RequestError or subclass \u2014 emitted on stream 'error' event, NOT a Promise rejection.
+        required_handling: >
+          Caller MUST attach stream.on('error', handler). try-catch on the synchronous call site
+          catches nothing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stream.head
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut for HEAD requests. Returns a Duplex stream.
+      Errors emit on the 'error' event. Same contract as got.stream() with method='HEAD'.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error during the request (network, timeout, HTTPError when throwHttpErrors=true,
+          ReadError). Emitted on the stream's 'error' event.
+        throws: RequestError or subclass \u2014 emitted on stream 'error' event, NOT a Promise rejection.
+        required_handling: >
+          Caller MUST attach stream.on('error', handler). try-catch on the synchronous call site
+          catches nothing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: stream.delete
+    import_path: got
+    description: >
+      HTTP-method-aliased Stream API shortcut for DELETE requests. Same shape and error semantics
+      as got.stream.post() \u2014 does not auto-end, errors emit on 'error' events.
+    postconditions:
+      - id: stream-alias-error-event
+        condition: >
+          Any error during the request (network, timeout, HTTPError when throwHttpErrors=true,
+          ReadError, UploadError). Emitted on the stream's 'error' event.
+        throws: RequestError or subclass \u2014 emitted on stream 'error' event, NOT a Promise rejection.
+        required_handling: >
+          Caller MUST attach stream.on('error', handler). try-catch on the synchronous call site
+          catches nothing.
+        sources:
+          - https://github.com/sindresorhus/got/blob/main/documentation/3-streams.md
+          - https://github.com/sindresorhus/got/blob/main/source/create.ts
         severity: error
         business_impact:
           incident_label: DOWNTIME
