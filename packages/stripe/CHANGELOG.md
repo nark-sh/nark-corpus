@@ -1,6 +1,19 @@
 # CHANGELOG — stripe
 
 All notable verification, deepen, and fork events for this profile. Newest first.
+
+## 2026-06-24 — deepen pass — coverage 78% -> 82.6%
+
+- **Profile:** `packages/stripe/contract.yaml`
+- **Functions added:** update (1 total — promoted from previously-omitted list)
+- **Postconditions added:** 4 (update-permission-error, update-idempotency-error, update-invalid-state-transition, update-invalid-parameter)
+- **Error classes newly covered:** StripePermissionError and StripeIdempotencyError — both declared in stripe/types/Errors.d.ts and instantiated in stripe/cjs/Error.js since at least v8 but had NO postcondition referencing them across the 18 prior contracted functions (verified via grep before pass)
+- **Functions intentionally omitted this pass:** list (read-only paginated enumeration), search (read-only), expire (narrow state-transition; surface fully overlapping with cancel), reverse-payout (narrow state-transition; surface fully overlapping with cancel/refund)
+- **Scanner concerns queued:** 4 (`concern-20260624-stripe-deepen-1` ... `-4`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://docs.stripe.com/error-handling (fetched 2026-06-24, confirms both new error classes), https://docs.stripe.com/api/idempotent_requests, stripe@20.4.1 node_modules (Errors.d.ts + cjs/Error.js)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 78 on 2026-06-24T10:28Z)
+
 ## 2026-06-18 — re-verified (no action; sibling fork covers latest)
 
 - **Latest published:** stripe@22.2.1

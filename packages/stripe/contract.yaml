@@ -1,8 +1,8 @@
 package: stripe
 semver: ">=8.0.0 <21.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-15"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -12,14 +12,29 @@ evidence_quality: confirmed
 #   sendInvoice, voidInvoice, markUncollectible, resume, incrementAuthorization,
 #   verifyMicrodeposits, reverse (payout)
 # Contracted before: 9 (create, confirm, constructEvent, retrieve, capture, cancel, refund, attach, detach)
-# Contracted after: 18 (+9 this pass: constructEventAsync, finalizeInvoice, pay, sendInvoice,
+# Contracted after pass 8: 18 (+9: constructEventAsync, finalizeInvoice, pay, sendInvoice,
 #   voidInvoice, markUncollectible, resume, incrementAuthorization, verifyMicrodeposits)
-# Intentionally omitted (5): update, list, search, expire, reverse(payout)
-# Evidence: stripe v22.0.2 TypeScript declarations, https://docs.stripe.com/error-codes,
-#   https://docs.stripe.com/billing/invoices/workflow, https://docs.stripe.com/api/invoices/
-# Error codes confirmed from stripe/cjs/resources/*.d.ts Code union types
-# coverage_score: 18/23 = 0.78 raw; effective = 18/18 non-omitted = 1.0
-coverage_score: 0.78
+# Depth pass 2026-06-24 (deepen-stream-2 pass 78):
+# Added 'update' function with 4 postconditions covering previously-uncovered error classes:
+#   StripePermissionError (restricted-key / Connect / role-scoped failures — first time covered)
+#   StripeIdempotencyError (idempotency-key collision with different payload — first time covered)
+#   plus state-transition errors and update-specific invalid-parameter errors.
+# Both StripePermissionError and StripeIdempotencyError were genuine gaps confirmed
+# from node_modules/stripe@20.4.1/types/Errors.d.ts and cjs/Error.js: those classes are
+# declared and instantiated but no postcondition in the corpus referenced them before
+# this pass. https://docs.stripe.com/error-handling (fetched 2026-06-24) lists both
+# explicitly.
+# Contracted after pass 78: 19 (+1 this pass: update)
+# Intentionally omitted (4): list, search, expire, reverse(payout) — all read-only or
+#   narrow state-transition operations whose error surface is fully covered by the
+#   existing cancel/create/confirm postconditions when they fail.
+# Evidence: stripe v20.4.1 TypeScript declarations, https://docs.stripe.com/error-codes,
+#   https://docs.stripe.com/billing/invoices/workflow, https://docs.stripe.com/api/invoices/,
+#   https://docs.stripe.com/error-handling, https://docs.stripe.com/api/idempotent_requests
+# Error codes confirmed from stripe/cjs/resources/*.d.ts Code union types and
+#   stripe/cjs/Error.js StripePermissionError / StripeIdempotencyError class declarations.
+# coverage_score: 19/23 = 0.826 raw; effective = 19/19 non-omitted = 1.0
+coverage_score: 0.826
 
 functions:
   - name: create
@@ -1162,3 +1177,147 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: high
+
+  - name: update
+    import_path: "stripe"
+    description: >
+      Updates a mutable field on a Stripe resource (Customer, PaymentIntent, Subscription,
+      Invoice, Charge, etc.). Unlike create, update is constrained by resource state — many
+      resources can only be updated while in certain statuses (e.g. an Invoice can only be
+      updated while 'draft'; a PaymentIntent's amount can only change before confirm).
+      Update is also the most common surface for restricted-API-key permission failures and
+      idempotency-key collisions, because update calls are frequently retried by background
+      workers that re-use the same idempotency key with mutating payloads.
+
+    postconditions:
+      # Evidence: https://docs.stripe.com/error-handling (fetched 2026-06-24)
+      # Error class confirmed from node_modules/stripe/types/Errors.d.ts:
+      # `class StripePermissionError extends StripeError { readonly type: 'StripePermissionError'; }`
+      # And node_modules/stripe/cjs/RequestSender.js: `err = new StripePermissionError(jsonResponse.error)`
+      # NOT currently covered by any other postcondition in this contract — first appearance.
+      - id: update-permission-error
+        condition: >
+          The API key used for the update request lacks the required permission to mutate
+          the target resource. Common with restricted API keys (rak_*) that have read-only
+          access to a resource type, with Stripe Connect platform keys attempting to update
+          a connected-account-owned object without the correct Stripe-Account header, or
+          with team-member API keys whose role does not include update permission for the
+          resource type.
+        throws: "StripePermissionError with error.type === 'StripePermissionError'"
+        required_handling: >
+          Caller MUST catch StripePermissionError separately from StripeInvalidRequestError.
+          DO NOT retry — permission errors will not resolve on retry. Log the error with
+          the restricted key prefix (rak_*) and alert the operations team to widen the
+          key's scope or rotate to an unrestricted key. For Connect calls, verify the
+          Stripe-Account header is set on the request options.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripePermissionError"
+        sources:
+          - "https://docs.stripe.com/error-handling"
+          - "https://docs.stripe.com/keys#limit-access"
+          - "https://docs.stripe.com/connect/authentication"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: https://docs.stripe.com/error-handling (fetched 2026-06-24) — quote:
+      # "You used an idempotency key for something unexpected, like replaying a request
+      #  but passing different parameters."
+      # Error class confirmed from node_modules/stripe/types/Errors.d.ts:
+      # `class StripeIdempotencyError extends StripeError { readonly rawType: 'idempotency_error'; }`
+      # And node_modules/stripe/cjs/Error.js: `return new StripeIdempotencyError(rawStripeError);`
+      # NOT currently covered by any other postcondition in this contract — first appearance.
+      - id: update-idempotency-error
+        condition: >
+          The request re-used an Idempotency-Key header value with a different request body
+          than the original. Stripe stores the first response for an idempotency key for 24
+          hours and rejects subsequent requests that change parameters. Common in retry
+          loops where the worker bumps an updated_at timestamp or recalculates an amount
+          before retrying, breaking idempotency.
+        throws: "StripeIdempotencyError with error.type === 'StripeIdempotencyError'"
+        required_handling: >
+          Caller MUST either generate a fresh idempotency key for retries that mutate the
+          payload, OR ensure the retry sends the exact same body as the original request.
+          DO NOT swallow idempotency errors — a swallowed error means the update either
+          succeeded with the original payload (caller now has stale state) or never
+          executed (caller now has unwritten state). Both branches require manual
+          reconciliation.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeIdempotencyError"
+        sources:
+          - "https://docs.stripe.com/error-handling"
+          - "https://docs.stripe.com/api/idempotent_requests"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      # Evidence: stripe/cjs/resources/Invoices.d.ts, Subscriptions.d.ts, PaymentIntents.d.ts
+      # all declare update() methods that throw StripeInvalidRequestError for resources
+      # in non-updatable status (e.g. Invoice not in 'draft', Subscription in 'canceled',
+      # PaymentIntent past 'requires_confirmation').
+      # Distinct from create's validation errors — create cannot fail this way (no prior state).
+      - id: update-invalid-state-transition
+        condition: >
+          The target resource is in a status that does not permit the requested update.
+          For Invoices: only 'draft' invoices are fully editable. For Subscriptions: 'canceled'
+          and 'incomplete_expired' subscriptions cannot be updated. For PaymentIntents: most
+          fields are immutable after confirm. For Charges: refunded charges cannot have
+          metadata mutated in some configurations.
+        throws: "StripeInvalidRequestError with error.code in {'resource_already_exists', 'invoice_not_editable', 'subscription_canceled', 'payment_intent_unexpected_state'}"
+        required_handling: >
+          Caller SHOULD read the resource's current status before calling update and skip
+          the update if the resource is already in a terminal state. For idempotent retry
+          handlers, treat invalid-state-transition as a no-op (the previous attempt already
+          advanced the state) and log for review. Do NOT retry — the underlying state will
+          not change without an explicit operation.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/billing/invoices/workflow"
+          - "https://docs.stripe.com/api/payment_intents/update"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: stripe/cjs/resources/*.d.ts — Code union on update endpoints includes
+      # 'parameter_invalid_empty', 'parameter_invalid_string_blank', 'parameter_unknown',
+      # 'metadata_invalid_keys', 'currency_unsupported_for_account' across most resources.
+      # Distinct from create's invalid-params because update allows null-to-clear semantics
+      # that have their own validation surface.
+      - id: update-invalid-parameter
+        condition: >
+          Update payload contains an invalid parameter — unknown field name, empty string
+          where a value is required, metadata key exceeding 40 chars, or a value that
+          conflicts with the existing resource (e.g. changing currency on a Customer that
+          has active subscriptions in a different currency).
+        throws: "StripeInvalidRequestError with error.type === 'invalid_request_error'"
+        required_handling: >
+          Caller MUST validate the update payload before sending. Catch
+          StripeInvalidRequestError and surface error.param to the user so they know which
+          field caused the failure. Do NOT retry without fixing the payload — invalid
+          parameters will fail identically on retry.
+        sources:
+          - "https://docs.stripe.com/error-codes"
+          - "https://docs.stripe.com/api/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low

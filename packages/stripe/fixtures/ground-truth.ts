@@ -713,3 +713,48 @@ export async function constructEventViaHelper(payload: string, sig: string, secr
   const event = lazyClient.webhooks.constructEvent(payload, sig, secret);
   return event;
 }
+
+// update — added in deepen pass 78 (2026-06-24)
+// Covers StripePermissionError, StripeIdempotencyError, invalid-state-transition, invalid-parameter.
+
+export async function updateCustomerNoCatch() {
+  // SHOULD_FIRE: update-permission-error
+  const customer = await stripe.customers.update('cus_123', { email: 'new@example.com' });
+  return customer;
+}
+
+export async function updateCustomerWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: update inside try-catch satisfies all four update postconditions
+    const customer = await stripe.customers.update('cus_123', { email: 'new@example.com' });
+    return customer;
+  } catch (err: any) {
+    if (err.type === 'StripePermissionError') throw new Error(`perm: ${err.message}`);
+    if (err.type === 'StripeIdempotencyError') throw new Error(`idem: ${err.message}`);
+    throw err;
+  }
+}
+
+export async function updateSubscriptionNoCatch() {
+  // SHOULD_FIRE: update-invalid-state-transition
+  const sub = await stripe.subscriptions.update('sub_123', { metadata: { plan_tier: 'gold' } });
+  return sub;
+}
+
+export async function updateInvoiceWithInstanceofCatch() {
+  try {
+    // SHOULD_NOT_FIRE: instanceof Stripe.errors.StripePermissionError satisfies the postcondition
+    const invoice = await stripe.invoices.update('in_123', { description: 'updated' });
+    return invoice;
+  } catch (err) {
+    if (err instanceof Stripe.errors.StripePermissionError) throw new Error('perm');
+    if (err instanceof Stripe.errors.StripeIdempotencyError) throw new Error('idem');
+    throw err;
+  }
+}
+
+export async function updatePaymentIntentNoCatchInvalidParam() {
+  // SHOULD_FIRE: update-invalid-parameter
+  const pi = await stripe.paymentIntents.update('pi_123', { amount: 5000 });
+  return pi;
+}
