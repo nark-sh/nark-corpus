@@ -284,6 +284,51 @@ function addKeywordDuplicate(): void {
   ajvKwd.addKeyword(nullableKeyword); // crashes on second call!
 }
 
+/**
+ * VIOLATION: removeSchema() called with a value whose type is not narrowed
+ */
+function removeSchemaWithUntypedKey(rawKey: unknown): void {
+  const ajvRemove = new Ajv();
+  // SHOULD_FIRE: removeschema-invalid-parameter
+  ajvRemove.removeSchema(rawKey as any);
+}
+
+/**
+ * VIOLATION: addMetaSchema() called twice with the same $id without checking
+ */
+function addMetaSchemaDuplicate(): void {
+  const ajvMeta = new Ajv();
+  const draft = {
+    $id: 'https://example.com/meta/custom-dialect.json',
+    $schema: 'http://json-schema.org/draft-07/schema#',
+    type: 'object'
+  };
+  // SHOULD_FIRE: addmetaschema-duplicate-key
+  ajvMeta.addMetaSchema(draft);
+  ajvMeta.addMetaSchema(draft); // crashes on second call
+}
+
+/**
+ * VIOLATION: addMetaSchema() registering an untrusted meta-schema without try-catch
+ */
+function addMetaSchemaUntrusted(externalMetaSchema: object): void {
+  const ajvMeta = new Ajv();
+  // SHOULD_FIRE: addmetaschema-invalid-schema
+  ajvMeta.addMetaSchema(externalMetaSchema);
+}
+
+/**
+ * VIOLATION: validateSchema() called on a schema that may have non-string $schema
+ */
+function validateSchemaWithUnsafeDollarSchema(schema: object): void {
+  const ajvVS = new Ajv();
+  // SHOULD_FIRE: validateschema-invalid-dollar-schema
+  const ok = ajvVS.validateSchema(schema);
+  if (!ok) {
+    console.error(ajvVS.errors);
+  }
+}
+
 // Export functions to prevent tree-shaking
 export {
   validateUserWithoutChecking,
@@ -299,5 +344,9 @@ export {
   compileAsyncWithoutLoadSchema,
   compileAsyncWithoutErrorHandling,
   addSchemaDuplicateId,
-  addKeywordDuplicate
+  addKeywordDuplicate,
+  removeSchemaWithUntypedKey,
+  addMetaSchemaDuplicate,
+  addMetaSchemaUntrusted,
+  validateSchemaWithUnsafeDollarSchema
 };

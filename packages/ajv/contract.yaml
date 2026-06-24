@@ -2,11 +2,11 @@ package: ajv
 semver: ">=8.18.0 <10.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.86
+coverage_score: 0.89
 # analyzer_limitation: return_value_pattern
 # Detection is limited: analyzer cannot reliably detect missing return value checks.
 # Historical: False positive rate ~23%, detection rate ~42% on fixtures. Requires dataflow analysis.
@@ -82,6 +82,35 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      - id: validateschema-invalid-dollar-schema
+        # Evidence: ajv/dist/core.js line 253-254 (v8.20.0):
+        # if ($schema !== undefined && typeof $schema != "string") {
+        #     throw new Error("$schema must be a string");
+        # }
+        # Source-confirmed synchronous throw, not a return-false case.
+        condition: >
+          The schema object contains a `$schema` property whose value is not a string
+          (e.g., a number, boolean, object, or null). validateSchema throws synchronously
+          BEFORE running meta-schema validation, so the errors array is never populated.
+        throws: "Error: $schema must be a string"
+        required_handling: >
+          Caller MUST wrap validateSchema() in try-catch when the schema may be user-supplied
+          or programmatically constructed. The thrown Error is NOT captured in ajv.errors —
+          it propagates as an exception. Schema-builder libraries that accidentally emit a
+          non-string $schema (e.g., from an object spread that overwrites the field) will
+          crash the process here.
+          Use pattern: try { if (!ajv.validateSchema(schema)) { /* invalid */ } } catch (e) { /* malformed $schema */ }
+        sources:
+          - "https://ajv.js.org/api.html#validateschema-schema-object-boolean"
+        evidence_quality: confirmed
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
   - name: compileAsync
     import_path: "ajv"
@@ -264,8 +293,109 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
-# coverage_score: 0.86  # 6 contracted / 7 total (validate, compile, validateSchema, compileAsync, addSchema, addKeyword, constructor)
-# last_deepened: 2026-04-17
+  - name: removeSchema
+    import_path: "ajv"
+    description: >
+      Removes a previously added schema from the Ajv instance, identified by key, $id,
+      RegExp pattern, or the schema object itself. Returns the Ajv instance for chaining.
+      Commonly used during hot-reload of dynamic schemas or in tests to reset state.
+    postconditions:
+      # Evidence: ajv/dist/core.js lines 291-324 (v8.20.0):
+      # switch (typeof schemaKeyRef) {
+      #   case "undefined": ...
+      #   case "string": ...
+      #   case "object": ...
+      #   default:
+      #     throw new Error("ajv.removeSchema: invalid parameter");
+      # }
+      # Source-confirmed throw for any non-string, non-object, non-RegExp, non-undefined input.
+      - id: removeschema-invalid-parameter
+        severity: error
+        condition: >
+          removeSchema() is called with a parameter that is not undefined, a string,
+          a RegExp, or an object (e.g., a number, boolean, or symbol). This typically
+          occurs when the schema identifier is sourced from untyped JSON or user input
+          without runtime type narrowing.
+        throws: "Error: ajv.removeSchema: invalid parameter"
+        required_handling: >
+          Caller MUST ensure the schemaKeyRef is one of: undefined, string ($id or key),
+          RegExp, or the schema object itself. When the identifier comes from external
+          input (config files, HTTP requests, queue messages), narrow the type before
+          calling removeSchema. Otherwise wrap in try-catch to prevent a runtime crash
+          from a misconfigured identifier.
+          Use pattern: if (typeof key === 'string') { ajv.removeSchema(key); } else if (key instanceof RegExp) { ... }
+        sources:
+          - "https://ajv.js.org/api.html#removeschema-schemakeyref-ajv"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: addMetaSchema
+    import_path: "ajv"
+    description: >
+      Adds a meta-schema (a schema that validates other schemas) to the Ajv instance.
+      Internally delegates to addSchema with the meta flag set, so it inherits the
+      same throw behavior on duplicate $id or invalid meta-schema structure.
+      Typically called at startup when supporting JSON Schema drafts beyond the default,
+      or when registering a custom validation dialect.
+    postconditions:
+      # Evidence: ajv/dist/core.js lines 240-245 (v8.20.0):
+      # addMetaSchema(schema, key, _validateSchema = this.opts.validateSchema) {
+      #     this.addSchema(schema, key, true, _validateSchema);
+      #     return this;
+      # }
+      # Delegates to addSchema — inherits both duplicate-id throw and invalid-schema throw.
+      - id: addmetaschema-duplicate-key
+        severity: error
+        condition: >
+          A meta-schema with the same $id or key is added a second time to the same
+          Ajv instance. Internally addMetaSchema calls addSchema, which throws on
+          duplicate registration.
+        throws: "Error: schema with key or id already exists"
+        required_handling: >
+          Caller MUST check whether the meta-schema is already registered before calling
+          addMetaSchema(). This is especially common when multiple modules independently
+          try to register the same JSON Schema draft (e.g., draft-2019-09) on a shared
+          Ajv instance during application startup or in test setup that runs per-file.
+          Use pattern: if (!ajv.getSchema(metaSchema.$id)) { ajv.addMetaSchema(metaSchema); }
+        sources:
+          - "https://ajv.js.org/api.html#addmetaschema-schema-object-key-string-ajv"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: addmetaschema-invalid-schema
+        severity: warning
+        condition: >
+          The meta-schema being added has invalid structure and validateSchema is true
+          (default). Ajv validates the incoming meta-schema against its own meta-schema
+          during addMetaSchema(), throwing synchronously on failure.
+        throws: "Error: schema is invalid"
+        required_handling: >
+          Caller MUST wrap addMetaSchema() in try-catch when registering meta-schemas
+          loaded from external sources (custom JSON Schema dialects, third-party schema
+          libraries). For static meta-schemas bundled with the application, failure
+          here indicates a developer mistake and should fail-fast at startup.
+        sources:
+          - "https://ajv.js.org/api.html#addmetaschema-schema-object-key-string-ajv"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+# coverage_score: 0.89  # 8 contracted / 9 total async-shaped + throwing (validate, compile, validateSchema, compileAsync, addSchema, addKeyword, removeSchema, addMetaSchema) — errorsText omitted (pure formatter)
+# last_deepened: 2026-06-24
 # Category: validation
 # npm: https://www.npmjs.com/package/ajv
 # Repository: https://github.com/ajv-validator/ajv
