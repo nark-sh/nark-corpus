@@ -3,6 +3,16 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen re-verification pass (coverage 100% -> 100%)
+
+- **Latest published:** dotenv@17.4.2
+- **Profile semver:** `>=1.0.0` (unchanged)
+- **API surface re-enumerated:** 5 exported functions (config, configDotenv, parse, populate, decrypt)
+- **Verdict:** no API drift — all 5 functions still contracted; all 5 thrown error codes (MISSING_DATA, INVALID_DOTENV_KEY, NOT_FOUND_DOTENV_ENVIRONMENT, DECRYPTION_FAILED, OBJECT_REQUIRED) still match source in lib/main.js
+- **Evidence:** packed dotenv@17.4.2 tarball; diffed lib/main.d.ts exports against contract.yaml function list (identical); confirmed throw codes in lib/main.js lines 87, 157-186, 357-378
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass=60, drift-by-staleness mode)
+- **Reason:** oldest unclaimed `last_deepened` in public-tier index (2026-04-17)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** dotenv@17.4.2
