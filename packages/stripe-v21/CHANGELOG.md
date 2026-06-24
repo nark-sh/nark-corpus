@@ -2,6 +2,25 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-24 — deepen pass 2 — coverage 86% → 87.5% (effective 100%)
+
+- **Profile:** `packages/stripe-v21/contract.yaml`
+- **Functions added:** `parseEventNotificationAsync` (1 total)
+- **Postconditions added:** 2 (`parse-event-notification-async-signature-failed`, `parse-event-notification-async-wrong-payload-type`)
+- **Functions intentionally omitted this pass:** none new (existing omission of `oauth.authorizeUrl` carried forward — synchronous URL builder, no async errors)
+- **Scanner concerns queued:** 1 (`concern-20260624-stripe-v21-deepen-parse-event-notification-async`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `stripe-node v22.2.3 cjs/stripe.core.js` lines 560-601 — `parseEventNotificationAsync` implementation
+  - `stripe-node v22.2.3 cjs/stripe.core.d.ts` line 331 — `Promise<V2.Core.EventNotification>` signature
+  - `stripe-node v22.2.3 CHANGELOG.md` — version added in v22.0.2 (PR #2685)
+  - `https://github.com/stripe/stripe-node/pull/2685` — "Adds parseEventNotificationAsync to match existing sync function"
+  - `https://github.com/stripe/stripe-node/pull/2618` — wrong-parsing-method guard (mirrored to async variant)
+  - `https://docs.stripe.com/webhooks/signatures`
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T11:54:21Z)
+
+**Key new insight:** `parseEventNotificationAsync` was added in stripe-node v22.0.2 (2026-04-16, PR #2685) and was missed by deepen pass 1 (2026-06-11). Edge Runtime webhook handlers (Cloudflare Workers, Vercel Edge Functions, Deno) require this variant — Node's `crypto` module is unavailable so the sync `parseEventNotification` cannot be used. Same error semantics as the sync variant: `StripeSignatureVerificationError` on bad signatures and plain `Error` on wrong-payload-type (the v21 wrong-parsing-method guard from PR #2618 was mirrored for the async variant in PR #2685). The async path uses `verifyHeaderAsync` (SubtleCrypto/WebCrypto) instead of `verifyHeader` (Node crypto).
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** stripe@22.2.1

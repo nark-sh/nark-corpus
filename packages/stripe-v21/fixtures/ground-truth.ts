@@ -163,3 +163,67 @@ export async function brokenV21WebhookHandler(
   const related = await notification.fetchRelatedObject();
   console.log(related);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. parseEventNotificationAsync — added 2026-06-24 (deepen pass 2)
+//    Async mirror of parseEventNotification. Required in Edge Runtimes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function parseEventNotificationAsyncNoCatch(payload: string, header: string) {
+  // SHOULD_FIRE: parse-event-notification-async-signature-failed
+  const notification = await stripe.parseEventNotificationAsync(payload, header, webhookSecret);
+  return notification;
+}
+
+export async function parseEventNotificationAsyncWithCatch(payload: string, header: string) {
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch satisfies error handling
+    const notification = await stripe.parseEventNotificationAsync(payload, header, webhookSecret);
+    return notification;
+  } catch (err) {
+    if (err instanceof Stripe.errors.StripeSignatureVerificationError) {
+      throw new Error('400: Invalid webhook signature');
+    }
+    throw err;
+  }
+}
+
+export async function edgeRuntimeWebhookHandler(
+  rawBody: string,
+  signature: string
+): Promise<void> {
+  // SHOULD_NOT_FIRE: Edge Runtime pattern with proper try-catch on async parse
+  let notification: Stripe.V2.Core.EventNotification;
+  try {
+    notification = await stripe.parseEventNotificationAsync(rawBody, signature, webhookSecret);
+  } catch (err) {
+    if (err instanceof Stripe.errors.StripeSignatureVerificationError) {
+      throw new Error('400: Invalid webhook signature');
+    }
+    // Plain Error from wrong-payload-type guard caught here too
+    throw err;
+  }
+
+  if (notification.type === 'v1.billing.meter.error_report_triggered') {
+    try {
+      const meter = await notification.fetchRelatedObject();
+      if (!meter) return;
+      console.log('Meter:', meter);
+    } catch (err) {
+      if (err instanceof Stripe.errors.TemporarySessionExpiredError) {
+        console.error('Context expired');
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+export async function brokenEdgeRuntimeHandler(
+  rawBody: string,
+  signature: string
+): Promise<void> {
+  // SHOULD_FIRE: parse-event-notification-async-signature-failed — no outer try-catch
+  const notification = await stripe.parseEventNotificationAsync(rawBody, signature, webhookSecret);
+  console.log(notification.id);
+}

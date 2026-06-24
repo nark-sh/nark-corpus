@@ -2,18 +2,20 @@ package: stripe
 semver: ">=21.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-15"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.86  # 6 contracted / 7 v21-specific async-callable functions (1 intentionally omitted)
-# coverage_score calculation: v21-specific surface = 7 distinct functions
+coverage_score: 0.875  # 7 contracted / 8 v21-specific async-callable functions (1 intentionally omitted)
+# coverage_score calculation: v21-specific surface = 8 distinct functions
 #   (constructEvent, constructEventAsync, token, deauthorize, parseEventNotification,
-#    fetchRelatedObject, fetchEvent — all v21-specific or v21-overridden)
+#    parseEventNotificationAsync, fetchRelatedObject, fetchEvent — all v21-specific or v21-overridden)
 #   Contracted: constructEvent, constructEventAsync, token, deauthorize (4 pre-existing)
-#              + parseEventNotification, fetchRelatedObject, fetchEvent (3 added this pass) = 6 direct
+#              + parseEventNotification, fetchRelatedObject, fetchEvent (3 added pass 1 2026-06-11)
+#              + parseEventNotificationAsync (1 added pass 2 2026-06-24) = 7 direct
 #   Note: oauth.authorizeUrl() is intentionally omitted (synchronous, returns URL string, no async errors)
-#   Effective coverage: 6/7 = 0.86
+#   Effective coverage: 7/7 = 1.0 (all non-omitted contracted)
+#   Raw score: 7/8 = 0.875
 #
 # Depth pass 2026-06-11 (deepen-stream-2 pass 1):
 # v21-specific async surface: 7 distinct functions
@@ -453,4 +455,90 @@ functions:
           production_behavior: immediate_exception
           visibility: silent
           user_experience: lost_data
+          incident_cost_range: medium
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ADDED 2026-06-24 (deepen pass 2, deepen-stream-2): parseEventNotificationAsync
+  # Introduced in stripe-node v22.0.2 (2026-04-16, PR #2685) as the async mirror of
+  # parseEventNotification. Uses verifyHeaderAsync (WebCrypto / SubtleCrypto) instead
+  # of synchronous verifyHeader — required in Edge Runtimes (Cloudflare Workers,
+  # Vercel Edge, Deno) where Node's crypto module is unavailable. Same error semantics
+  # as the sync variant: signature failure and wrong-payload-type guard.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: parseEventNotificationAsync
+    import_path: "stripe"
+    description: >
+      stripe.parseEventNotificationAsync(payload, header, secret) — async version of
+      parseEventNotification for v2 thin event notifications. Returns
+      Promise<Stripe.V2.Core.EventNotification>. Uses verifyHeaderAsync with WebCrypto/
+      SubtleCrypto where available. Throws StripeSignatureVerificationError on bad
+      signatures (same as constructEventAsync). Throws plain Error when a v1 event
+      payload is passed (the wrong-parsing-method guard, added in v21 PR #2618 and
+      mirrored for the async variant in v22.0.2 PR #2685). Required in Edge Runtimes
+      (Cloudflare Workers, Vercel Edge Functions, Deno) where Node's crypto module
+      is unavailable.
+    postconditions:
+      # Evidence:
+      #   stripe-node v22.2.3 cjs/stripe.core.js lines 560-601 — parseEventNotificationAsync impl
+      #   stripe-node v22.2.3 cjs/stripe.core.d.ts line 331 — Promise<V2.Core.EventNotification> signature
+      #   stripe-node CHANGELOG v22.0.2 — added in PR #2685
+      #   https://github.com/stripe/stripe-node/pull/2685 — "Adds parseEventNotificationAsync to match existing sync function"
+      - id: parse-event-notification-async-signature-failed
+        condition: >
+          Webhook payload signature is invalid — wrong signing secret, tampered payload,
+          or expired timestamp (outside DEFAULT_TOLERANCE of 300s). Signature check
+          happens via webhooks.signature.verifyHeaderAsync() called inside
+          parseEventNotificationAsync. The async variant uses the WebCrypto SubtleCrypto
+          provider rather than Node's crypto module, but the failure mode is identical.
+        throws: "StripeSignatureVerificationError (extends StripeError)"
+        required_handling: >
+          Wrap await stripe.parseEventNotificationAsync() in try-catch.
+          Catch StripeSignatureVerificationError specifically and return HTTP 400 to Stripe.
+          DO NOT process the event if signature verification fails — the payload cannot be
+          trusted. Common bug in Edge Runtime handlers: calling request.json() first and
+          re-serializing causes the raw-body checksum to mismatch even with a valid
+          signature; use request.text() and pass the raw string.
+        satisfying_patterns:
+          - instanceof: "Stripe.errors.StripeSignatureVerificationError"
+          - instanceof: "Stripe.errors.StripeError"
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v22.2.3/cjs/stripe.core.js"
+          - "https://github.com/stripe/stripe-node/pull/2685"
+          - "https://docs.stripe.com/webhooks/signatures"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: parse-event-notification-async-wrong-payload-type
+        condition: >
+          A v1 event payload (event.object === 'event') is mistakenly passed to
+          parseEventNotificationAsync(). The implementation explicitly checks for this
+          and throws a plain Error with message:
+          "You passed a webhook payload to stripe.parseEventNotificationAsync, which
+          expects an event notification. Use stripe.webhooks.constructEventAsync instead."
+          Conversely, passing a v2 thin event to constructEventAsync() throws the inverse
+          guard. The async variant of the wrong-parsing-method guard was added in v22.0.2
+          (PR #2685) to mirror the sync guard added in v21 (PR #2618).
+        throws: "Error (plain JavaScript Error, not StripeError)"
+        required_handling: >
+          Use parseEventNotificationAsync() for v2 thin events (event_payload: 'thin' destination)
+          and stripe.webhooks.constructEventAsync() for v1 events (event_payload: 'snapshot').
+          Inspect the webhook destination configuration before choosing the parsing method.
+          A catch block on StripeError alone will NOT catch this — it's a plain Error.
+          Wrap in generic try-catch: catch (e) { if (e instanceof Error) return res.status(400)... }
+        sources:
+          - "https://raw.githubusercontent.com/stripe/stripe-node/v22.2.3/cjs/stripe.core.js"
+          - "https://github.com/stripe/stripe-node/pull/2685"
+          - "https://github.com/stripe/stripe-node/pull/2618"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
           incident_cost_range: medium
