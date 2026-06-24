@@ -24,9 +24,16 @@
  *   blob-create-multipart-uploader-no-try-catch        (createMultipartUploader)
  *   blob-create-multipart-uploader-plain-object-body   (createMultipartUploader)
  *   blob-create-folder-no-try-catch                    (createFolder)
+ *   blob-issue-signed-token-no-try-catch               (issueSignedToken)
+ *   blob-issue-signed-token-valid-until-in-past        (issueSignedToken)
+ *   blob-presign-url-no-try-catch                      (presignUrl)
+ *   blob-presign-url-delegation-expired                (presignUrl)
+ *   blob-handle-upload-presigned-no-try-catch          (handleUploadPresigned)
+ *   blob-handle-upload-presigned-missing-webhook-public-key (handleUploadPresigned)
+ *   blob-upload-presigned-no-try-catch                 (uploadPresigned)
  */
-import { put, del, list, head, copy, get, createMultipartUpload, uploadPart, completeMultipartUpload, createMultipartUploader, createFolder } from '@vercel/blob';
-import { handleUpload, upload, generateClientTokenFromReadWriteToken, type HandleUploadBody } from '@vercel/blob/client';
+import { put, del, list, head, copy, get, createMultipartUpload, uploadPart, completeMultipartUpload, createMultipartUploader, createFolder, issueSignedToken, presignUrl } from '@vercel/blob';
+import { handleUpload, upload, generateClientTokenFromReadWriteToken, handleUploadPresigned, uploadPresigned, type HandleUploadBody } from '@vercel/blob/client';
 
 // 1. put() without try-catch (SHOULD_FIRE)
 async function gt_put_missing(path: string, content: Buffer) {
@@ -400,6 +407,116 @@ async function gt_create_folder_safe(folderPath: string) {
     return folder.url;
   } catch (err) {
     console.error('createFolder failed:', err);
+    throw err;
+  }
+}
+
+// ─── issueSignedToken() ──────────────────────────────────────────────────────
+
+// 30. issueSignedToken() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-issue-signed-token-no-try-catch
+async function gt_issue_signed_token_missing(pathname: string) {
+  // SHOULD_FIRE: blob-issue-signed-token-no-try-catch
+  const token = await issueSignedToken({ pathname, operations: ['put'], validUntil: Date.now() + 3600 * 1000 });
+  return token;
+}
+
+// 31. issueSignedToken() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_issue_signed_token_safe(pathname: string) {
+  try {
+    // SHOULD_NOT_FIRE: issueSignedToken() inside try-catch
+    const token = await issueSignedToken({ pathname, operations: ['put'], validUntil: Date.now() + 3600 * 1000 });
+    return token;
+  } catch (err) {
+    console.error('issueSignedToken failed:', err);
+    throw err;
+  }
+}
+
+// ─── presignUrl() ────────────────────────────────────────────────────────────
+
+// 32. presignUrl() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-presign-url-no-try-catch
+async function gt_presign_url_missing(
+  signedToken: { clientSigningToken: string; delegationToken: string },
+  pathname: string
+) {
+  // SHOULD_FIRE: blob-presign-url-no-try-catch
+  const result = await presignUrl(signedToken, { operation: 'put', pathname, access: 'public' });
+  return result.presignedUrl;
+}
+
+// 33. presignUrl() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_presign_url_safe(
+  signedToken: { clientSigningToken: string; delegationToken: string },
+  pathname: string
+) {
+  try {
+    // SHOULD_NOT_FIRE: presignUrl() inside try-catch
+    const result = await presignUrl(signedToken, { operation: 'put', pathname, access: 'public' });
+    return result.presignedUrl;
+  } catch (err) {
+    console.error('presignUrl failed:', err);
+    throw err;
+  }
+}
+
+// ─── handleUploadPresigned() ─────────────────────────────────────────────────
+
+// 34. handleUploadPresigned() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-handle-upload-presigned-no-try-catch
+async function gt_handle_upload_presigned_missing(request: Request, body: any) {
+  // SHOULD_FIRE: blob-handle-upload-presigned-no-try-catch
+  const result = await handleUploadPresigned({
+    request,
+    body,
+    getSignedToken: async (_p, _cp, _m) => ({
+      token: await issueSignedToken({ pathname: '*', operations: ['put'], validUntil: Date.now() + 3600 * 1000 }),
+    }),
+  });
+  return result;
+}
+
+// 35. handleUploadPresigned() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_handle_upload_presigned_safe(request: Request, body: any) {
+  try {
+    // SHOULD_NOT_FIRE: handleUploadPresigned() inside try-catch
+    const result = await handleUploadPresigned({
+      request,
+      body,
+      getSignedToken: async (_p, _cp, _m) => ({
+        token: await issueSignedToken({ pathname: '*', operations: ['put'], validUntil: Date.now() + 3600 * 1000 }),
+      }),
+    });
+    return result;
+  } catch (err) {
+    console.error('handleUploadPresigned failed:', err);
+    throw err;
+  }
+}
+
+// ─── uploadPresigned() ───────────────────────────────────────────────────────
+
+// 36. uploadPresigned() without try-catch (SHOULD_FIRE)
+// @expect-violation: blob-upload-presigned-no-try-catch
+async function gt_upload_presigned_missing(pathname: string, body: Buffer) {
+  // SHOULD_FIRE: blob-upload-presigned-no-try-catch
+  const blob = await uploadPresigned(pathname, body, { access: 'public', handleUploadUrl: '/api/upload-presigned' });
+  return blob.url;
+}
+
+// 37. uploadPresigned() with try-catch (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_upload_presigned_safe(pathname: string, body: Buffer) {
+  try {
+    // SHOULD_NOT_FIRE: uploadPresigned() inside try-catch
+    const blob = await uploadPresigned(pathname, body, { access: 'public', handleUploadUrl: '/api/upload-presigned' });
+    return blob.url;
+  } catch (err) {
+    console.error('uploadPresigned failed:', err);
     throw err;
   }
 }

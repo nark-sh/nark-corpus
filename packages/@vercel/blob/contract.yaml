@@ -1,23 +1,30 @@
 package: '@vercel/blob'
 semver: '>=0.19.0'
-contract_version: 1.2.0
+contract_version: 1.3.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-# Depth pass 2026-04-16 (deepen-stream-2 pass 10):
-# API surface: 16 distinct async-callable functions (server + client exports)
-# Contracted before: 10 (put, del, list, head, get, copy, handleUpload, createMultipartUpload,
-#                         uploadPart, completeMultipartUpload)
-# Contracted after: 14 (+4 this pass: upload, generateClientTokenFromReadWriteToken,
-#                         createMultipartUploader, createFolder)
-# Omitted: 6 (client multipart functions with same profiles as server versions, getDownloadUrl sync,
+# Depth pass 2026-06-24 (deepen-stream-2 pass 42, drift-by-staleness mode):
+# Installed version probed: 2.4.1
+# API surface: 20 distinct async-callable functions (server + client exports, incl. v2 presigned-URL flow)
+# Contracted before: 14 (put, del, list, head, get, copy, handleUpload, createMultipartUpload,
+#                         uploadPart, completeMultipartUpload, upload,
+#                         generateClientTokenFromReadWriteToken, createMultipartUploader, createFolder)
+# Contracted after: 18 (+4 this pass: issueSignedToken, presignUrl, handleUploadPresigned,
+#                         uploadPresigned — all introduced in @vercel/blob v2.x presigned-URL flow)
+# Omitted: 2 (parseStoreIdFromDelegationToken sync, parseStoreIdFromPresignedUrl sync — both
+#              synchronous helpers with no I/O), plus the 6 client multipart functions previously
+#              omitted (same error profiles as server versions, getDownloadUrl sync,
 #              getPayloadFromClientToken sync, client.put with same profile as upload)
-# Coverage: 14/16 = 0.88 (before: 10/16 = 0.63 uncorrected)
-# Evidence: @vercel/blob source — dist/client.cjs + dist/chunk-WCA6LLLU.cjs
+# Coverage: 18/20 = 0.90 (before: 14/16 = 0.88)
+# Evidence: @vercel/blob v2.4.1 source — dist/index.d.ts + dist/client.d.ts + dist/chunk-HZSIXSMY.cjs
 #   https://vercel.com/docs/vercel-blob/using-blob-sdk
-coverage_score: 0.88
+#
+# Depth pass 2026-04-16 (deepen-stream-2 pass 10):
+# +4 functions: upload, generateClientTokenFromReadWriteToken, createMultipartUploader, createFolder
+coverage_score: 0.9
 functions:
   - name: put
     import_path: '@vercel/blob'
@@ -676,6 +683,239 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: issueSignedToken
+    import_path: '@vercel/blob'
+    description: >
+      Server-side function that requests short-lived signed-token material from the Blob control API
+      (POST /signed-token). Returns IssuedSignedToken with { delegationToken, clientSigningToken, validUntil }.
+      Used together with presignUrl() to obtain a presigned URL for GET/HEAD/PUT/DELETE that the CDN
+      verifies without a bearer token. Authenticate with OIDC (VERCEL_OIDC_TOKEN + storeId) or a
+      read-write token. Client (browser) tokens are NOT allowed by the server for this operation.
+      Introduced in @vercel/blob v2.x as part of the presigned-URL workflow.
+
+    postconditions:
+      # Evidence: dist/chunk-HZSIXSMY.cjs:1734 issueSignedToken()
+      # Source confirmed: throws BlobError on missing options or invalid validUntil
+      - id: blob-issue-signed-token-no-try-catch
+        condition: >
+          issueSignedToken() throws BlobError on synchronous validation failures (missing options
+          object, empty operations array, validUntil that is not a finite integer milliseconds
+          timestamp, or validUntil <= now). It also throws BlobAccessError (auth failure),
+          BlobStoreSuspendedError, BlobStoreNotFoundError, BlobServiceRateLimited,
+          BlobServiceNotAvailable, or BlobUnknownError from the underlying requestApi() call to
+          POST /signed-token.
+        throws: BlobError, BlobAccessError, BlobStoreSuspendedError, BlobStoreNotFoundError, BlobServiceRateLimited, BlobServiceNotAvailable, or BlobUnknownError.
+        required_handling: >
+          Caller MUST wrap issueSignedToken() in try-catch. This is the first call in the
+          presigned-URL workflow — if it fails, no presigned URL can be issued and the entire
+          client upload / signed-URL session is aborted. Sync validation errors (BlobError on
+          bad validUntil) are programming errors that should be caught at request-time and
+          surfaced as 400 to the client, not as 500. Auth errors should be surfaced as 401/500
+          depending on whether the request originated server-side or proxied a client request.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/signed-token.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/chunk-HZSIXSMY.cjs:1725-1732 — assertIssueSignedTokenValidUntilOption()
+      # throws BlobError if validUntil is not an integer ms timestamp OR is in the past.
+      - id: blob-issue-signed-token-valid-until-in-past
+        condition: >
+          issueSignedToken() is called with validUntil that is <= Date.now() (a timestamp already
+          in the past). This is a synchronous BlobError thrown before any network call. Common
+          cause: passing a number-of-seconds (e.g. 3600) instead of an absolute ms timestamp
+          (Date.now() + 3600 * 1000), or reusing a cached validUntil after the cache TTL elapsed.
+        throws: 'BlobError: `issueSignedToken`: validUntil must be in the future.'
+        required_handling: >
+          Always compute validUntil as Date.now() + ttlMs, not a duration. Validate the value is
+          a future timestamp before calling. If signing tokens are pre-computed, recompute
+          validUntil at issuance time, not at scheduling time.
+        sources:
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/signed-token.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: presignUrl
+    import_path: '@vercel/blob'
+    description: >
+      Server-side function that builds a presigned URL for GET / HEAD (blob object host),
+      PUT / multipart (control API), or DELETE (DELETE /?pathname=… on the control API).
+      Consumes the { delegationToken, clientSigningToken } pair returned from issueSignedToken().
+      The CDN verifies the URL signature without requiring a bearer token. HEAD reuses the GET
+      URL shape but the canonical signing string includes `operation=head` so a GET-signed URL
+      cannot be replayed as HEAD. Introduced in @vercel/blob v2.x.
+
+    postconditions:
+      # Evidence: dist/chunk-HZSIXSMY.cjs:1932 presignUrl() + 1840 presign()
+      # Confirmed: throws BlobError on missing token fields, invalid delegation payload,
+      # pathname mismatch vs scope, expired delegation, or operation not authorized in scope.
+      - id: blob-presign-url-no-try-catch
+        condition: >
+          presignUrl() throws BlobError synchronously for any of: missing clientSigningToken /
+          delegationToken from the IssuedSignedToken pair, invalid or unreadable delegationToken
+          payload, pathname mismatch (options.pathname does not match the scope encoded in the
+          delegation), expired delegation (Date.now() > scope.validUntil), or operation not
+          present in scope.operations (e.g. operation: 'put' against a get-only delegation).
+        throws: BlobError (sync — clientSigningToken/delegationToken required, invalid delegation payload, pathname mismatch, expired delegation, operation not authorized).
+        required_handling: >
+          Caller MUST wrap presignUrl() in try-catch. These are all programming errors except
+          the expired-delegation case, which is the normal expiry path and must be handled by
+          issuing a fresh token via issueSignedToken() and retrying. Returning a 5xx for
+          expired-delegation is wrong UX — surface a 400 with "presigned URL expired, retry"
+          so the client can re-request a token.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/signed-token.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/chunk-HZSIXSMY.cjs:1858-1862 — scope validUntil expiry check
+      - id: blob-presign-url-delegation-expired
+        condition: >
+          presignUrl() is called with a signedToken whose scope.validUntil has already passed
+          (Date.now() > scope.validUntil). This is the dominant expected-failure mode in
+          production: signed tokens are short-lived (default 1 hour) and any retry or queued
+          job picked up after the TTL window will throw. Treating this as a generic error
+          buries the legitimate retry path.
+        throws: 'BlobError: The signed delegation has expired; issue a new token first.'
+        required_handling: >
+          Catch this error explicitly and re-issue a fresh token via issueSignedToken(), then
+          retry presignUrl(). Do NOT bubble it as a 5xx to the client — it is an expected
+          condition. For background jobs, refresh the token at the start of each batch, not
+          at job enqueue time.
+        sources:
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/signed-token.ts'
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: handleUploadPresigned
+    import_path: '@vercel/blob/client'
+    description: >
+      Server route helper for presigned client uploads — the counterpart of handleUpload() for
+      the presigned-URL flow. Returns a presigned control-plane PUT URL for single-object
+      uploads, or a presigned POST URL for /mpu when multipart. Verifies upload-completed
+      callbacks with Ed25519 (BLOB_WEBHOOK_PUBLIC_KEY) over x-vercel-signature. Requires a
+      getSignedToken callback that returns a token with 'put' privileges. Introduced in
+      @vercel/blob v2.x.
+
+    postconditions:
+      # Evidence: dist/client.d.ts:452 handleUploadPresigned() — same outer wrapping pattern
+      # as handleUpload(). Re-throws errors from getSignedToken and onUploadCompleted callbacks.
+      - id: blob-handle-upload-presigned-no-try-catch
+        condition: >
+          handleUploadPresigned() throws BlobError on missing/invalid request body, signature
+          verification failure (BLOB_WEBHOOK_PUBLIC_KEY mismatch on the upload-completed
+          callback), or BlobAccessError on missing/invalid token. It also re-throws any error
+          thrown by the getSignedToken or onUploadCompleted callbacks. Webhook signature
+          mismatch is the dominant failure mode — happens whenever the public key env var
+          drifts from the keypair Vercel signs callbacks with.
+        throws: BlobError (sync validation, signature verification failure), BlobAccessError (auth failure), or re-thrown errors from getSignedToken / onUploadCompleted callbacks.
+        required_handling: >
+          The outer route handler MUST wrap handleUploadPresigned() in try-catch and return
+          an HTTP error response, not let the exception propagate. Signature-verification
+          failures should be returned as 401 (callback rejected) — a 500 here would silently
+          fail upload completion notifications. Validation errors from getSignedToken (e.g.
+          pathname not allowed for this user) should be returned as 403.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: dist/client.d.ts:445 — Ed25519 webhook signature verification
+      - id: blob-handle-upload-presigned-missing-webhook-public-key
+        condition: >
+          handleUploadPresigned() is called without webhookPublicKey AND BLOB_WEBHOOK_PUBLIC_KEY
+          env var is not set. Upload-completed callbacks cannot be verified — either the
+          handler will reject all callbacks (no key configured), or in worst case it will
+          accept unsigned callbacks and let an attacker spoof "upload completed" events to
+          trigger your onUploadCompleted business logic (e.g. database inserts) without an
+          actual upload occurring.
+        throws: BlobError on signature verification failure, or silently accepts spoofed callbacks if misconfigured.
+        required_handling: >
+          Set BLOB_WEBHOOK_PUBLIC_KEY in your Vercel project env vars BEFORE deploying any
+          route that uses handleUploadPresigned(). Treat a missing public key as a fatal
+          startup error, not a warning. The keypair is generated by Vercel and must be
+          fetched once via the dashboard.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+  - name: uploadPresigned
+    import_path: '@vercel/blob/client'
+    description: >
+      Client-side upload via the presigned-URL flow. Mirrors upload(), but instead of fetching
+      a client token from handleUpload(), it fetches a presigned URL from a handleUploadPresigned()
+      route and uploads directly to the presigned URL. Useful when you want a stateless,
+      signature-based authorization model without persistent client tokens. Introduced in
+      @vercel/blob v2.x.
+
+    postconditions:
+      # Evidence: dist/client.d.ts:218 uploadPresigned() — same error surface as upload()
+      # (shared infrastructure in createPutMethod + retrieveClientToken-equivalent).
+      - id: blob-upload-presigned-no-try-catch
+        condition: >
+          uploadPresigned() throws BlobError if handleUploadUrl is missing (programming error,
+          synchronous), if the presigned-URL fetch from the server route fails (non-2xx or
+          non-JSON response), if the presigned URL has expired between fetch and use
+          (BlobClientTokenExpiredError-equivalent), or if the storage API rejects the upload
+          (BlobAccessError, BlobFileTooLargeError, BlobServiceRateLimited, BlobUnknownError).
+        throws: BlobError, BlobAccessError, BlobFileTooLargeError, BlobServiceRateLimited, BlobUnknownError, or BlobClientTokenExpiredError-equivalent.
+        required_handling: >
+          Caller MUST wrap uploadPresigned() in try-catch. Distinguish expired-presigned-URL
+          (retry by re-fetching) from auth-rejected (surface auth error to user) from
+          size-too-large (surface file-size error). A single catch-all "upload failed" message
+          buries the legitimate retry path for expired URLs.
+        sources:
+          - 'https://vercel.com/docs/vercel-blob/using-blob-sdk#client-uploads'
+          - 'https://github.com/vercel/storage/blob/main/packages/blob/src/client.ts'
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - All functions require BLOB_READ_WRITE_TOKEN env var (set automatically on Vercel, must be set manually in dev)
   - 'BlobAccessError: missing/invalid token. BlobUnknownError: network/API failures.'
@@ -695,6 +935,11 @@ notes:
   - 'BlobClientTokenExpiredError: token TTL expired (default 1 hour). Retry the upload to get a fresh token.'
   - 'BlobPathnameMismatchError: client token pathname does not match upload() pathname'
   - 'BlobStoreSuspendedError: store suspended by Vercel — contact support'
+  - 'issueSignedToken() + presignUrl() are the v2.x presigned-URL flow — server-side, control-plane'
+  - 'issueSignedToken() validUntil MUST be an integer ms timestamp in the future (sync BlobError otherwise)'
+  - 'presignUrl() throws BlobError if scope.validUntil has expired — re-issue token + retry instead of bubbling 5xx'
+  - 'handleUploadPresigned() verifies webhooks with Ed25519 over BLOB_WEBHOOK_PUBLIC_KEY — set in prod env'
+  - 'uploadPresigned() is the client-side counterpart to handleUploadPresigned() — distinguish expired vs auth-rejected vs file-too-large failures'
 tags:
   - vercel
   - blob
