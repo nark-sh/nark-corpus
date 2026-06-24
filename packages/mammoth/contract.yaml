@@ -1,24 +1,36 @@
 package: "mammoth"
 semver: ">=1.11.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80  # 4 contracted / 5 total primary async functions (1 intentionally omitted)
-# Depth pass 2026-04-17 (deepen-stream-2 pass 7):
-# API surface: 5 primary async-callable functions (convert() alias omitted as identical to convertToHtml;
-#              image.read* methods omitted as internal callbacks used only in custom imageConverter options)
-# Contracted before: 2 (convertToHtml, extractRawText)
-# Contracted after: 4 (+2 this pass: convertToMarkdown, embedStyleMap)
-# Omitted: 1 (readEmbeddedStyleMap — read-only, returns null when absent, same file/zip error profile as others)
-# Coverage: 4/5 = 0.80
+coverage_score: 0.78  # 7 contracted / 9 total async-callable functions (2 intentionally omitted)
+# Depth pass 2026-06-24 (deepen-stream-2 pass 72):
+# API surface (mammoth@1.12.0): 9 async-callable functions
+#   Top-level exports (5):
+#     convertToHtml, convertToMarkdown, extractRawText, embedStyleMap (contracted)
+#     readEmbeddedStyleMap (intentionally omitted — undocumented in README, read-only,
+#       returns null when absent, same file/zip error profile as siblings)
+#   Image-callback methods (4) — invoked inside user imageConverter callbacks
+#     readAsArrayBuffer, readAsBase64String, readAsBuffer (contracted this pass)
+#     read([encoding]) (intentionally omitted — deprecated per README L503, retained
+#       for backwards compatibility with 0.3.x only)
+# Contracted before: 4 (convertToHtml, convertToMarkdown, extractRawText, embedStyleMap)
+# Contracted after:  7 (+3 this pass: readAsArrayBuffer, readAsBase64String, readAsBuffer)
+# Omitted: 2 (readEmbeddedStyleMap, image.read — see reasons above)
+# Coverage: 7/9 = 0.78  (effective 7/7 = 1.0 over the non-omitted surface)
 # Evidence sources confirmed from:
 #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.js — exported functions
 #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/index.d.ts — TypeScript declarations
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/documents.js — Image() factory, readAs* methods
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/images.js — imgElement / dataUri converters
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/zipfile.js — JSZip null-file TypeError surface
 #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/unzip.js — error throw sites
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/docx/body-reader.js — embedded-image resolution
 #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/style-reader.js — style map parse errors
+#   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/README.md (locally installed, mammoth@1.12.0)
 #   https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
 
 functions:
@@ -251,3 +263,181 @@ functions:
         sources:
           - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
           - https://github.com/mwilliamson/mammoth.js/blob/master/lib/index.js
+
+  - name: readAsArrayBuffer
+    import_path: "mammoth"
+    description: >
+      Image.readAsArrayBuffer() — async method on the Image element passed into a custom
+      imageConverter callback (created via mammoth.images.imgElement(func)). Reads the
+      embedded image file from the underlying .docx zip as an ArrayBuffer. Returns a
+      Promise<ArrayBuffer>. Called inside the user's imgElement(func) callback when
+      processing each image element in the document.
+
+    postconditions:
+      # Evidence:
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/documents.js:174-176
+      #     readAsArrayBuffer: function() { return options.readImage(); }
+      #     - delegates to options.readImage (bound to docxFile.read.bind(docxFile, path))
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/zipfile.js:14-25
+      #     read(name, encoding) → zipFile.file(name).async("uint8array")
+      #     - if zipFile.file(name) returns null (image missing from zip), .async() throws
+      #       TypeError: Cannot read properties of null (reading 'async')
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/docx/body-reader.js:640-646
+      #     findEmbeddedImageFile resolves the zip path from the relationship target;
+      #     malformed/missing relationships yield invalid paths that hit the null-file branch above
+      #   README documents this as the recommended way to access image bytes:
+      #     /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/README.md:493-494
+      - id: readasarraybuffer-image-missing-from-zip
+        condition: >
+          The embedded image referenced in the .docx relationships is missing from the
+          underlying zip archive (corrupt or hand-edited .docx where the image part was
+          deleted but the relationship/reference remained), OR the relationship resolves
+          to an invalid zip path. JSZip's zipFile.file(name) returns null and the
+          subsequent .async("uint8array") access throws TypeError.
+        throws: "TypeError (Cannot read properties of null (reading 'async')) from JSZip"
+        required_handling: >
+          Caller MUST wrap image.readAsArrayBuffer() in try-catch inside the imageConverter
+          callback (or attach .catch() to the returned Promise). Without handling, the
+          rejected Promise propagates up through the imgElement wrapper and surfaces as a
+          conversion-level rejection that crashes the entire convertToHtml/convertToMarkdown
+          call — one missing image breaks the whole document conversion.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/zipfile.js
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/documents.js
+
+  - name: readAsBase64String
+    import_path: "mammoth"
+    description: >
+      Image.readAsBase64String() — async method on the Image element passed into a custom
+      imageConverter callback. Reads the embedded image as a base64-encoded string.
+      Returns a Promise<string>. This is the method used by the default mammoth.images.dataUri
+      converter, so it is exercised on every document containing images when no custom
+      converter is supplied.
+
+    postconditions:
+      # Evidence:
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/documents.js:177-179
+      #     readAsBase64String: function() { return options.readImage("base64"); }
+      #     - delegates to docxFile.read(path, "base64")
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/zipfile.js:14-25
+      #     read(name, "base64") → zipFile.file(name).async("uint8array").then(base64js.fromByteArray)
+      #     - same null-file branch as readAsArrayBuffer (TypeError on missing image)
+      #     - additional surface: base64js.fromByteArray throws on malformed input (very rare;
+      #       the input is always a valid Uint8Array from JSZip when the file exists)
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/images.js:25-31
+      #     dataUri = imgElement(element => element.readAsBase64String().then(...))
+      #     - default converter calls readAsBase64String for every image; an uncaught
+      #       rejection here halts the whole document conversion
+      #   README documents this as the canonical pattern:
+      #     /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/README.md:500-501, 515-521
+      - id: readasbase64string-image-missing-from-zip
+        condition: >
+          The embedded image referenced in the .docx relationships is missing from the
+          underlying zip archive, OR the relationship resolves to an invalid zip path.
+          JSZip's zipFile.file(name) returns null and the subsequent .async() access throws.
+          This is the common failure mode for hand-edited or partially-corrupted .docx files
+          and propagates through the default dataUri converter.
+        throws: "TypeError (Cannot read properties of null (reading 'async')) from JSZip"
+        required_handling: >
+          Caller MUST wrap image.readAsBase64String() in try-catch inside the imageConverter
+          callback, or attach .catch() to the returned Promise. Custom imgElement callbacks
+          that use readAsBase64String to build data-URI src attributes must handle the
+          rejection — without handling, one corrupt image embed crashes the entire
+          convertToHtml/convertToMarkdown pipeline and the user sees a 500/unhandled
+          rejection instead of a partial document with a warning.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/zipfile.js
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/documents.js
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/images.js
+
+  - name: readAsBuffer
+    import_path: "mammoth"
+    description: >
+      Image.readAsBuffer() — async method on the Image element passed into a custom
+      imageConverter callback. Reads the embedded image as a Node.js Buffer.
+      Returns a Promise<Buffer>. Two failure modes: (1) the same image-missing-from-zip
+      branch as the other readAs* methods, and (2) calling this method in a browser
+      environment without a Buffer polyfill, where Buffer.from is undefined.
+
+    postconditions:
+      # Evidence:
+      #   /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/lib/documents.js:180-184
+      #     readAsBuffer: function() {
+      #         return options.readImage().then(function(arrayBuffer) {
+      #             return Buffer.from(arrayBuffer);
+      #         });
+      #     }
+      #     - same readImage() path as readAsArrayBuffer (null-file TypeError surface)
+      #     - additional surface: Buffer.from is unavailable in browsers without polyfill
+      #       (ReferenceError: Buffer is not defined)
+      #   README explicitly documents the browser limitation:
+      #     /private/tmp/claude/bc-deepen/mammoth/node_modules/mammoth/README.md:496-498
+      #     "This is not supported in browsers unless a `Buffer` polyfill has been used."
+      - id: readasbuffer-image-missing-from-zip
+        condition: >
+          The embedded image referenced in the .docx relationships is missing from the
+          underlying zip archive, OR the relationship path is invalid. JSZip's
+          zipFile.file(name) returns null and the .async() access throws TypeError
+          before Buffer.from is reached.
+        throws: "TypeError (Cannot read properties of null (reading 'async')) from JSZip"
+        required_handling: >
+          Caller MUST wrap image.readAsBuffer() in try-catch inside the imageConverter
+          callback, or attach .catch() to the returned Promise. An uncaught rejection
+          propagates through the imgElement wrapper and crashes the whole document
+          conversion.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/zipfile.js
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/documents.js
+
+      - id: readasbuffer-browser-no-buffer-polyfill
+        condition: >
+          image.readAsBuffer() is called from browser code without a Buffer polyfill
+          (e.g. mammoth bundled into a frontend app without webpack/vite Buffer shim).
+          The underlying options.readImage() resolves an ArrayBuffer, then Buffer.from
+          throws ReferenceError because Buffer is not a global in browsers.
+        throws: "ReferenceError (Buffer is not defined) — browsers without polyfill"
+        required_handling: >
+          Caller MUST either (a) avoid readAsBuffer() in browser code and use
+          readAsArrayBuffer() or readAsBase64String() instead, OR (b) wrap the call
+          in try-catch and supply a polyfilled fallback. The mammoth README explicitly
+          warns "This is not supported in browsers unless a Buffer polyfill has been
+          used." Custom imageConverters shipped in isomorphic libraries must guard
+          this method or ship a polyfill.
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - https://raw.githubusercontent.com/mwilliamson/mammoth.js/master/README.md
+          - https://github.com/mwilliamson/mammoth.js/blob/master/lib/documents.js

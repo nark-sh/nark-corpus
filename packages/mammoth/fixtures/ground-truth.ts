@@ -169,3 +169,78 @@ export async function embedStyleMapBufferNoCatch(buffer: Buffer, styleMap: strin
   const result = await mammoth.embedStyleMap({ buffer }, styleMap);
   return result.toArrayBuffer();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Image.readAsArrayBuffer — inside imgElement callback, without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function makeImageConverterArrayBufferNoCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    // PENDING_DETECTOR: readasarraybuffer-image-missing-from-zip — scanner does not yet flag bare await inside imgElement callback; concern queued for bc-scanner-upgrade (see upgrade-concerns.json)
+    const arrayBuffer = await image.readAsArrayBuffer();
+    return { src: "data:" + image.contentType + ";base64," + Buffer.from(arrayBuffer).toString("base64") };
+  });
+}
+
+export function makeImageConverterArrayBufferWithCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    try {
+      // SHOULD_NOT_FIRE: image.readAsArrayBuffer() inside try-catch satisfies error handling
+      const arrayBuffer = await image.readAsArrayBuffer();
+      return { src: "data:" + image.contentType + ";base64," + Buffer.from(arrayBuffer).toString("base64") };
+    } catch (error) {
+      console.error("readAsArrayBuffer failed:", error);
+      return { src: "" };
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Image.readAsBase64String — inside imgElement callback, without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function makeImageConverterBase64NoCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    // PENDING_DETECTOR: readasbase64string-image-missing-from-zip — scanner does not yet flag bare await inside imgElement callback; concern queued for bc-scanner-upgrade (see upgrade-concerns.json)
+    const base64 = await image.readAsBase64String();
+    return { src: "data:" + image.contentType + ";base64," + base64 };
+  });
+}
+
+export function makeImageConverterBase64WithCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    try {
+      // SHOULD_NOT_FIRE: image.readAsBase64String() inside try-catch satisfies error handling
+      const base64 = await image.readAsBase64String();
+      return { src: "data:" + image.contentType + ";base64," + base64 };
+    } catch (error) {
+      console.error("readAsBase64String failed:", error);
+      return { src: "" };
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Image.readAsBuffer — inside imgElement callback, without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function makeImageConverterBufferNoCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    // PENDING_DETECTOR: readasbuffer-image-missing-from-zip — scanner does not yet flag bare await inside imgElement callback; concern queued for bc-scanner-upgrade (see upgrade-concerns.json)
+    const buf = await image.readAsBuffer();
+    return { src: "data:" + image.contentType + ";base64," + buf.toString("base64") };
+  });
+}
+
+export function makeImageConverterBufferWithCatch() {
+  return mammoth.images.imgElement(async function (image) {
+    try {
+      // SHOULD_NOT_FIRE: image.readAsBuffer() inside try-catch satisfies error handling
+      const buf = await image.readAsBuffer();
+      return { src: "data:" + image.contentType + ";base64," + buf.toString("base64") };
+    } catch (error) {
+      console.error("readAsBuffer failed:", error);
+      return { src: "" };
+    }
+  });
+}
