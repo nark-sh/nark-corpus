@@ -182,3 +182,101 @@ async function uploadFileInChunksWithErrorHandling() {
     throw error;
   }
 }
+
+// =============================================================================
+// Bucket.combine() test cases
+// =============================================================================
+
+// SHOULD_FIRE: combine-source-limit-exceeded
+// SHOULD_FIRE: combine-source-not-found
+// SHOULD_FIRE: combine-precondition-failed
+async function combineFilesWithoutErrorHandling() {
+  const bucket = storage.bucket('my-bucket');
+  const sources = ['chunk-1.bin', 'chunk-2.bin', 'chunk-3.bin'];
+  await bucket.combine(sources, 'assembled.bin');
+}
+
+// @expect-clean
+async function combineFilesWithErrorHandling() {
+  try {
+    const bucket = storage.bucket('my-bucket');
+    const sources = ['chunk-1.bin', 'chunk-2.bin', 'chunk-3.bin'];
+    await bucket.combine(sources, 'assembled.bin');
+  } catch (error: any) {
+    if (error.code === 412) {
+      // Precondition failed — concurrent writer changed the destination
+      console.error('Compose conflict, re-read destination and retry');
+    } else if (error.code === 404) {
+      console.error('Source object missing, cannot assemble:', error.message);
+    } else if (error.code === 400) {
+      console.error('Compose rejected (likely > 32 sources):', error.message);
+    }
+    throw error;
+  }
+}
+
+// =============================================================================
+// File.moveFileAtomic() test cases
+// =============================================================================
+
+// SHOULD_FIRE: move-file-atomic-non-hns-bucket
+// SHOULD_FIRE: move-file-atomic-precondition-failed
+// SHOULD_FIRE: move-file-atomic-source-not-found
+async function moveFileAtomicWithoutErrorHandling() {
+  const file = storage.bucket('hns-bucket').file('source.txt');
+  await file.moveFileAtomic('destination.txt');
+}
+
+// @expect-clean
+async function moveFileAtomicWithErrorHandling() {
+  try {
+    const file = storage.bucket('hns-bucket').file('source.txt');
+    await file.moveFileAtomic('destination.txt');
+  } catch (error: any) {
+    if (error.code === 400) {
+      // Fall back to non-atomic move on flat buckets
+      console.warn('Bucket is not HNS, falling back to non-atomic move');
+      const file2 = storage.bucket('hns-bucket').file('source.txt');
+      await file2.move('destination.txt');
+    } else if (error.code === 412) {
+      console.error('Precondition failed on atomic move, re-evaluate destination');
+    } else {
+      throw error;
+    }
+  }
+}
+
+// =============================================================================
+// Bucket.lock() test cases
+// =============================================================================
+
+// SHOULD_FIRE: lock-precondition-failed
+// SHOULD_FIRE: lock-no-retention-policy
+// SHOULD_FIRE: lock-permission-error
+async function lockRetentionWithoutErrorHandling() {
+  const bucket = storage.bucket('compliance-bucket');
+  const [metadata] = await bucket.getMetadata();
+  await bucket.lock(metadata.metageneration!);
+}
+
+// @expect-clean
+async function lockRetentionWithErrorHandling() {
+  try {
+    const bucket = storage.bucket('compliance-bucket');
+    const [metadata] = await bucket.getMetadata();
+    if (!metadata.retentionPolicy) {
+      throw new Error('No retention policy set — refusing to lock empty policy');
+    }
+    await bucket.lock(metadata.metageneration!);
+  } catch (error: any) {
+    if (error.code === 412) {
+      // Metadata changed between read and lock — re-read and retry
+      console.error('Bucket metadata changed since read, refusing to lock stale state');
+    } else if (error.code === 403) {
+      console.error('Insufficient permissions to lock retention policy');
+    } else if (error.code === 400) {
+      console.error('Lock rejected (no retention policy or invalid request)');
+    }
+    throw error;
+  }
+}

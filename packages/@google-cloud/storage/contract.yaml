@@ -1,12 +1,12 @@
 package: "@google-cloud/storage"
 semver: ">=5.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83
+coverage_score: 0.87
 
 functions:
   # Bucket Operations
@@ -865,3 +865,229 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: combine
+    import_path: "@google-cloud/storage"
+    description: >
+      Composes (concatenates) up to 32 source objects in a single bucket into one destination
+      object using the GCS compose API. Called as bucket.combine(sources, destination, options).
+      Common SaaS uses: assembling parallel chunked uploads into one final file, building
+      log archives, joining sharded report exports. Source files are NOT deleted after
+      compose — caller must clean up source objects separately if desired.
+    postconditions:
+      # Evidence: source confirmed from bucket.js line 1094-1175 (combine() implementation).
+      # The 32-source limit is documented in the GCS compose REST API:
+      # https://cloud.google.com/storage/docs/json_api/v1/objects/compose
+      # combine() synchronously throws Error before the request when:
+      # - sources is not an array or is empty (line 1096-1098, PROVIDE_SOURCE_FILE)
+      # - destination is falsy (line 1099-1101, DESTINATION_FILE_NOT_SPECIFIED)
+      # Async API errors come back through the request callback (line 1168-1173).
+      - id: combine-source-limit-exceeded
+        condition: "More than 32 source objects passed in a single compose request"
+        throws: "ApiError with HTTP 400 Bad Request from GCS — compose API rejects sources.length > 32"
+        required_handling: >
+          Caller MUST handle the 32-source cap. The GCS compose REST API limits a single
+          request to 32 source components. For larger composes, caller must do a multi-level
+          compose: combine 32 sources into intermediate objects, then combine the intermediates.
+          Without try-catch, the rejection surfaces as an unhandled promise rejection and the
+          partial workflow (e.g. chunked upload assembly) stalls with no remediation hint.
+        sources:
+          - "https://cloud.google.com/storage/docs/json_api/v1/objects/compose"
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#combine"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: combine-source-not-found
+        condition: "One or more source files referenced in sources[] do not exist (HTTP 404)"
+        throws: "ApiError with HTTP 404 Not Found — naming the missing source object in the message"
+        required_handling: >
+          Caller MUST handle source-missing errors. Compose fails atomically — if any one
+          source object is missing, no destination object is created. This is common when
+          a parallel upload path (e.g. chunked uploadFileInChunks or TransferManager) had
+          a partial failure and the missing chunk was retried under a different name.
+          Distinguish 404 from 403 to avoid silently retrying a request that will always
+          fail.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#combine"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: combine-precondition-failed
+        condition: "ifGenerationMatch on the destination does not match — concurrent compose conflict"
+        throws: "ApiError with HTTP 412 Precondition Failed"
+        required_handling: >
+          Caller MUST handle 412 precondition failures. When ifGenerationMatch is set on
+          the destination (or via instancePreconditionOpts), a concurrent writer may have
+          updated the destination object since the caller read its generation. Compose
+          becomes a no-op and the caller must re-read destination state and retry — or
+          treat the conflict as a write-loss event. Without explicit handling, a parallel
+          assembly job will silently produce stale output or duplicate the work.
+        sources:
+          - "https://cloud.google.com/storage/docs/json_api/v1/objects/compose"
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#combine"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: moveFileAtomic
+    import_path: "@google-cloud/storage"
+    description: >
+      Atomically moves a file within the same hierarchical-namespace (HNS) bucket using
+      the GCS `objects.moveTo` API. Called as file.moveFileAtomic(destination, options).
+      Distinct from file.move() (which is a non-atomic copy+delete) — moveFileAtomic is
+      a single server-side rename with no possibility of duplicate files lingering.
+      Requires the bucket to have hierarchical namespace enabled and is same-bucket only.
+    postconditions:
+      # Evidence: source confirmed from file.js line 2766-2824 (moveFileAtomic() implementation).
+      # Synchronous throw on no destination (line 2768-2770). Asynchronous errors via the
+      # underlying request callback at line 2818-2820. The `moveTo` REST endpoint requires
+      # HNS-enabled buckets — calling on a flat bucket fails with HTTP 400.
+      - id: move-file-atomic-non-hns-bucket
+        condition: "Called on a bucket without hierarchical namespace enabled"
+        throws: "ApiError with HTTP 400 Bad Request — moveTo endpoint rejects non-HNS buckets"
+        required_handling: >
+          Caller MUST handle non-HNS errors with a fallback path. moveFileAtomic only works
+          on HNS buckets — most existing GCS buckets are flat. Catch the 400 and either
+          fall back to file.move() (and accept the non-atomic semantics), or surface a
+          configuration error to operators so they enable HNS at bucket-creation time
+          (HNS cannot be enabled retroactively). Without try-catch, callers silently
+          assume atomicity they do not have.
+        sources:
+          - "https://cloud.google.com/storage/docs/json_api/v1/objects/move"
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#moveFileAtomic"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: move-file-atomic-precondition-failed
+        condition: "ifGenerationMatch precondition does not match the destination's current generation"
+        throws: "ApiError with HTTP 412 Precondition Failed"
+        required_handling: >
+          Caller MUST handle 412 precondition failures. When preconditionOpts.ifGenerationMatch
+          is set, a concurrent writer may have created or updated the destination since the
+          caller's last read. moveFileAtomic does not overwrite — it fails. Without explicit
+          412 handling, retrying with the same precondition will loop indefinitely; the
+          caller must re-read the destination, decide whether to overwrite, and resubmit.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#moveFileAtomic"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: move-file-atomic-source-not-found
+        condition: "Source file does not exist or was deleted before the move request landed"
+        throws: "ApiError with HTTP 404 Not Found"
+        required_handling: >
+          Caller MUST handle source-not-found errors. Unlike file.move() (where a 404 in
+          the delete phase is benign), a 404 from moveFileAtomic always means the source
+          never moved — the destination was not created. Treat as a hard failure and
+          investigate whether another worker raced the move or the source was cleaned up
+          prematurely.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/File.html#moveFileAtomic"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: lock
+    import_path: "@google-cloud/storage"
+    description: >
+      Permanently locks the bucket's retention policy via POST /lockRetentionPolicy.
+      Called as bucket.lock(metageneration). This action is IRREVERSIBLE — once locked,
+      the retention policy can never be reduced or removed, even by the bucket owner.
+      Used for compliance/regulatory holds (SEC, HIPAA, GDPR archival). Mistakes here
+      have permanent blast radius: a too-long retention period cannot be shortened.
+    postconditions:
+      # Evidence: source confirmed from bucket.js line 2529-2541 (lock() implementation).
+      # Synchronous throw if metageneration is not number|string (line 2530-2533).
+      # The /lockRetentionPolicy REST endpoint requires ifMetagenerationMatch — if the
+      # bucket metadata has changed since the caller read it, the lock fails with 412.
+      # Lock is irreversible per GCS docs: "Once you lock a retention policy, you cannot
+      # remove the retention period or unlock the policy."
+      - id: lock-precondition-failed
+        condition: "ifMetagenerationMatch does not match — bucket metadata changed since caller read it"
+        throws: "ApiError with HTTP 412 Precondition Failed"
+        required_handling: >
+          Caller MUST handle 412 precondition failures. The lock request includes the
+          metageneration the caller observed; if any other writer mutated bucket metadata
+          between the read and the lock call, the lock is rejected. Without try-catch,
+          the operator sees a generic promise rejection and may retry the lock against
+          stale state — locking the WRONG retention period permanently. Re-fetch
+          getMetadata(), re-confirm the retention period is the intended value, and only
+          then resubmit.
+        sources:
+          - "https://cloud.google.com/storage/docs/json_api/v1/buckets/lockRetentionPolicy"
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#lock"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: critical
+
+      - id: lock-no-retention-policy
+        condition: "Bucket has no retention policy to lock — nothing to lock"
+        throws: "ApiError with HTTP 400 Bad Request — lockRetentionPolicy on bucket without policy"
+        required_handling: >
+          Caller MUST handle the no-policy case. lock() only works when a retention
+          policy is already set via setRetentionPeriod(). If called on a bucket with no
+          policy, the API returns 400. Without try-catch, the deployment scripts that
+          enforce compliance posture silently believe they locked the bucket — but the
+          bucket has no retention enforcement at all. This is a compliance-audit time
+          bomb. Verify getMetadata().retentionPolicy exists before calling lock().
+        sources:
+          - "https://cloud.google.com/storage/docs/json_api/v1/buckets/lockRetentionPolicy"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+      - id: lock-permission-error
+        condition: "Service account lacks storage.buckets.update or the role required to lock retention"
+        throws: "ApiError with HTTP 403 Forbidden"
+        required_handling: >
+          Caller MUST handle permission errors on lock(). Locking a retention policy
+          requires elevated permissions (typically Storage Admin or a custom role with
+          storage.buckets.update). A silently-swallowed 403 means compliance automation
+          believes locking succeeded but the policy remains mutable. Verify the service
+          account role at deployment time and surface 403s as a hard failure to the
+          compliance owner.
+        sources:
+          - "https://googleapis.dev/nodejs/storage/latest/Bucket.html#lock"
+        severity: error
+        business_impact:
+          incident_label: COMPLIANCE_VIOLATION
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
