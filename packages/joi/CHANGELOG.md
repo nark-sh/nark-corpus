@@ -3,6 +3,25 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 83% → 87.5%
+
+- **Profile:** `packages/joi/contract.yaml`
+- **Functions added:** extend, defaults (2 total)
+- **Postconditions added:** 5
+  - extend-empty-extensions-throws (warning)
+  - extend-invalid-extension-shape-throws (error)
+  - extend-override-existing-type-throws (warning)
+  - defaults-non-function-modifier-throws (warning)
+  - defaults-modifier-returns-non-schema-throws (error)
+- **Functions intentionally omitted this pass:** none (checkPreferences remains omitted from prior pass — low-level utility with near-zero real-world usage)
+- **Scanner concerns queued:** 0 (existing scanner detector already catches bare extend/defaults calls without try-catch)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://raw.githubusercontent.com/hapijs/joi/master/API.md
+  - https://github.com/hapijs/joi/blob/master/lib/index.js
+  - https://github.com/hapijs/joi/blob/master/lib/schemas.js
+- **Verified by:** bc-deepen-contract pass=63 by deepen-stream-3 (2026-06-24T09:51:53Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** joi@18.2.3

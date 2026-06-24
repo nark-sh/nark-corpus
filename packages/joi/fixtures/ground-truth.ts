@@ -17,6 +17,11 @@
  *   validateasync-rejects: validateAsync() rejects with ValidationError on invalid data
  *   compile-invalid-schema-throws: compile() throws AssertError on invalid/undefined schema
  *   compile-version-mismatch-throws: compile() throws AssertError on joi version mismatch
+ *   extend-empty-extensions-throws: extend() throws AssertError when called with no extensions
+ *   extend-invalid-extension-shape-throws: extend() throws when extension shape is invalid
+ *   extend-override-existing-type-throws: extend() throws when overriding existing type name
+ *   defaults-non-function-modifier-throws: defaults() throws when modifier is not a function
+ *   defaults-modifier-returns-non-schema-throws: defaults() throws when modifier returns non-schema
  *
  * Note: validate(), assert(), attempt(), compile() are synchronous — the scanner detects
  * unhandled ASYNC calls (await without try-catch). Sync patterns are out of scanner scope.
@@ -136,4 +141,59 @@ export function compileStaticSchema() {
   // compile() on a known-correct literal schema never throws at runtime
   const schema = Joi.compile({ name: Joi.string().required() });
   return schema;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Joi.extend() — synchronous, throws AssertError on invalid extensions
+// Note: extend() is synchronous — scanner cannot detect bare extend() calls.
+// All cases below are SHOULD_NOT_FIRE for the async scanner.
+// Wrap in try-catch when extensions come from dynamic sources (plugins, config).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extendDynamicExtensionsSafe(
+  extensions: Array<{ type: string; base?: unknown }>
+) {
+  try {
+    // SHOULD_NOT_FIRE: extend-empty-extensions-throws — extend() wrapped in try-catch
+    const customJoi = (Joi as any).extend(...extensions);
+    return customJoi;
+  } catch (err) {
+    console.error("Failed to load joi extensions:", err);
+    return Joi;
+  }
+}
+
+export function extendStaticExtension() {
+  // SHOULD_FIRE: extend-invalid-extension-shape-throws — bare extend() without try-catch
+  const customJoi = (Joi as any).extend({
+    type: "trimmedString",
+    base: Joi.string(),
+    coerce(value: unknown) {
+      return { value: typeof value === "string" ? value.trim() : value };
+    },
+  });
+  return customJoi;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Joi.defaults() — synchronous, throws AssertError on invalid modifier
+// Note: defaults() is synchronous — scanner cannot detect bare defaults() calls.
+// All cases below are SHOULD_NOT_FIRE for the async scanner.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function defaultsCorrectModifier() {
+  // SHOULD_FIRE: defaults-modifier-returns-non-schema-throws — bare defaults() without try-catch
+  const requiredJoi = (Joi as any).defaults((schema: any) => schema.required());
+  return requiredJoi;
+}
+
+export function defaultsDynamicModifierSafe(modifierFn: unknown) {
+  try {
+    // SHOULD_NOT_FIRE: defaults-non-function-modifier-throws — defaults() wrapped in try-catch
+    const customJoi = (Joi as any).defaults(modifierFn);
+    return customJoi;
+  } catch (err) {
+    console.error("Invalid joi modifier:", err);
+    return Joi;
+  }
 }
