@@ -35,11 +35,11 @@ package: "replicate"
 semver: ">=0.16.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0
+coverage_score: 1.0   # 9/19 high-impact functions contracted; remaining 10 are read-only GETs / list / paginate / generic request helper / sync parseProgressFromLogs — intentionally omitted (no documented error contracts beyond generic ApiError already covered by sibling postconditions)
 
 detection:
   class_names:
@@ -592,6 +592,110 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+
+  - name: deployments.create
+    import_path: "replicate"
+    description: >
+      Provisions a new deployment — a custom, always-warm endpoint with dedicated
+      scaled infrastructure for a specific model version. Called as
+      replicate.deployments.create({ name, model, version, hardware, min_instances, max_instances }).
+      The deployment is paid infrastructure that bills per-minute even when idle
+      (min_instances > 0). Throws on auth failure, naming collision, unknown hardware
+      SKU, or invalid model version. Returns a Deployment object once provisioning
+      starts — the deployment may still be scaling up when this resolves.
+
+    postconditions:
+      # Evidence: source-confirmed from replicate@1.4.0 lib/deployments.js lines 101-109
+      # POST /deployments — body is the full DeploymentCreateRequest
+      # No client-side validation in createDeployment() — all errors come via this.request()
+      # ApiError thrown by index.js line 295 on any non-2xx response
+      - id: deployments-create-no-error-handling
+        condition: >
+          replicate.deployments.create() called without try-catch or .catch() handler
+        throws: >
+          ApiError with response.status: 401 (invalid API token),
+          402 (no credits / billing not configured for paid hardware),
+          403 (caller lacks permission to create deployments in target org),
+          409 (deployment name already exists in the org — names are unique per owner),
+          422 (invalid hardware SKU, unknown model, unknown version, or min/max instance
+          constraints violated such as min_instances > max_instances or max_instances above
+          plan limit), 429 (rate limit on deployment creation).
+          Network errors propagate as-is (ECONNREFUSED, ETIMEDOUT).
+        required_handling: >
+          Caller MUST wrap await replicate.deployments.create() in try-catch.
+          CRITICAL: a successful create() does NOT mean the deployment is ready to serve
+          traffic — provisioning takes 30s-5min depending on hardware. Treating the
+          returned Deployment as immediately ready will cause 404/503 responses for
+          early predictions against the new endpoint. Poll deployments.get(owner, name)
+          and check current_release until provisioning completes before routing traffic.
+
+          try {
+            const deployment = await replicate.deployments.create({
+              name: "production-sdxl",
+              model: "stability-ai/sdxl",
+              version: "abc123...",
+              hardware: "gpu-a100",
+              min_instances: 1,
+              max_instances: 5
+            });
+            // Deployment is being provisioned — poll deployments.get() before use
+            return deployment;
+          } catch (error) {
+            if (error instanceof Replicate.ApiError && error.response.status === 409) {
+              throw new Error(`Deployment name already exists: ${error.message}`);
+            }
+            console.error("Deployment creation failed:", error);
+            throw error;
+          }
+        sources:
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/deployments.js"
+          - "https://github.com/replicate/replicate-javascript/blob/main/index.js"
+          - "https://replicate.com/docs/topics/deployments"
+          - "https://replicate.com/docs/reference/http#deployments.create"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: deployments-create-not-yet-ready
+        condition: >
+          Code routes prediction traffic to a freshly-created deployment immediately
+          after replicate.deployments.create() resolves, without polling for readiness
+        throws: >
+          Does NOT throw at create() time — the deployment object resolves before the
+          underlying infrastructure is warm. Subsequent calls to
+          deployments.predictions.create(owner, name, ...) against the new deployment
+          will throw ApiError 503 (or fall through to the default routing if instances
+          are still scaling). Code that creates a deployment and immediately fires
+          predictions silently loses those requests until scale-up completes.
+        required_handling: >
+          After deployments.create() resolves, poll deployments.get(owner, name) and
+          inspect current_release. Do not route traffic until current_release is
+          populated with the expected version. For automation pipelines (Terraform,
+          CI/CD), introduce a readiness wait of 60-300s minimum.
+
+          const deployment = await replicate.deployments.create({...});
+
+          // Wait for readiness
+          const start = Date.now();
+          while (Date.now() - start < 300_000) {
+            const d = await replicate.deployments.get(deployment.owner, deployment.name);
+            if (d.current_release?.version === deployment.current_release?.version) break;
+            await new Promise(r => setTimeout(r, 5_000));
+          }
+        sources:
+          - "https://replicate.com/docs/topics/deployments"
+          - "https://github.com/replicate/replicate-javascript/blob/main/lib/deployments.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
 notes:
   - "new Replicate({ auth }) does NOT make network calls — no try-catch needed for constructor"

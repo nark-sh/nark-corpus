@@ -15,6 +15,8 @@
  *   trainings-create-result-not-polled
  *   files-create-no-error-handling
  *   deployments-predictions-create-no-error-handling
+ *   deployments-create-no-error-handling
+ *   deployments-create-not-yet-ready
  *   validatewebhook-return-value-not-checked
  *   validatewebhook-missing-headers-throws
  */
@@ -334,5 +336,64 @@ async function gt_validatewebhook_checked(request: Request) {
     return body;
   } catch (error) {
     return new Response("Invalid webhook request", { status: 400 });
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 12. deployments.create — missing try-catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+async function gt_deployments_create_missing() {
+  // SHOULD_FIRE: deployments-create-no-error-handling
+  const deployment = await replicate.deployments.create({
+    name: "production-sdxl",
+    model: "stability-ai/sdxl",
+    version: "abc123def456",
+    hardware: "gpu-a100",
+    min_instances: 1,
+    max_instances: 5,
+  });
+  return deployment;
+}
+
+// 12. deployments.create — with try-catch (SHOULD_NOT_FIRE)
+async function gt_deployments_create_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: deployments.create has try-catch
+    const deployment = await replicate.deployments.create({
+      name: "production-sdxl",
+      model: "stability-ai/sdxl",
+      version: "abc123def456",
+      hardware: "gpu-a100",
+      min_instances: 1,
+      max_instances: 5,
+    });
+    return deployment;
+  } catch (error) {
+    console.error("Deployment creation failed:", error);
+    throw error;
+  }
+}
+
+// 12b. deployments.create — followed by immediate traffic routing (SHOULD_FIRE not-yet-ready)
+async function gt_deployments_create_immediate_use() {
+  try {
+    const deployment = await replicate.deployments.create({
+      name: "production-sdxl",
+      model: "stability-ai/sdxl",
+      version: "abc123def456",
+      hardware: "gpu-a100",
+      min_instances: 1,
+      max_instances: 5,
+    });
+    // PENDING DETECTOR: deployments-create-not-yet-ready — traffic before readiness poll (scanner concern queued)
+    const prediction = await replicate.deployments.predictions.create(
+      "my-org",
+      "production-sdxl",
+      { input: { prompt: "test" } }
+    );
+    return prediction;
+  } catch (error) {
+    throw error;
   }
 }
