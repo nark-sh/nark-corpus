@@ -1,6 +1,25 @@
 # CHANGELOG — pdfjs-dist
 
 All notable verification, deepen, and fork events for this profile. Newest first.
+
+## 2026-06-24 — deepen pass — coverage 100% -> 100% (effective)
+
+- **Profile:** `packages/pdfjs-dist/contract.yaml`
+- **Package version verified:** pdfjs-dist@6.0.227 (latest)
+- **Functions added:** none (all contractable async methods already covered)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** `page.getXfa` — thin async wrapper around `_transport._htmlForXfa?.children[pageIndex] || null`. No worker call, no input validation, no throws. Returns null for non-XFA PDFs (the common case). Used internally by `getTextContent()` for XFA forms. Same omission pattern as the other read-only data accessors already omitted.
+- **Total omitted now:** 21 (20 prior + 1 new)
+- **Effective contractable:** 13 contracted / 13 contractable = 100%
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/pdfjs-dist/types/src/display/api.d.ts` (pdfjs-dist@6.0.227)
+  - `node_modules/pdfjs-dist/types/src/display/text_layer.d.ts`
+  - `node_modules/pdfjs-dist/build/pdf.mjs` line 15470 (async getXfa implementation)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24)
+- **Notes:** Re-enumeration also confirmed three regex false positives that are NOT Promise-returning: `cachedPageNumber(ref): number | null`, `getRawData(data): any`, `streamTextContent({...}): ReadableStream` (sync stream factory). All constructors intentionally excluded from async-callable count.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** pdfjs-dist@6.0.227

@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (re-confirmed-complete)
+
+- **Profile:** `packages/archiver/contract.yaml`
+- **Functions added:** none — Phase 1 re-enumeration against archiver@8.0.0 confirmed full surface coverage
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** abort() (sync this-returning), pointer() (sync getter, returns number) — unchanged from prior pass
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** @types/archiver@8.0.0 index.d.ts (full Archiver class declaration); archiver@8.0.0 lib/core.js (methods at lines 507/525/570/651/672/710/749/792); archiver@8.0.0 lib/error.js (ArchiverError code map, 15 codes)
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 80, drift-by-staleness mode, on 2026-06-24T13:03:56Z)
+- **Notes:** Phase 1 enumeration via @types/archiver and lib/core.js confirms 9 callable methods on Archiver class: abort, append, directory, file, glob, finalize, pointer, symlink (8 instance methods + constructor factory). 7 async-callable groups all contracted (archiver factory, append, directory, file, glob, finalize, symlink). 2 sync methods correctly omitted (abort returns `this`, pointer returns `number`). Error code surface unchanged from prior pass — all 11 user-facing ArchiverError codes still mapped to existing postconditions; 4 internal codes (NOENDMETHOD, FORMATSET, MODULESET, ENTRYNOTSUPPORTED) remain implicit-omit (thrown only during format-module registration, not user code paths). last_verified bumped from 2026-06-18 to 2026-06-24; coverage_score stays 1.0.
+
 ## 2026-06-18 — deepen pass — coverage 85% → 100%
 
 - **Profile:** `packages/archiver/contract.yaml`
