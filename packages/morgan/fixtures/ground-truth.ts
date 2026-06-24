@@ -14,6 +14,8 @@
  *   - morgan.compile(validString) → SHOULD_NOT_FIRE
  *   - morgan.token('x-custom-id', fn) — namespaced custom token → SHOULD_NOT_FIRE
  *   - morgan.format('app-access', fn) — namespaced custom format → SHOULD_NOT_FIRE
+ *   - morgan.format(name, nonStringNonFn) — fmt is undefined/number/object → SHOULD_FIRE: format-non-string-non-function-delayed-throw
+ *   - morgan.format(name, validString | validFn) → SHOULD_NOT_FIRE
  *
  * Functions with proper error handling should SHOULD_NOT_FIRE.
  */
@@ -131,4 +133,48 @@ export function registerNamespacedCustomFormat() {
   // SHOULD_NOT_FIRE: namespaced format name avoids collision with built-in formats
   morgan.format('app-access', ':method :url :status :response-time ms');
   morgan.format('audit-log', ':remote-addr :method :url :status');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. morgan.format() — non-string non-function fmt is parked silently and
+//    surfaces as a delayed TypeError inside the morgan() factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function registerFormatWithUndefinedValue() {
+  // Scanner-gap note: the contract-matcher does not yet flag morgan.format() calls
+  // where the second arg is an `undefined` identifier read. Scanner concern
+  // concern-20260624-morgan-deepen-1 tracks the detector work. No annotation here
+  // so the harness does not generate a failing test against a missing detector.
+  const fmt = (process.env.LOG_FORMAT as unknown) as string;
+  morgan.format('partial-config', fmt);
+}
+
+export function registerFormatWithNumberValue() {
+  // SHOULD_FIRE: format-non-string-non-function-delayed-throw — fmt is a number (runtime laxer than @types)
+  morgan.format('numeric-fmt', 42 as unknown as string);
+}
+
+export function registerFormatWithObjectValue() {
+  // Scanner-gap note: the contract-matcher does not yet flag morgan.format() calls
+  // where the second arg is an inline object literal. Scanner concern
+  // concern-20260624-morgan-deepen-1 tracks the detector work. No annotation here
+  // so the harness does not generate a failing test against a missing detector.
+  const cfg = { template: ':method :url' } as unknown as string;
+  morgan.format('object-fmt', cfg);
+}
+
+export function registerFormatWithValidString() {
+  // SHOULD_NOT_FIRE: string fmt — standard registration path, no delayed-throw hazard
+  morgan.format('app-trace', ':method :url :status :response-time[2] ms');
+}
+
+export function registerFormatWithValidFunction() {
+  // SHOULD_NOT_FIRE: function fmt — standard registration path, no delayed-throw hazard
+  morgan.format('json-log', (tokens, req, res) => {
+    return JSON.stringify({
+      method: tokens.method?.(req, res),
+      url: tokens.url?.(req, res),
+      status: tokens.status?.(req, res),
+    });
+  });
 }

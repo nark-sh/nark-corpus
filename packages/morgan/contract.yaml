@@ -1,8 +1,8 @@
 package: morgan
 semver: ">=1.0.0 <2.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -32,6 +32,37 @@ evidence_quality: confirmed
 #   node_modules/morgan/index.js lines 488-491 (function format body)
 #   node_modules/morgan/index.js lines 178-209 (built-in formats registered via morgan.format)
 #   https://github.com/expressjs/morgan#readme  (morgan.format(name, fmt) docs)
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 88):
+# Re-enumerated against morgan@1.11.0 + @types/morgan@1.9.10 — same 4 exports,
+# no new exports introduced. Added one new postcondition on morgan.format() —
+# format-non-string-non-function-delayed-throw — covering a delayed-throw
+# hazard previously left implicit. morgan.format(name, fmt) does NOT type-check
+# fmt before assigning to morgan[name] (lib/index.js lines 488-491: no guard
+# beyond direct assignment). If fmt is neither a string nor a function (e.g.
+# undefined, null, number, plain object), it is stored without error. The
+# delayed-throw fires later inside the morgan() factory: getFormatFunction()
+# at lines 501-509 reads morgan[name] and passes non-function values to
+# compile(), which at lines 427-430 throws TypeError("argument format must
+# be a string") only for non-string values. For object/array/number values,
+# compile() silently produces a format function returning the JSON-encoded
+# representation, causing garbled log lines instead of an exception.
+# Hazard: factory-time vs registration-time error separation makes the bug
+# surface in a different stack frame than its cause, hard to diagnose at
+# scale. Distinct from compile-non-string-throws (which fires when caller
+# passes the bad value directly to compile()) — here the bad value is
+# parked in morgan[name] state and the throw is decoupled in time and
+# call site.
+# After this pass: 4/4 callable exports contracted, 5 postconditions total
+# (stream-write-error, next-called-with-error on factory; compile-non-string-throws
+# precondition + compile-invalid-token-syntax-silent on compile; token-name-overwrite-silent
+# on token; format-name-overwrite-silent + format-non-string-non-function-delayed-throw
+# on format).
+# Evidence:
+#   node_modules/morgan/index.js lines 488-491 (function format — no type guard)
+#   node_modules/morgan/index.js lines 501-509 (getFormatFunction — late dispatch)
+#   node_modules/morgan/index.js lines 427-430 (compile — string check throws TypeError)
+#   node_modules/@types/morgan/index.d.ts lines 107-112, 135-151 (format() type overloads accept string|FormatFn — runtime is laxer than the types)
 coverage_score: 1.0  # 4 contracted / 4 total callable exports (0 omitted)
 
 functions:
@@ -257,4 +288,39 @@ functions:
           production_behavior: degraded_service
           visibility: silent
           user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: node_modules/morgan/index.js lines 488-491 (function format body — direct assignment, no type guard)
+      # Evidence: node_modules/morgan/index.js lines 501-509 (getFormatFunction — late dispatch on stored value)
+      # Evidence: node_modules/morgan/index.js lines 427-430 (compile — TypeError thrown only for non-string)
+      # Source confirmed at morgan@1.11.0: format(name, fmt) writes morgan[name] = fmt with NO check
+      # that fmt is string|function. The runtime is laxer than the TypeScript types in @types/morgan,
+      # which constrain fmt to `string | FormatFn`. Non-string non-function values (number, object,
+      # array, undefined, null) reach the storage slot. Failure surfaces later when morgan(name)
+      # is called and getFormatFunction passes the bad value to compile() — a different stack frame.
+      - id: format-non-string-non-function-delayed-throw
+        condition: "morgan.format() is called with fmt argument that is neither a string nor a function (e.g., number, plain object, undefined, null)"
+        throws: >
+          No error thrown at format() call site. Later, when morgan(name) is invoked for that format,
+          getFormatFunction passes the stored value to compile(), which throws TypeError 'argument
+          format must be a string' for non-string values. For object/array values, compile() may
+          silently produce a format function that returns the JSON-encoded representation,
+          causing garbled log lines instead of an exception.
+        required_handling: >
+          Caller MUST ensure the second argument to morgan.format() is a non-empty format string
+          (using :token-name syntax) or a FormatFn ((tokens, req, res) => string|undefined|null).
+          The TypeScript declarations in @types/morgan enforce this at compile time, but plain
+          JavaScript callers, dynamic-typed wrappers, and config-loaded format values can defeat
+          the type check. Validate format values at the integration boundary where they enter
+          the morgan registration call. Do not register a format from untrusted config without
+          verifying its type.
+        sources:
+          - "https://raw.githubusercontent.com/expressjs/morgan/master/index.js"
+          - "https://github.com/expressjs/morgan#readme"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: service_unavailable
           incident_cost_range: low

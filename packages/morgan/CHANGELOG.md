@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (+1 postcondition)
+
+- **Profile:** `packages/morgan/contract.yaml`
+- **Functions added:** none (re-enumeration confirmed 4 exports unchanged)
+- **Postconditions added:** 1 (`format-non-string-non-function-delayed-throw` on `morgan.format()`)
+- **Functions intentionally omitted this pass:** none
+- **Scanner concerns queued:** 1 (`concern-20260624-morgan-deepen-1` — detector for non-string non-function `fmt` argument in `morgan.format()`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/morgan/index.js` (morgan@1.11.0) lines 488-491 (function format body — no type guard), 501-509 (getFormatFunction late dispatch), 427-430 (compile TypeError on non-string)
+  - `node_modules/@types/morgan/index.d.ts` (@types/morgan@1.9.10) lines 107-112, 135-151 (format() type overloads)
+  - https://github.com/expressjs/morgan#readme
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 88, 2026-06-24T12:28:00+00:00)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** morgan@1.11.0
