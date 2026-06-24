@@ -22,6 +22,7 @@ import {
   ManagedIdentityCredential,
   WorkloadIdentityCredential,
   InteractiveBrowserCredential,
+  DeviceCodeCredential,
   CredentialUnavailableError,
   AuthenticationError,
   getBearerTokenProvider,
@@ -279,4 +280,47 @@ export async function interactiveAuthWithCatch(): Promise<string | undefined> {
     }
     throw err;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. DeviceCodeCredential.authenticate() — device code OAuth flow (CLI/headless)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const deviceCodeCredential = new DeviceCodeCredential({
+  tenantId: process.env.AZURE_TENANT_ID ?? 'mock-tenant-id',
+  clientId: process.env.AZURE_CLIENT_ID ?? 'mock-client-id',
+});
+
+export async function deviceCodeAuthNoCatch(): Promise<string | undefined> {
+  // SHOULD_FIRE: device-code-authenticate-no-try-catch — DeviceCodeCredential.authenticate() without try-catch; throws CredentialUnavailableError on device code expiry
+  const record = await deviceCodeCredential.authenticate(['User.Read']);
+  return record ? serializeAuthenticationRecord(record) : undefined;
+}
+
+export async function deviceCodeAuthWithCatch(): Promise<string | undefined> {
+  try {
+    // SHOULD_NOT_FIRE: DeviceCodeCredential.authenticate() wrapped in try-catch with null check
+    const record = await deviceCodeCredential.authenticate(['User.Read']);
+    if (record) {
+      return serializeAuthenticationRecord(record);
+    }
+    return undefined;
+  } catch (err) {
+    if (err instanceof CredentialUnavailableError) {
+      console.error('Device code auth failed:', err.message);
+    } else if (err instanceof AuthenticationError) {
+      console.error('Auth rejected:', err.errorResponse.error, err.errorResponse.errorDescription);
+    }
+    throw err;
+  }
+}
+
+export async function deviceCodeAuthLocalNoCatch(): Promise<string | undefined> {
+  const cred = new DeviceCodeCredential({
+    tenantId: 'tenant-id',
+    clientId: 'client-id',
+  });
+  // SHOULD_FIRE: device-code-authenticate-no-try-catch — local DeviceCodeCredential instance, authenticate() without try-catch
+  const record = await cred.authenticate(['https://graph.microsoft.com/.default']);
+  return record ? serializeAuthenticationRecord(record) : undefined;
 }

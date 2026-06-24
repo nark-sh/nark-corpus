@@ -1,8 +1,8 @@
 package: "@azure/identity"
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -272,6 +272,110 @@ functions:
           - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/interactivebrowsercredential?view=azure-node-preview"
           - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/?view=azure-node-latest"
           - "https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/identity/identity"
+
+  - name: DeviceCodeCredential.authenticate
+    import_path: "@azure/identity"
+    description: >
+      Authenticates with Microsoft Entra ID using the device code flow. The user is
+      shown a device code via the userPromptCallback (default: console.log) and
+      enters it at https://microsoft.com/devicelogin in a separate browser. Once
+      the user completes the flow, the method returns an `AuthenticationRecord`
+      (or `undefined` if no active account is available). Unlike getToken(),
+      authenticate() forces interactive user prompting on every call — even when
+      the user provided `disableAutomaticAuthentication`. Used in CLI tools,
+      headless servers, and devices without a web browser (IoT, SSH-only hosts).
+
+    postconditions:
+      # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/identity/devicecodecredential?view=azure-node-latest
+      # Microsoft docs explicitly state: "If authentication fails, a CredentialUnavailableError will be thrown with the details of the failure."
+      # Source confirmed from dist/commonjs/credentials/deviceCodeCredential.js: msalClient.getTokenByDeviceCode propagates errors; getActiveAccount() returns undefined when no record exists
+      # Signature confirmed from dist/commonjs/credentials/deviceCodeCredential.d.ts:
+      #   authenticate(scopes: string | string[], options?: GetTokenOptions): Promise<AuthenticationRecord | undefined>
+      - id: device-code-authenticate-no-try-catch
+        condition: >
+          DeviceCodeCredential.authenticate() is called with `await` but is not
+          wrapped in a try-catch block. Pattern:
+          `const record = await credential.authenticate(scopes)` where credential
+          is an instance of DeviceCodeCredential.
+        throws: >
+          CredentialUnavailableError — thrown with details of the failure when
+          the device code flow cannot complete. Common causes: user did not enter
+          the code at https://microsoft.com/devicelogin before the device code
+          expired (default 15 min), tenant blocked device code flow via conditional
+          access policy, or the App Registration is not configured to allow
+          public-client device code grants.
+
+          AuthenticationError — thrown when the OAuth 2.0 device code exchange
+          completes but Azure AD rejects the authorization (consent not granted,
+          conditional access blocking, MFA required but not satisfied, user account
+          disabled).
+
+          AuthenticationRequiredError — thrown when the token cannot be retrieved
+          silently and user interaction is required but has been disabled via
+          the `disableAutomaticAuthentication` option on the underlying msalClient
+          (rare; authenticate() forces interaction by default).
+        severity: warning
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: low
+        description: >
+          DeviceCodeCredential.authenticate() drives an interactive flow that
+          requires user action in a separate browser. It is the standard
+          credential for CLI tools, container init scripts, and headless servers
+          where InteractiveBrowserCredential cannot open a local browser.
+
+          The critical failure mode: authenticate() returns
+          `AuthenticationRecord | undefined`, but on infrastructure failures it
+          DOES throw — and the most common case (device code expiry from user
+          inattention) surfaces as CredentialUnavailableError. CLI tools that
+          await credential.authenticate() without try-catch crash with an
+          unhandled promise rejection, leaving the user with no actionable error
+          message — just a stack trace.
+
+          Additionally, callers frequently fail to null-check the returned record
+          before serializing it. `serializeAuthenticationRecord(record!)` with a
+          non-null assertion crashes when the underlying MSAL client has no active
+          account (e.g. silent flow returned no record).
+
+          Common dangerous pattern in CLI auth flows:
+            const credential = new DeviceCodeCredential({tenantId, clientId});
+            const record = await credential.authenticate(['User.Read']); // crashes on code expiry
+            fs.writeFileSync('.auth', serializeAuthenticationRecord(record!)); // crashes if undefined
+
+          Correct pattern:
+            try {
+              const record = await credential.authenticate(['User.Read']);
+              if (record) {
+                fs.writeFileSync('.auth', serializeAuthenticationRecord(record));
+              } else {
+                console.error('Device code flow returned no authentication record');
+                process.exit(1);
+              }
+            } catch (err) {
+              if (err instanceof CredentialUnavailableError) {
+                console.error('Device code authentication failed:', err.message);
+              } else if (err instanceof AuthenticationError) {
+                console.error('Azure AD rejected the authorization:',
+                  err.errorResponse.error, err.errorResponse.errorDescription);
+              }
+              throw err;
+            }
+        required_handling: >
+          MUST wrap await credential.authenticate() in try-catch.
+          MUST check if the returned AuthenticationRecord is defined before using
+          it (the return type is `AuthenticationRecord | undefined`).
+          Do not use non-null assertion (!) on the return value.
+          For CLI tools, surface the specific error type to the user — device code
+          expiry, conditional access blocks, and tenant misconfiguration each have
+          different remediation paths.
+        source: "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/devicecodecredential?view=azure-node-latest"
+        sources:
+          - "https://learn.microsoft.com/en-us/javascript/api/@azure/identity/devicecodecredential?view=azure-node-latest"
+          - "https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/src/credentials/deviceCodeCredential.ts"
+          - "https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code"
 
 tags:
   - azure

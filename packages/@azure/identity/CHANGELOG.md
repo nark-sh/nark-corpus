@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% (3/3) → 100% (4/4)
+
+- **Profile:** `packages/@azure/identity/contract.yaml`
+- **Functions added:** DeviceCodeCredential.authenticate (1 total)
+- **Postconditions added:** 1 (`device-code-authenticate-no-try-catch`)
+- **Functions intentionally omitted this pass:** none (synchronous helpers and the 18+ credential classes' `getToken()` methods stay covered under the universal `credential.getToken()` postcondition)
+- **Scanner concerns queued:** 1 (`concern-20260624-azure-identity-deepen-3` — distinguish per-credential-class `.authenticate()` dispatch so DeviceCodeCredential vs InteractiveBrowserCredential map to their respective postconditions instead of the matcher falling back to method-name only)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://learn.microsoft.com/en-us/javascript/api/@azure/identity/devicecodecredential?view=azure-node-latest, https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/identity/identity/src/credentials/deviceCodeCredential.ts, https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code
+- **Rationale:** drift-by-staleness sweep — prior deepen was 2026-04-16 (oldest in deepen-index). Re-enumeration of @azure/identity@4.13.1 dist/commonjs/credentials/*.d.ts surfaced one uncovered async method: `DeviceCodeCredential.authenticate()`. Microsoft docs explicitly state CredentialUnavailableError is thrown on failure; most common production cause is device code expiry from user inattention (15-min default TTL). Signature mirrors InteractiveBrowserCredential.authenticate(): `Promise<AuthenticationRecord | undefined>`.
+- **Verified by:** bc-deepen-contract (pass 45 on 2026-06-24T06:09:39Z, deepen-stream-3)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @azure/identity@4.13.1
