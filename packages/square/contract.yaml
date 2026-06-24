@@ -46,13 +46,27 @@
 # Contracted after: 20 (+5 this pass)
 # Omitted: 5 (unchanged: read-only GETs)
 # Coverage: 20/25 = 0.80
-coverage_score: 0.80
+#
+# Depth pass 2026-06-24 (deepen-stream-3 pass 41, drift-by-staleness mode):
+# Re-enumerated square@44.2.0 (current latest, within profile semver >=40.0.0).
+# Previous pass under-counted the v44 namespaced surface — subscriptions.pause,
+# subscriptions.resume, and invoices.cancel were missing from both contracted
+# and omitted lists. 3 new function entries added this pass. All three are
+# state-mutating write operations on financial objects with silent-failure
+# risk. Two of the three (pause, invoices.cancel) have non-obvious behavior
+# (deferred billing-cycle effect; required version parameter for optimistic
+# concurrency control) not present in the previously contracted set.
+# Contracted before: 20. Contracted after: 23. API surface total updated to 28
+# (bookings.create, invoices.update, invoices.delete also surfaced during
+# re-enum but deferred to a follow-up pass — flagged in deepen-index.json).
+# Omitted: 5 (unchanged read-only GETs). Coverage: 23/28 = 0.82.
+coverage_score: 0.82
 
 package: square
 semver: ">=40.0.0"
-contract_version: "2.0.0"
+contract_version: "2.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # updated by deepen-stream-1 pass 5
+last_verified: "2026-06-24"  # updated by deepen-stream-3 pass 41
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -68,6 +82,7 @@ detection:
     - "CatalogClient"
     - "DisputesClient"
     - "GiftCardsClient"
+    - "InvoicesClient"   # added 2026-06-24 deepen-stream-3 pass 41 for invoices.cancel detection
 
 functions:
   - name: payments.create
@@ -1160,3 +1175,326 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: medium
+
+  # Depth pass 2026-06-24 (deepen-stream-3 pass 41): 3 new functions
+  # (subscriptions.pause, subscriptions.resume, invoices.cancel). Re-enumerated
+  # square@44.2.0 dist .d.ts files. Square SDK 44.x added these write operations
+  # to the namespaced API. All three are state-mutating operations on financial
+  # objects where silent failures cause customer-billing or revenue impact.
+  # Sources fetched 2026-06-24:
+  #   https://developer.squareup.com/reference/square/subscriptions-api/pause-subscription
+  #   https://developer.squareup.com/reference/square/subscriptions-api/resume-subscription
+  #   https://developer.squareup.com/reference/square/invoices-api/cancel-invoice
+  #   https://developer.squareup.com/reference/square/enums/ErrorCode
+
+  - name: subscriptions.pause
+    import_path: "square"
+    description: >
+      Schedules a PAUSE action for an active subscription. Usage:
+      await client.subscriptions.pause({ subscriptionId, pauseEffectiveDate?,
+      pauseCycleDuration?, resumeEffectiveDate? }). Returns
+      HttpResponsePromise<PauseSubscriptionResponse>. CRITICAL: pause is
+      DEFERRED — when pauseEffectiveDate is unspecified or falls within the
+      current billing cycle, the subscription is paused on the starting date of
+      the NEXT billing cycle. The caller cannot assume billing stops
+      immediately after a successful call.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/subscriptions-api/pause-subscription (fetched 2026-06-24)
+      # Documented error codes: CUSTOMER_NOT_FOUND, INVALID_PAUSE_LENGTH,
+      # INVALID_DATE, CARD_PROCESSING_NOT_ENABLED. Standard SquareError
+      # categories (AUTHENTICATION_ERROR, RATE_LIMIT_ERROR, API_ERROR) also
+      # apply per ErrorCategory enum.
+      - id: square-subscriptions-pause-invalid-request
+        condition: >
+          The pause request is rejected: pauseEffectiveDate is in the past,
+          pauseCycleDuration exceeds the remaining duration of the current
+          subscription phase (INVALID_PAUSE_LENGTH), the date format is invalid
+          (INVALID_DATE), the location is not enabled for card processing
+          (CARD_PROCESSING_NOT_ENABLED 403), or the customer linked to the
+          subscription cannot be found (CUSTOMER_NOT_FOUND).
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR or PAYMENT_METHOD_ERROR.
+          Specific codes: INVALID_PAUSE_LENGTH (400), INVALID_DATE (400),
+          CARD_PROCESSING_NOT_ENABLED (403), CUSTOMER_NOT_FOUND (400).
+        required_handling: >
+          Caller MUST wrap in try-catch. Silent failure leaves the subscription
+          ACTIVE — the customer continues to be billed while the app's UI
+          claims the subscription is paused. Surface the error to the user,
+          revert any optimistic UI update, and log INVALID_PAUSE_LENGTH /
+          INVALID_DATE separately so support can correct the requested pause
+          window. CARD_PROCESSING_NOT_ENABLED indicates an environment-level
+          configuration issue and should page on-call rather than be retried.
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/pause-subscription"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-subscriptions-pause-deferred-billing-trap
+        condition: >
+          The pause call succeeds but the pause action is SCHEDULED — when
+          pauseEffectiveDate is omitted or falls within the current billing
+          cycle, the subscription is paused at the START of the next billing
+          cycle. The current billing cycle still completes and the customer is
+          charged at least one more time after the "successful" pause.
+        throws: >
+          No exception — the trap is that the success response carries an
+          ACTION object whose effective date is in the future. The
+          subscription.status field returned reflects the CURRENT state, not
+          the post-pause state.
+        required_handling: >
+          Caller MUST wrap in try-catch. After a successful pause, inspect the
+          returned action.effective_date (or pauseEffectiveDate echoed in the
+          response) and surface it to the user as "Pause takes effect on
+          <date>." Do not message "Subscription paused" without that
+          qualifier. Do not assume the next invoice will be skipped — the
+          subscription will bill normally until effective_date arrives. For
+          immediate pause, the caller must compute the next billing-cycle
+          start themselves and inform the customer accordingly.
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/pause-subscription"
+        severity: warning
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-subscriptions-pause-auth-and-throttling
+        condition: >
+          Authentication token is invalid, expired, or revoked
+          (AUTHENTICATION_ERROR), or the subscription pause endpoint is being
+          called above the per-merchant rate cap (RATE_LIMIT_ERROR / 429).
+          Background workers that bulk-pause subscriptions for an outage or
+          plan migration commonly trip the rate cap.
+        throws: >
+          SquareError with AUTHENTICATION_ERROR (401) or RATE_LIMIT_ERROR
+          (429). RATE_LIMITED is the documented error code per Square's
+          ErrorCode enum.
+        required_handling: >
+          Caller MUST wrap in try-catch. AUTHENTICATION_ERROR halts ALL
+          subscription pauses on the worker — page on-call to rotate the
+          token. RATE_LIMIT_ERROR must be retried with exponential backoff;
+          carry the original idempotency_key on retry so the same logical
+          pause is not registered twice. Track partial-batch state (which
+          subscription IDs successfully paused) so the worker can resume after
+          a token rotation or rate-limit recovery without re-pausing already
+          paused subscriptions.
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/pause-subscription"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: subscriptions.resume
+    import_path: "square"
+    description: >
+      Schedules a RESUME action to resume a paused or deactivated subscription.
+      Usage: await client.subscriptions.resume({ subscriptionId,
+      resumeEffectiveDate?, resumeChangeTiming? }). Returns
+      HttpResponsePromise<ResumeSubscriptionResponse>. The resumeChangeTiming
+      (beta) controls whether resume is IMMEDIATE or END_OF_BILLING_CYCLE.
+      Race conditions are real: if pause and resume actions are scheduled in
+      overlapping windows, the LATER scheduled action wins and the earlier
+      action may be silently dropped.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/subscriptions-api/resume-subscription (fetched 2026-06-24)
+      # Documented error codes: CUSTOMER_MISSING_EMAIL, CUSTOMER_MISSING_NAME,
+      # CUSTOMER_NOT_FOUND, INVALID_CARD, INVALID_DATE,
+      # CARD_PROCESSING_NOT_ENABLED.
+      - id: square-subscriptions-resume-customer-card-error
+        condition: >
+          The subscription's customer no longer has the data required to
+          charge them on resume: their card on file has been deleted or has
+          expired, their email or name is missing on the customer record, or
+          the customer was deleted between pause and resume. Subscriptions
+          paused for months commonly hit this on resume because cards
+          captured at pause time have since expired.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR or PAYMENT_METHOD_ERROR.
+          Specific codes: CUSTOMER_MISSING_EMAIL (400),
+          CUSTOMER_MISSING_NAME (400), CUSTOMER_NOT_FOUND (400),
+          INVALID_CARD (400), CARD_PROCESSING_NOT_ENABLED (403).
+        required_handling: >
+          Caller MUST wrap in try-catch. Treat as a customer-fixable issue:
+          surface a "Please update your payment method to resume your
+          subscription" CTA, do NOT just log and ignore. Do not retry blindly
+          — the customer must update the card on file or customer record
+          first. Track resume failures separately from pause failures because
+          their root cause is fundamentally different (stale customer data vs
+          bad pause window).
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/resume-subscription"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: square-subscriptions-resume-invalid-date
+        condition: >
+          resumeEffectiveDate is invalid: in the past, before the scheduled
+          pauseEffectiveDate, or after the subscription's canonical end date.
+          Common in admin tooling that allows operators to type free-form
+          resume dates without server-side range validation.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR. Specific code:
+          INVALID_DATE (400).
+        required_handling: >
+          Caller MUST wrap in try-catch. Validate resumeEffectiveDate
+          client-side: must be in the future, must be on or after the
+          subscription's current paused-until date. Surface the parsed reason
+          to the operator so they can re-enter a valid date — do not swallow
+          and assume the resume succeeded.
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/resume-subscription"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-subscriptions-resume-auth-and-throttling
+        condition: >
+          Authentication token is invalid, expired, or revoked
+          (AUTHENTICATION_ERROR), or the resume endpoint is being called above
+          the per-merchant rate cap (RATE_LIMIT_ERROR / 429). End-of-month
+          batch resumes are a common trigger.
+        throws: >
+          SquareError with AUTHENTICATION_ERROR (401) or RATE_LIMIT_ERROR
+          (429). RATE_LIMITED is the documented error code per Square's
+          ErrorCode enum.
+        required_handling: >
+          Caller MUST wrap in try-catch. AUTHENTICATION_ERROR halts all
+          resumes — page on-call. For RATE_LIMIT_ERROR, retry with exponential
+          backoff and the same idempotency_key. Track per-subscription resume
+          state so a partially-completed batch can be resumed without
+          double-resuming already-resumed subscriptions.
+        sources:
+          - "https://developer.squareup.com/reference/square/subscriptions-api/resume-subscription"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: invoices.cancel
+    import_path: "square"
+    description: >
+      Cancels an invoice that has been published but is not yet in a terminal
+      state. Usage: await client.invoices.cancel({ invoiceId, version }).
+      Returns HttpResponsePromise<CancelInvoiceResponse>. CRITICAL: the
+      version parameter is REQUIRED and acts as optimistic-concurrency
+      control — if the local version is stale, the cancel is rejected.
+      Successful cancellation transitions the invoice to status CANCELED and
+      is IRREVERSIBLE: the seller cannot collect payments for the canceled
+      invoice and there is no uncancel endpoint.
+
+    postconditions:
+      # Evidence: https://developer.squareup.com/reference/square/invoices-api/cancel-invoice (fetched 2026-06-24)
+      # Invoice status restrictions and version requirement confirmed from the
+      # Cancel Invoice reference. Documented prohibition: DRAFT, and terminal
+      # states PAID/REFUNDED/CANCELED/FAILED cannot be canceled.
+      - id: square-invoices-cancel-invalid-state
+        condition: >
+          The invoice is in a state that cannot be canceled: DRAFT (must be
+          published first or deleted), or in a terminal state (PAID,
+          REFUNDED, CANCELED, FAILED). A common race is two operators each
+          clicking "Cancel" — the second click hits an already-CANCELED
+          invoice and the catch-less caller silently UI-confirms a
+          double-cancel.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR. The Square Invoices API
+          explicitly prohibits canceling invoices in DRAFT or terminal states.
+        required_handling: >
+          Caller MUST wrap in try-catch. Distinguish CANCELED-already from
+          PAID-already in the error path — surface "Invoice was already
+          canceled" as a soft success to the operator, but surface "Invoice
+          has already been paid; issue a refund instead" as a hard error
+          that routes them to the refund flow. Never silently swallow.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/cancel-invoice"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-invoices-cancel-version-mismatch
+        condition: >
+          The version field passed does not match the invoice's current
+          server-side version. Stale local cache after a webhook-driven
+          update, a concurrent edit by another operator, or a missing
+          GetInvoice round-trip before the cancel call all trigger this.
+        throws: >
+          SquareError with INVALID_REQUEST_ERROR carrying a version-mismatch
+          message. The Square Invoices API requires the current version on
+          every PublishInvoice, UpdateInvoice, and CancelInvoice request.
+        required_handling: >
+          Caller MUST wrap in try-catch. On a version-mismatch error, fetch
+          the latest invoice via invoices.get(), recompute whether
+          cancellation is still appropriate against the freshly-fetched
+          status, and only then retry with the new version number. Do NOT
+          loop blindly — the underlying change may have already moved the
+          invoice to PAID or CANCELED, in which case the retry is wrong.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/cancel-invoice"
+          - "https://developer.squareup.com/docs/invoices-api/overview"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: square-invoices-cancel-auth-and-throttling
+        condition: >
+          Authentication token is invalid, expired, or revoked
+          (AUTHENTICATION_ERROR), the caller lacks INVOICES_WRITE or
+          ORDERS_WRITE scope, or the endpoint is being called above the
+          per-merchant rate cap (RATE_LIMIT_ERROR / 429).
+        throws: >
+          SquareError with AUTHENTICATION_ERROR (401) or RATE_LIMIT_ERROR
+          (429). RATE_LIMITED is the documented error code per Square's
+          ErrorCode enum.
+        required_handling: >
+          Caller MUST wrap in try-catch. AUTHENTICATION_ERROR halts all
+          cancellations on the worker — page on-call. For RATE_LIMIT_ERROR,
+          retry with exponential backoff. Since cancellation is irreversible,
+          do NOT use a fire-and-forget retry — confirm via invoices.get()
+          that the invoice status is now CANCELED before marking the local
+          record as canceled, even on retry success.
+        sources:
+          - "https://developer.squareup.com/reference/square/invoices-api/cancel-invoice"
+          - "https://developer.squareup.com/reference/square/enums/ErrorCode"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high

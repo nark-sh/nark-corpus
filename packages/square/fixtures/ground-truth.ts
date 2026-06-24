@@ -541,6 +541,123 @@ async function createGiftCardWithActivation() {
   }
 }
 
+// ===== deepen-stream-3 pass 41 additions (2026-06-24) =====
+// New v44 namespaced methods: subscriptions.pause, subscriptions.resume,
+// invoices.cancel. All three are state-mutating financial write operations
+// where silent failure causes customer-billing or revenue impact.
+
+// @expect-violation: square-subscriptions-pause-invalid-request
+// @expect-violation: square-subscriptions-pause-auth-and-throttling
+async function pauseSubscriptionMissingErrorHandling() {
+  // ❌ No try-catch. INVALID_PAUSE_LENGTH / INVALID_DATE / 401 / 429 all
+  // silently leave the subscription ACTIVE while the UI claims it's paused —
+  // customer continues to be billed.
+  const response = await client.subscriptions.pause({
+    subscriptionId: "SUB_ID",
+    pauseEffectiveDate: "2026-07-01",
+    pauseCycleDuration: BigInt(2),
+  });
+  return response;
+}
+
+// @expect-clean
+async function pauseSubscriptionWithProperHandling() {
+  try {
+    const response = await client.subscriptions.pause({
+      subscriptionId: "SUB_ID",
+      pauseEffectiveDate: "2026-07-01",
+      pauseCycleDuration: BigInt(2),
+    });
+    // ✅ Deferred-billing-trap mitigation: surface the effective_date to the
+    // caller so they can show "Pause takes effect on <date>" rather than
+    // "Subscription paused" unconditionally.
+    return {
+      action: response.actions?.[0],
+      effectiveDate: response.actions?.[0]?.effectiveDate ?? null,
+    };
+  } catch (err) {
+    if (err instanceof SquareError) {
+      throw new Error(`Pause failed: ${err.errors?.[0]?.code}`);
+    }
+    throw err;
+  }
+}
+
+// @expect-violation: square-subscriptions-resume-customer-card-error
+// @expect-violation: square-subscriptions-resume-auth-and-throttling
+async function resumeSubscriptionMissingErrorHandling() {
+  // ❌ No try-catch. INVALID_CARD / CUSTOMER_NOT_FOUND on resume of a
+  // long-paused subscription is the dominant failure mode — silent swallow
+  // means the customer is never told to update their payment method.
+  const response = await client.subscriptions.resume({
+    subscriptionId: "SUB_ID",
+    resumeEffectiveDate: "2026-08-01",
+  });
+  return response;
+}
+
+// @expect-clean
+async function resumeSubscriptionWithProperHandling() {
+  try {
+    const response = await client.subscriptions.resume({
+      subscriptionId: "SUB_ID",
+      resumeEffectiveDate: "2026-08-01",
+    });
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      const code = err.errors?.[0]?.code;
+      // ✅ Distinguish customer-fixable from operator-fixable errors.
+      if (code === "INVALID_CARD" || code === "CUSTOMER_NOT_FOUND") {
+        throw new Error(`Resume blocked: customer must update payment method (${code})`);
+      }
+      throw new Error(`Resume failed: ${code}`);
+    }
+    throw err;
+  }
+}
+
+// @expect-violation: square-invoices-cancel-invalid-state
+// @expect-violation: square-invoices-cancel-version-mismatch
+// @expect-violation: square-invoices-cancel-auth-and-throttling
+async function cancelInvoiceMissingErrorHandling() {
+  // ❌ No try-catch. CancelInvoice fails on DRAFT invoices, terminal-state
+  // invoices (PAID/CANCELED/FAILED/REFUNDED), and stale version numbers.
+  // Silent swallow plus optimistic UI = operator believes the invoice was
+  // canceled when it's still collectible.
+  const response = await client.invoices.cancel({
+    invoiceId: "INV_ID",
+    version: 1,
+  });
+  return response;
+}
+
+// @expect-clean
+async function cancelInvoiceWithProperHandling() {
+  try {
+    // ✅ Fetch fresh version before cancel to minimize version-mismatch risk.
+    const current = await client.invoices.get({ invoiceId: "INV_ID" });
+    if (!current.invoice?.version) {
+      throw new Error("Invoice has no version — cannot safely cancel");
+    }
+    const response = await client.invoices.cancel({
+      invoiceId: "INV_ID",
+      version: current.invoice.version,
+    });
+    // ✅ Cancellation is irreversible — verify the post-state explicitly.
+    const verified = await client.invoices.get({ invoiceId: "INV_ID" });
+    if (verified.invoice?.status !== "CANCELED") {
+      throw new Error(`Cancel returned success but invoice status is ${verified.invoice?.status}`);
+    }
+    return response;
+  } catch (err) {
+    if (err instanceof SquareError) {
+      throw new Error(`Invoice cancel failed: ${err.errors?.[0]?.code}`);
+    }
+    throw err;
+  }
+}
+
 export {
   createPaymentMissingErrorHandling,
   refundPaymentMissingErrorHandling,
@@ -573,4 +690,11 @@ export {
   batchUpsertCatalogWithProperHandling,
   acceptDisputeWithProperHandling,
   createGiftCardWithActivation,
+  // deepen-stream-3 pass 41 additions
+  pauseSubscriptionMissingErrorHandling,
+  resumeSubscriptionMissingErrorHandling,
+  cancelInvoiceMissingErrorHandling,
+  pauseSubscriptionWithProperHandling,
+  resumeSubscriptionWithProperHandling,
+  cancelInvoiceWithProperHandling,
 };
