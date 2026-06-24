@@ -593,3 +593,124 @@ async function pauseQueueLocallyWithTimeout() {
 
 // Stub for compilation
 async function doExclusiveWork(data: any) { return data; }
+
+// === deepen-stream-2 pass 83 (2026-06-24): Queue.getNextJob / setWorkerName / getWorkers ===
+
+async function getNextJobWithoutErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  while (true) {
+    // SHOULD_FIRE: get-next-job-no-try-catch
+    const job = await queue.getNextJob();
+    if (!job) continue;
+    await processJobBody(job);
+    await job.moveToCompleted('ok', true);
+  }
+}
+
+async function getNextJobNotFinalized() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  try {
+    // SHOULD_FIRE: get-next-job-not-finalized
+    const job = await queue.getNextJob();
+    if (job) {
+      await processJobBody(job);
+      // Never transitioned to completed/failed — stays stuck in active list
+    }
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// @expect-clean
+async function getNextJobWithFullHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  while (true) {
+    let job;
+    try {
+      job = await queue.getNextJob();
+    } catch (err) {
+      console.error('getNextJob failed; backing off 5s', err);
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
+    if (!job) continue;
+    try {
+      const result = await processJobBody(job);
+      await job.moveToCompleted(String(result), true);
+    } catch (err: any) {
+      await job.moveToFailed({ message: String(err?.message ?? err) });
+    }
+  }
+}
+
+async function setWorkerNameWithoutErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  // SHOULD_FIRE: set-worker-name-no-try-catch
+  await queue.setWorkerName();
+  console.log('Worker name registered');
+}
+
+// @expect-clean
+async function setWorkerNameWithErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  try {
+    await queue.setWorkerName();
+  } catch (err) {
+    console.warn('setWorkerName failed (non-CLIENT error)', err);
+  }
+}
+
+async function getWorkersUnsafeUndefinedDeref() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  try {
+    // SHOULD_FIRE: get-workers-returns-undefined-when-client-disabled
+    const workers = await queue.getWorkers();
+    console.log(`${workers.length} workers connected`);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+async function getWorkersWithoutErrorHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  // SHOULD_FIRE: get-workers-no-try-catch
+  const workers = (await queue.getWorkers()) ?? [];
+  console.log(`${workers.length} workers connected`);
+}
+
+// @expect-clean
+async function getWorkersWithFullHandling() {
+  const queue = new Queue('worker-queue', { redis: { host: 'localhost', port: 6379 } });
+  queue.on('failed', (job, err) => console.error(err));
+  queue.on('stalled', (job) => console.error('stalled'));
+  queue.on('error', (err) => console.error(err));
+  try {
+    const workers = (await queue.getWorkers()) ?? [];
+    console.log(`${workers.length} workers connected`);
+  } catch (err) {
+    console.error('getWorkers failed', err);
+  }
+}
+
+async function processJobBody(_job: Job): Promise<string> { return 'done'; }

@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 84% -> 91%
+
+- **Profile:** `packages/bull/contract.yaml`
+- **Functions added:** Queue.getNextJob, Queue.setWorkerName, Queue.getWorkers (3 total)
+- **Postconditions added:** 6 (get-next-job-no-try-catch, get-next-job-not-finalized, set-worker-name-silently-swallowed-on-disabled-client, set-worker-name-no-try-catch, get-workers-returns-undefined-when-client-disabled, get-workers-no-try-catch)
+- **Functions intentionally omitted this pass:** none new (prior omissions in `contract.yaml` tail block stand). Queue.promote / Queue.finished / Queue.extendLock evaluated as candidates but do not exist as Queue-level methods (only as Job-level — already contracted).
+- **Scanner concerns queued:** 3 (`concern-20260624-bull-deepen-getnextjob`, `concern-20260624-bull-deepen-setworkername`, `concern-20260624-bull-deepen-getworkers`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** `lib/queue.js` (getNextJob lines 1235-1265), `lib/worker.js` (setWorkerName lines 12-23, getWorkers lines 25-37) — bull@4.16.5 source
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 83 on 2026-06-24)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** bull@4.16.5

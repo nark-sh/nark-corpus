@@ -2,14 +2,15 @@ package: bull
 semver: ">=3.0.0 <5.0.0"
 contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"  # deepen-stream-1 pass 4: expanded from 23→26 contracted functions (+3: Job.moveToCompleted, Job.takeLock, Queue.pause)
+last_verified: "2026-06-24"  # deepen-stream-2 pass 83: expanded from 26→29 contracted functions (+3: Queue.getNextJob, Queue.setWorkerName, Queue.getWorkers)
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.84  # 26 contracted / 31 total async-callable (13 omitted read-only/monitoring; +3 this pass)
-# effective_coverage: 1.0 — 26/26 non-omitted functions contracted (Job.discard synchronous-only omitted)
-# functions_added_this_pass (deepen-stream-1 pass 4): Job.moveToCompleted, Job.takeLock, Queue.pause
-# functions_added_previous_pass (pass 3): Job.extendLock, Queue.getMetrics
+coverage_score: 0.91  # 29 contracted / 32 total async-callable (after Job.discard synchronous-only omitted; revised total includes worker/getNextJob APIs)
+# effective_coverage: 1.0 — 29/29 non-omitted functions contracted
+# functions_added_this_pass (deepen-stream-2 pass 83, 2026-06-24): Queue.getNextJob, Queue.setWorkerName, Queue.getWorkers
+# functions_added_previous_pass (deepen-stream-1 pass 4): Job.moveToCompleted, Job.takeLock, Queue.pause
+# functions_added_earlier_pass (pass 3): Job.extendLock, Queue.getMetrics
 # Queue.getCountsPerPriority intentionally omitted — read-only diagnostic (see omission note below)
 
 # Event handler detection NOW SUPPORTED (as of 2026-02-27):
@@ -1743,6 +1744,268 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/queue.js Queue.prototype.getNextJob() lines 1235-1265
+  # Manual single-job retrieval API. Used for advanced custom worker loops outside
+  # the normal Queue.process() flow. Either calls scripts.moveToActive() directly
+  # (drained=false path) or blocks on Redis BRPOPLPUSH (drained=true path).
+  # Both paths can throw on Redis connection error; the BRPOPLPUSH path explicitly
+  # swallows "Connection is closed." errors when this.paused is true (local pause
+  # forces disconnection) — otherwise rethrows.
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/queue.js
+  - name: Queue.getNextJob
+    import_path: "bull"
+    description: >
+      Manually retrieves the next available job from the queue and atomically moves
+      it from the wait list to the active list. Used by advanced consumers that
+      implement custom worker loops outside of Queue.process(). Returns Promise<Job>
+      if a job is available, Promise<undefined> if the queue is drained and the
+      BRPOPLPUSH wait timed out, or Promise<undefined> if the queue is closing.
+      The BRPOPLPUSH path blocks for up to settings.drainDelay seconds (default 5).
+      Mutates queue state — the returned job is already in the active list and MUST
+      be moved to completed or failed by the caller; otherwise it appears as a
+      stalled job to the StalledChecker.
+    postconditions:
+      # Evidence: lib/queue.js line 1257-1262 — try-catch rethrows unless paused
+      # The function explicitly throws on Redis errors except when this.paused && err.message === 'Connection is closed.'
+      - id: get-next-job-no-try-catch
+        condition: "await queue.getNextJob() called without try-catch and Redis connection is unavailable"
+        throws: "Error (ioredis connection error from BRPOPLPUSH or scripts.moveToActive Lua execution)"
+        required_handling: >
+          Wrap await queue.getNextJob() in try-catch in custom worker loops. On Redis
+          error, the function rethrows (except in the local-pause force-disconnect case
+          which is silently swallowed). A worker loop that does not catch will crash
+          the process or leave the worker stuck:
+
+            // WRONG — worker process crashes on first Redis blip
+            while (running) {
+              const job = await queue.getNextJob();
+              if (job) await processJob(job);
+            }
+
+            // CORRECT — catch and back off on Redis errors
+            while (running) {
+              let job;
+              try {
+                job = await queue.getNextJob();
+              } catch (err) {
+                logger.error('getNextJob failed; backing off 5s', err);
+                await new Promise(r => setTimeout(r, 5000));
+                continue;
+              }
+              if (job) {
+                try {
+                  await processJob(job);
+                } catch (err) {
+                  await job.moveToFailed({ message: err.message });
+                }
+              }
+            }
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: lib/queue.js Queue.prototype.getNextJob() — after moveToActive,
+      # the returned job is committed to the active list. If the caller never
+      # transitions it via moveToCompleted/moveToFailed, the StalledChecker will
+      # eventually flag it as stalled (after lockDuration expires).
+      - id: get-next-job-not-finalized
+        condition: >
+          await queue.getNextJob() returns a Job, but the caller does not transition
+          the job to a terminal state (moveToCompleted, moveToFailed, retry, or remove)
+          before the worker exits or the lockDuration expires.
+        throws: "Does not throw — job remains in active list, becomes stalled"
+        required_handling: >
+          Every getNextJob() result that returns a Job MUST be transitioned to a
+          terminal state. Use try/finally to guarantee finalization on processor
+          exceptions:
+
+            const job = await queue.getNextJob();
+            if (!job) return;
+            try {
+              const result = await processJob(job);
+              await job.moveToCompleted(result, true);
+            } catch (err) {
+              await job.moveToFailed({ message: String(err) });
+            }
+
+          Failing to finalize causes the StalledChecker to reschedule the job (often
+          duplicating execution) after lockDuration elapses — same failure mode as
+          missing 'stalled' event listener.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/queue.js"
+          - "https://github.com/OptimalBits/bull/blob/master/lib/job.js"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/worker.js Queue.prototype.setWorkerName() lines 12-23
+  # Calls Redis CLIENT SETNAME to tag the bclient connection for monitoring.
+  # SILENTLY SWALLOWS errors matching /ERR unknown command ['`]\s*client\s*['`]/
+  # — i.e. when Redis is configured to disallow CLIENT commands (common in managed
+  # Redis like AWS ElastiCache, Redis Enterprise Cloud, some Azure Cache plans).
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/worker.js
+  - name: Queue.setWorkerName
+    import_path: "bull"
+    description: >
+      Registers the worker's name with Redis via CLIENT SETNAME for observability
+      and monitoring. Called automatically by Queue.process() during worker init,
+      but can also be called manually. Resolves with the result of CLIENT SETNAME
+      (or undefined if the CLIENT command is disabled by the Redis server). The
+      method specifically catches and swallows "unknown command 'client'" errors
+      to preserve compatibility with managed Redis providers that disable CLIENT.
+      Any other Redis error (connection lost, auth failure, etc.) propagates.
+    postconditions:
+      # Evidence: lib/worker.js lines 19-22 — .catch(err => { if (!clientCommandMessageReg.test(err.message)) throw err; })
+      # Errors matching the CLIENT regex are swallowed; resolved value becomes undefined
+      - id: set-worker-name-silently-swallowed-on-disabled-client
+        condition: >
+          await queue.setWorkerName() called against a Redis instance that disables the
+          CLIENT command (AWS ElastiCache, some Redis Enterprise Cloud tiers, managed
+          Redis plans that strip dangerous commands).
+        throws: "Does not throw — promise resolves with undefined; worker name NOT registered with Redis"
+        required_handling: >
+          Code that relies on CLIENT-LIST monitoring (e.g. queue.getWorkers() introspection,
+          ops dashboards counting active workers via Redis CLIENT LIST) must not assume
+          setWorkerName() actually registered the name. The promise resolves successfully
+          regardless. To detect this case, attempt to read back the worker list after
+          setWorkerName() and compare:
+
+            await queue.setWorkerName();
+            const workers = await queue.getWorkers();
+            // workers may be undefined OR may not include this connection name
+            // — both indicate CLIENT is disabled. Fall back to internal tracking.
+
+          Most production code does not need to detect this; the silent swallow is by
+          design. But callers building admin/observability tooling on top of CLIENT LIST
+          must be aware that worker names may not appear.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/worker.js"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      # Evidence: lib/worker.js lines 13-18 — isRedisReady can reject, .client('setname') can reject
+      # Only CLIENT-unknown errors are swallowed; all other Redis errors rethrow
+      - id: set-worker-name-no-try-catch
+        condition: "await queue.setWorkerName() called without try-catch and Redis is unreachable / auth failed / blocked"
+        throws: "Error (ioredis connection error from isRedisReady, or any non-CLIENT Redis error from CLIENT SETNAME)"
+        required_handling: >
+          When invoking setWorkerName() manually (outside of the auto-call during
+          Queue.process() init), wrap in try-catch in startup/initialization code:
+
+            try {
+              await queue.setWorkerName();
+            } catch (err) {
+              logger.warn('setWorkerName failed (non-CLIENT error)', err);
+              // Continue startup — name registration is observability, not correctness
+            }
+
+          Note: the Queue.process() internal call path already swallows this via
+          a different code path (process() does not await setWorkerName's rejection),
+          so the manual-call site is the only place where this throws.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/worker.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  # Evidence: bull/lib/worker.js Queue.prototype.getWorkers() lines 25-37
+  # Calls Redis CLIENT LIST and parses the response. Same silent-swallow pattern
+  # as setWorkerName — returns undefined if CLIENT command is disabled.
+  # Source: https://github.com/OptimalBits/bull/blob/master/lib/worker.js
+  - name: Queue.getWorkers
+    import_path: "bull"
+    description: >
+      Returns the list of Redis clients connected to the queue's Redis instance,
+      parsed into objects keyed by client metadata. Used for monitoring dashboards,
+      worker count checks, and ops tooling. Returns Promise<Array<{[index: string]:
+      string}>> on success or Promise<undefined> when CLIENT LIST is disabled by
+      the Redis server (managed Redis providers).
+    postconditions:
+      # Evidence: lib/worker.js lines 33-37 — .catch swallows CLIENT-unknown errors → returns undefined
+      # The d.ts signature claims Promise<Array<...>> but the implementation can resolve undefined.
+      - id: get-workers-returns-undefined-when-client-disabled
+        condition: >
+          await queue.getWorkers() called against a Redis instance that disables the
+          CLIENT command. The promise resolves to undefined, NOT an empty array — TypeScript
+          type signature claims Promise<Array<...>> but runtime can be undefined.
+        throws: "Does not throw — returns undefined silently"
+        required_handling: >
+          Callers MUST defensively check for undefined before iterating. The d.ts type
+          is misleading — it claims Array<{...}> but the implementation can return undefined:
+
+            // WRONG — crashes with "Cannot read properties of undefined (reading 'length')"
+            const workers = await queue.getWorkers();
+            console.log(`${workers.length} workers`);
+
+            // CORRECT — coalesce to empty array
+            const workers = (await queue.getWorkers()) ?? [];
+            console.log(`${workers.length} workers`);
+
+          Particularly important for admin dashboards deployed to environments using
+          AWS ElastiCache, Upstash, or other managed Redis where CLIENT is restricted.
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/worker.js"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      # Evidence: lib/worker.js line 28 — utils.isRedisReady(this.client) can reject
+      # Connection errors propagate (only CLIENT-unknown errors are caught)
+      - id: get-workers-no-try-catch
+        condition: "await queue.getWorkers() called without try-catch and Redis is unreachable"
+        throws: "Error (ioredis connection error from isRedisReady or CLIENT LIST)"
+        required_handling: >
+          Wrap await queue.getWorkers() in try-catch when called from monitoring
+          endpoints or admin UIs. Connection failures should not crash the request:
+
+            app.get('/admin/workers', async (req, res) => {
+              try {
+                const workers = (await queue.getWorkers()) ?? [];
+                res.json({ workers });
+              } catch (err) {
+                logger.error('getWorkers failed', err);
+                res.status(503).json({ error: 'Redis unavailable' });
+              }
+            });
+        sources:
+          - "https://github.com/OptimalBits/bull/blob/master/lib/worker.js"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
         evidence_quality: confirmed
 
 # Intentionally omitted from deepen-stream-1 pass 3:
