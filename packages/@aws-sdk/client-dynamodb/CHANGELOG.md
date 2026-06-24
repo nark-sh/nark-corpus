@@ -3,6 +3,22 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 78% → 100%
+
+- **Profile:** `packages/@aws-sdk/client-dynamodb/contract.yaml`
+- **Functions added:** waitUntilTableExists (covers the entire waitUntil* family — 6 helpers: Table[Not]Exists, ContributorInsightsEnabled, Export/Import Completed, KinesisStreamingDestinationActive)
+- **Postconditions added:** 2 (aws-dynamodb-wait-until-table-exists-no-try-catch, aws-dynamodb-wait-until-abort-not-distinguished)
+- **Functions intentionally omitted this pass:** the 6 deprecated waitFor* siblings — AWS marks them `@deprecated` with rationale "does not throw error in non-success cases"; they return `WaiterResult.state` instead of throwing, requiring a different (caller-inspects-state) contract that AWS itself recommends migrating away from.
+- **Scanner concerns queued:** 2 (`concern-20260623-aws-sdk-client-dynamodb-deepen-7`, `concern-20260623-aws-sdk-client-dynamodb-deepen-8`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `@smithy/core/dist-es/submodules/client/util-waiter/waiter.js` (checkExceptions lines 14-35 — source of truth for AbortError / TimeoutError throw)
+  - `@aws-sdk/client-dynamodb@3.1075.0/dist-types/waiters/*.d.ts` (6 waitUntil* + 6 deprecated waitFor* enumerated)
+  - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-dynamodb/Class/DynamoDB/
+  - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-util-waiter/
+- **Rationale for revisit:** the 2026-04-16 pass omitted `waitUntilTableExists` / `waitUntilTableNotExists` as "infrastructure waiter — not called in SaaS app runtime code." That classification was incomplete: serverless tenant-provisioning paths (Lambda cold-start awaiting per-tenant table ACTIVE) and runtime Export/Import workflows triggered from API endpoints both call waitUntil* in production code paths. The pattern is the same as `@aws-sdk/client-s3` (deepened pass 23, 2026-06-23) where waitUntilBucketExists / waitUntilBucketNotExists got the same treatment.
+- **Verified by:** bc-deepen-contract (pass 24 on 2026-06-23T20:00:00Z, deepen-stream-3)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-dynamodb@3.1072.0

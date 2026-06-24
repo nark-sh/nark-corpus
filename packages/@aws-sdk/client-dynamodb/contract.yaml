@@ -1,12 +1,12 @@
 package: "@aws-sdk/client-dynamodb"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.78
+coverage_score: 1.0
 
 functions:
   - name: send
@@ -425,6 +425,176 @@ functions:
         sources:
           - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchExecuteStatement.html"
           - "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchStatementError.html"
+
+  - name: waitUntilTableExists
+    import_path: "@aws-sdk/client-dynamodb"
+    description: >
+      Polling waiter helper that resolves when a DescribeTable acceptor succeeds (table TableStatus === ACTIVE)
+      and rejects with TimeoutError (name === "TimeoutError") when maxWaitTime is exceeded, or AbortError
+      (name === "AbortError") when the WaiterConfiguration.abortSignal is signaled. Implementation lives in
+      @smithy/util-waiter (checkExceptions). The contract applies identically to the entire waitUntil* family
+      exported from @aws-sdk/client-dynamodb's waiters/index: waitUntilTableExists, waitUntilTableNotExists,
+      waitUntilContributorInsightsEnabled, waitUntilExportCompleted, waitUntilImportCompleted,
+      waitUntilKinesisStreamingDestinationActive — all delegate to the same createWaiter() / checkExceptions()
+      machinery in @smithy/core/dist-es/submodules/client/util-waiter/waiter.js. Note the DEPRECATED waitFor*
+      siblings (waitForTableExists, etc.) DO NOT throw on non-success — they resolve with WaiterResult.state
+      ∈ {ABORTED, TIMEOUT, FAILURE} and are out of scope for this postcondition.
+
+    postconditions:
+      # Evidence: @smithy/core/dist-es/submodules/client/util-waiter/waiter.js (lines 14-35) — checkExceptions
+      #   throws { name: "AbortError" } on WaiterState.ABORTED and { name: "TimeoutError" } on WaiterState.TIMEOUT.
+      # Evidence: @aws-sdk/client-dynamodb/dist-types/waiters/waitForTableExists.d.ts — @deprecated note
+      #   "Use waitUntilTableExists instead. waitForTableExists does not throw error in non-success cases."
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-dynamodb/Class/DynamoDB/
+      #   AWS SDK v3 docs — Waiter API reference, signature WaiterConfiguration<Client>, returns Promise<WaiterResult>.
+      - id: aws-dynamodb-wait-until-table-exists-no-try-catch
+        severity: error
+        condition: >
+          Call to waitUntilTableExists (or any waitUntil* waiter from this SDK) is awaited without a
+          surrounding try-catch. The waiter rejects with TimeoutError (error.name === "TimeoutError")
+          when DescribeTable acceptor never resolves to ACTIVE within WaiterConfiguration.maxWaitTime,
+          or with AbortError (error.name === "AbortError") when WaiterConfiguration.abortSignal fires.
+        description: >
+          waitUntilTableExists is a polling waiter exported from @aws-sdk/client-dynamodb that delegates
+          to @smithy/util-waiter's createWaiter() and checkExceptions(). When the underlying poll loop
+          exhausts maxWaitTime (e.g. 60 seconds with default minDelay=2/maxDelay=120), checkExceptions
+          throws a synthetic Error with .name === "TimeoutError" and a JSON-stringified WaiterResult as
+          .message. When the caller passes an abortSignal that fires (e.g. request cancellation, container
+          shutdown, parent process SIGTERM), checkExceptions throws a similar Error with .name === "AbortError".
+
+          The dominant production failure mode for this family is COLD-START TIMEOUT in serverless
+          handlers: a Lambda function waits for a tenant-provisioning table to become ACTIVE during
+          cold start, the wait exceeds the Lambda's 15-min cap (or a custom maxWaitTime), and the
+          handler crashes with an uncaught TimeoutError. Without a try-catch, the rejection propagates
+          to the runtime and surfaces as a 5xx with no application-level context — the SaaS owner sees
+          a generic "Unhandled Promise Rejection" in CloudWatch with no signal that the table wait was
+          the cause. AbortError manifests similarly on graceful shutdown paths where the orchestrator
+          (e.g. Step Functions, EventBridge Scheduler, or a custom workflow runner) cancels the wait
+          mid-flight and the handler does not distinguish "cancelled" from "failed permanently."
+
+          This is a true RUNTIME concern — not infrastructure-only — for two classes of caller:
+          (1) Serverless tenant provisioners that create per-tenant tables on first sign-up and wait
+          for ACTIVE before issuing the first write, and (2) Export / Import / KinesisStreamingDestination
+          workflows triggered from API endpoints where the user-initiated request awaits the waiter
+          inline. The previous deepen pass dismissed waiters as "infrastructure waiter — not called in
+          SaaS app runtime code." That classification was incomplete: it covered the CI/CD-only path
+          but missed the runtime-tenant-provisioning and runtime-export-workflow paths.
+
+          The DEPRECATED waitFor* variants (waitForTableExists, waitForTableNotExists, etc.) do NOT
+          throw — they resolve with a WaiterResult whose .state is one of ABORTED/TIMEOUT/FAILURE.
+          Calling code that checks result.state is fine; calling code that assumes ACTIVE-success
+          without inspecting .state silently misses the failure. AWS marked them @deprecated
+          precisely because of this silent-failure footgun.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Wrap waitUntilTableExists (and any waitUntil* sibling) in try-catch. Inspect error.name to
+          distinguish TimeoutError (retry with longer maxWaitTime, or alert on stuck provisioning) from
+          AbortError (graceful shutdown — propagate cancellation, do not retry) from any other rejection
+          (likely DynamoDBServiceException from the underlying DescribeTable call).
+
+          Minimum handling:
+            try {
+              await waitUntilTableExists(
+                { client: dynamoClient, maxWaitTime: 60 },
+                { TableName: 'orders' }
+              );
+            } catch (error) {
+              if (error.name === 'TimeoutError') {
+                throw new ProvisioningTimeoutError('Table did not become ACTIVE within 60s');
+              }
+              if (error.name === 'AbortError') {
+                // Graceful cancellation — propagate to caller, do not treat as failure
+                throw error;
+              }
+              throw error;
+            }
+
+          For workflows that legitimately retry the wait (e.g. tenant provisioning with longer maxWaitTime
+          on TimeoutError), implement bounded retry with exponential backoff. Never swallow TimeoutError
+          silently — that hides the SaaS owner's only signal that table provisioning is stuck.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-dynamodb/Class/DynamoDB/"
+          - "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/getting-started-step-1.html"
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-util-waiter/"
+
+      # Evidence: @smithy/types WaiterConfiguration declares optional abortSignal: AbortSignal.
+      # Evidence: @smithy/core/dist-es/submodules/client/util-waiter/waiter.js — WaiterState.ABORTED
+      #   path in checkExceptions throws with error.name === "AbortError".
+      - id: aws-dynamodb-wait-until-abort-not-distinguished
+        severity: warning
+        condition: >
+          Caller wraps waitUntilTableExists (or any waitUntil* waiter) in try-catch but treats AbortError
+          the same as TimeoutError or DynamoDBServiceException — does not check error.name === "AbortError"
+          and does not propagate cancellation distinctly from failure.
+        description: >
+          When a caller passes WaiterConfiguration.abortSignal and that signal fires mid-poll (e.g. the
+          parent request is cancelled, the Lambda container is being recycled, a Step Functions execution
+          is aborted), @smithy/util-waiter's checkExceptions throws an Error with .name === "AbortError"
+          — NOT a normal resolved WaiterResult, and NOT a DynamoDBServiceException. Callers that catch
+          the rejection but do not check error.name will conflate "cancelled" with "failed permanently"
+          and either (a) retry the wait, wasting compute and potentially triggering provisioning twice,
+          or (b) surface a misleading "provisioning failed" error to the user when the actual cause was
+          graceful cancellation.
+
+          This matters in three concrete production patterns:
+          1. Long-running tenant provisioning workflows orchestrated by Step Functions / Temporal /
+             custom workflow runners — the orchestrator cancels the wait on workflow abort, and the
+             handler should report "cancelled" not "failed."
+          2. API endpoints with client-side cancellation (AbortController on the inbound request) that
+             forward the signal to the SDK waiter — the API should respond 499 Client Closed Request,
+             not 500 Internal Server Error.
+          3. Graceful shutdown handlers (SIGTERM in containerized deployments) that fire abortSignal
+             on all in-flight waiters — the shutdown sequence should not page on-call for "table
+             provisioning failed" when the actual cause was a deploy.
+
+          AbortError handling is the distinguishing axis between "this code is cancellation-aware"
+          and "this code silently absorbs cancellations as failures." The latter is one of the
+          highest-impact silent-failure modes in serverless deployments.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        required_handling: >
+          When using waitUntil* with an abortSignal, branch on error.name === "AbortError" in the catch
+          and propagate cancellation distinctly (re-throw, return a cancellation result, or set a 499
+          status). Never retry an AbortError — the caller explicitly cancelled. Use a separate branch
+          for TimeoutError (may retry with longer maxWaitTime) and a third branch for everything else
+          (typically DynamoDBServiceException from the underlying DescribeTable / DescribeExport /
+          DescribeImport / DescribeContributorInsights / DescribeKinesisStreamingDestination acceptor,
+          surfaced as a generic Error wrapping the service exception).
+
+          Recommended pattern:
+            const abortSignal = AbortSignal.timeout(60_000);
+            try {
+              await waitUntilTableExists(
+                { client: dynamoClient, maxWaitTime: 60, abortSignal },
+                { TableName: 'orders' }
+              );
+            } catch (error) {
+              if (error.name === 'AbortError') {
+                // Caller cancelled (signal fired) — propagate cancellation
+                throw new CancelledError('Wait cancelled by caller');
+              }
+              if (error.name === 'TimeoutError') {
+                // Bounded retry, then alert
+                throw new ProvisioningStuckError(...);
+              }
+              // Underlying DescribeTable failed — service error
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-util-waiter/"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal"
+          - "https://docs.aws.amazon.com/lambda/latest/dg/runtimes-context.html"
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All DynamoDB operations use the same send() entry point."

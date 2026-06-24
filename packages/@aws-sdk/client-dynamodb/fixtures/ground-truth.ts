@@ -691,3 +691,129 @@ class DynamoRepository {
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// N. waitUntil* family — polling waiters that throw TimeoutError / AbortError
+//    via @smithy/util-waiter checkExceptions. Postcondition family applies to
+//    all 6 exported waitUntil* helpers (Table[Not]Exists, ContributorInsightsEnabled,
+//    Export/Import Completed, KinesisStreamingDestinationActive).
+// ─────────────────────────────────────────────────────────────────────────────
+
+import {
+  waitUntilTableExists,
+  waitUntilTableNotExists,
+  waitUntilExportCompleted,
+  waitUntilImportCompleted,
+  waitUntilContributorInsightsEnabled,
+  waitUntilKinesisStreamingDestinationActive,
+} from '@aws-sdk/client-dynamodb';
+
+export async function provisionTenantTableNoCatch(tableName: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  // Bare await on waitUntilTableExists with no try-catch — TimeoutError propagates as unhandled rejection in tenant provisioning path.
+  await waitUntilTableExists(
+    { client: dynamoClient, maxWaitTime: 60 },
+    { TableName: tableName },
+  );
+}
+
+export async function deprovisionTenantTableNoCatch(tableName: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  // Same family member — waitUntilTableNotExists also rejects with TimeoutError / AbortError.
+  await waitUntilTableNotExists(
+    { client: dynamoClient, maxWaitTime: 60 },
+    { TableName: tableName },
+  );
+}
+
+export async function waitForExportNoCatch(exportArn: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  // Export workflow triggered from API endpoint — runtime path, not infrastructure-only.
+  await waitUntilExportCompleted(
+    { client: dynamoClient, maxWaitTime: 600 },
+    { ExportArn: exportArn },
+  );
+}
+
+export async function waitForImportNoCatch(importArn: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  await waitUntilImportCompleted(
+    { client: dynamoClient, maxWaitTime: 600 },
+    { ImportArn: importArn },
+  );
+}
+
+export async function waitForContributorInsightsNoCatch(tableName: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  await waitUntilContributorInsightsEnabled(
+    { client: dynamoClient, maxWaitTime: 120 },
+    { TableName: tableName },
+  );
+}
+
+export async function waitForKinesisDestNoCatch(tableName: string, streamArn: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  await waitUntilKinesisStreamingDestinationActive(
+    { client: dynamoClient, maxWaitTime: 120 },
+    { TableName: tableName, StreamArn: streamArn },
+  );
+}
+
+export async function provisionTenantTableWithCatch(tableName: string) {
+  // SHOULD_NOT_FIRE: try-catch present, distinguishes TimeoutError / AbortError
+  try {
+    await waitUntilTableExists(
+      { client: dynamoClient, maxWaitTime: 60 },
+      { TableName: tableName },
+    );
+  } catch (error: any) {
+    if (error.name === 'TimeoutError') {
+      throw new Error(`Table ${tableName} did not become ACTIVE within 60s`);
+    }
+    if (error.name === 'AbortError') {
+      throw error; // Propagate cancellation distinctly
+    }
+    throw error;
+  }
+}
+
+export async function waitForExportWithCancellationHandling(exportArn: string, signal: AbortSignal) {
+  // SHOULD_NOT_FIRE: try-catch with abort-aware branch for cancellation paths
+  try {
+    await waitUntilExportCompleted(
+      { client: dynamoClient, maxWaitTime: 600, abortSignal: signal },
+      { ExportArn: exportArn },
+    );
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      // Caller cancelled — 499 Client Closed Request, not 500
+      throw new Error('Export wait cancelled by caller');
+    }
+    if (error.name === 'TimeoutError') {
+      throw new Error('Export did not complete within 10 minutes');
+    }
+    throw error;
+  }
+}
+
+export async function fireAndForgetWaitNoCatch(tableName: string) {
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
+  // Fire-and-forget pattern — no await, no .catch — TimeoutError becomes unhandled rejection.
+  waitUntilTableExists(
+    { client: dynamoClient, maxWaitTime: 60 },
+    { TableName: tableName },
+  );
+}
+
+export function waitWithCatchHandler(tableName: string) {
+  // SHOULD_NOT_FIRE: .catch() chained on returned promise — abort-aware branch
+  return waitUntilTableExists(
+    { client: dynamoClient, maxWaitTime: 60 },
+    { TableName: tableName },
+  ).catch((error: any) => {
+    if (error.name === 'AbortError') {
+      return { cancelled: true };
+    }
+    throw error;
+  });
+}
