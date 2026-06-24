@@ -22,11 +22,11 @@ package: "@pinecone-database/pinecone"
 semver: ">=1.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 21 contracted / 21 non-omitted async-callable functions (pass-5 2026-04-16)
+coverage_score: 1.0  # 22 contracted / 58 total async-callable / 36 intentionally omitted (drift-by-staleness re-verify 2026-06-24 against v8.0.0; v8 added Assistant vertical + backup family which are intentionally omitted)
 
 detection:
   class_names:
@@ -1014,6 +1014,72 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: low
 
+  - name: inference.rerank
+    import_path: "@pinecone-database/pinecone"
+    description: >
+      Reranks a candidate document set against a query using a hosted Pinecone
+      cross-encoder model (e.g. bge-reranker-v2-m3, cohere-rerank-3.5). Called
+      as pc.inference.rerank(). Makes an HTTPS POST request to the Pinecone
+      inference API. Reranking is the second-stage refinement step in modern
+      RAG pipelines — first-stage vector search returns top-K candidates, then
+      rerank() reorders by precise semantic relevance. As of 2026, reranking
+      is a standard component of production RAG and is now equally important
+      to embed() (revised from the 2026-04-16 deepen note that classified it
+      as "less adoption").
+
+    postconditions:
+      # Evidence: https://docs.pinecone.io/guides/search/rerank-results
+      # SDK source: dist/inference/rerank.js (v8.0.0) — throws PineconeArgumentError
+      # on empty documents, missing query, or missing model BEFORE the HTTPS call.
+      # HTTP error mapping identical to inference.embed via shared InferenceApi.
+      - id: inference-rerank-no-error-handling
+        condition: >
+          pc.inference.rerank() called without try-catch or .catch() handler
+        throws: >
+          PineconeArgumentError (runtime validation BEFORE network call —
+            empty documents array, missing query, or missing/unsupported model name).
+          PineconeAuthorizationError (HTTP 401 — bad API key).
+          PineconeBadRequestError (HTTP 400 — unsupported rerank model, invalid
+            rankFields, or document field mismatch with rankFields;
+            HTTP 403 — inference quota exceeded).
+          PineconeInternalServerError (HTTP 500 — Pinecone inference server error).
+          PineconeUnavailableError (HTTP 503 — inference service down).
+          PineconeConnectionError (network failures: ECONNREFUSED, ETIMEDOUT).
+          PineconeTimeoutError (request exceeded client-configured timeout).
+        required_handling: >
+          Caller MUST wrap await pc.inference.rerank() in try-catch.
+          In two-stage RAG (vector search + rerank), uncaught rerank failures
+          either crash the API route or, if the caller falls back to the
+          un-reranked candidate list, silently degrade answer quality without
+          any signal to the user or operator. Catch and either retry with
+          backoff (for 5xx/timeout) or fall back to un-reranked top-K with
+          explicit logging so the degraded mode is observable.
+
+          try {
+            const reranked = await pc.inference.rerank({
+              model: 'bge-reranker-v2-m3',
+              query: userQuery,
+              documents: candidateDocs,
+              topN: 5,
+              returnDocuments: true,
+            });
+            return reranked.data;
+          } catch (error) {
+            console.error('Rerank failed:', error);
+            throw error;
+          }
+        sources:
+          - "https://docs.pinecone.io/guides/search/rerank-results"
+          - "https://docs.pinecone.io/reference/api/inference/rerank"
+          - "https://github.com/pinecone-io/pinecone-ts-client (dist/inference/rerank.js v8.0.0)"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
 notes:
   - "Pinecone client (new Pinecone({apiKey})) constructor does NOT make network calls — no try-catch needed there"
   - "pinecone.index('name') does NOT make a network call — returns a local Index client object"
@@ -1029,7 +1095,7 @@ notes:
   - "startImport() is async — returns import ID immediately; poll with describeImport() for completion"
   - "configureIndex(), createCollection(), deleteCollection(), describeIndex(), describeCollection() intentionally omitted — admin/config operations not typical app code"
   - "createAssistant(), listAssistants() etc. intentionally omitted — assistant feature, separate from core vector ops"
-  - "pc.inference.rerank() omitted — less adoption than embed, same error contract as embed"
+  - "pc.inference.rerank() CONTRACTED 2026-06-24 (drift-by-staleness pass) — rerank is now a standard 2-stage RAG component; throws PineconeArgumentError on empty documents/query/model before network call, same HTTP error contract as embed"
   - "pc.inference.listModels(), pc.inference.getModel() omitted — read-only, no write or destructive behavior"
   - "describeIndexStats() omitted — read-only stats query, no destructive behavior, same error contract as fetch()"
   - "describeImport() omitted — read-only GET polling, documented in startImport() notes, same error contract"

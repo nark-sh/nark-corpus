@@ -31,6 +31,9 @@
  *   cancelimport-no-error-handling
  *   createnamespace-no-error-handling
  *   listimports-no-error-handling
+ *
+ * Postcondition IDs (added by deepen-stream-3 pass-48 2026-06-24, drift-by-staleness):
+ *   inference-rerank-no-error-handling
  */
 import { Pinecone } from '@pinecone-database/pinecone';
 
@@ -523,6 +526,39 @@ async function gt_listImports_with_try_catch() {
     return result.data ?? [];
   } catch (error) {
     console.error('listImports failed:', error);
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 22. inference.rerank — missing try-catch (SHOULD_FIRE)
+// Added by deepen-stream-3 pass-48 2026-06-24
+// ──────────────────────────────────────────────────
+
+async function gt_rerank_missing() {
+  // SHOULD_FIRE: inference-rerank-no-error-handling — rerank without try-catch
+  const reranked = await pinecone.inference.rerank({
+    model: 'bge-reranker-v2-m3',
+    query: 'user query',
+    documents: ['doc1', 'doc2', 'doc3'],
+    topN: 2,
+  });
+  return reranked.data;
+}
+
+// 22. inference.rerank — with try-catch (SHOULD_NOT_FIRE)
+async function gt_rerank_with_try_catch() {
+  try {
+    // SHOULD_NOT_FIRE: rerank has try-catch
+    const reranked = await pinecone.inference.rerank({
+      model: 'bge-reranker-v2-m3',
+      query: 'user query',
+      documents: ['doc1', 'doc2', 'doc3'],
+      topN: 2,
+    });
+    return reranked.data;
+  } catch (error) {
+    console.error('rerank failed:', error);
     throw error;
   }
 }
