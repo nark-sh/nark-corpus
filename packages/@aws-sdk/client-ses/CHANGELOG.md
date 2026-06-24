@@ -3,6 +3,31 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 77% -> 82%
+
+- **Profile:** `packages/@aws-sdk/client-ses/contract.yaml`
+- **Functions added:** CloneReceiptRuleSetCommand, CreateReceiptFilterCommand, UpdateReceiptRuleCommand (3 total)
+- **Postconditions added:** 6 (2 per function)
+  - `ses-clone-receipt-rule-set-already-exists` (error, DOWNTIME)
+  - `ses-clone-receipt-rule-set-source-not-found` (error, DOWNTIME)
+  - `ses-create-receipt-filter-already-exists` (error, SECURITY_RISK — silent security hazard)
+  - `ses-create-receipt-filter-limit-exceeded` (error, SECURITY_RISK)
+  - `ses-update-receipt-rule-invalid-action-config` (error, DATA_LOSS — silent mail loss)
+  - `ses-update-receipt-rule-not-found` (error, DATA_LOSS)
+- **Functions intentionally omitted this pass:** 36 commands that throw only generic `SESServiceException` (covered by existing `sesClient.send` postcondition), all `Describe*`/`Get*`/`List*` read-only commands, and identity-toggle commands (`SetIdentityDkimEnabled`, `UpdateAccountSendingEnabled`, `DeleteIdentity`, etc.)
+- **Scanner concerns queued:** 3 (`concern-20260624-aws-sdk-client-ses-deepen-1`, `-2`, `-3`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CloneReceiptRuleSetCommand/
+  - https://docs.aws.amazon.com/ses/latest/APIReference/API_CloneReceiptRuleSet.html
+  - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptFilterCommand/
+  - https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptFilter.html
+  - https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateReceiptRuleCommand/
+  - https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateReceiptRule.html
+  - https://docs.aws.amazon.com/ses/latest/DeveloperGuide/receiving-email-permissions.html
+- **Drift mode:** STALENESS — profile's prior `last_deepened` was 2026-04-16 (oldest public-tier entry in deepen-index.json). Re-enumerated dist-types/commands/*.d.ts at @aws-sdk/client-ses@3.1075.0. Of 47 uncovered commands, picked the 3 highest-impact mutation commands with distinct typed throws.
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24, deepen-stream-3 pass 32)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-ses@3.1072.0

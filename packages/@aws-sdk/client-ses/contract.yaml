@@ -1,13 +1,13 @@
 package: "@aws-sdk/client-ses"
 semver: "^3.0.0"
-contract_version: "1.4.0"
+contract_version: "1.5.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.77
-# coverage_score = 24 contracted / 31 total relevant API functions (24 contracted + 7 intentionally omitted)
+coverage_score: 0.82
+# coverage_score = 27 contracted / 33 total relevant-with-distinct-throws (excluding generic-SESServiceException-only commands)
 # Previously contracted (7): send, SendTemplatedEmailCommand, SendBulkTemplatedEmailCommand,
 #   SendRawEmailCommand, SendCustomVerificationEmailCommand, CreateTemplateCommand, UpdateTemplateCommand
 # Previously contracted pass 2 (6): SendEmailCommand, TestRenderTemplateCommand,
@@ -15,16 +15,21 @@ coverage_score: 0.77
 #   CreateCustomVerificationEmailTemplateCommand, UpdateCustomVerificationEmailTemplateCommand
 # Previously contracted pass 3 (4): SendBounceCommand, UpdateConfigurationSetEventDestinationCommand,
 #   PutConfigurationSetDeliveryOptionsCommand, DeleteConfigurationSetCommand
-# Newly contracted this pass (7): CreateReceiptRuleSetCommand, CreateReceiptRuleCommand,
+# Previously contracted pass 4 (7): CreateReceiptRuleSetCommand, CreateReceiptRuleCommand,
 #   SetActiveReceiptRuleSetCommand, CreateConfigurationSetTrackingOptionsCommand,
 #   UpdateConfigurationSetSendingEnabledCommand, PutIdentityPolicyCommand,
 #   DeleteConfigurationSetEventDestinationCommand
+# Newly contracted this pass (3, 2026-06-24 deepen-stream-3 pass 32):
+#   CloneReceiptRuleSetCommand, CreateReceiptFilterCommand, UpdateReceiptRuleCommand
 # Intentionally omitted (7): VerifyEmailIdentityCommand (setup only, generic error),
 #   VerifyDomainIdentityCommand (setup only, generic error),
 #   DeleteTemplateCommand (only SESServiceException generic), GetTemplateCommand,
 #   ListTemplatesCommand, GetSendQuotaCommand, GetSendStatisticsCommand
 #   — all are setup/read-only with no distinct error contracts beyond generic SESServiceException
-# Note: The full SDK has 72 commands; the above counts only those relevant for SaaS app runtime code.
+# Note: The full SDK has 72 commands. Of those, ~33 have distinct typed throws beyond generic
+# SESServiceException; the remaining ~39 (all DescribeXxx, GetXxx, ListXxx, SetIdentityXxx
+# toggles, UpdateAccountSendingEnabled, DeleteIdentity, DeleteIdentityPolicy, etc.) throw
+# only SESServiceException and are covered by the generic send() postcondition.
 
 functions:
   - name: send
@@ -1650,6 +1655,226 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CloneReceiptRuleSetCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates a receipt rule set by cloning an existing one. The destination rule
+      set must not already exist, and the source rule set must exist. Used in
+      infrastructure-as-code patterns where teams promote a staging receipt rule
+      set to production, or duplicate an existing rule set for a new domain. Not
+      idempotent — re-running with the same RuleSetName throws AlreadyExistsException.
+      Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CloneReceiptRuleSetCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CloneReceiptRuleSet.html
+      # Error types confirmed from dist-types/commands/CloneReceiptRuleSetCommand.d.ts:
+      # AlreadyExistsException, LimitExceededException, RuleSetDoesNotExistException
+      - id: ses-clone-receipt-rule-set-already-exists
+        condition: >-
+          sesClient.send(new CloneReceiptRuleSetCommand({ RuleSetName: target,
+          OriginalRuleSetName: source })) where target already exists in the account
+        throws: AlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. AlreadyExistsException is thrown when the
+          destination RuleSetName already exists in the SES account. Provisioning
+          scripts that re-run after a partial failure will throw on the second run
+          because cloning is NOT idempotent. The clone is NOT applied — the existing
+          rule set is preserved unchanged.
+          Catch block SHOULD distinguish AlreadyExistsException (already provisioned,
+          safe to skip) from LimitExceededException (hit SES rule-set quota, requires
+          a quota increase request) and from RuleSetDoesNotExistException (typo in
+          source name, requires operator intervention). Idempotent provisioning
+          scripts should treat AlreadyExistsException as success and verify the
+          existing rule set matches expectations with DescribeReceiptRuleSet.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CloneReceiptRuleSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CloneReceiptRuleSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: ses-clone-receipt-rule-set-source-not-found
+        condition: >-
+          sesClient.send(new CloneReceiptRuleSetCommand({ RuleSetName: target,
+          OriginalRuleSetName: source })) where source does not exist
+        throws: RuleSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. RuleSetDoesNotExistException is thrown when the
+          OriginalRuleSetName does not exist. The clone is NOT applied. Common in
+          environment-promotion scripts that hardcode a source rule set name that
+          has been renamed or deleted in the source environment.
+          Catch block SHOULD log the missing source name and either fail loudly or
+          fall back to creating the rule set from scratch with CreateReceiptRuleSet.
+          Do NOT silently swallow — inbound mail receipt rules are security-critical
+          and a missing rule set means inbound mail is being processed by a different
+          (possibly default) rule set.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CloneReceiptRuleSetCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CloneReceiptRuleSet.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: CreateReceiptFilterCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Creates an IP address allow-list or block-list filter for inbound email
+      receipt. Filters are evaluated before receipt rules and can BLOCK or ALLOW
+      based on a CIDR range. Used to mitigate inbound mail abuse (spam sources)
+      and to whitelist trusted senders. The filter applies to the entire AWS
+      account in the region — NOT scoped to a rule set. Maximum 100 filters per
+      account. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptFilterCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptFilter.html
+      # Error types confirmed from dist-types/commands/CreateReceiptFilterCommand.d.ts:
+      # AlreadyExistsException, LimitExceededException
+      - id: ses-create-receipt-filter-already-exists
+        condition: >-
+          sesClient.send(new CreateReceiptFilterCommand({ Filter: { Name: name,
+          IpFilter: { Cidr: cidr, Policy: 'Block' | 'Allow' } } })) where Filter.Name
+          already exists in the account
+        throws: AlreadyExistsException
+        required_handling: >-
+          MUST wrap in try-catch. AlreadyExistsException is thrown when a filter
+          with the same Name already exists. The new filter is NOT applied — the
+          existing filter (which may have a DIFFERENT CIDR or Policy) is preserved.
+          This is a security hazard: a provisioning script that intends to BLOCK a
+          new CIDR may silently fail and leave the existing ALLOW filter in place,
+          allowing abuse traffic through.
+          Catch block SHOULD distinguish AlreadyExistsException (verify the existing
+          filter matches expected CIDR + Policy via ListReceiptFilters; if not,
+          delete and recreate) from LimitExceededException (hit 100-filter quota,
+          requires consolidation or quota increase). NEVER silently treat
+          AlreadyExistsException as success without verifying the existing filter.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptFilterCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptFilter.html"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: security_breach
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: ses-create-receipt-filter-limit-exceeded
+        condition: >-
+          sesClient.send(new CreateReceiptFilterCommand({ Filter: { Name: name,
+          IpFilter: {...} } })) when account already has 100 filters
+        throws: LimitExceededException
+        required_handling: >-
+          MUST wrap in try-catch. LimitExceededException is thrown when the account
+          quota of 100 receipt filters has been reached. Automated abuse-mitigation
+          systems that add a filter per blocked IP will hit this limit and start
+          silently failing if the exception is swallowed, leaving new abusive CIDRs
+          unblocked.
+          Catch block SHOULD trigger consolidation (merge contiguous CIDRs into
+          larger blocks via summarization) or escalate to an operator. Log the
+          attempted filter name and CIDR so the gap is visible in audit trails.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/CreateReceiptFilterCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_CreateReceiptFilter.html"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: security_breach
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: UpdateReceiptRuleCommand
+    import_path: "@aws-sdk/client-ses"
+    description: >-
+      Updates an existing receipt rule in a receipt rule set. A receipt rule
+      defines what SES does with inbound email matching the rule's recipient
+      pattern (S3 bucket, Lambda invocation, SNS topic, bounce, etc.). UpdateReceiptRule
+      replaces the rule wholesale — all Actions, Recipients, ScanEnabled, TlsPolicy
+      fields must be supplied. Partial updates are NOT supported. Used during
+      ongoing operations to swap Lambda function ARNs, add recipients, or change
+      TLS policy. Rate-limited to 1 call per second.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateReceiptRuleCommand/
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateReceiptRule.html
+      # Error types confirmed from dist-types/commands/UpdateReceiptRuleCommand.d.ts:
+      # InvalidLambdaFunctionException, InvalidS3ConfigurationException,
+      # InvalidSnsTopicException, LimitExceededException, RuleDoesNotExistException,
+      # RuleSetDoesNotExistException
+      - id: ses-update-receipt-rule-invalid-action-config
+        condition: >-
+          sesClient.send(new UpdateReceiptRuleCommand({ RuleSetName, Rule: { Actions:
+          [{ LambdaAction | S3Action | SNSAction: {...} }] } })) where the Lambda
+          ARN, S3 bucket, or SNS topic is invalid or SES lacks permission to invoke/write/publish
+        throws: InvalidLambdaFunctionException | InvalidS3ConfigurationException | InvalidSnsTopicException
+        required_handling: >-
+          MUST wrap in try-catch. Each of these exceptions is thrown when the
+          corresponding action target is misconfigured: InvalidLambdaFunctionException
+          (Lambda ARN does not exist or SES service principal lacks lambda:InvokeFunction),
+          InvalidS3ConfigurationException (S3 bucket missing, in wrong region, or
+          lacks a bucket policy granting ses.amazonaws.com PutObject), InvalidSnsTopicException
+          (SNS topic ARN invalid or missing permission).
+          The rule is NOT updated — the previous (working or not) version is preserved.
+          For an in-place rule update during incident response (e.g. switching the
+          target Lambda after a function rename), an unhandled exception leaves the
+          rule pointing at the OLD target. Inbound mail continues to flow to the
+          deprecated function (which may have been deleted), causing silent mail loss.
+          Catch block SHOULD validate action targets BEFORE calling UpdateReceiptRule
+          (Lambda GetFunction, S3 HeadBucket + GetBucketPolicy, SNS GetTopicAttributes)
+          and surface a clear error to the operator describing which action failed.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateReceiptRuleCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateReceiptRule.html"
+          - "https://docs.aws.amazon.com/ses/latest/DeveloperGuide/receiving-email-permissions.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: ses-update-receipt-rule-not-found
+        condition: >-
+          sesClient.send(new UpdateReceiptRuleCommand({ RuleSetName: rsName,
+          Rule: { Name: ruleName, ... } })) where ruleName does not exist in rsName,
+          or rsName itself does not exist
+        throws: RuleDoesNotExistException | RuleSetDoesNotExistException
+        required_handling: >-
+          MUST wrap in try-catch. UpdateReceiptRule does NOT create missing rules
+          (use CreateReceiptRule for that). When the named rule or rule set is gone
+          (e.g. another operator deleted it, or the script is running against the
+          wrong AWS region), the exception leaves the inbound mail processing
+          pipeline in its prior state — usually the disposition is unchanged but
+          the operator BELIEVES they updated it.
+          Catch block SHOULD distinguish RuleDoesNotExistException (rule was deleted
+          — fall back to CreateReceiptRule with the same params) from
+          RuleSetDoesNotExistException (whole rule set is gone — escalate to operator,
+          do not auto-create). Log the names so the divergence is auditable.
+        sources:
+          - "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ses/command/UpdateReceiptRuleCommand/"
+          - "https://docs.aws.amazon.com/ses/latest/APIReference/API_UpdateReceiptRule.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
         evidence_quality: confirmed
 
 tags:

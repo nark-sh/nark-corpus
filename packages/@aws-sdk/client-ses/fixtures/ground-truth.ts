@@ -45,6 +45,12 @@
  *   - PutIdentityPolicyCommand  postcondition: ses-put-identity-policy-invalid
  *   - DeleteConfigurationSetEventDestinationCommand  postconditions: ses-delete-event-dest-not-found,
  *       ses-delete-event-dest-config-set-not-found
+ *   - CloneReceiptRuleSetCommand  postconditions: ses-clone-receipt-rule-set-already-exists,
+ *       ses-clone-receipt-rule-set-source-not-found
+ *   - CreateReceiptFilterCommand  postconditions: ses-create-receipt-filter-already-exists,
+ *       ses-create-receipt-filter-limit-exceeded
+ *   - UpdateReceiptRuleCommand  postconditions: ses-update-receipt-rule-invalid-action-config,
+ *       ses-update-receipt-rule-not-found
  *
  * Detection pattern:
  *   - SESClient is imported from @aws-sdk/client-ses
@@ -78,6 +84,9 @@ import {
   UpdateConfigurationSetSendingEnabledCommand,
   PutIdentityPolicyCommand,
   DeleteConfigurationSetEventDestinationCommand,
+  CloneReceiptRuleSetCommand,
+  CreateReceiptFilterCommand,
+  UpdateReceiptRuleCommand,
 } from '@aws-sdk/client-ses';
 
 const sesClient = new SESClient({ region: 'us-east-1' });
@@ -1004,6 +1013,140 @@ export async function deleteEventDestinationIdempotent(configSetName: string, de
     } else if (err instanceof Error && err.name === 'ConfigurationSetDoesNotExistException') {
       // Parent config set also gone — full teardown already complete
       console.log('Configuration set already deleted, skipping teardown:', configSetName);
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. CloneReceiptRuleSetCommand — promote staging rule set to production
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-clone-receipt-rule-set-already-exists
+// @expect-violation: ses-clone-receipt-rule-set-source-not-found
+export async function cloneReceiptRuleSetNoCatch(target: string, source: string) {
+  // SHOULD_FIRE: ses-clone-receipt-rule-set-* — CloneReceiptRuleSetCommand throws AlreadyExistsException or RuleSetDoesNotExistException no try-catch
+  await sesClient.send(new CloneReceiptRuleSetCommand({
+    RuleSetName: target,
+    OriginalRuleSetName: source,
+  }));
+}
+
+// @expect-clean
+export async function cloneReceiptRuleSetIdempotent(target: string, source: string) {
+  try {
+    // SHOULD_NOT_FIRE: CloneReceiptRuleSetCommand inside try-catch with AlreadyExists/NotFound handling
+    await sesClient.send(new CloneReceiptRuleSetCommand({
+      RuleSetName: target,
+      OriginalRuleSetName: source,
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AlreadyExistsException') {
+      // Target rule set already exists — verify it matches expectations
+      console.log('Receipt rule set already provisioned, skipping clone:', target);
+    } else if (err instanceof Error && err.name === 'RuleSetDoesNotExistException') {
+      // Source rule set is missing — escalate, do not silently swallow
+      console.error('Source receipt rule set missing — operator intervention required:', source);
+      throw err;
+    } else if (err instanceof Error && err.name === 'LimitExceededException') {
+      console.error('SES receipt-rule-set quota exhausted — request quota increase');
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. CreateReceiptFilterCommand — IP allow/block list for inbound mail
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-create-receipt-filter-already-exists
+// @expect-violation: ses-create-receipt-filter-limit-exceeded
+export async function createReceiptFilterNoCatch(name: string, cidr: string) {
+  // SHOULD_FIRE: ses-create-receipt-filter-* — CreateReceiptFilterCommand throws AlreadyExistsException or LimitExceededException no try-catch
+  await sesClient.send(new CreateReceiptFilterCommand({
+    Filter: {
+      Name: name,
+      IpFilter: { Cidr: cidr, Policy: 'Block' },
+    },
+  }));
+}
+
+// @expect-clean
+export async function createReceiptFilterWithVerify(name: string, cidr: string) {
+  try {
+    // SHOULD_NOT_FIRE: CreateReceiptFilterCommand inside try-catch with verify-existing branch
+    await sesClient.send(new CreateReceiptFilterCommand({
+      Filter: {
+        Name: name,
+        IpFilter: { Cidr: cidr, Policy: 'Block' },
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AlreadyExistsException') {
+      // Verify existing filter has expected CIDR + Policy before treating as success
+      console.warn('Receipt filter exists — verify CIDR/Policy match expectations:', name);
+      throw err;
+    } else if (err instanceof Error && err.name === 'LimitExceededException') {
+      // 100-filter quota hit — trigger consolidation or escalate
+      console.error('SES receipt-filter quota exhausted — consolidate CIDRs:', name);
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. UpdateReceiptRuleCommand — swap Lambda ARN, change TLS policy, etc.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: ses-update-receipt-rule-invalid-action-config
+// @expect-violation: ses-update-receipt-rule-not-found
+export async function updateReceiptRuleNoCatch(rsName: string, ruleName: string, lambdaArn: string) {
+  // SHOULD_FIRE: ses-update-receipt-rule-* — UpdateReceiptRuleCommand throws InvalidLambdaFunctionException or RuleDoesNotExistException no try-catch
+  await sesClient.send(new UpdateReceiptRuleCommand({
+    RuleSetName: rsName,
+    Rule: {
+      Name: ruleName,
+      Enabled: true,
+      Actions: [{ LambdaAction: { FunctionArn: lambdaArn } }],
+    },
+  }));
+}
+
+// @expect-clean
+export async function updateReceiptRuleWithFallback(rsName: string, ruleName: string, lambdaArn: string) {
+  try {
+    // SHOULD_NOT_FIRE: UpdateReceiptRuleCommand inside try-catch with create-fallback branch
+    await sesClient.send(new UpdateReceiptRuleCommand({
+      RuleSetName: rsName,
+      Rule: {
+        Name: ruleName,
+        Enabled: true,
+        Actions: [{ LambdaAction: { FunctionArn: lambdaArn } }],
+      },
+    }));
+  } catch (err) {
+    if (err instanceof Error && err.name === 'RuleDoesNotExistException') {
+      // Rule was deleted — fall back to create
+      console.log('Receipt rule missing, falling back to CreateReceiptRule:', ruleName);
+      throw err;
+    } else if (err instanceof Error && err.name === 'RuleSetDoesNotExistException') {
+      // Whole rule set is gone — escalate to operator
+      console.error('Receipt rule set missing — operator intervention required:', rsName);
+      throw err;
+    } else if (
+      err instanceof Error &&
+      (err.name === 'InvalidLambdaFunctionException' ||
+        err.name === 'InvalidS3ConfigurationException' ||
+        err.name === 'InvalidSnsTopicException')
+    ) {
+      // Action target misconfigured — surface clearly, do not silently leave old target in place
+      console.error('UpdateReceiptRule action target invalid:', err.name, lambdaArn);
+      throw err;
     } else {
       throw err;
     }
