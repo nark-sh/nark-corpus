@@ -451,3 +451,118 @@ async function sendTestEventWithDeliveryConfirmation(svix: Svix, appId: string, 
     throw error;
   }
 }
+
+// ============================================================
+// message.precheck() — VIOLATIONS (missing try-catch, ignored result)
+// Added 2026-06-24 (deepen-stream-2 pass 84, svix@1.96.0)
+// ============================================================
+
+// SHOULD_FIRE: message-precheck-api-error
+async function precheckMissingErrorHandling(svix: Svix, appId: string) {
+  // No try-catch. ApiException swallowed if eventType is not registered (422)
+  // or app not found (404). Caller treats undefined as falsy and skips publishing
+  // events that DO have active subscribers.
+  const result = await svix.message.precheck(appId, {
+    eventType: "user.signup",
+  });
+  return result.active;
+}
+
+// SHOULD_FIRE: message-precheck-result-not-checked
+async function precheckResultDiscarded(svix: Svix, appId: string) {
+  try {
+    // result.active is computed but never branched on. Calling precheck and
+    // then unconditionally calling message.create() defeats the purpose.
+    await svix.message.precheck(appId, { eventType: "user.signup" });
+    // Unconditional create regardless of precheck outcome
+    await svix.message.create(appId, {
+      eventType: "user.signup",
+      payload: { userId: "user_123" },
+    });
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`svix call failed: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function precheckBeforeCreate(svix: Svix, appId: string) {
+  try {
+    const { active } = await svix.message.precheck(appId, {
+      eventType: "user.signup",
+    });
+    if (!active) {
+      // No active subscribers. Short-circuit; do not call message.create().
+      return null;
+    }
+    return await svix.message.create(appId, {
+      eventType: "user.signup",
+      payload: { userId: "user_123" },
+    });
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`svix precheck/create failed: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// endpoint.bulkReplay() — VIOLATIONS (missing try-catch, unpolled task)
+// Added 2026-06-24 (deepen-stream-2 pass 84, svix@1.96.0)
+// ============================================================
+
+// SHOULD_FIRE: endpoint-bulk-replay-api-error
+async function bulkReplayMissingErrorHandling(svix: Svix, appId: string, endpointId: string) {
+  // No try-catch. ApiException swallowed during incident response. Operator
+  // believes a bulk replay was kicked off when none was queued. Backlog
+  // remains undelivered, runbook assertion is false.
+  await svix.endpoint.bulkReplay(appId, endpointId, {
+    since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+  });
+}
+
+// SHOULD_FIRE: endpoint-bulk-replay-async-not-polled
+async function bulkReplayWithoutPolling(svix: Svix, appId: string, endpointId: string) {
+  try {
+    // bulkReplay() returns ReplayOut with task ID, but we discard it.
+    // Replay runs in background; "finished" status never confirmed.
+    await svix.endpoint.bulkReplay(appId, endpointId, {
+      since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      eventTypes: ["order.created"],
+    });
+    // Caller declares incident resolved while messages still queueing
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`bulkReplay failed: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function bulkReplayWithPolling(svix: Svix, appId: string, endpointId: string) {
+  try {
+    const replay = await svix.endpoint.bulkReplay(appId, endpointId, {
+      since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      eventTypes: ["order.created"],
+    });
+    // Poll background task until finished
+    let task = await svix.backgroundTask.get(replay.id);
+    while (task.status === "running") {
+      await new Promise((r) => setTimeout(r, 2000));
+      task = await svix.backgroundTask.get(replay.id);
+    }
+    if (task.status === "failed") {
+      throw new Error(`bulkReplay task ${replay.id} failed`);
+    }
+    return replay.id;
+  } catch (error) {
+    if (error instanceof ApiException) {
+      throw new Error(`bulkReplay error: HTTP ${error.code}`);
+    }
+    throw error;
+  }
+}

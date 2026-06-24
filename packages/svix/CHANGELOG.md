@@ -1,3 +1,20 @@
+## 2026-06-24 — deepen pass — coverage 92% -> 100%
+
+- **Profile:** `packages/svix/contract.yaml`
+- **Functions added:** message.precheck, endpoint.bulkReplay (2 total)
+- **Postconditions added:** 4 (message-precheck-api-error, message-precheck-result-not-checked, endpoint-bulk-replay-api-error, endpoint-bulk-replay-async-not-polled)
+- **Functions intentionally omitted this pass:** authentication.streamExpireAll (streaming portal token revocation; narrow streaming adoption), authentication.streamLogout (streaming session mgmt; matches existing authentication.logout omission)
+- **Scanner concerns queued:** 2 (`concern-20260624-svix-deepen-8`, `concern-20260624-svix-deepen-9`)
+- **Scanner version used:** nark@3.2.0 (from nark-dev/nark/package.json)
+- **API surface re-enumeration:** svix@1.96.0 vs previously enumerated 1.84.1 — diff identified 4 new methods (message.precheck, endpoint.bulkReplay, authentication.streamExpireAll, authentication.streamLogout); contracted 2, omitted 2 per consistent streaming-niche rationale established in pass 2.
+- **Sources fetched:**
+  - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/message.ts
+  - https://github.com/svix/svix-webhooks/blob/main/javascript/src/api/endpoint.ts
+  - https://github.com/svix/svix-webhooks/blob/main/javascript/src/models/messagePrecheckOut.ts
+  - https://github.com/svix/svix-webhooks/blob/main/javascript/src/models/replayOut.ts
+  - https://github.com/svix/svix-webhooks/blob/main/javascript/src/request.ts
+- **Verified by:** bc-deepen-contract (pass 84 on 2026-06-24T11:38Z, deepen-stream-2)
+
 ## 2026-06-17 — re-verified clean
 
 - **Latest published:** svix@1.95.2
