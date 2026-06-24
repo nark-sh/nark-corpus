@@ -1,8 +1,8 @@
 package: nodemailer
-semver: ">=7.0.11"
-contract_version: "1.0.0"
+semver: ">=7.0.11 <10.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-03"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -16,7 +16,21 @@ coverage_score: 1.0
 # - CVE-2025-13033 (Medium): Email parsing misrouting
 #
 # MINIMUM VERSION: 7.0.11 (includes all security fixes)
-# RECOMMENDED VERSION: 7.0.11+ (latest stable)
+# RECOMMENDED VERSION: 9.0.1+ (latest stable, strict TLS by default)
+#
+# v9.0.0 BREAKING CHANGE (2026-06-14):
+#   HTTPS requests for attachment fetching (href/path URLs), OAuth2 token
+#   endpoints, and HTTPS proxy CONNECT now validate the server TLS certificate
+#   by default. Previously-successful requests to hosts with self-signed,
+#   expired, or hostname-mismatched certs now fail with a TLS error during
+#   sendMail(). Surface is the existing tls-ssl-error postcondition — code may
+#   appear as a TLS/SSL error wrapped by EFETCH or ETLS depending on which
+#   subsystem rejected it. Opt out per-request with tls.rejectUnauthorized=false
+#   (NOT recommended; relax only for explicitly-trusted internal CAs).
+#
+# v8.0.11 (2026-06-10): AWS SES transport errors now tagged with `ESES` code.
+# v8.0.8  (2026-05-23): strict TLS for OAuth2 and Ethereal credential requests.
+# v8.0.9  (2026-05-26): jsonTransport access bypass + List-* CRLF injection fixed.
 #
 # Common production bugs:
 # 1. Missing await in serverless functions - MOST COMMON (30-40% of issues)
@@ -94,8 +108,18 @@ functions:
           EREQUIRETLS: RFC 8689 REQUIRETLS extension unsupported by server.
           DO NOT RETRY - indicates certificate or TLS configuration issue.
           Verify SSL certificate validity and STARTTLS support.
+
+          v9.0.0+ EXPANDED SURFACE (2026-06-14):
+          TLS validation is now strict by default for HTTPS requests during:
+          (1) attachment fetching when href/path is an HTTPS URL,
+          (2) OAuth2 token endpoint requests,
+          (3) HTTPS proxy CONNECT tunnels.
+          Code paths that worked against self-signed or expired certs in v8 will
+          now throw a TLS error during sendMail(). DO NOT relax with
+          tls.rejectUnauthorized=false except for explicitly-trusted internal CAs.
         sources:
           - "https://nodemailer.com/smtp/#tls-options"
+          - "https://github.com/nodemailer/nodemailer/blob/v9.0.0/CHANGELOG.md"
         severity: error
         business_impact:
           incident_label: DOWNTIME
@@ -129,13 +153,21 @@ functions:
         required_handling: >
           Caller MUST validate message content and attachments.
           EMESSAGE: Invalid message structure, encoding issues.
-          EFILEACCESS: Attachment file not found or unreadable.
-          EURLACCESS: Cannot fetch URL attachment.
-          EFETCH: HTTP error fetching remote content.
+          EFILEACCESS: Attachment file not found or unreadable (also raised when
+            disableFileAccess is set and a file path is encountered, including v9.0.1+
+            enforcement of the option for raw message attachments).
+          EURLACCESS: Cannot fetch URL attachment (also raised when disableUrlAccess
+            blocks an http(s) attachment URL).
+          EFETCH: HTTP error fetching remote content (since v9.0.0 also surfaces
+            TLS validation failures on attachment HTTPS URLs by default — see
+            tls-ssl-error for the certificate-validation surface).
           ESTREAM: Attachment stream failed.
-          Verify attachment paths exist and are readable before sending.
+          Verify attachment paths exist and are readable before sending. For
+          user-supplied attachment URLs, set disableUrlAccess: true and provide
+          attachments inline as Buffer/string to avoid network fetches.
         sources:
           - "https://nodemailer.com/message/attachments/"
+          - "https://github.com/nodemailer/nodemailer/blob/v9.0.0/CHANGELOG.md"
         severity: error
         business_impact:
           incident_label: SILENT_FAILURE
@@ -146,15 +178,45 @@ functions:
 
       - id: protocol-error
         condition: "SMTP protocol violation or configuration error"
-        throws: "Error with code: EPROTOCOL, ECONFIG, EMAXLIMIT"
+        throws: "Error with code: EPROTOCOL, ECONFIG, EMAXLIMIT, EPROXY"
         required_handling: >
           Caller MUST handle protocol errors.
           EPROTOCOL: SMTP protocol error from server.
           ECONFIG: Invalid transport configuration.
           EMAXLIMIT: Message size exceeds server limit.
+          EPROXY: HTTP/HTTPS proxy CONNECT tunnel failed (since v9.0.0 also
+            includes TLS validation failures on the proxy endpoint by default).
           Check SMTP server logs and message size limits.
         sources:
           - "https://nodemailer.com/errors/#eprotocol"
+          - "https://github.com/nodemailer/nodemailer/blob/v9.0.1/lib/errors.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: transport-specific-error
+        condition: "Transport implementation raises a transport-tagged error (added v8.0.11+)"
+        throws: "Error with code: ESES, ESENDMAIL"
+        required_handling: >
+          Caller MUST distinguish transport-tagged errors from generic SMTP errors
+          when running multiple transports in the same process. Without the code
+          tag, retry logic and alerting cannot route errors to the right runbook.
+          ESES: AWS SES transport error (added v8.0.11). Underlying SES SDK error
+            wrapped with the ESES code so callers can detect "this was the SES
+            transport, not generic SMTP". The wrapped error preserves the SES
+            HTTP status and SDK error name on err.responseCode and err.response.
+          ESENDMAIL: Local sendmail binary error. Process spawn failed, sendmail
+            exited non-zero, or local mail queue rejected the message. NOT
+            retriable in-process — escalate to ops, do not loop.
+          For ESES specifically: check err.responseCode for AWS HTTP status
+            (429 = throttle/retriable; 4xx = config issue; 5xx = SES outage).
+        sources:
+          - "https://github.com/nodemailer/nodemailer/blob/v8.0.11/CHANGELOG.md"
+          - "https://github.com/nodemailer/nodemailer/blob/v9.0.1/lib/errors.js"
         severity: error
         business_impact:
           incident_label: DOWNTIME
