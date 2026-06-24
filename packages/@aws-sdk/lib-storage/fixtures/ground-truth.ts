@@ -3,6 +3,8 @@
  * Postcondition IDs:
  *   upload-done-no-try-catch       (Upload.done())
  *   upload-done-already-called     (Upload.done() called twice)
+ *   upload-done-exceeds-max-parts  (Upload.done() with file size requiring >10000 parts)
+ *   upload-done-missing-etag-cors  (Upload.done() with bucket CORS missing ETag in ExposeHeaders)
  *   abort-does-not-clean-up-synchronously  (Upload.abort() fire-and-forget)
  *   leave-parts-on-error-prevents-cleanup  (leavePartsOnError: true)
  *   abort-before-done-is-noop      (abort() before done())
@@ -139,6 +141,74 @@ async function gt_leave_parts_on_error_with_cleanup(bucket: string, key: string,
     await upload.done();
   } catch (err) {
     console.error('Upload failed, would manually clean up uploadId:', uploadId);
+    throw err;
+  }
+}
+
+// 10. Large file upload (>48.8 GB) WITHOUT partSize tuning — done() will throw "Exceeded 10000 parts"
+// @expect-violation: upload-done-exceeds-max-parts
+async function gt_upload_exceeds_max_parts(bucket: string, key: string, hugeBody: Readable) {
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: hugeBody },
+    // Default partSize is 5 MB; with files larger than ~48.8 GB this will throw.
+  });
+  // SHOULD_FIRE: upload-done-exceeds-max-parts — done() without try-catch and no partSize tuning
+  await upload.done();
+}
+
+// 11. Large file upload with try-catch AND tuned partSize (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_upload_large_file_with_part_size(bucket: string, key: string, hugeBody: Readable, maxBytes: number) {
+  // partSize sized to keep total parts under 10,000 even at maxBytes.
+  const partSize = Math.max(5 * 1024 * 1024, Math.ceil(maxBytes / 10000));
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: hugeBody },
+    partSize,
+    queueSize: 4,
+  });
+  try {
+    // SHOULD_NOT_FIRE: try-catch present AND partSize tuned for file size
+    await upload.done();
+  } catch (err) {
+    console.error('Upload failed:', err);
+    await upload.abort();
+    throw err;
+  }
+}
+
+// 12. Browser upload to a bucket without ETag in CORS ExposeHeaders — done() will throw "missing ETag"
+// @expect-violation: upload-done-missing-etag-cors
+async function gt_upload_missing_etag_cors(bucket: string, key: string, fileBlob: Blob) {
+  // If the destination bucket's CORS rules omit "ETag" from ExposeHeaders,
+  // done() throws "Part N is missing ETag in UploadPart response."
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: fileBlob as unknown as Buffer },
+  });
+  // SHOULD_FIRE: upload-done-missing-etag-cors — browser upload without try-catch
+  await upload.done();
+}
+
+// 13. Browser upload with try-catch that explicitly handles the CORS hint (SHOULD_NOT_FIRE)
+// @expect-clean
+async function gt_upload_handles_etag_cors_error(bucket: string, key: string, fileBlob: Blob) {
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: fileBlob as unknown as Buffer },
+  });
+  try {
+    // SHOULD_NOT_FIRE: try-catch present
+    await upload.done();
+  } catch (err: any) {
+    if (typeof err?.message === 'string' && err.message.includes('missing ETag')) {
+      console.error(
+        'S3 bucket CORS configuration is missing "ETag" in ExposeHeaders. ' +
+          'Add ETag to the bucket CORS rule and retry.',
+      );
+    }
+    await upload.abort();
     throw err;
   }
 }

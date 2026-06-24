@@ -1,8 +1,8 @@
 package: "@aws-sdk/lib-storage"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"  # deepen-stream-2 pass 1: coverage unknown → 100% (2 async functions, both contracted)
+last_verified: "2026-06-24"  # deepen-stream-2 pass 50: drift-by-staleness re-verification + 2 new error postconditions
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -12,17 +12,37 @@ evidence_quality: confirmed
 # This pass added: abort() (3 postconditions: abort-does-not-clean-up, abort-after-done-is-noop,
 #   leave-parts-on-error-cost). Also added done() second postcondition: done-already-called.
 # Coverage: 2/2 async functions = 100% (constructor sync, on() is sync event registration).
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 50, drift-by-staleness):
+# Re-verified API surface against @aws-sdk/lib-storage@3.1075.0 — unchanged from 3.x baseline.
+# Upload.d.ts confirms 2 async-callable methods: done() and abort(); on() returns this (sync).
+# Surface-coverage remains 100%. This pass DEEPENS the existing done() coverage with two
+# evidence-based postconditions for thrown errors that were not previously broken out:
+#   done-exceeds-max-parts (Upload.ts: `Exceeded ${MAX_PARTS} parts in multipart upload`)
+#   done-missing-etag-cors (Upload.ts: `Part N is missing ETag in UploadPart response.
+#     Missing Bucket CORS configuration for ETag header?`)
+# Both throws are subsumed by upload-done-no-try-catch (which is generic), but breaking them
+# out names the specific error so a downstream scanner upgrade can recognize the message text
+# and a fix-bot can route the developer to the right remediation (queueSize/partSize tuning vs
+# bucket CORS configuration).
+#
 # Evidence sources inspected this pass:
 #   https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
 #   https://github.com/aws/aws-sdk-js-v3/tree/main/lib/lib-storage (README)
 #   https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-lib-storage/
-#   Source inspection: dist-cjs/index.js (node_modules, @aws-sdk/lib-storage@3.x)
+#   Source inspection: dist-cjs/index.js (node_modules, @aws-sdk/lib-storage@3.1075.0)
 # Key findings:
 #   abort() does NOT directly clean up uploaded parts — it only signals the AbortController.
 #   done() must still resolve/reject (via Promise.race) before cleanup via markUploadAsAborted() runs.
 #   If done() has not been called yet, abort() is a no-op regarding cleanup — there is nothing to abort.
 #   If leavePartsOnError=true, even abort() will NOT send AbortMultipartUploadCommand — S3 costs accumulate.
 #   Calling done() twice throws "already executed .done()" error — upload instances are single-use.
+#   done() throws if multipart upload would exceed 10,000 parts (S3 hard limit) — file size /
+#     partSize must stay under 10k; default 5 MB part size caps total file size at ~50 GB.
+#   done() throws "Part N is missing ETag in UploadPart response. Missing Bucket CORS
+#     configuration for ETag header?" when the bucket's CORS rules omit ETag from
+#     ExposeHeaders — common when using browser uploads to a bucket configured for the
+#     server SDK only.
 coverage_score: 1.0  # 2/2 async-callable functions contracted
 
 detection:
@@ -110,6 +130,100 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+      # Evidence: dist-cjs/index.js (v3.1075.0) line 330:
+      #   `throw new Error("Exceeded ${this.MAX_PARTS} parts in multipart upload to Bucket: ... Key: ...");`
+      # MAX_PARTS is the S3-imposed hard cap of 10,000 parts per multipart upload.
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      # S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+      - id: upload-done-exceeds-max-parts
+        condition: >
+          The Upload's total body size divided by the configured partSize (default 5 MB)
+          exceeds 10,000 parts. With the default partSize this caps the file at ~48.8 GB.
+          The error is thrown DURING done() execution after parts have already been
+          uploaded — partial cleanup runs only when leavePartsOnError is false (the
+          default), otherwise costs accumulate.
+        throws: >
+          Error: "Exceeded 10000 parts in multipart upload to Bucket: <bucket> Key: <key>."
+        required_handling: >
+          Caller MUST wrap upload.done() in try-catch (already required by
+          upload-done-no-try-catch). For files larger than 48.8 GB, the caller MUST
+          also explicitly tune partSize:
+
+          CORRECT — uploading a 1 TB file (must use ≥100 MB parts):
+            new Upload({
+              client: s3,
+              params: { Bucket, Key, Body: stream },
+              partSize: 100 * 1024 * 1024, // 100 MB; 1 TB / 100 MB = 10,240 parts → still over
+              queueSize: 4,
+            });
+            // For files near or above 5 TB (S3's per-object limit), use 500 MB+ parts.
+
+          The maximum object size S3 supports is 5 TB. To stay under 10,000 parts:
+            minimum partSize = ceil(fileSize / 10000)
+
+          Operationally, the safer pattern is to size partSize from a known maximum
+          file size at construction time:
+            const partSize = Math.max(5 * 1024 * 1024, Math.ceil(maxBytes / 10000));
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: dist-cjs/index.js (v3.1075.0) line 385:
+      #   `throw new Error("Part ${dataPart.partNumber} is missing ETag in UploadPart response.
+      #    Missing Bucket CORS configuration for ETag header?");`
+      # Triggered when UploadPart returns no ETag header — almost always a CORS misconfiguration
+      # on the destination bucket (ExposeHeaders missing ETag), most visible in browser uploads.
+      # Source: https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts
+      # CORS docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManageCorsUsing.html
+      - id: upload-done-missing-etag-cors
+        condition: >
+          UploadPart succeeds (HTTP 200) but the response does not include the ETag
+          header. This is almost always caused by the destination bucket's CORS
+          configuration omitting ETag from ExposeHeaders — the browser strips the
+          header before the SDK can read it. The SDK aborts the entire multipart
+          upload mid-stream because it cannot send a CompleteMultipartUpload without
+          the per-part ETags.
+        throws: >
+          Error: "Part N is missing ETag in UploadPart response. Missing Bucket CORS
+          configuration for ETag header?"
+        required_handling: >
+          Caller MUST wrap upload.done() in try-catch (already required by
+          upload-done-no-try-catch). When this specific error message appears,
+          surface a remediation hint pointing at the bucket's CORS configuration —
+          the SDK cannot recover automatically.
+
+          Remediation (bucket CORS rules MUST include ETag in ExposeHeaders):
+            [
+              {
+                "AllowedHeaders": ["*"],
+                "AllowedMethods": ["PUT", "POST"],
+                "AllowedOrigins": ["https://your-app.example.com"],
+                "ExposeHeaders": ["ETag"]
+              }
+            ]
+
+          In a backend-only deployment (no browser uploads) this error is rare
+          but possible if a proxy or service worker is stripping response headers.
+          Log the full error text so the CORS-vs-proxy distinction can be made
+          from logs alone.
+        sources:
+          - "https://raw.githubusercontent.com/aws/aws-sdk-js-v3/main/lib/lib-storage/src/Upload.ts"
+          - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManageCorsUsing.html"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
   - name: abort
     import_path: "@aws-sdk/lib-storage"
