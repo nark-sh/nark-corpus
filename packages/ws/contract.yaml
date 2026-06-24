@@ -1,12 +1,18 @@
 package: ws
 semver: ">=8.17.1"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.88  # 7 contracted / 8 total async-callable (1 intentionally omitted: createWebSocketStream)
+coverage_score: 0.9  # 9 contracted / 10 total async-callable (1 intentionally omitted: createWebSocketStream)
+# Deepen pass 2026-06-24 (deepen-stream-2 pass 59) — drift-by-staleness mode:
+# Re-enumerated ws@8.21.0 lib/websocket.js prototype methods. Found 2 uncontracted
+# methods with confirmed throw/silent-failure hazards: pong() (line 399-421) and
+# terminate() (line 492-504). Coverage 7/8 = 0.88 → 9/10 = 0.9.
+# pause()/resume() (lines 347, 428) silently return on CONNECTING/CLOSED — flow-control
+# helpers used in <1% of codebases; intentionally omitted per ICP filter.
 # Evidence: scan-ws-2026-04-04.json — 0 repos scanned successfully (all 123 errored on TS compilation)
 # 16 repos skipped (no tsconfig). ws repos tend to be plain JS or custom TS setups.
 # FP check: 0/50 repos false-positive-free. FP rate 0%. Confirmed evidence quality.
@@ -590,6 +596,165 @@ functions:
         severity: warning
         business_impact:
           incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: lib/websocket.js line 399-421 (ws@8.21.0) — pong() throws synchronously
+  # when readyState === CONNECTING (line 400-402); when CLOSING/CLOSED, error is
+  # delivered via callback only (sendAfterClose helper).
+  # Source: https://github.com/websockets/ws/blob/master/lib/websocket.js#L399
+  - name: pong
+    import_path: "ws"
+    description: >
+      Sends a WebSocket pong frame, typically as an unsolicited keepalive or in
+      response to a ping. Used in custom heartbeat protocols where the server
+      expects unsolicited pongs from clients. Less common than ping() but has
+      identical pre-open / post-close failure modes.
+    postconditions:
+      # Evidence: websocket.js line 400-402 — throws synchronously when CONNECTING
+      # Source: https://github.com/websockets/ws/blob/master/lib/websocket.js#L400
+      - id: pong-before-open
+        condition: >
+          pong() is called while the WebSocket is still in CONNECTING state
+          (readyState === WebSocket.CONNECTING, i.e., before the 'open' event fires).
+        throws: "Error: WebSocket is not open: readyState 0 (CONNECTING)"
+        required_handling: >
+          Caller MUST check readyState before calling pong(), or only send pongs
+          after the 'open' event. Unsolicited-pong keepalive intervals MUST start
+          in the 'open' event handler, NOT immediately after new WebSocket().
+
+          CORRECT pattern:
+            ws.on('open', () => {
+              const keepalive = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) ws.pong();
+              }, 30000);
+              ws.on('close', () => clearInterval(keepalive));
+            });
+
+          WRONG (crashes if called before connection is established):
+            ws.pong(); // Throws synchronously when readyState === CONNECTING
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: websocket.js line 414-417 — when readyState is CLOSING/CLOSED,
+      # sendAfterClose() delivers error via callback (process.nextTick) and returns silently.
+      - id: pong-callback-receives-error
+        condition: >
+          pong() is called when connection is CLOSING or CLOSED and a callback is provided.
+          The callback receives an error but no exception is thrown synchronously.
+        throws: >
+          No synchronous throw. If a callback is provided, it receives:
+          Error: WebSocket is not open: readyState X (CLOSING|CLOSED)
+        required_handling: >
+          If using pong() with a callback for error detection, the callback MUST
+          check for error. The more reliable pattern is to check
+          readyState === WebSocket.OPEN before pong()-ing. Silent callback errors
+          in keepalive logic cause zombie-connection symptoms.
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # Evidence: lib/websocket.js line 492-504 (ws@8.21.0) — terminate() behavior:
+  #   - readyState === CLOSED  → return (no-op)        (line 493)
+  #   - readyState === CONNECTING → abortHandshake()    (lines 494-498)
+  #   - else (OPEN/CLOSING) → destroy underlying socket (lines 500-503)
+  # Source: https://github.com/websockets/ws/blob/master/lib/websocket.js#L492
+  - name: terminate
+    import_path: "ws"
+    description: >
+      Forcibly closes the WebSocket connection by destroying the underlying socket.
+      Unlike close() which sends a close frame and waits for acknowledgement,
+      terminate() drops the connection immediately. The remote peer sees an
+      abnormal close (code 1006). Used in heartbeat-timeout enforcement and in
+      shutdown paths where graceful close is unnecessary.
+    postconditions:
+      # Evidence: lines 494-498 — when CONNECTING, terminate() calls abortHandshake().
+      # No 'open' event fires; only a 'close' event with code 1006. Callers awaiting
+      # 'open' (e.g. promise-wrapped connect helpers) hang forever unless they also
+      # listen for 'close'.
+      - id: terminate-during-connecting-silent
+        condition: >
+          terminate() is called while the WebSocket is in CONNECTING state.
+          The handshake is aborted; no 'open' event is emitted; only a 'close'
+          event fires with code 1006 (abnormal closure).
+        throws: >
+          Does NOT throw. The connection is silently aborted — promise-wrapped
+          connect helpers that only resolve on 'open' will hang indefinitely if
+          they do not also reject on 'close' or 'error' events.
+        required_handling: >
+          Connect helpers that wrap new WebSocket() in a Promise MUST register
+          handlers for BOTH 'open' (resolve) AND 'close'/'error' (reject) so a
+          mid-connect terminate() is observable to the caller.
+
+          CORRECT promise-wrapped connect:
+            const ws = new WebSocket(url);
+            await new Promise((resolve, reject) => {
+              ws.once('open', resolve);
+              ws.once('error', reject);
+              ws.once('close', () => reject(new Error('closed before open')));
+            });
+
+          WRONG (hangs forever if terminate() called during CONNECTING):
+            await new Promise(resolve => ws.once('open', resolve));
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+          - "https://github.com/websockets/ws/blob/master/doc/ws.md"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: line 493 — terminate() on a CLOSED socket is a no-op. Callers
+      # relying on side effects (e.g. cleanup hooks tied to 'close' event) get
+      # no signal if the connection was already closed when terminate() was called.
+      - id: terminate-on-closed-no-op
+        condition: >
+          terminate() is called when the WebSocket is already in CLOSED state.
+          The call is a silent no-op — no 'close' event is re-emitted, no
+          callback is invoked, no error surfaces.
+        throws: "Does NOT throw and produces no observable side effect."
+        required_handling: >
+          Cleanup logic MUST NOT rely on terminate() to trigger a 'close' event
+          if the connection may already be CLOSED. Always perform cleanup
+          (clearing intervals, removing entries from connection registries) at
+          the 'close' event itself or in finally blocks, not after terminate().
+
+          CORRECT cleanup pattern:
+            ws.on('close', () => { connections.delete(ws); });
+            ws.terminate();  // may be no-op; cleanup runs from 'close' handler if any
+
+          WRONG (cleanup never runs if already closed):
+            ws.terminate();
+            connections.delete(ws);  // OK actually but if cleanup runs in close handler, redundant
+            // worse: relying on a side effect of terminate() to fire 'close'
+        sources:
+          - "https://github.com/websockets/ws/blob/master/lib/websocket.js"
+        severity: info
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
           production_behavior: silent_failure
           visibility: silent
           user_experience: degraded_performance

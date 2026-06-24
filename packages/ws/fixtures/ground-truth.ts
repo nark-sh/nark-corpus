@@ -165,3 +165,70 @@ export function serverCloseWithErrorHandling() {
     }
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. ws.pong() — before 'open' event (pong-before-open)
+//    Added 2026-06-24 deepen pass 59 (deepen-stream-2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function pongBeforeOpen() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  // SHOULD_FIRE: pong-before-open
+  ws.pong();
+}
+
+export function pongInsideOpenHandler() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  ws.on('open', () => {
+    // SHOULD_NOT_FIRE: pong inside 'open' handler — readyState is OPEN
+    ws.pong();
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. ws.terminate() — silent abort during CONNECTING
+//    Added 2026-06-24 deepen pass 59 (deepen-stream-2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function connectPromiseMissesTerminate() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  // SHOULD_FIRE: terminate-during-connecting-silent
+  return new Promise<void>((resolve) => {
+    ws.once('open', () => resolve());
+    // Caller is missing ws.once('close', reject) — if terminate() called during CONNECTING,
+    // promise hangs forever because only 'close' (not 'open') fires after abortHandshake.
+  });
+}
+
+export function connectPromiseHandlesTerminate() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  // SHOULD_NOT_FIRE: caller listens for both 'open' and 'close' to handle mid-connect terminate
+  return new Promise<void>((resolve, reject) => {
+    ws.once('open', () => resolve());
+    ws.once('close', () => reject(new Error('closed before open')));
+    ws.once('error', (err) => reject(err));
+  });
+}
+
+export function terminateOnAlreadyClosedReliesOnSideEffect() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  ws.on('open', () => {
+    ws.close();
+    // SHOULD_FIRE: terminate-on-closed-no-op — relies on terminate() to fire a fresh 'close'
+    ws.terminate();
+  });
+}
+
+export function terminateWithCloseHandlerCleanup() {
+  const ws = new WebSocket('ws://localhost:8080');
+  ws.on('error', (err) => console.error(err));
+  const heartbeat = setInterval(() => { /* ... */ }, 30000);
+  // SHOULD_NOT_FIRE: cleanup runs from 'close' handler, not from terminate() side effect
+  ws.on('close', () => { clearInterval(heartbeat); });
+  ws.terminate();
+}
