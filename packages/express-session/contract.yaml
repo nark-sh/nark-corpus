@@ -1,12 +1,12 @@
 package: express-session
 semver: '>=1.17.0 <2.0.0'
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80
+coverage_score: 1.00
 functions:
   - name: session
     import_path: express-session
@@ -372,3 +372,145 @@ functions:
           visibility: silent
           user_experience: degraded_performance
           incident_cost_range: medium
+
+  # Evidence: README.md "Session Store Implementation" §store.all(callback)
+  # Source: https://raw.githubusercontent.com/expressjs/session/master/README.md
+  # store.all is an optional Store method commonly used by admin tooling
+  # (session inventory pages, "active users" dashboards). The callback signature
+  # is callback(error, sessions) — application code that calls
+  # req.sessionStore.all(...) directly MUST handle the error case or admin
+  # screens will appear empty when the store has a connection issue.
+  - name: req.sessionStore.all
+    import_path: express-session
+    description: >
+      Optional Store method: returns all sessions in the store as an array (or object keyed by sid).
+      Called as req.sessionStore.all(callback). Used by admin dashboards, "active users" pages, and
+      maintenance scripts. Callback signature is callback(err, sessions). If err is not checked, store
+      failures (Redis down, DB timeout) produce an empty sessions list that looks indistinguishable
+      from "no active sessions" — a silent failure that misleads operators.
+    postconditions:
+      # Evidence: README "store.all(callback) — Optional. The callback should be called as callback(error, sessions)."
+      - id: all-callback-error-unchecked
+        condition: >
+          req.sessionStore.all(callback) called but callback does not check the err argument.
+          Store failures (connection lost, permission denied, store does not implement all()) are
+          silently swallowed and treated as "no sessions in store" by the admin UI.
+        throws: >
+          Store-dependent errors passed as first argument to callback:
+          Redis: ReplyError (connection lost, READONLY)
+          PostgreSQL: connection errors, relation does not exist
+          Custom stores: TypeError if the store implementation does not provide all()
+          (since all() is marked optional in the express-session Store interface).
+        required_handling: >
+          Caller MUST check err in the all() callback before iterating sessions. Pattern:
+          req.sessionStore.all(function(err, sessions) {
+            if (err) { return next(err); } // surface to error handler, do not render empty UI
+            // sessions may still be undefined/null on success-with-no-data — handle separately
+          })
+          Admin dashboards that ignore err render an empty session list, masking infrastructure
+          failures. Operators may incorrectly conclude "nobody is logged in" and take action
+          (restart, scale down) that worsens the underlying outage.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+          - https://github.com/expressjs/session/blob/master/index.js
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      - id: all-method-not-implemented
+        condition: >
+          req.sessionStore.all(callback) called against a store implementation that does not
+          provide the all() method. all() is marked Optional in the express-session Store
+          interface — many third-party stores (connect-pg-simple older versions, some Redis
+          adapters) do not implement it.
+        throws: "TypeError: req.sessionStore.all is not a function"
+        required_handling: >
+          Caller MUST either (1) check typeof req.sessionStore.all === 'function' before
+          invoking, or (2) wrap the call in try/catch to handle the TypeError. Without this
+          guard, admin endpoints crash with a 500 when deployed against a store that omits
+          all(), even if the same code worked in development against MemoryStore (which does
+          implement all()).
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Evidence: README.md "Session Store Implementation" §store.clear(callback)
+  # Source: https://raw.githubusercontent.com/expressjs/session/master/README.md
+  # store.clear is the "logout every user" hammer — used in security incident
+  # response and in maintenance windows. Errors here are particularly damaging
+  # because the caller usually assumes the operation succeeded and proceeds
+  # with downstream actions (force-reauth flag set, audit log written, etc.)
+  # while the store actually retained the sessions.
+  - name: req.sessionStore.clear
+    import_path: express-session
+    description: >
+      Optional Store method: deletes ALL sessions from the store. Called as
+      req.sessionStore.clear(callback). Used in security-incident response (revoke every active
+      session after a credential leak), tenant offboarding, and maintenance scripts. Callback
+      signature is callback(err). If err is not checked, an audit-log entry may claim "all sessions
+      revoked" while the store actually retains some or all of them — a critical security
+      false-confidence failure.
+    postconditions:
+      # Evidence: README "store.clear(callback) — Optional. The callback should be called as callback(error) once the store is cleared."
+      - id: clear-callback-error-unchecked
+        condition: >
+          req.sessionStore.clear(callback) called but callback does not check err. The store
+          may have failed mid-clear (Redis SCAN/DEL partial failure, PostgreSQL TRUNCATE rolled
+          back, network split). The caller proceeds as if all sessions were destroyed.
+        throws: >
+          Store-dependent errors passed as first argument to callback:
+          Redis: ReplyError (READONLY during failover, connection lost mid-SCAN)
+          PostgreSQL: TransactionRollbackError, permission errors on TRUNCATE
+          Custom stores: any error from the underlying bulk-delete operation.
+        required_handling: >
+          Caller MUST check err in the clear() callback. In security-incident response, an
+          unchecked err means the runbook says "revoked all sessions" but compromised sessions
+          remain valid in the store. Pattern:
+          req.sessionStore.clear(function(err) {
+            if (err) { auditLog.failure('clear', err); return next(err); }
+            auditLog.success('clear');
+          })
+          Skipping the err check creates a split-brain between the audit log (claims success)
+          and the store (still holding sessions) — the most dangerous failure mode in incident
+          response.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: high
+
+      - id: clear-method-not-implemented
+        condition: >
+          req.sessionStore.clear(callback) called against a store implementation that does
+          not provide the clear() method. clear() is marked Optional — many production stores
+          (some connect-redis configurations with namespaced keys, custom enterprise stores)
+          omit it to prevent accidental mass-revocation.
+        throws: "TypeError: req.sessionStore.clear is not a function"
+        required_handling: >
+          Caller MUST guard with typeof req.sessionStore.clear === 'function' or wrap in
+          try/catch. In a security incident, a TypeError raised here means the
+          revoke-all-sessions runbook silently failed — operators may believe the mitigation
+          ran when no sessions were actually revoked.
+        sources:
+          - https://raw.githubusercontent.com/expressjs/session/master/README.md
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: security_breach
+          incident_cost_range: high

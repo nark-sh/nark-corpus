@@ -159,3 +159,70 @@ const goodMiddleware = session({
   saveUninitialized: false,
   cookie: { secure: true, httpOnly: true, sameSite: 'strict' }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. req.sessionStore.all — admin "list active sessions" tool
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SHOULD_FIRE: all-callback-error-unchecked
+app.get('/admin/sessions-bad', (req, res) => {
+  req.sessionStore.all!(function(err, sessions) {
+    // err ignored — admin UI silently shows empty list when store is down
+    res.json({ count: sessions ? Object.keys(sessions).length : 0, sessions });
+  });
+});
+
+// SHOULD_FIRE: all-method-not-implemented
+app.get('/admin/sessions-no-guard', (req, res, next) => {
+  // No typeof check before calling — crashes against stores that omit all()
+  (req.sessionStore as any).all(function(err: any, sessions: any) {
+    if (err) return next(err);
+    res.json({ sessions });
+  });
+});
+
+// SHOULD_NOT_FIRE: proper error handling and method-exists guard
+app.get('/admin/sessions-good', (req, res, next) => {
+  if (typeof req.sessionStore.all !== 'function') {
+    return res.status(501).json({ error: 'session store does not support listing' });
+  }
+  req.sessionStore.all(function(err, sessions) {
+    if (err) return next(err);
+    res.json({ sessions: sessions || [] });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. req.sessionStore.clear — security-incident "revoke all sessions"
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SHOULD_FIRE: clear-callback-error-unchecked
+app.post('/admin/revoke-all-bad', (req, res) => {
+  req.sessionStore.clear!(function(err) {
+    // err ignored — audit log will claim success while store may still hold sessions
+    res.json({ revoked: true });
+  });
+});
+
+// SHOULD_FIRE: clear-method-not-implemented
+app.post('/admin/revoke-all-no-guard', (req, res, next) => {
+  // No typeof check — crashes against stores that omit clear()
+  (req.sessionStore as any).clear(function(err: any) {
+    if (err) return next(err);
+    res.json({ revoked: true });
+  });
+});
+
+// SHOULD_NOT_FIRE: proper error handling and method-exists guard
+app.post('/admin/revoke-all-good', (req, res, next) => {
+  if (typeof req.sessionStore.clear !== 'function') {
+    return res.status(501).json({ error: 'session store does not support bulk revoke' });
+  }
+  req.sessionStore.clear(function(err) {
+    if (err) {
+      // SECURITY-CRITICAL: do NOT log success when clear failed
+      return next(err);
+    }
+    res.json({ revoked: true });
+  });
+});
