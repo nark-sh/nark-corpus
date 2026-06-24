@@ -409,3 +409,77 @@ export async function syncReplicaWithProperHandling() {
     console.error('Sync failed — serving stale replica data:', error);
   }
 }
+
+// ============================================================================
+// transaction.batch() — promoted from omitted to contracted on 2026-06-24
+// ============================================================================
+
+// @expect-violation: transaction-batch-no-try-catch
+// Future SHOULD_FIRE: tx.batch() called without try-catch — throws LibsqlError(TRANSACTION_CLOSED)
+// on closed stream or LibsqlBatchError(statementIndex) on per-statement failure. Detection
+// pending scanner upgrade (concern-20260624-libsql-client-deepen-1).
+export async function txBatchBareNoTryCatch() {
+  const tx = await db.transaction("write");
+  // Future violation: tx.batch() without try-catch leaves transaction open on failure
+  await tx.batch([
+    'INSERT INTO orders (user_id) VALUES (1)',
+    { sql: 'UPDATE inventory SET qty = qty - 1 WHERE id = ?', args: [42] },
+  ]);
+  await tx.commit();
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: properly wraps tx.batch in try-catch with finally close
+export async function txBatchProperHandling() {
+  const tx = await db.transaction("write");
+  try {
+    await tx.batch([
+      'INSERT INTO orders (user_id) VALUES (1)',
+      { sql: 'UPDATE inventory SET qty = qty - 1 WHERE id = ?', args: [42] },
+    ]);
+    await tx.commit();
+  } catch (error) {
+    console.error('Batch failed:', error);
+    throw error;
+  } finally {
+    tx.close();
+  }
+}
+
+// ============================================================================
+// transaction.executeMultiple() — promoted from omitted to contracted on 2026-06-24
+// ============================================================================
+
+// @expect-violation: transaction-execute-multiple-no-try-catch
+// Future SHOULD_FIRE: tx.executeMultiple() called without try-catch — throws
+// LibsqlError(TRANSACTION_CLOSED) on closed stream or LibsqlError(SQLITE_ERROR) on inner failure.
+// executeMultiple internally calls this.close() in its catch block, so subsequent tx.execute
+// calls will throw TRANSACTION_CLOSED. Detection pending scanner upgrade
+// (concern-20260624-libsql-client-deepen-2).
+export async function txExecuteMultipleBareNoTryCatch() {
+  const tx = await db.transaction("write");
+  // Future violation: tx.executeMultiple() without try-catch
+  await tx.executeMultiple(`
+    INSERT INTO orders (user_id) VALUES (1);
+    UPDATE inventory SET qty = qty - 1 WHERE id = 42;
+  `);
+  await tx.commit();
+}
+
+// @expect-clean
+// SHOULD_NOT_FIRE: properly wraps tx.executeMultiple in try-catch with finally close
+export async function txExecuteMultipleProperHandling() {
+  const tx = await db.transaction("write");
+  try {
+    await tx.executeMultiple(`
+      INSERT INTO orders (user_id) VALUES (1);
+      UPDATE inventory SET qty = qty - 1 WHERE id = 42;
+    `);
+    await tx.commit();
+  } catch (error) {
+    console.error('Multi-statement failed:', error);
+    throw error;
+  } finally {
+    tx.close();
+  }
+}

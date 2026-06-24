@@ -44,7 +44,7 @@ package: "@libsql/client"
 semver: ">=0.3.0"
 contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-11"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -57,8 +57,28 @@ evidence_quality: confirmed
 # API surface: 13 total (9 contracted, 4 omitted — sync promoted, close/reconnect/tx-variants remain)
 # Coverage: 9/13 = 0.69 (was 8/13 = 0.62)
 # Effective coverage (contracted/non-omitted): 9/9 = 1.0 (was 8/8 = 1.0)
-coverage_score: 0.69  # 9 contracted / 13 total async-callable functions (pass 2026-06-11)
-# Note: effective coverage (contracted/non-omitted) = 9/9 = 1.0
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 82):
+# Package version: @libsql/client v0.17.4 (patch from v0.17.3 — no new API surface added).
+# Re-enumerated full Client + Transaction interface from
+#   node_modules/@libsql/client/lib-esm/node.d.ts
+#   node_modules/@libsql/core/lib-esm/api.d.ts
+# Surface: Client has 6 async methods (execute, batch, migrate, transaction,
+#   executeMultiple, sync) plus 2 sync void (close, reconnect) and 2 sync
+#   property accessors (closed, protocol). Transaction interface adds 5 async
+#   methods (execute, batch, executeMultiple, rollback, commit) plus 1 sync
+#   void (close) and 1 sync accessor (closed).
+# Promoted from intentionally-omitted to contracted: transaction.batch,
+#   transaction.executeMultiple. Their previous omission rationale ("variants
+#   covered by tx.execute semantics") understated the unique TRANSACTION_CLOSED
+#   footgun and the LibsqlBatchError(statementIndex) shape on tx.batch failure.
+#   2 new function entries, 2 new postconditions total.
+# API surface: 13 total (11 contracted, 2 omitted — close/reconnect remain
+#   omitted as synchronous void methods that cannot throw)
+# Coverage: 11/13 = 0.85 (was 9/13 = 0.69)
+# Effective coverage (contracted/non-omitted): 11/11 = 1.0 (was 9/9 = 1.0)
+coverage_score: 0.85  # 11 contracted / 13 total async-callable functions (pass 2026-06-24)
+# Note: effective coverage (contracted/non-omitted) = 11/11 = 1.0
 
 detection:
   function_names:
@@ -782,6 +802,135 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: low
 
+  - name: transaction.batch
+    import_path: "@libsql/client"
+    description: >
+      Executes a batch of SQL statements within an interactive transaction. Unlike
+      client.batch(), the batch is part of the surrounding interactive transaction —
+      a per-statement failure does NOT auto-rollback the transaction (the failure
+      throws and the transaction is left open for the caller to commit or close).
+      Has the same TRANSACTION_CLOSED throw behavior as transaction.execute().
+    postconditions:
+      # Evidence: @libsql/client v0.17.4 source (confirmed 2026-06-24):
+      #   lib-esm/hrana.js: 'async batch(stmts)' first checks 'if (stream.closed)' and
+      #   throws new LibsqlError("Cannot execute statements because the transaction is
+      #   closed", "TRANSACTION_CLOSED"). Subsequent statement failures propagate as
+      #   LibsqlError or LibsqlBatchError(statementIndex) via mapHranaError().
+      # Docs: https://docs.turso.tech/sdk/ts/reference (Transaction interface)
+      - id: transaction-batch-no-try-catch
+        condition: >
+          transaction.batch() is called without try-catch inside a transaction block.
+          If any statement fails (SQL syntax, constraint violation, network failure)
+          or the transaction stream was already closed, the promise rejects. Unlike
+          client.batch() (which atomically rolls back its implicit transaction),
+          tx.batch() leaves the surrounding interactive transaction OPEN on failure —
+          the caller must explicitly rollback or rely on tx.close() in finally.
+          A bare await without try-catch propagates the error up the call stack,
+          potentially leaving the write-lock held until server timeout (5s).
+        throws: >
+          LibsqlError with code TRANSACTION_CLOSED if the transaction was already
+          closed before this call (e.g., timed out by server or after a prior commit).
+          Message: "Cannot execute statements because the transaction is closed".
+          LibsqlBatchError with statementIndex if a specific statement fails inside
+          the batch (extends LibsqlError, code SQLITE_ERROR or extended code such as
+          SQLITE_CONSTRAINT_UNIQUE). SERVER_ERROR / HRANA_WEBSOCKET_ERROR on transport
+          failure. Confirmed from hrana.js: tx.batch throws TRANSACTION_CLOSED then
+          mapHranaError() on any inner failure.
+        required_handling: >
+          Always wrap transaction.batch() in try-catch with tx.close() in finally:
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.batch([
+                'INSERT INTO orders (user_id) VALUES (1)',
+                { sql: 'UPDATE inventory SET qty = qty - 1 WHERE id = ?', args: [42] },
+              ]);
+              await tx.commit();
+            } catch (error) {
+              if (error instanceof LibsqlBatchError) {
+                console.error('Batch failed at statement', error.statementIndex);
+              }
+              // transaction NOT auto-rolled back — close() in finally handles cleanup
+              throw error;
+            } finally {
+              tx.close();
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: transaction.executeMultiple
+    import_path: "@libsql/client"
+    description: >
+      Executes a sequence of SQL statements separated by semicolons within an
+      interactive transaction. Same shape as client.executeMultiple() except the
+      statements run inside the surrounding interactive transaction — partial
+      execution leaves the transaction open and rolled-back state depends on
+      whether commit() is later called. Has the TRANSACTION_CLOSED throw behavior.
+    postconditions:
+      # Evidence: @libsql/client v0.17.4 source (confirmed 2026-06-24):
+      #   lib-esm/hrana.js: 'async executeMultiple(sql)' first checks 'if (stream.closed)'
+      #   and throws new LibsqlError("Cannot execute statements because the transaction
+      #   is closed", "TRANSACTION_CLOSED"). Then calls stream.sequence(sql) which
+      #   propagates SQLite errors via mapHranaError() to LibsqlError. Note: the
+      #   transaction stream is closed on inner failure for sequence errors (see catch
+      #   block calling this.close()).
+      # Docs: https://docs.turso.tech/sdk/ts/reference (Transaction interface)
+      - id: transaction-execute-multiple-no-try-catch
+        condition: >
+          transaction.executeMultiple() is called without try-catch inside a
+          transaction block. If any statement in the SQL string fails or the
+          transaction stream was closed beforehand, the promise rejects. Statements
+          that ran before the failing one are part of the interactive transaction —
+          if commit() is not subsequently called (because an exception propagated),
+          all of them are rolled back when tx.close() runs. But the caller must
+          actually call tx.close() — a bare await without try-catch-finally leaks
+          the transaction and holds the write lock for up to 5 seconds.
+        throws: >
+          LibsqlError with code TRANSACTION_CLOSED if the transaction stream was
+          closed before this call. Message: "Cannot execute statements because the
+          transaction is closed".
+          LibsqlError with code SQLITE_ERROR (syntax error, constraint violation,
+          unknown table) or SERVER_ERROR (network failure) on inner statement failure.
+          Confirmed from hrana.js executeMultiple() catch block — the transaction is
+          closed automatically on inner failure (this.close() is called inside catch).
+        required_handling: >
+          Always wrap transaction.executeMultiple() in try-catch with tx.close()
+          in finally. The auto-close-on-failure behavior of executeMultiple is a
+          one-shot — subsequent tx.execute calls will throw TRANSACTION_CLOSED:
+
+            const tx = await client.transaction("write");
+            try {
+              await tx.executeMultiple(`
+                INSERT INTO orders (user_id) VALUES (1);
+                UPDATE inventory SET qty = qty - 1 WHERE id = 42;
+              `);
+              await tx.commit();
+            } catch (error) {
+              console.error('Multi-statement failed:', error);
+              // transaction may already be closed by executeMultiple's internal catch
+              throw error;
+            } finally {
+              tx.close();  // safe to call even if already closed
+            }
+        sources:
+          - "https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts"
+          - "https://docs.turso.tech/sdk/ts/reference"
+        severity: warning
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: degraded_service
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
 notes:
   - "LibsqlError.code values: SERVER_ERROR (HTTP failure), AUTH_FAILED, SQLITE_ERROR, URL_INVALID, TRANSACTION_CLOSED, CLIENT_CLOSED, HRANA_CLOSED_ERROR, HRANA_WEBSOCKET_ERROR, HRANA_PROTO_ERROR, INTERNAL_ERROR, SYNC_NOT_SUPPORTED"
   - "LibsqlBatchError extends LibsqlError with statementIndex field — thrown by batch() and migrate() on per-statement failure"
@@ -793,3 +942,4 @@ notes:
   - "createClient() itself does not throw — it's a synchronous factory function"
   - "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are the standard env var names"
   - "sync() promoted from omitted to contracted 2026-06-11: SYNC_NOT_SUPPORTED error on non-embedded-replica clients is a real runtime footgun"
+  - "transaction.batch() and transaction.executeMultiple() promoted from omitted to contracted 2026-06-24: TRANSACTION_CLOSED throw on closed-stream + LibsqlBatchError(statementIndex) per-statement failure shape are not equivalent to tx.execute() semantics"

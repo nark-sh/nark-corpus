@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 69% -> 85%
+
+- **Profile:** `packages/@libsql/client/contract.yaml`
+- **Functions added:** transaction.batch, transaction.executeMultiple (2 total)
+- **Postconditions added:** 2 (transaction-batch-no-try-catch, transaction-execute-multiple-no-try-catch)
+- **Functions intentionally omitted this pass:** Client.close (synchronous void), Client.reconnect (synchronous void)
+- **Scanner concerns queued:** 2 (`concern-20260624-libsql-client-deepen-1`, `concern-20260624-libsql-client-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** node_modules/@libsql/client/lib-esm/hrana.js (async batch + async executeMultiple confirmed throwing LibsqlError(TRANSACTION_CLOSED) on closed stream and LibsqlBatchError(statementIndex) on per-statement failure), node_modules/@libsql/core/lib-esm/api.d.ts (Client + Transaction interface definitions), https://docs.turso.tech/sdk/ts/reference, https://github.com/tursodatabase/libsql-client-ts/blob/main/packages/libsql-client/src/hrana.ts
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T11:13Z, deepen-stream-2 pass 82)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @libsql/client@0.17.4
