@@ -1,12 +1,18 @@
 package: inngest
 semver: ">=3.0.0 <5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-13"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
 coverage_score: 1.0
+# Pass 27 (deepen-stream-3, 2026-06-24): API surface re-enumerated against
+# inngest@4.11.0. Added 5 new function entries (step.sleep, step.sleepUntil,
+# step.fetch, step.ai.infer, step.realtime.publish) plus inngest.realtime.publish
+# for the client-level non-durable variant. Coverage effective remained 1.0
+# (all in-scope async-callable functions covered). Out-of-scope async surface
+# tagged in functions_intentionally_omitted in deepen-index.json.
 
 detection:
   class_names:
@@ -294,6 +300,415 @@ functions:
           user_experience: degraded_performance
           incident_cost_range: low
 
+  - name: step.sleep
+    import_path: "inngest"
+    description: >
+      Pauses the function's execution for a specified duration. Returns a
+      Promise<void>. The documentation explicitly states this MUST be awaited
+      to ensure the function sleeps correctly. Used to introduce delays
+      (e.g., follow-up emails, polling backoff) between durable steps.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/reference/functions/step-sleep
+      # Confirmed from docs: "must be called using await or some other Promise
+      # handler to ensure your function sleeps correctly"
+      # SDK signature: step.sleep(id, time): Promise<void>
+      - id: step-sleep-not-awaited
+        condition: >
+          step.sleep() is called without await (or .then/.catch) inside an
+          Inngest function handler. The documentation explicitly states this
+          must be awaited. Without await, the function continues executing
+          immediately rather than pausing, breaking the durable-pause contract.
+          Subsequent steps that depend on the elapsed delay (rate-limited API
+          calls, scheduled follow-ups, debounced batches) fire too early.
+        throws: >
+          Silent failure: no exception is raised, but the pause does not occur.
+          The function execution proceeds immediately past the step.sleep() call.
+          On retry, memoization will not match the expected step shape, which
+          may cause non-deterministic execution.
+        required_handling: >
+          Always await step.sleep():
+
+            await step.sleep("wait-before-follow-up", "1h");
+
+          For dynamic delays, the time argument can be a number (ms), a
+          ms-compatible string ("30 mins", "2.5d"), or a Temporal.Duration.
+          Use step.sleepUntil() for absolute date targets instead.
+        source: "https://www.inngest.com/docs/reference/functions/step-sleep"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-sleep"
+          - "https://www.inngest.com/docs/learn/inngest-steps"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: step.sleepUntil
+    import_path: "inngest"
+    description: >
+      Pauses the function's execution until a specific date and time. Returns
+      a Promise<void>. Accepts a Date, ISO 8601 string, Temporal.Instant, or
+      Temporal.ZonedDateTime. The documentation explicitly states this MUST be
+      awaited. The SDK additionally throws synchronously when the time argument
+      cannot be parsed as a valid date.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/reference/functions/step-sleep-until
+      # Confirmed from SDK source (inngest/components/InngestStepTools.cjs L275):
+      #   throw new Error(`Invalid \`Date\`, date string, \`Temporal.Instant\`, or
+      #     \`Temporal.ZonedDateTime\` passed to sleepUntil: ${time}`);
+      # Throws SYNCHRONOUSLY before the Promise is queued — wrapping the call
+      # in try/catch is required because the throw is not caught by step-level
+      # retry logic (it's an invalid-args error, not a runtime step error).
+      - id: step-sleep-until-invalid-date
+        condition: >
+          step.sleepUntil() is called with a time argument that cannot be parsed
+          as a Date, ISO 8601 string, Temporal.Instant, or Temporal.ZonedDateTime.
+          The SDK throws synchronously inside step.sleepUntil() with the message
+          "Invalid Date, date string, Temporal.Instant, or Temporal.ZonedDateTime
+          passed to sleepUntil: <time>". Because this is a programmer-error
+          throw (not a runtime step failure), it bypasses the retry machinery
+          and crashes the function run immediately.
+        throws: >
+          Error("Invalid Date, date string, Temporal.Instant, or Temporal.ZonedDateTime
+          passed to sleepUntil: <time>") — thrown synchronously from the SDK.
+          Common triggers: passing a string that does not parse as ISO 8601,
+          passing undefined/null when user data was expected, passing a
+          Number-of-ms (which is sleep's signature, not sleepUntil's).
+        required_handling: >
+          Validate the time argument before calling step.sleepUntil(), OR wrap
+          step.sleepUntil() in try/catch to handle the synchronous throw:
+
+            const target = parseUserDate(userInput);
+            if (!target || isNaN(target.getTime())) {
+              return { status: "invalid_target_date" };
+            }
+            await step.sleepUntil("wait-until-target", target);
+
+          When validating dynamic dates from user input, prefer Date construction
+          with explicit validation over implicit string parsing.
+        source: "https://www.inngest.com/docs/reference/functions/step-sleep-until"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-sleep-until"
+          - "https://github.com/inngest/inngest-js/blob/main/packages/inngest/src/components/InngestStepTools.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: same docs page — "must be called using await or some other
+      # Promise handler to ensure your function sleeps correctly"
+      - id: step-sleep-until-not-awaited
+        condition: >
+          step.sleepUntil() is called without await (or .then/.catch). The
+          documentation explicitly states this must be awaited. Without await
+          the function does not pause, and the rest of the handler executes
+          immediately — defeating the purpose of the scheduled wait and
+          causing non-deterministic behavior on retry due to a memoization
+          mismatch.
+        throws: >
+          Silent failure: the function does not pause at the scheduled time.
+          The handler continues executing as if step.sleepUntil() resolved
+          instantly. Memoization shape differs from awaited form, so retries
+          may produce inconsistent results.
+        required_handling: >
+          Always await step.sleepUntil():
+
+            await step.sleepUntil("wait-until-trial-end", trialEndDate);
+        source: "https://www.inngest.com/docs/reference/functions/step-sleep-until"
+        sources:
+          - "https://www.inngest.com/docs/reference/functions/step-sleep-until"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: step.fetch
+    import_path: "inngest"
+    description: >
+      Durable HTTP fetch. Fetch-API compatible (typeof globalThis.fetch). When
+      called inside an Inngest function, the request is offloaded to the
+      Inngest platform — the function does not stay awake waiting on the
+      response. Falls back to global fetch when called outside an Inngest
+      execution context. Returns a Promise<Response> with standard Fetch API
+      semantics: HTTP 4xx/5xx do NOT throw (they resolve as response.ok=false);
+      only network failures, DNS, ECONNREFUSED, TLS errors, AbortController
+      timeouts throw a TypeError. Each call is memoized and retried per the
+      function's step retry policy.
+      Accessed via the `step` argument in the function handler callback, or
+      imported at module scope as `fetch` from "inngest".
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/features/inngest-functions/steps-workflows/fetch
+      # SDK source: components/Fetch.d.ts declares StepFetch as `typeof globalFetch`
+      # Behavior matches the global Fetch API: network errors throw TypeError
+      # ("Failed to fetch", "fetch failed", etc.). HTTP error status codes do NOT throw.
+      - id: step-fetch-network-error-no-try-catch
+        condition: >
+          step.fetch() called in an async context without a surrounding
+          try/catch block. Network-layer failures (DNS resolution failure,
+          ECONNREFUSED, TLS handshake error, AbortController abort, malformed
+          URL) throw a TypeError. Without try/catch, this terminates the
+          enclosing step.run() with a StepError after retries exhaust, or
+          bubbles uncaught when used outside a step.run() wrapper.
+        throws: >
+          TypeError — thrown by the underlying fetch implementation on:
+          - DNS resolution failure ("getaddrinfo ENOTFOUND")
+          - Connection refused ("ECONNREFUSED")
+          - Connection reset ("ECONNRESET")
+          - TLS errors ("self signed certificate", "unable to verify the first certificate")
+          - AbortController abort ("The operation was aborted")
+          - Malformed URL ("Invalid URL")
+          HTTP 4xx/5xx do NOT throw — they resolve with response.ok=false. Callers
+          MUST also check response.ok to handle HTTP-level errors.
+        required_handling: >
+          Wrap step.fetch() in try/catch AND check response.ok:
+
+            try {
+              const res = await step.fetch("call-external-api", "https://api.example.com/data");
+              if (!res.ok) {
+                throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+              }
+              return await res.json();
+            } catch (err) {
+              // TypeError (network) or thrown HTTP error from above
+              logger.error("step.fetch failed", { err });
+              throw err;  // propagate to trigger step retry
+            }
+
+          When step.fetch is called inside step.run(), the step retry policy
+          handles transient failures — but the inner try/catch + response.ok
+          check is still required to distinguish recoverable vs terminal errors.
+        source: "https://www.inngest.com/docs/features/inngest-functions/steps-workflows/fetch"
+        sources:
+          - "https://www.inngest.com/docs/features/inngest-functions/steps-workflows/fetch"
+          - "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#checking_that_the_fetch_was_successful"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: step.ai.infer
+    import_path: "inngest"
+    description: >
+      Offloads an AI inference request to the Inngest platform — the function
+      does not stay awake while the provider (OpenAI, Gemini, Anthropic, Grok,
+      Azure OpenAI) processes the request. Returns a Promise resolving to the
+      provider-specific response. Provider error semantics propagate: rate
+      limits, authentication failures, invalid-model errors, and timeout
+      errors all reject the Promise. Each call is memoized and retried per
+      the function's step retry policy.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: https://www.inngest.com/docs/features/inngest-functions/steps-workflows/step-ai-orchestration
+      # Inngest offloads the call but propagates provider errors back to the caller.
+      # AI providers (OpenAI, Anthropic, etc.) raise on:
+      # - Invalid/missing API key → AuthenticationError equivalent
+      # - Rate limit exceeded → RateLimitError equivalent (HTTP 429)
+      # - Invalid model name / unsupported model → InvalidRequestError
+      # - Input token limit exceeded → InvalidRequestError
+      # - Provider downtime / 5xx → APIError
+      - id: ai-infer-provider-error-no-try-catch
+        condition: >
+          step.ai.infer() called without a surrounding try/catch. Provider
+          errors (rate limit, auth, model not found, token limit, provider 5xx)
+          all reject the returned Promise. After step retries exhaust, the
+          uncaught error becomes a StepError and marks the Inngest function
+          as failed — for agentic workflows, this kills the entire chain.
+        throws: >
+          Provider-specific errors propagated through Inngest:
+          - AuthenticationError / 401 — invalid or missing API key for the provider
+          - RateLimitError / 429 — provider rate limit exceeded (especially during
+            burst inference or token-heavy batches)
+          - InvalidRequestError / 400 — unsupported model, malformed prompt,
+            input exceeds context window, missing required params
+          - APIError / 5xx — provider downtime, gateway timeout, transient failure
+          Inngest's step retry policy will retry retryable errors automatically;
+          a final StepError surfaces after retries exhaust.
+        required_handling: >
+          Wrap step.ai.infer() in try/catch and decide per-error-class whether
+          to fall back to a different model, queue for later, or mark the step
+          permanently failed:
+
+            try {
+              const result = await step.ai.infer("classify-message", {
+                model: openai({ model: "gpt-4o-mini" }),
+                body: { messages: [{ role: "user", content: input }] },
+              });
+              return result.choices[0].message.content;
+            } catch (err) {
+              // Provider error after Inngest retries exhausted
+              if (isRateLimitError(err)) {
+                throw new RetryAfterError("AI rate limit", "5 mins");
+              }
+              if (isAuthError(err)) {
+                throw new NonRetriableError("AI auth failed — check API key");
+              }
+              // Fallback model / human review
+              await step.run("queue-for-human-review", () => enqueue(input));
+              return null;
+            }
+
+          For agentic workflows that compose multiple step.ai.infer() calls,
+          each call needs its own error policy — failures should not silently
+          truncate the chain.
+        source: "https://www.inngest.com/docs/features/inngest-functions/steps-workflows/step-ai-orchestration"
+        sources:
+          - "https://www.inngest.com/docs/features/inngest-functions/steps-workflows/step-ai-orchestration"
+          - "https://platform.openai.com/docs/guides/error-codes"
+          - "https://docs.anthropic.com/en/api/errors"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: step.realtime.publish
+    import_path: "inngest"
+    description: >
+      Publishes a realtime message to a typed channel topic as a durable,
+      memoized step. Unlike inngest.realtime.publish() (client-level,
+      non-durable), step.realtime.publish() runs as its own step and will not
+      re-fire on retry. Returns Promise<TData> — the published data is
+      returned for chaining. Throws on schema validation failure (when the
+      topic has a "~standard" schema) and on non-ok responses from the
+      realtime API.
+      Accessed via the `step` argument in the function handler callback.
+
+    postconditions:
+      # Evidence: SDK source — components/InngestStepTools.cjs L166, L173
+      #   if ((await topicConfig.schema["~standard"].validate(data)).issues)
+      #     throw new Error(`Schema validation failed for topic "${topicRef.topic}"`);
+      #   if (!res.ok)
+      #     throw new Error(`Failed to publish to realtime: ${res.error?.error || "Unknown error"}`);
+      - id: step-realtime-publish-no-try-catch
+        condition: >
+          step.realtime.publish() called without a surrounding try/catch. The
+          SDK throws synchronously inside the step on either schema validation
+          failure (when the channel topic declares a Standard Schema validator)
+          or a non-ok response from the Inngest realtime API. After step retries
+          exhaust, the uncaught error becomes a StepError and marks the
+          enclosing function as failed.
+        throws: >
+          Error("Schema validation failed for topic <topic>") — thrown when
+          the published data fails the topic's Standard Schema validator. This
+          is a permanent failure that retries cannot resolve.
+
+          Error("Failed to publish to realtime: <reason>") — thrown when the
+          Inngest realtime API returns a non-ok response. Transient network /
+          API issues are auto-retried by Inngest's step retry policy.
+        required_handling: >
+          Wrap step.realtime.publish() in try/catch and distinguish schema
+          errors (permanent — fix the publisher) from transport errors
+          (transient — Inngest retries handle it):
+
+            try {
+              await step.realtime.publish(
+                "emit-progress",
+                channel.progress,
+                { percent: 50, message: "Halfway done" }
+              );
+            } catch (err) {
+              if (err.message.includes("Schema validation failed")) {
+                // Programmer error — log and proceed, do not retry
+                logger.error("Realtime payload schema violation", { err });
+                return;
+              }
+              throw err;  // transport — let step retry handle it
+            }
+        source: "https://www.inngest.com/docs/features/realtime"
+        sources:
+          - "https://www.inngest.com/docs/features/realtime"
+          - "https://github.com/inngest/inngest-js/blob/main/packages/inngest/src/components/InngestStepTools.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: realtime.publish
+    import_path: "inngest"
+    description: >
+      Client-level (non-durable) realtime publish. Emits a message to a typed
+      channel topic immediately, without memoization or step-level retry.
+      Intended for transient progress updates (token streams, throughput
+      tickers) where dropping a message is acceptable. Inside an Inngest
+      function handler, prefer step.realtime.publish() for durability — this
+      method is for non-durable contexts (API routes, scripts, server-side
+      handlers outside the function).
+      Accessed via inngest.realtime.publish() on the client instance.
+
+    postconditions:
+      # Evidence: SDK source — components/Inngest.cjs L358, L366
+      #   if ((await topicConfig.schema["~standard"].validate(data)).issues)
+      #     throw new Error(`Schema validation failed for topic "${topicRef.topic}"`);
+      #   if (!res.ok)
+      #     throw new Error(`Failed to publish to realtime: ${res.error?.error || "Unknown error"}`);
+      - id: realtime-publish-no-try-catch
+        condition: >
+          inngest.realtime.publish() called without a surrounding try/catch.
+          Unlike the step-level variant, this is NOT retried — a single
+          non-ok response from the realtime API causes a permanent throw.
+          Schema validation failures (when the topic declares a Standard
+          Schema validator) also throw permanently. Failures here often
+          surface inside API route handlers, where an uncaught throw becomes
+          an HTTP 500 to the calling client.
+        throws: >
+          Error("Schema validation failed for topic <topic>") — thrown when
+          the published data fails the topic's Standard Schema validator.
+
+          Error("Failed to publish to realtime: <reason>") — thrown when the
+          Inngest realtime API returns a non-ok response (network failure,
+          auth failure, rate limit, downtime). No automatic retry.
+        required_handling: >
+          Wrap inngest.realtime.publish() in try/catch — there is no step-level
+          retry safety net here:
+
+            try {
+              await inngest.realtime.publish(channel.status, {
+                percent: progress,
+                message: "Working...",
+              });
+            } catch (err) {
+              // Progress update lost — log but do NOT fail the request.
+              // Realtime is best-effort by design at the client level.
+              logger.warn("Failed to publish realtime update", { err });
+            }
+
+          For critical updates that MUST be delivered, use step.realtime.publish()
+          inside an Inngest function handler instead — it benefits from step
+          retry semantics.
+        source: "https://www.inngest.com/docs/features/realtime"
+        sources:
+          - "https://www.inngest.com/docs/features/realtime"
+          - "https://github.com/inngest/inngest-js/blob/main/packages/inngest/src/components/Inngest.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "inngest.send() makes an HTTP call to the Inngest API — always needs try-catch"
   - "serve() (from inngest/next, inngest/hono, etc.) does NOT need try-catch — factory only"
@@ -307,3 +722,13 @@ notes:
   - "step.run() throws StepError after all retries exhausted — catch it to implement rollback patterns"
   - "step.waitForEvent() null return is NOT an error — it means timeout elapsed, handle it explicitly"
   - "step.sendEvent() must be awaited — non-awaited call breaks memoization and function execution flow"
+  - "step.sleep() / step.sleepUntil() must be awaited — non-awaited call defeats the durable pause"
+  - "step.sleepUntil() throws synchronously on invalid date — validate the time arg or wrap in try/catch"
+  - "step.fetch() follows global Fetch API semantics — HTTP 4xx/5xx do NOT throw, network errors DO throw TypeError"
+  - "step.ai.infer() propagates provider errors (rate limit / auth / model / 5xx) after Inngest retries exhaust"
+  - "step.realtime.publish() throws on schema validation failure (permanent) and non-ok realtime API response (transient — auto-retried)"
+  - "inngest.realtime.publish() is non-durable — no step-level retry; failures must be tolerated by the caller"
+  - "Intentionally omitted (experimental, marked unstable in SDK d.ts as of 4.11.0): inngest.sendSignal(), step.sendSignal(), step.waitForSignal() — revisit once promoted out of EXPERIMENTAL"
+  - "Intentionally omitted (synchronous / factory / no novel async contract): createFunction, serve, setEnvVars, endpoint, endpointProxy, NonRetriableError, RetryAfterError, StepError, isInngest, isInngestFunction, isInngestRequest, serializeError, slugify, fetch (module-level export — same surface as step.fetch and global fetch)"
+  - "Intentionally omitted (wraps user-provided SDK call — error semantics same as wrapped SDK, no novel contract surface): step.ai.wrap()"
+  - "Intentionally omitted (low real-world adoption + auxiliary network read): inngest.realtime.subscribe(), inngest.realtime.token()"
