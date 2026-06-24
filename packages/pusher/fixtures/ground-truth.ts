@@ -223,3 +223,51 @@ export async function postEventWithCatch(path: string, body: object) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. trigger — encrypted-channel guards (added 2026-06-24 deepen pass)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const pusherEncrypted = new Pusher({
+  appId: process.env.PUSHER_APP_ID || 'test-app-id',
+  key: process.env.PUSHER_KEY || 'test-key',
+  secret: process.env.PUSHER_SECRET || 'test-secret',
+  cluster: 'us2',
+  encryptionMasterKeyBase64: process.env.PUSHER_ENCRYPTION_KEY || 'YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU=',
+});
+
+export async function triggerEncryptedMultiChannelNoCatch(roomIds: string[], payload: object) {
+  // SHOULD_FIRE: trigger-encrypted-multi-channel-error — sync plain Error when multi-encrypted-channel trigger has no try-catch
+  await pusherEncrypted.trigger(roomIds.map(id => `private-encrypted-${id}`), 'msg', payload);
+}
+
+export async function triggerEncryptedMultiChannelWithCatch(roomIds: string[], payload: object) {
+  try {
+    // SHOULD_NOT_FIRE: encrypted multi-channel trigger inside try-catch (caller may fan out per channel)
+    await pusherEncrypted.trigger(roomIds.map(id => `private-encrypted-${id}`), 'msg', payload);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('encrypted channels')) {
+      for (const id of roomIds) {
+        await pusherEncrypted.trigger(`private-encrypted-${id}`, 'msg', payload);
+      }
+    }
+    throw err;
+  }
+}
+
+export async function triggerEncryptedMissingMasterKeyNoCatch(roomId: string, payload: object) {
+  // SHOULD_FIRE: trigger-encryption-master-key-missing — pusher constructed without encryptionMasterKeyBase64, encrypted trigger throws sync
+  await pusher.trigger(`private-encrypted-${roomId}`, 'msg', payload);
+}
+
+export async function triggerEncryptedMissingMasterKeyWithCatch(roomId: string, payload: object) {
+  try {
+    // SHOULD_NOT_FIRE: encrypted trigger inside try-catch surfaces the setup error
+    await pusher.trigger(`private-encrypted-${roomId}`, 'msg', payload);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('encryptionMasterKey')) {
+      console.error('Pusher encrypted-channel setup error — check config');
+    }
+    throw err;
+  }
+}

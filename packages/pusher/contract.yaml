@@ -1,11 +1,12 @@
 package: pusher
 semver: "^5.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-11"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
+coverage_score: 1.0  # 6 contracted / 6 async-callable (3 sync methods omitted; trigger() now covers encrypted-channel guards added 2026-06-24)
 
 functions:
   - name: trigger
@@ -53,6 +54,91 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Evidence: lib/events.js exports.trigger lines 36-44 — throws synchronously when
+      # channels.length > 1 AND any channel name starts with `private-encrypted-`.
+      # Pusher end-to-end encryption only supports single-channel triggers; multi-channel
+      # encrypted broadcasts are not allowed. Confirmed in pusher@5.3.4.
+      - id: trigger-encrypted-multi-channel-error
+        condition: >
+          Calling trigger() with an array of channels where any channel name starts
+          with `private-encrypted-` (E2E encrypted channel) and channels.length > 1.
+          Encrypted channels can only be triggered one at a time.
+        throws: >
+          Plain Error: "You cannot trigger to multiple channels when using encrypted channels".
+          Thrown synchronously inside the returned Promise body before any HTTP request —
+          a try-catch around `await pusher.trigger(...)` catches it as a rejected Promise.
+        required_handling: >
+          Caller MUST handle this error path when triggering across multiple channels with
+          mixed channel types. Either pre-filter encrypted channels and call trigger() per
+          channel for those, or document the constraint in the calling layer.
+
+            try {
+              await pusher.trigger(channels, event, data);
+            } catch (err) {
+              if (err.message.includes('encrypted channels')) {
+                for (const ch of channels) {
+                  await pusher.trigger(ch, event, data);
+                }
+              }
+              throw err;
+            }
+
+          Bypassing this error means the original event silently never sends — a real-time
+          data loss bug masked as a rejected Promise.
+        sources:
+          - "https://github.com/pusher/pusher-http-node/blob/master/lib/events.js#L36-L44"
+          - "https://pusher.com/docs/channels/using_channels/encrypted-channels/"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: lib/events.js encrypt() lines 6-10 — throws synchronously when an encrypted
+      # channel is triggered without `encryptionMasterKeyBase64` set in Pusher constructor opts.
+      # Pre-validation path before any HTTP call. Confirmed in pusher@5.3.4.
+      - id: trigger-encryption-master-key-missing
+        condition: >
+          Calling trigger() on a `private-encrypted-` channel when the Pusher client was
+          constructed without `encryptionMasterKeyBase64`. The library has no fallback —
+          E2E encryption requires a master key, and absence is treated as a programming error.
+        throws: >
+          Plain Error: "Set encryptionMasterKey before triggering events on encrypted channels".
+          Thrown synchronously from encrypt() during the trigger() call body. Rejects the
+          returned Promise — visible to a try-catch around `await pusher.trigger(...)`.
+        required_handling: >
+          Caller MUST configure encryptionMasterKeyBase64 in the Pusher() constructor when
+          any encrypted channel will be triggered. This is a setup-time invariant — failing
+          here means the entire encrypted-channel feature is broken at runtime.
+
+            const pusher = new Pusher({
+              appId, key, secret, cluster,
+              encryptionMasterKeyBase64: process.env.PUSHER_ENCRYPTION_KEY,
+            });
+            try {
+              await pusher.trigger('private-encrypted-room', 'msg', payload);
+            } catch (err) {
+              if (err.message.includes('encryptionMasterKey')) {
+                console.error('Pusher encrypted-channel setup error — check config');
+              }
+              throw err;
+            }
+
+          Without handling, encrypted-channel events silently fail every time, leaving
+          end-to-end encrypted UX broken across the entire deployment.
+        sources:
+          - "https://github.com/pusher/pusher-http-node/blob/master/lib/events.js#L6-L10"
+          - "https://pusher.com/docs/channels/using_channels/encrypted-channels/#how-it-works"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: triggerBatch
     import_path: "pusher"
@@ -286,9 +372,9 @@ functions:
           incident_cost_range: low
 
 metadata:
-  last_verified: "2026-04-17"
+  last_verified: "2026-06-24"
   evidence_quality: confirmed
-  coverage_score: 0.83  # 5 contracted / 6 total async-callable (terminateUserConnections, get, post added; get/post are LOW priority but contracted for completeness)
+  coverage_score: 1.0  # 6 contracted / 6 async-callable; trigger() deepened with 2 encrypted-channel postconditions on 2026-06-24 (pusher@5.3.4 surface re-verified)
 
 notes:
   - "pusher uses its own RequestError class (not a standard Error subclass) — check instanceof Pusher.RequestError"
@@ -303,3 +389,5 @@ notes:
   - "terminateUserConnections() disconnects current sessions only — pair with blocking auth endpoint to prevent reconnection"
   - "get() HTTP 400 for invalid attribute on wrong channel type (e.g. user_count on non-presence channel)"
   - "post() HTTP 413 when event payload exceeds 10KB Pusher limit"
+  - "trigger() throws sync plain Error when triggering >1 channel where any is `private-encrypted-` — E2E encryption forbids multi-channel"
+  - "trigger() throws sync plain Error when `encryptionMasterKeyBase64` is missing from Pusher() opts and an encrypted channel is targeted"
