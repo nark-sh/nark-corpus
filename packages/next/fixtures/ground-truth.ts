@@ -207,14 +207,179 @@ async function getCachedUserCorrect(userId: string) {
 }
 
 // ============================================================
+// Depth pass 2026-06-24 — class-hierarchy gaps added in v1.2.0
+// forbidden() / unauthorized() / connection() / draftMode() / after() / updateTag()
+// ============================================================
+
+import { forbidden, unauthorized } from 'next/navigation';
+import { connection, after } from 'next/server';
+import { draftMode } from 'next/headers';
+import { updateTag } from 'next/cache';
+
+// ----- forbidden() inside try-catch — VIOLATION -----
+
+// SHOULD_FIRE: forbidden-inside-try-catch
+async function forbiddenInsideTryCatch(postId: string, viewerId: string) {
+  try {
+    const post = await fetchPost(postId);
+    if ((post as any)?.ownerId !== viewerId) forbidden();
+    return post;
+  } catch (error) {
+    console.error('Error:', error);
+    return null;
+  }
+}
+
+// @expect-clean
+async function forbiddenOutsideTryCatch(postId: string, viewerId: string) {
+  let post: { id: string; title: string } | null;
+  try {
+    post = await fetchPost(postId);
+  } catch (error) {
+    console.error('DB error:', error);
+    throw error;
+  }
+  if ((post as any)?.ownerId !== viewerId) forbidden();
+  return post;
+}
+
+// ----- unauthorized() inside try-catch — VIOLATION -----
+
+// SHOULD_FIRE: unauthorized-inside-try-catch
+async function unauthorizedInsideTryCatch() {
+  try {
+    const session = await getSession();
+    if (!session) unauthorized();
+    return session;
+  } catch (error) {
+    console.error('Session error:', error);
+    return null;
+  }
+}
+
+// @expect-clean
+async function unauthorizedOutsideTryCatch() {
+  let session: { user: { id: string } } | null;
+  try {
+    session = await getSession();
+  } catch (error) {
+    console.error('Session lookup failed:', error);
+    throw error;
+  }
+  if (!session) unauthorized();
+  return session;
+}
+
+// ----- connection() missing await — VIOLATION -----
+
+// SHOULD_FIRE: connection-missing-await
+async function connectionWithoutAwait() {
+  connection();
+  return Date.now();
+}
+
+// @expect-clean
+async function connectionWithAwait() {
+  await connection();
+  return Date.now();
+}
+
+// ----- connection() inside after() — VIOLATION -----
+
+// SHOULD_FIRE: connection-inside-after
+async function connectionInsideAfterScope() {
+  after(async () => {
+    await connection();
+    await sendMetric('post-response');
+  });
+}
+
+// @expect-clean
+async function connectionBeforeAfterScope() {
+  await connection();
+  after(async () => {
+    await sendMetric('post-response');
+  });
+}
+
+// ----- draftMode() missing await — VIOLATION -----
+
+// SHOULD_FIRE: draft-mode-missing-await
+async function draftModeWithoutAwait() {
+  const { isEnabled } = draftMode() as unknown as { isEnabled: boolean };
+  if (isEnabled) return fetchDraftPost('1');
+  return fetchPost('1');
+}
+
+// @expect-clean
+async function draftModeWithAwait() {
+  const { isEnabled } = await draftMode();
+  if (isEnabled) return fetchDraftPost('1');
+  return fetchPost('1');
+}
+
+// ----- after() callback with no error handling — VIOLATION -----
+
+// SHOULD_FIRE: after-error-swallowed
+async function afterCallbackNoErrorHandling(data: { id: string }) {
+  after(async () => {
+    await sendAnalytics(data);
+  });
+  return { ok: true };
+}
+
+// @expect-clean
+async function afterCallbackWithErrorHandling(data: { id: string }) {
+  after(async () => {
+    try {
+      await sendAnalytics(data);
+    } catch (err) {
+      console.error('after analytics failed:', err);
+    }
+  });
+  return { ok: true };
+}
+
+// ----- updateTag() after redirect — VIOLATION -----
+
+// SHOULD_FIRE: update-tag-after-redirect
+async function updateTagAfterRedirect(postId: string) {
+  'use server';
+  await updateInDB({ id: postId });
+  redirect('/posts');
+  updateTag('posts');
+}
+
+// @expect-clean
+async function updateTagBeforeRedirect(postId: string) {
+  'use server';
+  await updateInDB({ id: postId });
+  updateTag('posts');
+  redirect('/posts');
+}
+
+// ----- updateTag() outside Server Action — VIOLATION -----
+
+// SHOULD_FIRE: update-tag-outside-server-action
+export async function POST_updateTagFromRouteHandler(req: Request) {
+  const event = await req.json();
+  await createInDB(event as { title: string });
+  updateTag('events');
+  return Response.json({ ok: true });
+}
+
+// ============================================================
 // Stub functions (not part of behavioral contract tests)
 // ============================================================
 
 declare function fetchUser(id: string): Promise<{ id: string; name: string } | null>;
 declare function fetchPost(id: string): Promise<{ id: string; title: string } | null>;
+declare function fetchDraftPost(id: string): Promise<{ id: string; title: string } | null>;
 declare function deleteFromDB(id: string): Promise<void>;
 declare function createInDB(data: { title: string }): Promise<{ id: string }>;
 declare function updateInDB(data: { id: string }): Promise<void>;
 declare function fetchDataFromDB(): Promise<unknown>;
 declare function fetchUserWithToken(userId: string, token: string): Promise<unknown>;
 declare function getSession(): Promise<{ user: { id: string } } | null>;
+declare function sendMetric(name: string): Promise<void>;
+declare function sendAnalytics(data: { id: string }): Promise<void>;

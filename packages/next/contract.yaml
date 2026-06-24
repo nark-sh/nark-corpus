@@ -24,6 +24,33 @@
 #                      revalidatePath, revalidateTag)
 # Omitted: 7 (client-side hooks and declarative directives with no error contracts)
 # Coverage: 9/9 = 1.0 (effective contracted/non-omitted)
+#
+# Depth pass 2026-06-24 (deepen-stream-3 pass 56, class-hierarchy gaps mode):
+# Next.js 16.2.9 introduced new sibling control-flow + request-scope APIs not covered
+# in the 2026-04-17 pass:
+#   - forbidden() / unauthorized() — siblings of notFound() in HTTPAccessFallback family
+#     (digest "NEXT_HTTP_ERROR_FALLBACK;403" and ";401"), experimental.authInterrupts-gated
+#   - connection() — async (Promise<void>), sibling of cookies()/headers() — must await
+#   - draftMode() — async in v15+ (Promise<DraftMode>), sibling of cookies()/headers()
+#   - after() — post-response callback scheduler with swallowed errors
+#   - updateTag() — read-your-own-writes revalidation sibling to revalidateTag()
+# Contracted before: 9
+# Contracted after: 15 (+6 functions, +9 postconditions)
+# Omitted: 7 (unchanged — client hooks)
+# Coverage: 15/15 = 1.0 (effective)
+# Evidence sources fetched this pass:
+#   https://nextjs.org/docs/app/api-reference/functions/forbidden (2026-06-24)
+#   https://nextjs.org/docs/app/api-reference/functions/unauthorized (2026-06-24)
+#   https://nextjs.org/docs/app/api-reference/functions/connection (2026-06-24)
+#   https://nextjs.org/docs/app/api-reference/functions/draft-mode (2026-06-24)
+#   https://nextjs.org/docs/app/api-reference/functions/after (2026-06-24)
+#   https://nextjs.org/docs/app/api-reference/functions/updateTag (2026-06-24)
+#   node_modules/next@16.2.9/dist/client/components/forbidden.js (E1019, digest 403)
+#   node_modules/next@16.2.9/dist/client/components/unauthorized.js (E1002, digest 401)
+#   node_modules/next@16.2.9/dist/server/request/connection.js (E827, E841)
+#   node_modules/next@16.2.9/dist/server/request/draft-mode.d.ts (Promise<DraftMode>)
+#   node_modules/next@16.2.9/dist/server/after/after.js (E468)
+#   node_modules/next@16.2.9/dist/server/web/spec-extension/revalidate.d.ts (updateTag)
 # Evidence sources confirmed from:
 #   https://nextjs.org/docs/app/api-reference/functions/redirect (fetched 2026-04-17)
 #   https://nextjs.org/docs/app/api-reference/functions/not-found (fetched 2026-04-17)
@@ -38,13 +65,13 @@
 #   node_modules/next/dist/client/components/http-access-fallback/http-access-fallback.d.ts
 package: "next"
 semver: ">=13.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 9 contracted / 9 non-omitted async-callable functions
+coverage_score: 1.0  # 15 contracted / 15 non-omitted async-callable functions (Next.js 16.x surface)
 
 detection:
   type_names:
@@ -856,6 +883,505 @@ functions:
           visibility: visible
           user_experience: degraded_performance
           incident_cost_range: low
+
+  - name: forbidden
+    import_path: "next/navigation"
+    description: >
+      Renders the forbidden.js UI for a route segment and sets the HTTP status to 403.
+      New in Next.js 15 (experimental, gated by experimental.authInterrupts). Same
+      class hierarchy as notFound() — HTTPAccessFallback control-flow throw.
+      Used for authenticated-but-not-authorized scenarios (user is logged in but lacks
+      permission for the resource).
+      Confirmed from next/dist/client/components/forbidden.js source:
+      digest = "NEXT_HTTP_ERROR_FALLBACK;403". Throws when experimental.authInterrupts
+      is OFF as well — with a different "must enable feature" error.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/forbidden (fetched 2026-06-24)
+      # Source: node_modules/next/dist/client/components/forbidden.js
+      # DIGEST = `${HTTP_ERROR_FALLBACK_ERROR_CODE};403` — same family as notFound/unauthorized
+      # isHTTPAccessFallbackError() detects all three (404/401/403)
+      - id: forbidden-inside-try-catch
+        condition: >
+          forbidden() is called inside a try-catch block. Like notFound() and
+          unauthorized(), forbidden() works by throwing an HTTPAccessFallbackError
+          with digest="NEXT_HTTP_ERROR_FALLBACK;403". The catch block intercepts
+          the throw and the 403 page never renders — the request continues with
+          incomplete/null data, leaking access to the unauthorized resource.
+
+          Critical security issue: an authorization guard that wraps forbidden()
+          in try-catch becomes a no-op authorization check. The user receives
+          the resource (or a partially-rendered page) instead of a 403 response.
+
+          Common buggy pattern in admin guards:
+            try {
+              const post = await db.post.findFirst({ where: { id } });
+              if (post.ownerId !== session.userId) forbidden();  // SWALLOWED!
+              return <PostEditor post={post} />;
+            } catch (error) {
+              console.error(error);  // catches the forbidden throw
+              return <PostEditor post={null} />;  // serves the editor anyway
+            }
+        throws: >
+          HTTPAccessFallbackError — Error object with digest: "NEXT_HTTP_ERROR_FALLBACK;403"
+          Type: `Error & { digest: string }` where digest = "NEXT_HTTP_ERROR_FALLBACK;403"
+          CONSTANT: HTTP_ERROR_FALLBACK_ERROR_CODE = "NEXT_HTTP_ERROR_FALLBACK"
+          Use `isHTTPAccessFallbackError(error)` to detect and re-throw.
+          Note: If experimental.authInterrupts is disabled, forbidden() throws a
+          DIFFERENT error first ("forbidden() is experimental...") — both must be
+          re-thrown when caught.
+        required_handling: >
+          Call forbidden() OUTSIDE the try block. If wrapping is unavoidable
+          (e.g. error boundary around all auth logic), re-throw the fallback error:
+
+            // CORRECT
+            export default async function AdminPage({ params }) {
+              const session = await getSession();
+              const post = await db.post.findUnique({ where: { id: params.id } });
+              if (post.ownerId !== session.userId) {
+                forbidden();  // outside any try-catch
+              }
+              return <PostEditor post={post} />;
+            }
+
+            // CORRECT if try-catch is required:
+            try {
+              const result = await fetchProtectedData();
+              if (!canAccess(result)) forbidden();
+            } catch (error) {
+              if (isHTTPAccessFallbackError(error)) throw error;  // re-throw!
+              console.error('Actual error:', error);
+            }
+
+            // Also enable in next.config:
+            // module.exports = { experimental: { authInterrupts: true } }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/forbidden"
+          - "https://nextjs.org/docs/app/api-reference/file-conventions/forbidden"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: security_breach
+          incident_cost_range: critical
+
+  - name: unauthorized
+    import_path: "next/navigation"
+    description: >
+      Renders the unauthorized.js UI for a route segment and sets the HTTP status to 401.
+      New in Next.js 15 (experimental, gated by experimental.authInterrupts). Sibling
+      to forbidden() — distinct status code (401 vs 403). Used when the user is NOT
+      authenticated (no session) and must log in to access the resource.
+      Confirmed from next/dist/client/components/unauthorized.js source:
+      digest = "NEXT_HTTP_ERROR_FALLBACK;401". Same throwing mechanism as forbidden().
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/unauthorized (fetched 2026-06-24)
+      # Source: node_modules/next/dist/client/components/unauthorized.js
+      # DIGEST = `${HTTP_ERROR_FALLBACK_ERROR_CODE};401`
+      - id: unauthorized-inside-try-catch
+        condition: >
+          unauthorized() is called inside a try-catch block. Same control-flow
+          throw as forbidden() and notFound() — the catch silently swallows the
+          401 throw, and the request continues rendering with incomplete data
+          instead of returning a 401 response.
+
+          Auth guards wrapped in broad try-catch become no-ops. Unauthenticated
+          users receive content meant for authenticated users.
+
+          Common buggy pattern:
+            try {
+              const session = await getSession();
+              if (!session) unauthorized();  // SWALLOWED!
+              return <Dashboard userId={session.userId} />;  // session is undefined here
+            } catch (error) {
+              console.error(error);
+              return <Dashboard userId={null} />;  // serves dashboard anonymously
+            }
+        throws: >
+          HTTPAccessFallbackError — Error object with digest: "NEXT_HTTP_ERROR_FALLBACK;401"
+          Type: `Error & { digest: string }` where digest = "NEXT_HTTP_ERROR_FALLBACK;401"
+          CONSTANT: HTTP_ERROR_FALLBACK_ERROR_CODE = "NEXT_HTTP_ERROR_FALLBACK"
+          Use `isHTTPAccessFallbackError(error)` to detect and re-throw.
+          Same caveat as forbidden(): without experimental.authInterrupts enabled,
+          an experimental-feature-disabled error throws first.
+        required_handling: >
+          Call unauthorized() OUTSIDE try-catch, OR re-throw fallback errors when caught:
+
+            // CORRECT
+            export default async function DashboardPage() {
+              const session = await getSession();
+              if (!session) {
+                unauthorized();  // outside any try-catch
+              }
+              return <Dashboard userId={session.userId} />;
+            }
+
+            // CORRECT if try-catch is required:
+            try {
+              const session = await getSessionWithRefresh();
+              if (!session) unauthorized();
+            } catch (error) {
+              if (isHTTPAccessFallbackError(error)) throw error;  // re-throw!
+              console.error('Session refresh failed:', error);
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/unauthorized"
+          - "https://nextjs.org/docs/app/api-reference/file-conventions/unauthorized"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: critical
+
+  - name: connection
+    import_path: "next/server"
+    description: >
+      Indicates that the subsequent code requires an actual user Request before
+      continuing. During prerendering it never resolves (forces dynamic rendering);
+      during rendering it resolves immediately. New in Next.js 15 — replaces
+      unstable_noStore() for explicit dynamic opt-in. Returns Promise<void> and
+      MUST be awaited.
+      Confirmed from next/dist/server/request/connection.js: throws E827 when
+      called inside after(), E841 when called inside "use cache", and
+      StaticGenBailoutError when called with `dynamic = "error"`.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/connection (fetched 2026-06-24)
+      # Source: node_modules/next/dist/server/request/connection.js
+      - id: connection-missing-await
+        condition: >
+          connection() is called without await. Because connection() returns
+          Promise<void>, the function body continues executing immediately without
+          waiting for the dynamic-boundary signal. During prerendering this defeats
+          the entire purpose of the call — Next.js cannot detect that this code
+          must only run for a real request, so it may prerender the route statically
+          with stale or incorrect data.
+
+          Forgetting await on connection() is one of the most subtle Next.js bugs
+          because it doesn't crash — it silently produces a route that "works"
+          locally but renders incorrectly when deployed (e.g. random values appear
+          frozen at build time, request-specific data is missing).
+        throws: >
+          No exception thrown — the Promise is silently dropped. The bug surfaces
+          as static prerendering of code that should be dynamic. May produce
+          "PrerenderInterruptedError" in newer Next.js versions if the call site
+          is in a strict prerender scope.
+        required_handling: >
+          ALWAYS await connection():
+
+            // CORRECT
+            import { connection } from 'next/server';
+
+            export default async function Page() {
+              await connection();  // dynamic boundary signal
+              const now = Date.now();  // this code only runs for real requests
+              return <div>Current time: {now}</div>;
+            }
+
+            // WRONG
+            export default async function Page() {
+              connection();  // returns Promise, never awaited — bug!
+              const now = Date.now();  // may run at build time, frozen
+              return <div>Current time: {now}</div>;
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/connection"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: connection-inside-after
+        condition: >
+          connection() is called inside an after() callback. The after() phase
+          executes AFTER the request has finished, so the "wait for a real request"
+          semantic is contradictory. Next.js throws E827 explicitly to flag this
+          mistake at runtime.
+        throws: >
+          Error with __NEXT_ERROR_CODE = "E827" and message:
+          "Route ... used `connection()` inside `after()`. The `connection()`
+          function is used to indicate the subsequent code must only run when
+          there is an actual Request, but `after()` executes after the request,
+          so this function is not allowed in this scope."
+        required_handling: >
+          Do not call connection() inside after() callbacks. Move connection()
+          before the after() schedule, or restructure the code so the dynamic
+          opt-in happens during the request, not after it.
+
+            // WRONG
+            after(async () => {
+              await connection();  // throws E827
+              await sendMetric();
+            });
+
+            // CORRECT
+            await connection();
+            after(async () => {
+              await sendMetric();
+            });
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/connection"
+          - "https://nextjs.org/docs/app/api-reference/functions/after"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: draftMode
+    import_path: "next/headers"
+    description: >
+      Returns the current request's draft mode state (enabled/disabled) and the
+      methods to enable/disable it. ASYNC in Next.js 15+ — returns Promise<DraftMode>
+      that MUST be awaited. Used for preview environments where editors want to see
+      unpublished content. Sibling to cookies() and headers() — same async signature
+      change in Next.js 15.
+      Confirmed from next/dist/server/request/draft-mode.js: returns
+      createOrGetCachedDraftMode(provider, workStore) — a Promise resolving to
+      a DraftMode instance with isEnabled getter and enable()/disable() methods.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/draft-mode (fetched 2026-06-24)
+      # Source: node_modules/next/dist/server/request/draft-mode.d.ts — Promise<DraftMode>
+      # Sibling pattern to cookies()/headers() — both are async in v15+
+      - id: draft-mode-missing-await
+        condition: >
+          draftMode() is called without await, and the returned Promise object is
+          accessed directly (e.g. `draftMode().isEnabled`). The result is reading
+          the isEnabled getter on the Promise object itself, which returns undefined
+          — every check for "is draft mode on" silently returns false, and the
+          editor's preview never displays unpublished content.
+
+          Common buggy upgrade pattern from Next.js 14 → 15:
+            // worked in v14 (synchronous), broken in v15 (returns Promise)
+            const { isEnabled } = draftMode();  // isEnabled is undefined!
+            if (isEnabled) {
+              return fetchDraft(id);
+            }
+            return fetchPublished(id);  // ALWAYS hits this branch in v15
+        throws: >
+          No exception thrown — the bug is silent. TypeScript may catch it in
+          strict mode (Promise has no isEnabled property), but JavaScript users
+          and projects without strict types ship the bug to production.
+        required_handling: >
+          ALWAYS await draftMode():
+
+            // CORRECT (Next.js 15+)
+            import { draftMode } from 'next/headers';
+
+            export default async function PostPage({ params }) {
+              const { isEnabled } = await draftMode();
+              const post = isEnabled
+                ? await fetchDraft(params.id)
+                : await fetchPublished(params.id);
+              return <Post post={post} />;
+            }
+
+            // WRONG (Next.js 14 syntax still in v15 code)
+            const { isEnabled } = draftMode();  // isEnabled === undefined
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/draft-mode"
+          - "https://nextjs.org/docs/app/api-reference/file-conventions/route-segment-config"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: after
+    import_path: "next/server"
+    description: >
+      Schedules a callback to execute after the current request finishes sending
+      its response. New in Next.js 15 (stable in 15.1+). Used for analytics,
+      logging, and side effects that should not block the response. The task
+      runs in a separate phase where most request-bound APIs (cookies, headers,
+      connection) are disallowed.
+      Confirmed from next/dist/server/after/after.js: throws E468 if called
+      outside a request scope. The callback's errors do NOT propagate to the
+      caller — they are logged by Next.js and suppressed.
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/after (fetched 2026-06-24)
+      # Source: node_modules/next/dist/server/after/after.js
+      - id: after-error-swallowed
+        condition: >
+          An async callback passed to after() throws an error and the caller
+          assumes the error will surface in the request handler. It will not.
+          Next.js executes after() callbacks in a post-response phase where the
+          response has already been sent — there is no way to surface a 5xx to
+          the client. Failures in after() callbacks are logged to the server but
+          invisible to monitoring that only watches HTTP error rates.
+
+          This breaks observability assumptions: a Stripe webhook send inside
+          after() that fails will silently drop the event with no Sentry/Datadog
+          alert tied to the originating request.
+        throws: >
+          No exception propagates to the caller. The after() task's error is
+          caught internally and logged to stderr. The original request returns
+          200 even when the after() callback fails.
+        required_handling: >
+          Wrap after() callback bodies in try-catch and forward errors to your
+          error tracker explicitly:
+
+            // CORRECT
+            import { after } from 'next/server';
+            import * as Sentry from '@sentry/nextjs';
+
+            export async function POST(req: Request) {
+              const data = await req.json();
+              await db.event.create({ data });
+
+              after(async () => {
+                try {
+                  await analytics.track('event_created', data);
+                } catch (err) {
+                  Sentry.captureException(err, { tags: { source: 'after' } });
+                }
+              });
+
+              return Response.json({ ok: true });
+            }
+
+            // WRONG — silent failure
+            after(async () => {
+              await analytics.track('event_created', data);
+              // throws? logged to stderr only, no Sentry, no alert
+            });
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/after"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: after-called-outside-request-scope
+        condition: >
+          after() is called from code that runs outside a Next.js request scope
+          (e.g. a module-level side effect, a script run during build, or a
+          callback that escapes the request lifecycle). Next.js cannot schedule
+          the post-response work without a workStore, so it throws E468 at the
+          call site.
+        throws: >
+          Error with __NEXT_ERROR_CODE = "E468" and message:
+          "`after` was called outside a request scope."
+        required_handling: >
+          Only call after() inside a Route Handler, Server Action, or Server
+          Component executing during a request. Move module-level side effects
+          to instrumentation.ts or use the proper request-scoped API.
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/after"
+          - "https://nextjs.org/docs/messages/next-dynamic-api-wrong-context"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: updateTag
+    import_path: "next/cache"
+    description: >
+      Updates cached data on-demand for a specific cache tag, with read-your-own-writes
+      semantics. New in Next.js 16. Stronger than revalidateTag() — guarantees that
+      subsequent reads in the same Server Action see the fresh value. Can ONLY be
+      called from within a Server Action.
+      Confirmed from next/dist/server/web/spec-extension/revalidate.d.ts:
+      `updateTag(tag: string): undefined`. Must be called BEFORE redirect() in a
+      Server Action (same dead-code constraint as revalidateTag/revalidatePath).
+    postconditions:
+      # Evidence: https://nextjs.org/docs/app/api-reference/functions/updateTag (fetched 2026-06-24)
+      # Source: node_modules/next/dist/server/web/spec-extension/revalidate.d.ts
+      - id: update-tag-after-redirect
+        condition: >
+          updateTag() is called after redirect() in a Server Action. redirect()
+          throws RedirectError, so any code after it is unreachable. The cache
+          tag is never updated and clients receive stale data after the redirect
+          completes.
+
+          Same dead-code pattern as revalidateTag() and revalidatePath() — Next.js
+          control-flow throws make ordering matter.
+        throws: >
+          redirect() throws RedirectError — updateTag() never executes. No new
+          error; the bug is the silent omission.
+        required_handling: >
+          Call updateTag() BEFORE redirect():
+
+            // CORRECT
+            export async function publishPost(postId: string) {
+              'use server';
+              await db.post.update({ where: { id: postId }, data: { published: true } });
+              updateTag('posts');    // before redirect
+              redirect('/posts');
+            }
+
+            // WRONG
+            export async function publishPost(postId: string) {
+              'use server';
+              await db.post.update({ ... });
+              redirect('/posts');    // throws
+              updateTag('posts');    // dead code
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/updateTag"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: update-tag-outside-server-action
+        condition: >
+          updateTag() is called from a Route Handler or Server Component instead
+          of a Server Action. updateTag() is restricted to Server Actions because
+          read-your-own-writes semantics require the request to continue executing
+          after the cache write — Route Handlers terminate before that opportunity.
+          Calling it elsewhere throws or no-ops depending on Next.js version.
+        throws: >
+          In Next.js 16.x: Error indicating updateTag must be called from a Server
+          Action. The exact message and code may evolve — caller MUST handle the
+          throw or restructure to use revalidateTag() (which works in any context).
+        required_handling: >
+          Use updateTag() only inside `'use server'` functions. If you need to
+          invalidate cache from a Route Handler or webhook, use revalidateTag()
+          instead (no read-your-own-writes guarantee but works anywhere):
+
+            // CORRECT in Server Action
+            'use server';
+            export async function updatePost(id: string, data: PostData) {
+              await db.post.update({ where: { id }, data });
+              updateTag(`post-${id}`);  // read-your-own-writes
+              return db.post.findUnique({ where: { id } });  // sees fresh value
+            }
+
+            // CORRECT in Route Handler (webhook)
+            export async function POST(req: Request) {
+              const event = await req.json();
+              await db.event.create({ data: event });
+              revalidateTag('events');  // use revalidateTag, not updateTag
+              return Response.json({ ok: true });
+            }
+        sources:
+          - "https://nextjs.org/docs/app/api-reference/functions/updateTag"
+          - "https://nextjs.org/docs/app/api-reference/functions/revalidateTag"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
 
 notes:
   - "redirect() and notFound() throw control-flow exceptions — MUST be called outside try-catch, or re-throw when caught"
