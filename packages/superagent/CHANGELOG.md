@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen re-verified clean
+
+- **Latest published:** superagent@10.3.0 (stable since 2023; no API surface changes since last deepen pass on 2026-04-16)
+- **Profile semver:** `>=3.7.0` (unchanged)
+- **Effective coverage:** 9/9 non-omitted = 100% (unchanged)
+- **API surface re-enumerated from:** `@types/superagent@10.x` (`lib/node/index.d.ts`, `agent.d.ts`, `request-base.d.ts`)
+- **Async surface confirmed:** 9 contracted (get/post/put/patch/delete/del/head/pipe/agent) + 2 intentionally omitted (callable-as-function, end() callback) + 28 WebDAV/extended HTTP verb aliases (acl/bind/checkout/connect/copy/link/lock/merge/mkactivity/mkcalendar/mkcol/move/notify/options/propfind/proppatch/purge/rebind/report/search/source/subscribe/trace/unbind/unlink/unlock/unsubscribe/m-search) — all share identical error profile with already-contracted methods, no postcondition divergence
+- **Scanner re-test:** 45 violations across fixtures (44 errors, 1 warning) — detection holds for all postconditions
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 58)
+- **Verdict:** no functions added, no postconditions added; profile remains complete
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** superagent@10.3.0
