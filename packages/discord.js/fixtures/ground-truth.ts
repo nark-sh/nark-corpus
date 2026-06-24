@@ -174,3 +174,204 @@ export async function archiveThreadWithCatch(thread: ThreadChannel) {
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. MessageManager.delete() — channel.messages.delete(id) — without try-catch
+// Added 2026-06-24 deepen pass 35
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { TextChannel, GuildMember as GuildMember2, AutocompleteInteraction, ModalSubmitInteraction, Client } from 'discord.js';
+
+// @expect-violation: discord-messagemanager-delete-no-try-catch
+export async function deleteByManagerNoCatch(channel: TextChannel, messageId: string) {
+  // SHOULD_FIRE: discord-messagemanager-delete-no-try-catch — throws 10008 if message gone.
+  await channel.messages.delete(messageId);
+}
+
+// @expect-clean
+export async function deleteByManagerWithCatch(channel: TextChannel, messageId: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    await channel.messages.delete(messageId);
+  } catch (err: any) {
+    if (err?.code === 10008) {
+      // Already deleted — treat as success
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. MessageManager.fetch() — channel.messages.fetch(id) — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-messagemanager-fetch-no-try-catch
+export async function fetchMessageNoCatch(channel: TextChannel, messageId: string) {
+  // SHOULD_FIRE: discord-messagemanager-fetch-no-try-catch — throws 10008 / 50013.
+  const msg = await channel.messages.fetch(messageId);
+  return msg;
+}
+
+// @expect-clean
+export async function fetchMessageWithCatch(channel: TextChannel, messageId: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    return await channel.messages.fetch(messageId);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. GuildMemberManager.fetch() — guild.members.fetch() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-guildmembermanager-fetch-no-try-catch
+export async function fetchMemberNoCatch(member: GuildMember2, userId: string) {
+  // SHOULD_FIRE: discord-guildmembermanager-fetch-no-try-catch — throws 10007 if member left.
+  await member.guild.members.fetch(userId);
+}
+
+// @expect-clean
+export async function fetchMemberWithCatch(member: GuildMember2, userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    return await member.guild.members.fetch(userId);
+  } catch (err: any) {
+    if (err?.code === 10007) return null;
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. GuildMemberManager.bulkBan() — without try-catch and ignoring partial failures
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-guildmembermanager-bulkban-no-try-catch
+// @expect-violation: discord-guildmembermanager-bulkban-partial-failure-ignored
+export async function bulkBanNoCatch(member: GuildMember2, userIds: string[]) {
+  // SHOULD_FIRE: bulkban-no-try-catch — throws on hierarchy / empty list.
+  // SHOULD_FIRE: bulkban-partial-failure-ignored — result.failedUsers not inspected.
+  await member.guild.members.bulkBan(userIds, { deleteMessageSeconds: 0, reason: 'raid cleanup' });
+}
+
+// @expect-clean
+export async function bulkBanWithCatch(member: GuildMember2, userIds: string[]) {
+  if (userIds.length === 0) return;
+  try {
+    // SHOULD_NOT_FIRE: bulkban inside try-catch AND result.failedUsers inspected
+    const result = await member.guild.members.bulkBan(userIds, { deleteMessageSeconds: 0 });
+    if (result.failedUsers.length > 0) {
+      console.warn(`bulkBan partial failure: ${result.failedUsers.length} users not banned`);
+    }
+    return result;
+  } catch (err) {
+    console.error('bulkBan failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. GuildBanManager.create() — guild.bans.create() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-guildbanmanager-create-no-try-catch
+export async function createBanNoCatch(member: GuildMember2, userId: string) {
+  // SHOULD_FIRE: discord-guildbanmanager-create-no-try-catch — throws 50013 hierarchy.
+  await member.guild.bans.create(userId, { reason: 'spam' });
+}
+
+// @expect-clean
+export async function createBanWithCatch(member: GuildMember2, userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    await member.guild.bans.create(userId, { reason: 'spam' });
+  } catch (err: any) {
+    if (err?.code === 50013) {
+      console.warn('Cannot ban user above bot role hierarchy');
+      return;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. EntitlementManager.consume() — Discord monetization — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-entitlementmanager-consume-no-try-catch
+export async function consumeEntitlementNoCatch(client: Client<true>, entitlementId: string) {
+  // SHOULD_FIRE: discord-entitlementmanager-consume-no-try-catch — payment risk.
+  await client.application.entitlements.consume(entitlementId);
+}
+
+// @expect-clean
+export async function consumeEntitlementWithCatch(client: Client<true>, entitlementId: string) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch with idempotency handling
+    await client.application.entitlements.consume(entitlementId);
+  } catch (err: any) {
+    if (err?.code === 10067) {
+      // Already consumed — treat as success
+      return;
+    }
+    // Surface to dead-letter queue for reconciliation
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. AutocompleteInteraction.respond() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-autocompleteinteraction-respond-no-try-catch
+export async function respondAutocompleteNoCatch(interaction: AutocompleteInteraction) {
+  // SHOULD_FIRE: respond() throws 10062 if 3s deadline missed.
+  const choices = [
+    { name: 'Option 1', value: 'opt1' },
+    { name: 'Option 2', value: 'opt2' },
+  ];
+  await interaction.respond(choices);
+}
+
+// @expect-clean
+export async function respondAutocompleteWithCatch(interaction: AutocompleteInteraction) {
+  const choices = [
+    { name: 'Option 1', value: 'opt1' },
+    { name: 'Option 2', value: 'opt2' },
+  ].slice(0, 25);
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch with slice limit
+    if (interaction.responded) return;
+    await interaction.respond(choices);
+  } catch (err) {
+    // 10062 is unrecoverable — log and move on
+    console.error('Autocomplete respond failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. ModalSubmitInteraction.reply() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: discord-modalsubmitinteraction-reply-no-try-catch
+export async function replyModalNoCatch(interaction: ModalSubmitInteraction) {
+  // SHOULD_FIRE: reply() throws 10062 / 40060 on modal handlers.
+  await interaction.reply({ content: 'Submission received', ephemeral: true } as any);
+}
+
+// @expect-clean
+export async function replyModalWithCatch(interaction: ModalSubmitInteraction) {
+  try {
+    // SHOULD_NOT_FIRE: inside try-catch
+    await interaction.reply({ content: 'Submission received', ephemeral: true } as any);
+  } catch (err: any) {
+    if (err?.code === 40060) {
+      // Already acknowledged — use editReply instead
+      await interaction.editReply({ content: 'Submission received' });
+      return;
+    }
+    throw err;
+  }
+}

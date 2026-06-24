@@ -2,11 +2,11 @@ package: discord.js
 semver: ">=14.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 0.89  # 48 contracted functions / 54 async-callable functions (6 omitted as admin/infrastructure/read-only)
+coverage_score: 0.9  # 56 contracted functions / 62 async-callable functions in scoped surface (6 omitted as admin/infrastructure/read-only)
 description: "A powerful JavaScript library for interacting with the Discord API"
 
 # Detection rules for analyzer integration
@@ -61,6 +61,9 @@ detection:
     - .setNickname(
     - .setArchived(
     - .editMessage(  # Webhook.editMessage
+    - .bulkBan(       # GuildMemberManager / GuildBanManager bulk-create
+    - .respond(       # AutocompleteInteraction.respond
+    - .consume(       # EntitlementManager.consume (monetization)
 
   # Required event listeners to prevent process crashes
   required_event_listeners:
@@ -1144,3 +1147,298 @@ functions:
         sources:
           - "https://discord.js.org/docs/packages/discord.js/main/ThreadChannel:Class#delete"
           - "https://discord.com/developers/docs/resources/channel#deleteclose-channel"
+
+  # ============================================================================
+  # MESSAGE MANAGER OPERATIONS (channel.messages.*)
+  # Added 2026-06-24 deepen pass 35 (deepen-stream-2)
+  # ============================================================================
+
+  - name: MessageManager.delete
+    import_path: "discord.js"
+    description: "Deletes a message via channel.messages.delete(messageId)"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/MessageManager.js line 330-335
+      #   await this.client.rest.delete(Routes.channelMessage(this.channel.id, message));
+      # The manager form takes a message id (string) and works on uncached messages too.
+      - id: discord-messagemanager-delete-no-try-catch
+        condition: "MessageManager.delete() called without try-catch"
+        throws: "DiscordAPIError (10008 Unknown Message, 50013 Missing MANAGE_MESSAGES permission, 50001 Missing Access)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          MessageManager.delete() takes a message ID and issues DELETE /channels/{channel}/messages/{message}.
+          Common failure modes: 10008 if message was already deleted (race condition in moderation
+          flows where the user deletes their own message between the trigger and the bot's reaction),
+          50013 if bot lacks MANAGE_MESSAGES on the channel, 50001 if bot was kicked from the guild
+          mid-operation. Moderation pipelines that iterate over message IDs from audit logs are the
+          dominant call site and crash the whole batch on first 10008.
+        detector: "If channel.messages.delete() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; handle 10008 gracefully as message may already be deleted by user or another mod action"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/MessageManager:Class#delete"
+          - "https://discord.com/developers/docs/resources/channel#delete-message"
+
+  - name: MessageManager.fetch
+    import_path: "discord.js"
+    description: "Fetches a message or messages via channel.messages.fetch()"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/MessageManager.js _fetchSingle / _fetchMany
+      # Routes.channelMessage GET / Routes.channelMessages GET
+      - id: discord-messagemanager-fetch-no-try-catch
+        condition: "MessageManager.fetch() called without try-catch"
+        throws: "DiscordAPIError (10008 Unknown Message, 50001 Missing Access, 50013 Missing READ_MESSAGE_HISTORY permission)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          MessageManager.fetch() issues GET /channels/{channel}/messages or
+          GET /channels/{channel}/messages/{id}. Throws 10008 Unknown Message when fetching a
+          specific message ID that no longer exists (extremely common — moderators investigating
+          reports often query already-deleted messages). Throws 50013 if the bot lacks
+          READ_MESSAGE_HISTORY on the channel (silently true in many private-channel setups). The
+          plural form additionally rate-limits aggressively for pagination loops.
+        detector: "If channel.messages.fetch() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; specifically handle 10008 as message-may-not-exist rather than crashing"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/MessageManager:Class#fetch"
+          - "https://discord.com/developers/docs/resources/channel#get-channel-message"
+
+  # ============================================================================
+  # GUILD MEMBER MANAGER OPERATIONS (guild.members.*)
+  # ============================================================================
+
+  - name: GuildMemberManager.fetch
+    import_path: "discord.js"
+    description: "Fetches a guild member or members via guild.members.fetch()"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/GuildMemberManager.js — _fetchSingle / _fetchMany
+      # Route: GET /guilds/{guild}/members/{user} or /guilds/{guild}/members
+      - id: discord-guildmembermanager-fetch-no-try-catch
+        condition: "GuildMemberManager.fetch() called without try-catch"
+        throws: "DiscordAPIError (10007 Unknown Member, 50001 Missing Access) or WebSocketShardTimeoutError on chunk-based fetch"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildMemberManager.fetch() is the dominant entry point for resolving a user ID to a
+          member object — used everywhere from welcome handlers to permission checks to moderation
+          lookups. Throws 10007 Unknown Member when the user is no longer in the guild (extremely
+          common in audit-log replays and bulk-action pipelines processing historical data). The
+          chunk-based form (fetching ALL members) additionally rejects with WebSocketShardTimeoutError
+          if the GUILD_MEMBERS intent is enabled but the gateway is slow to deliver the
+          GUILD_MEMBERS_CHUNK opcode — a 120-second timeout that crashes the calling handler.
+        detector: "If guild.members.fetch() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; handle 10007 as member-left-guild; set explicit timeout on bulk fetches"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildMemberManager:Class#fetch"
+          - "https://discord.com/developers/docs/resources/guild#get-guild-member"
+
+  - name: GuildMemberManager.bulkBan
+    import_path: "discord.js"
+    description: "Bulk-bans up to 200 users via guild.members.bulkBan() (delegates to bans.bulkCreate)"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/GuildMemberManager.js line 597-599
+      #   bulkBan(users, options = {}) { return this.guild.bans.bulkCreate(users, options); }
+      # Source: /node_modules/discord.js/src/managers/GuildBanManager.js line 232-246
+      #   throws DiscordjsTypeError if !Array/Collection; throws DiscordjsError BulkBanUsersOptionEmpty
+      #   on empty list; returns {bannedUsers, failedUsers} on success — PARTIAL FAILURE is the result shape.
+      - id: discord-guildmembermanager-bulkban-no-try-catch
+        condition: "GuildMemberManager.bulkBan() called without try-catch"
+        throws: "DiscordjsTypeError (InvalidType users/options), DiscordjsError (BulkBanUsersOptionEmpty), DiscordAPIError (50013 Missing BAN_MEMBERS, 50001 Missing Access)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildMemberManager.bulkBan() throws DiscordjsTypeError if users isn't Array/Collection
+          (raid-protection bots that pull user IDs from a database often get an undefined back).
+          Throws DiscordjsError BulkBanUsersOptionEmpty if the array is empty — a common edge case
+          when the filter step matches no users but the action proceeds anyway. Throws 50013 if
+          the bot's role is below the highest-ranked target user. Anti-raid pipelines that
+          await bulkBan() without try-catch crash mid-raid, leaving the guild partially banned.
+        detector: "If guild.members.bulkBan() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; check users.length > 0 before calling; inspect result.failedUsers to surface partial failures"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildMemberManager:Class#bulkBan"
+          - "https://discord.com/developers/docs/resources/guild#bulk-guild-ban"
+
+      - id: discord-guildmembermanager-bulkban-partial-failure-ignored
+        condition: "GuildMemberManager.bulkBan() resolves to BulkBanResult but failedUsers is not inspected"
+        throws: "Silent partial-success — Promise resolves with {bannedUsers, failedUsers} but failedUsers can be non-empty even when the Promise does NOT reject"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        description: >
+          bulkBan() is one of the few discord.js APIs that returns a partial-success result shape
+          rather than rejecting the Promise. failedUsers contains user IDs that could not be banned
+          (already banned, above the bot's role, or hierarchy errors). A try-catch wrapper that
+          only checks for thrown errors will silently ignore failedUsers. Anti-raid dashboards then
+          report "X users banned" when X is actually bannedUsers.length but the operator sees the
+          input count. This creates a false sense of completion in moderation logs.
+        detector: "If guild.members.bulkBan() result is not destructured/inspected for failedUsers"
+        required_handling: "MUST inspect result.failedUsers.length and log/surface non-empty failedUsers separately from the try-catch error path"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildMemberManager:Class#bulkBan"
+
+  # ============================================================================
+  # GUILD BAN MANAGER — direct create (parallel to GuildMember.ban)
+  # ============================================================================
+
+  - name: GuildBanManager.create
+    import_path: "discord.js"
+    description: "Bans a single user via guild.bans.create() — the canonical direct-ban API"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/GuildBanManager.js line 178-201
+      # Route: PUT /guilds/{guild}/bans/{user}
+      - id: discord-guildbanmanager-create-no-try-catch
+        condition: "GuildBanManager.create() called without try-catch"
+        throws: "DiscordAPIError (50013 Missing BAN_MEMBERS, 50001 Missing Access, 10007 Unknown Member, 10013 Unknown User)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          GuildBanManager.create() is the modern direct-ban API (GuildMember.ban() delegates here).
+          Throws 50013 if the bot lacks BAN_MEMBERS or the target's highest role is at or above the
+          bot's highest role (hierarchy is server-state-dependent and not visible at call site).
+          Throws 10013 Unknown User if the snowflake doesn't resolve to a Discord account (common
+          when banning by ID pulled from external systems with stale data). Moderation command
+          handlers that await guild.bans.create() without try-catch crash on hierarchy errors,
+          leaving moderators with no feedback in the audit log.
+        detector: "If guild.bans.create() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; specifically surface 50013 hierarchy errors back to the moderator via the interaction reply"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/GuildBanManager:Class#create"
+          - "https://discord.com/developers/docs/resources/guild#create-guild-ban"
+
+  # ============================================================================
+  # ENTITLEMENT MANAGER (Discord Monetization — SKUs / Subscriptions)
+  # ============================================================================
+
+  - name: EntitlementManager.consume
+    import_path: "discord.js"
+    description: "Marks a one-time-purchase consumable entitlement as consumed"
+    postconditions:
+      # Source: /node_modules/discord.js/src/managers/EntitlementManager.js line 169-171
+      #   async consume(entitlementId) {
+      #     await this.client.rest.post(Routes.consumeEntitlement(...));
+      #   }
+      # Route: POST /applications/{application}/entitlements/{entitlement}/consume
+      - id: discord-entitlementmanager-consume-no-try-catch
+        condition: "EntitlementManager.consume() called without try-catch"
+        throws: "DiscordAPIError (10067 Unknown Entitlement, 50001 Missing Access, generic 400 if entitlement not consumable)"
+        severity: error
+        business_impact:
+          incident_label: PAYMENT_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: high
+        description: >
+          EntitlementManager.consume() is the critical-path API for Discord-monetized bots that
+          sell consumable SKUs (e.g. one-time premium boosts, currency packs). If consume() throws
+          and the error is not handled, the user is charged but never receives the in-app delivery
+          because the bot's fulfillment handler crashes mid-flow. Worst case: 10067 fires because
+          the entitlement was already consumed by a duplicate handler invocation (Discord interaction
+          retries on timeout), so the second call crashes a delivery flow that already succeeded.
+          This is a payment_risk hazard: real money exchanged hands, but the receipt path is broken.
+        detector: "If client.application.entitlements.consume() is awaited without try-catch wrapping"
+        required_handling: "MUST wrap in try-catch; specifically handle 10067 as idempotency-already-consumed (treat as success); log any other error to a dead-letter queue for manual reconciliation"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/EntitlementManager:Class#consume"
+          - "https://discord.com/developers/docs/monetization/entitlements#consume-an-entitlement"
+
+  # ============================================================================
+  # AUTOCOMPLETE INTERACTION (slash-command autocomplete handler)
+  # ============================================================================
+
+  - name: AutocompleteInteraction.respond
+    import_path: "discord.js"
+    description: "Sends autocomplete choices back to Discord for a slash-command option"
+    postconditions:
+      # Source: /node_modules/discord.js/typings/index.d.ts line 1371
+      #   public respond(options: readonly ApplicationCommandOptionChoiceData[]): Promise<void>;
+      # Route: POST /interactions/{interaction}/{token}/callback with type=8
+      # Critical timing: Discord rejects responses > 3 seconds after the interaction
+      - id: discord-autocompleteinteraction-respond-no-try-catch
+        condition: "AutocompleteInteraction.respond() called without try-catch"
+        throws: "DiscordAPIError (10062 Unknown Interaction — 3s deadline missed, 40060 Interaction Already Acknowledged, 50035 Invalid Form Body — >25 choices or duplicate values)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          AutocompleteInteraction.respond() must complete within 3 seconds of the interaction
+          arriving or Discord invalidates the interaction token (10062 Unknown Interaction).
+          Autocomplete handlers that query a database or external API hit this deadline regularly
+          under load. The function also rejects with 50035 if more than 25 choices are provided
+          (a frequent edge case when filtering a paginated list without a slice limit). 40060
+          Interaction Already Acknowledged fires when a handler accidentally calls respond() twice
+          due to a race in input throttling logic. Failure crashes the autocomplete handler and
+          breaks command UX for every user typing into that option.
+        detector: "If interaction.respond() is awaited without try-catch wrapping inside an autocomplete handler"
+        required_handling: "MUST wrap in try-catch; slice choices to 25 max BEFORE calling respond(); short-circuit if interaction.responded is true"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/AutocompleteInteraction:Class#respond"
+          - "https://discord.com/developers/docs/interactions/receiving-and-responding#create-interaction-response"
+
+  # ============================================================================
+  # MODAL SUBMIT INTERACTION (Modal form submission handler)
+  # ============================================================================
+
+  - name: ModalSubmitInteraction.reply
+    import_path: "discord.js"
+    description: "Replies to a modal submission (paired with interaction.showModal() from a prior interaction)"
+    postconditions:
+      # Source: /node_modules/discord.js/typings/index.d.ts line 2970-2977
+      # Pattern: parent CommandInteraction.showModal() → user fills form →
+      #   client.on(InteractionCreate) fires ModalSubmitInteraction → must reply within 3s
+      - id: discord-modalsubmitinteraction-reply-no-try-catch
+        condition: "ModalSubmitInteraction.reply() called without try-catch"
+        throws: "DiscordAPIError (10062 Unknown Interaction — 3s deadline missed, 40060 Interaction Already Acknowledged, 50035 Invalid Form Body)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          ModalSubmitInteraction.reply() inherits the same 3-second interaction deadline as the
+          rest of the interaction system. Modal handlers commonly perform validation against a
+          database (uniqueness checks, field constraints) or call an external API to act on the
+          submitted data, both of which can blow past the deadline and produce 10062 Unknown
+          Interaction. When that happens the modal UI in the Discord client hangs and the user
+          re-submits, often causing duplicate writes. Throws 40060 Interaction Already Acknowledged
+          if the handler called deferReply() then accidentally reply()ed instead of editReply().
+        detector: "If modalSubmit.reply() is awaited without try-catch wrapping inside a ModalSubmitInteraction handler"
+        required_handling: "MUST wrap in try-catch; defer with deferReply() before slow validation; use editReply() if previously deferred"
+        sources:
+          - "https://discord.js.org/docs/packages/discord.js/main/ModalSubmitInteraction:Class#reply"
+          - "https://discord.com/developers/docs/interactions/receiving-and-responding#create-interaction-response"
