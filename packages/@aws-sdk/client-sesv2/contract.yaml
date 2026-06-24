@@ -1,19 +1,19 @@
 package: "@aws-sdk/client-sesv2"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
-# Depth pass 2 (deepen-stream-2): added UpdateEmailTemplateCommand, PutSuppressedDestinationCommand, CreateContactCommand
+# Depth pass 3 (deepen-stream-3): added UpdateContactCommand, CreateExportJobCommand
 status: production
 evidence_quality: confirmed
-coverage_score: 0.82
-# coverage_score = 9 contracted / 11 total relevant API functions (9 contracted + 2 intentionally omitted)
-# Previously contracted (6): send (generic), SendEmailCommand, SendBulkEmailCommand,
+coverage_score: 0.85
+# coverage_score = 11 contracted / 13 total relevant API functions (11 contracted + 2 intentionally omitted)
+# Previously contracted (9): send (generic), SendEmailCommand, SendBulkEmailCommand,
 #   CreateEmailIdentityCommand, SendCustomVerificationEmailCommand,
-#   CreateEmailTemplateCommand, CreateImportJobCommand
-# Newly contracted this pass (3): UpdateEmailTemplateCommand, PutSuppressedDestinationCommand,
-#   CreateContactCommand
+#   CreateEmailTemplateCommand, CreateImportJobCommand,
+#   UpdateEmailTemplateCommand, PutSuppressedDestinationCommand, CreateContactCommand
+# Newly contracted this pass (2): UpdateContactCommand, CreateExportJobCommand
 # Intentionally omitted (2):
 #   TestRenderEmailTemplateCommand (dev/preview utility, not production code path)
 #   CreateConfigurationSetCommand (infrastructure management, not SaaS app runtime)
@@ -607,6 +607,160 @@ functions:
           user_experience: lost_data
           incident_cost_range: medium
 
+  - name: UpdateContactCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Updates a contact's topic preferences or unsubscribe status in a SES v2 contact list.
+      Companion to CreateContactCommand — used in resubscription / preference-update flows
+      where CreateContactCommand throws AlreadyExistsException. CRITICAL semantics: the
+      TopicPreferences array REPLACES all existing topic preferences, not merges with them.
+      Omitting a topic from the array silently removes the contact's preference for that
+      topic. UnsubscribeAll=true is a hard override that opts the contact out regardless
+      of TopicPreferences. Throws NotFoundException when either the contact list or the
+      contact within it does not exist.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_UpdateContact.html
+      # Error types confirmed from dist-types/commands/UpdateContactCommand.d.ts @throws annotations
+      - id: sesv2-update-contact-no-try-catch
+        condition: >
+          UpdateContactCommand can fail with:
+          NotFoundException (contact list does not exist OR contact with this email not found in list),
+          BadRequestException (invalid TopicPreferences shape, invalid SubscriptionStatus value, or malformed email),
+          ConcurrentModificationException (server-side conflict during concurrent contact updates — HTTP 500),
+          TooManyRequestsException (API rate limit exceeded — common during bulk preference-sync jobs).
+        throws: >
+          SESv2ServiceException subclass. NotFoundException (HTTP 404) is the most common
+          failure mode: it conflates "contact list missing" with "contact missing in list",
+          so error handling must read error.message to distinguish them. In webhook handlers
+          processing preference-change events, a NotFoundException silently drops the
+          preference update unless caught. ConcurrentModificationException is a server fault
+          retryable with exponential backoff.
+        required_handling: >
+          Caller MUST wrap client.send(new UpdateContactCommand(...)) in try-catch.
+          NotFoundException requires distinguishing list-missing (ops alert) from
+          contact-missing (typically: fall back to CreateContactCommand to upsert the
+          contact). ConcurrentModificationException should retry with backoff.
+
+          Minimum handling:
+            try {
+              await sesv2Client.send(new UpdateContactCommand({
+                ContactListName: 'MyNewsletter',
+                EmailAddress: userEmail,
+                TopicPreferences: allDesiredTopics, // MUST include all topics, not just changed ones
+              }));
+            } catch (err) {
+              if (err instanceof SESv2ServiceException) {
+                if (err.name === 'NotFoundException') {
+                  // Distinguish list-missing vs contact-missing via err.message
+                  // For contact-missing: fall back to CreateContactCommand (upsert)
+                  await sesv2Client.send(new CreateContactCommand({ ... }));
+                  return;
+                }
+                if (err.name === 'ConcurrentModificationException') {
+                  // Server-side conflict — retry with exponential backoff
+                }
+                console.error(`SES contact update failed [${err.name}]: ${err.message}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_UpdateContact.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: CreateExportJobCommand
+    import_path: "@aws-sdk/client-sesv2"
+    description: >
+      Creates an asynchronous export job that exports SES metrics data or message insights
+      to an S3 destination as CSV or JSON. Returns a JobId immediately with HTTP 200 — the
+      actual export runs asynchronously in the background. The API call succeeding does NOT
+      mean the export succeeded. Job status must be polled via GetExportJobCommand. Same
+      silent-failure async-poll pattern as CreateImportJobCommand. Rate-limited to 1 request
+      per second.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateExportJob.html
+      # Error types confirmed from dist-types/commands/CreateExportJobCommand.d.ts @throws annotations
+      - id: sesv2-export-job-result-not-polled
+        condition: >
+          CreateExportJobCommand returns a JobId immediately with HTTP 200. The export
+          job then runs asynchronously. If the caller does not poll GetExportJobCommand
+          for COMPLETED / FAILED / CANCELLED status, it will never know whether the export
+          actually produced output. A FAILED export job silently drops all requested data,
+          and reporting / analytics pipelines downstream see an empty S3 bucket they
+          assume contains complete data.
+        throws: >
+          Nothing thrown for job execution failures. The API only throws for request-level
+          errors: BadRequestException (invalid ExportDataSource or ExportDestination S3 URL),
+          LimitExceededException (concurrent export job limit exceeded — AWS account quota),
+          NotFoundException (referenced configuration set or message-insights filter
+          target does not exist), TooManyRequestsException (API rate limit > 1 req/sec).
+        required_handling: >
+          Caller MUST poll GetExportJobCommand until JobStatus is COMPLETED, FAILED, or
+          CANCELLED. A FAILED status with FailureInfo indicates the export did not
+          produce the expected S3 output — downstream analytics MUST be paused until
+          the failure is investigated.
+
+          Minimum handling:
+            const { JobId } = await sesv2Client.send(new CreateExportJobCommand({ ... }));
+            // Poll for job completion
+            let status = 'CREATED';
+            while (status !== 'COMPLETED' && status !== 'FAILED' && status !== 'CANCELLED') {
+              await new Promise(r => setTimeout(r, 5000)); // 5s poll interval
+              const job = await sesv2Client.send(new GetExportJobCommand({ JobId }));
+              status = job.JobStatus;
+            }
+            if (status !== 'COMPLETED') {
+              // Check job.FailureInfo for details; downstream analytics must NOT consume S3 output
+              throw new Error(`SES export job ${JobId} ended with status ${status}`);
+            }
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateExportJob.html"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      - id: sesv2-export-job-no-try-catch
+        condition: >
+          CreateExportJobCommand throws on request-level failures:
+          LimitExceededException (concurrent export job limit reached — must wait for
+          existing jobs to finish), BadRequestException (invalid ExportDataSource shape
+          or invalid S3Url destination), NotFoundException (referenced resource missing),
+          TooManyRequestsException (API rate limit > 1 req/sec, common in scheduled
+          export jobs that fire on a cron).
+        throws: >
+          SESv2ServiceException subclass. LimitExceededException means too many concurrent
+          export jobs are running — caller must wait for existing jobs to complete before
+          starting new ones. TooManyRequestsException requires 1-second minimum spacing
+          between calls.
+        required_handling: >
+          Caller MUST wrap client.send(new CreateExportJobCommand(...)) in try-catch in
+          addition to polling job status. LimitExceededException should defer the export
+          and retry later (not immediately). BadRequestException indicates a programming
+          error — log the request shape for debugging.
+        sources:
+          - "https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_CreateExportJob.html"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
 tags:
   - aws
   - email
@@ -632,6 +786,11 @@ notes:
   - "PutSuppressedDestinationCommand: MUST be called in bounce/complaint webhook handlers — failure causes webhook 5xx retry storms"
   - "CreateContactCommand: AlreadyExistsException is expected in resubscription flows — treat as UpdateContactCommand trigger, not fatal error"
   - "CreateContactCommand: NotFoundException means contact list missing — all new subscriptions failing, requires immediate ops alert"
+  - "Depth pass 3 (2026-06-24): 2 new command-specific function entries added (UpdateContactCommand, CreateExportJobCommand). Coverage 82%→85%."
+  - "UpdateContactCommand: TopicPreferences array REPLACES (not merges) existing preferences — omitting a topic silently removes the contact's opt-in for that topic"
+  - "UpdateContactCommand: NotFoundException conflates list-missing and contact-missing — must read err.message to distinguish; contact-missing typically routes to CreateContactCommand fallback"
+  - "CreateExportJobCommand: async job pattern like CreateImportJobCommand — always poll GetExportJobCommand for COMPLETED/FAILED/CANCELLED status"
+  - "CreateExportJobCommand: FAILED status with FailureInfo must pause downstream analytics that consume the S3 export bucket"
 
 related_packages:
   - "@aws-sdk/client-ses"

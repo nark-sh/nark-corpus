@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 82% to 85%
+
+- **Profile:** `packages/@aws-sdk/client-sesv2/contract.yaml`
+- **Functions added:** UpdateContactCommand, CreateExportJobCommand (2 total)
+- **Postconditions added:** 3 (sesv2-update-contact-no-try-catch, sesv2-export-job-result-not-polled, sesv2-export-job-no-try-catch)
+- **Functions intentionally omitted this pass:** none new (existing omissions retained: TestRenderEmailTemplateCommand, CreateConfigurationSetCommand)
+- **Scanner concerns queued:** 3 (`concern-20260624-aws-sdk-client-sesv2-deepen-1`, `concern-20260624-aws-sdk-client-sesv2-deepen-2`, `concern-20260624-aws-sdk-client-sesv2-deepen-3`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** dist-types/commands/UpdateContactCommand.d.ts (@throws annotations), dist-types/commands/CreateExportJobCommand.d.ts (@throws annotations), AWS SES V2 API Reference (UpdateContact, CreateExportJob)
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 35 on 2026-06-24T03:46Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/client-sesv2@3.1072.0

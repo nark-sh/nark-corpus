@@ -15,6 +15,8 @@
  *   - UpdateEmailTemplateCommand  postcondition: sesv2-update-template-no-try-catch  [ADDED pass 2]
  *   - PutSuppressedDestinationCommand  postcondition: sesv2-suppressed-destination-no-try-catch  [ADDED pass 2]
  *   - CreateContactCommand  postcondition: sesv2-create-contact-no-try-catch  [ADDED pass 2]
+ *   - UpdateContactCommand  postcondition: sesv2-update-contact-no-try-catch  [ADDED pass 3]
+ *   - CreateExportJobCommand  postconditions: sesv2-export-job-result-not-polled, sesv2-export-job-no-try-catch  [ADDED pass 3]
  *
  * Postcondition IDs:
  *   sesv2-send-no-try-catch                (generic SESv2Client.send())
@@ -29,6 +31,9 @@
  *   sesv2-update-template-no-try-catch     (UpdateEmailTemplateCommand) [pass 2]
  *   sesv2-suppressed-destination-no-try-catch (PutSuppressedDestinationCommand) [pass 2]
  *   sesv2-create-contact-no-try-catch      (CreateContactCommand) [pass 2]
+ *   sesv2-update-contact-no-try-catch      (UpdateContactCommand) [pass 3]
+ *   sesv2-export-job-result-not-polled     (CreateExportJobCommand async job not polled) [pass 3]
+ *   sesv2-export-job-no-try-catch          (CreateExportJobCommand request errors) [pass 3]
  */
 
 import {
@@ -45,6 +50,8 @@ import {
   PutSuppressedDestinationCommand,
   CreateContactCommand,
   UpdateContactCommand,
+  CreateExportJobCommand,
+  GetExportJobCommand,
 } from '@aws-sdk/client-sesv2';
 
 const sesv2Client = new SESv2Client({ region: 'us-east-1' });
@@ -468,6 +475,171 @@ export async function gt_createContact_safe(listName: string, email: string) {
         console.error(`Contact list '${listName}' not found — all subscriptions failing`);
       }
       console.error(`SES contact creation failed [${err.name}]: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. UpdateContactCommand (added pass 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function gt_updateContact_missing(listName: string, email: string) {
+  // SHOULD_FIRE: sesv2-update-contact-no-try-catch
+  await sesv2Client.send(new UpdateContactCommand({
+    ContactListName: listName,
+    EmailAddress: email,
+    TopicPreferences: [
+      { TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' },
+      { TopicName: 'product-updates', SubscriptionStatus: 'OPT_IN' },
+    ],
+  }));
+}
+
+export async function gt_updateContact_safe(listName: string, email: string) {
+  // SHOULD_NOT_FIRE: handles NotFoundException (contact missing → upsert via Create) and ConcurrentModificationException
+  try {
+    await sesv2Client.send(new UpdateContactCommand({
+      ContactListName: listName,
+      EmailAddress: email,
+      TopicPreferences: [
+        { TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' },
+        { TopicName: 'product-updates', SubscriptionStatus: 'OPT_IN' },
+      ],
+    }));
+  } catch (err: any) {
+    if (err instanceof SESv2ServiceException) {
+      if (err.name === 'NotFoundException') {
+        // Contact missing in list — upsert via CreateContactCommand
+        await sesv2Client.send(new CreateContactCommand({
+          ContactListName: listName,
+          EmailAddress: email,
+          TopicPreferences: [
+            { TopicName: 'newsletter', SubscriptionStatus: 'OPT_IN' },
+            { TopicName: 'product-updates', SubscriptionStatus: 'OPT_IN' },
+          ],
+        }));
+        return;
+      }
+      if (err.name === 'ConcurrentModificationException') {
+        console.error('Concurrent contact update — retry with backoff');
+      }
+      console.error(`SES contact update failed [${err.name}]: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. CreateExportJobCommand — async job not polled (added pass 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function gt_exportJob_notPolled() {
+  // SHOULD_FIRE: sesv2-export-job-result-not-polled
+  try {
+    const result = await sesv2Client.send(new CreateExportJobCommand({
+      ExportDataSource: {
+        MetricsDataSource: {
+          Dimensions: { ISP: ['gmail.com'] },
+          Namespace: 'VDM',
+          Metrics: [{ Name: 'SEND', Aggregation: 'VOLUME' }],
+          StartDate: new Date('2026-01-01'),
+          EndDate: new Date('2026-06-01'),
+        },
+      },
+      ExportDestination: {
+        DataFormat: 'CSV',
+        S3Url: 's3://my-bucket/exports/metrics.csv',
+      },
+    }));
+    console.log('Export job created:', result.JobId);
+  } catch (err) {
+    throw err;
+  }
+}
+
+export async function gt_exportJob_polled() {
+  // SHOULD_NOT_FIRE: polls GetExportJobCommand until COMPLETED / FAILED / CANCELLED
+  try {
+    const { JobId } = await sesv2Client.send(new CreateExportJobCommand({
+      ExportDataSource: {
+        MetricsDataSource: {
+          Dimensions: { ISP: ['gmail.com'] },
+          Namespace: 'VDM',
+          Metrics: [{ Name: 'SEND', Aggregation: 'VOLUME' }],
+          StartDate: new Date('2026-01-01'),
+          EndDate: new Date('2026-06-01'),
+        },
+      },
+      ExportDestination: {
+        DataFormat: 'CSV',
+        S3Url: 's3://my-bucket/exports/metrics.csv',
+      },
+    }));
+    let status = 'CREATED';
+    while (status !== 'COMPLETED' && status !== 'FAILED' && status !== 'CANCELLED') {
+      await new Promise(r => setTimeout(r, 5000));
+      const job = await sesv2Client.send(new GetExportJobCommand({ JobId }));
+      status = job.JobStatus ?? 'FAILED';
+    }
+    if (status !== 'COMPLETED') {
+      throw new Error(`SES export job ${JobId} ended with status ${status}`);
+    }
+  } catch (err) {
+    console.error('Export job failed:', err);
+    throw err;
+  }
+}
+
+export async function gt_exportJob_requestErrorMissing() {
+  // SHOULD_FIRE: sesv2-export-job-no-try-catch
+  await sesv2Client.send(new CreateExportJobCommand({
+    ExportDataSource: {
+      MetricsDataSource: {
+        Dimensions: { ISP: ['yahoo.com'] },
+        Namespace: 'VDM',
+        Metrics: [{ Name: 'COMPLAINT', Aggregation: 'RATE' }],
+        StartDate: new Date('2026-05-01'),
+        EndDate: new Date('2026-06-01'),
+      },
+    },
+    ExportDestination: {
+      DataFormat: 'JSON',
+      S3Url: 's3://my-bucket/exports/complaints.json',
+    },
+  }));
+}
+
+export async function gt_exportJob_requestErrorSafe() {
+  // SHOULD_NOT_FIRE: handles LimitExceededException (concurrent job cap) and TooManyRequestsException
+  try {
+    await sesv2Client.send(new CreateExportJobCommand({
+      ExportDataSource: {
+        MetricsDataSource: {
+          Dimensions: { ISP: ['yahoo.com'] },
+          Namespace: 'VDM',
+          Metrics: [{ Name: 'COMPLAINT', Aggregation: 'RATE' }],
+          StartDate: new Date('2026-05-01'),
+          EndDate: new Date('2026-06-01'),
+        },
+      },
+      ExportDestination: {
+        DataFormat: 'JSON',
+        S3Url: 's3://my-bucket/exports/complaints.json',
+      },
+    }));
+  } catch (err: any) {
+    if (err instanceof SESv2ServiceException) {
+      if (err.name === 'LimitExceededException') {
+        // Too many concurrent export jobs — defer and retry later
+        console.error('Export job concurrency limit reached — defer');
+        return;
+      }
+      if (err.name === 'TooManyRequestsException') {
+        console.error('Export job rate limited — retry with 1+ second spacing');
+        return;
+      }
+      console.error(`SES export job failed [${err.name}]: ${err.message}`);
     }
     throw err;
   }
