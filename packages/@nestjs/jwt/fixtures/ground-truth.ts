@@ -80,3 +80,48 @@ export function signStringPayloadWithOptions() {
   // SHOULD_FIRE: sign() with string payload + options throws synchronously
   return jwtService.sign('user-id-string', { expiresIn: '1h' } as any);
 }
+
+// ─── 8. signAsync() with string payload + options — .catch() can't help ──────
+// Postcondition: sign-async-sync-throw-on-string-payload-with-options
+// signAsync() throws SYNCHRONOUSLY (before returning a Promise) when payload is
+// a string AND signOptions contain disallowed keys. Attaching `.catch()` after
+// the call cannot save you — the throw happens before the Promise exists.
+
+export function signAsyncStringPayloadWithOptionsNoTryCatch() {
+  // SHOULD_FIRE: sign-async-sync-throw-on-string-payload-with-options
+  // No try-catch wrapping — sync throw escapes the .catch() guard.
+  return jwtService.signAsync('user-id-string', { expiresIn: '1h' } as any)
+    .catch(() => null);
+}
+
+export async function signAsyncStringPayloadWithOptionsWithTryCatch() {
+  try {
+    // SHOULD_NOT_FIRE: try-catch around signAsync() catches the sync throw.
+    return await jwtService.signAsync('user-id-string', { expiresIn: '1h' } as any);
+  } catch (error) {
+    return null;
+  }
+}
+
+// ─── 9. verifyAsync() on misconfigured JwtService — no try-catch ─────────────
+// Postcondition: verify-async-misconfigured-secret-unhandled-rejection
+// When JwtService has no secret/publicKey/secretOrKeyProvider, verifyAsync()
+// rejects with "secret or public key must be provided". The rejection is
+// real but easy to miss because it only fires on the first verify call after
+// a misconfigured deploy.
+
+const misconfiguredJwtService = new JwtService({});
+
+export async function verifyAsyncMisconfiguredNoCatch(token: string) {
+  // SHOULD_FIRE: verify-no-try-catch (existing) and verify-async-misconfigured-secret-unhandled-rejection
+  return misconfiguredJwtService.verifyAsync(token).then((payload) => payload);
+}
+
+export async function verifyAsyncMisconfiguredWithCatch(token: string) {
+  try {
+    // SHOULD_NOT_FIRE: try-catch on await catches the misconfig rejection.
+    return await misconfiguredJwtService.verifyAsync(token);
+  } catch (error) {
+    return null;
+  }
+}

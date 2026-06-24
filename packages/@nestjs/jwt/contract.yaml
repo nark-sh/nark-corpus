@@ -1,8 +1,8 @@
 package: "@nestjs/jwt"
 semver: ">=9.0.0 <12.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-15"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -13,6 +13,10 @@ coverage_score: 1.0
 # Deepen pass 2026-04-15 (deepen-stream-2): added sign() sync method.
 # API surface: 4 async-callable functions (sign, signAsync, verify, verifyAsync). decode() omitted (never throws, returns null).
 # coverage_score: 0.75 → 1.0 (4/4 functions contracted)
+# Deepen pass 2026-06-24 (deepen-stream-2 pass 36, drift-mode): added 2 postcondition-density entries against @nestjs/jwt@11.0.2 source:
+#   (1) signAsync sync-throw on string-payload+options (Promise constructor never runs, .catch() can't catch it)
+#   (2) verifyAsync misconfigured-secret unhandled-rejection (boot-time config validation gap)
+# Coverage stays 1.0 (no new functions, deepened density only). last_verified 2026-04-15 → 2026-06-24.
 
 detection:
   type_names:
@@ -39,6 +43,31 @@ functions:
           visibility: visible
           user_experience: authentication_failure
           incident_cost_range: high
+
+      # Evidence: https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts
+      # Source confirmed (node_modules/@nestjs/jwt/dist/jwt.service.js lines 69-78, version 11.0.2):
+      #   verifyAsync() calls getSecretKey() which, when no secret/publicKey/secretOrKeyProvider
+      #   is configured, returns undefined. jsonwebtoken's verify() then rejects with
+      #   "secret or public key must be provided" via the callback shim — but this rejection
+      #   surfaces only inside the inner Promise resolution, *not* via the outer .catch(reject)
+      #   on the same tick. The rejection propagates as an unhandledRejection if the caller
+      #   pattern is `verifyAsync(token).then(...)` without an attached catch.
+      - id: verify-async-misconfigured-secret-unhandled-rejection
+        condition: "JwtService instantiated without a secret/publicKey/secretOrKeyProvider AND verifyAsync() called without per-call secret override"
+        throws: "Error('secret or public key must be provided') from jsonwebtoken — Promise rejection, NOT a sync throw"
+        required_handling: "MUST validate JwtModule configuration at boot time (registerAsync useFactory should throw if secret resolution returns undefined). When config-validation is not feasible, every verifyAsync() call site must attach a .catch() or be wrapped in try-catch on await. Misconfigured JwtService is a deployment-time hazard that only fires on first verify call — easy to ship to staging undetected, common cause of '500 on /auth/me' incidents post-deploy."
+        sources:
+          - "https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts"
+          - "https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts#L69-L78"
+          - "https://github.com/auth0/node-jsonwebtoken/blob/master/verify.js"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: delayed_failure
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
 
   - name: verify
     import_path: "@nestjs/jwt"
@@ -78,6 +107,27 @@ functions:
           production_behavior: immediate_exception
           visibility: visible
           user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts
+      # Source confirmed (node_modules/@nestjs/jwt/dist/jwt.service.js lines 48-51, version 11.0.2):
+      #   signAsync() runs the string-payload + disallowed-options check BEFORE returning the Promise.
+      #   The throw happens synchronously, not as a Promise rejection. signAsync(...).catch() cannot
+      #   catch it because the Promise constructor never runs.
+      - id: sign-async-sync-throw-on-string-payload-with-options
+        condition: "signAsync() called with string payload AND signOptions containing keys other than 'secret' or 'privateKey' (e.g. expiresIn, audience, issuer)"
+        throws: "Error('Payload as string is not allowed with the following sign options: <keys>') — thrown SYNCHRONOUSLY before the Promise is constructed"
+        required_handling: "MUST wrap signAsync() call in try-catch (not just .catch()) when payload may be a string and signOptions vary at runtime. signAsync(payload, opts).catch() CANNOT catch this synchronous throw because the Promise never gets constructed. The .catch() handler runs against a Promise that throws during its own creation, leaving an unhandled exception that crashes the request handler."
+        sources:
+          - "https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts"
+          - "https://github.com/nestjs/jwt/blob/master/lib/jwt.service.ts#L48-L51"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
           incident_cost_range: medium
 
   - name: sign
