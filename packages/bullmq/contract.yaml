@@ -1,12 +1,12 @@
 package: bullmq
 semver: ">=5.0.0 <6.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-14"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production  # Event listener detection now supported by EventListenerAnalyzer
 evidence_quality: confirmed
-coverage_score: 1.0  # 17 contracted / 17 non-omitted async functions (16 intentionally omitted)
+coverage_score: 1.0  # 21 contracted / 21 non-omitted async functions (16 intentionally omitted)
 
 detection:
   class_names:
@@ -36,6 +36,10 @@ detection:
     - ".clean("
     - ".drain("
     - ".retryJobs("
+    - ".promoteJobs("
+    - ".removeOrphanedJobs("
+    - ".rateLimit("
+    - ".setGlobalConcurrency("
 
   # Required event listeners to prevent production issues
   required_event_listeners:
@@ -431,6 +435,109 @@ functions:
         required_handling: "Caller SHOULD wrap retryJobs() in try-catch. Batch retry operations iterate over potentially large job sets — Redis failure mid-iteration causes partial retries. Handle to track which jobs were actually retried."
         sources:
           - "https://docs.bullmq.io/guide/retrying-failing-jobs"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: promoteJobs
+    import_path: "bullmq"
+    description: >
+      Promotes all delayed jobs to the waiting state by iterating in batches
+      controlled by the optional count parameter. Added in bullmq@5.x to
+      complement retryJobs() with a delayed→wait transition path.
+    postconditions:
+      # Evidence: dist/esm/classes/queue.js — Queue.promoteJobs() iterates
+      # this.scripts.promoteJobs(opts.count) in a do/while loop until cursor=0
+      # Evidence: https://api.docs.bullmq.io/classes/v5.Queue.html#promotejobs
+      - id: queue-promotejobs-redis-error
+        condition: "Redis connection fails during batch promote operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap promoteJobs() in try-catch. Like retryJobs(), this iterates over potentially large delayed-job sets via Redis Lua scripts. Connection loss mid-iteration leaves jobs partially promoted — some in waiting, others still delayed — with no way for the caller to know how many transitioned. Handle to track and resume promotion."
+        sources:
+          - "https://api.docs.bullmq.io/classes/v5.Queue.html#promotejobs"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: removeOrphanedJobs
+    import_path: "bullmq"
+    description: >
+      Removes orphaned job keys that exist in Redis but are not referenced
+      in any queue state set. Provided as a one-time migration helper for
+      users affected by the bullmq@5.66.6 regression introduced via #3694
+      that leaked job hashes when sorted-set entries were removed by
+      max-age logic. Iterates with SCAN + Lua per cycle.
+    postconditions:
+      # Evidence: dist/esm/classes/queue.js — Queue.removeOrphanedJobs() uses
+      # client.scan() in a do/while loop, calling this.scripts.removeOrphanedJobs()
+      # per batch. Connection error mid-iteration leaves orphans behind.
+      # Evidence: https://api.docs.bullmq.io/classes/v5.Queue.html#removeorphanedjobs
+      - id: queue-removeorphanedjobs-redis-error
+        condition: "Redis connection fails during SCAN-based iteration"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller MUST wrap removeOrphanedJobs() in try-catch. The method runs an iterative SCAN+Lua loop over the entire queue keyspace and a connection failure mid-loop leaves orphans behind without returning a count. The d.ts comment recommends calling it in a while-loop with a limit to bound iteration; combine with try-catch so the loop can resume from cursor 0 after a transient Redis failure rather than crashing the migration script."
+        sources:
+          - "https://api.docs.bullmq.io/classes/v5.Queue.html#removeorphanedjobs"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: rateLimit
+    import_path: "bullmq"
+    description: >
+      Overrides the rate limit on the queue to be active for the next jobs by
+      setting the queue limiter key with a PX expiration. Used for runtime
+      throttling adjustments (e.g. cooling down after upstream rate limit).
+    postconditions:
+      # Evidence: dist/esm/classes/queue.js — Queue.rateLimit() does
+      # await client.set(this.keys.limiter, Number.MAX_SAFE_INTEGER, { PX: expireTimeMs })
+      # Evidence: https://api.docs.bullmq.io/classes/v5.Queue.html#ratelimit
+      - id: queue-ratelimit-redis-error
+        condition: "Redis connection fails during limiter SET operation"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap rateLimit() in try-catch. The method writes a single Redis SET on the limiter key — failure means the runtime throttle was never applied. In flows where rateLimit() is called in response to an upstream 429 (e.g. third-party API rate limit), a swallowed Redis error leads to continued requests against the upstream and an extended rate-limit ban."
+        sources:
+          - "https://api.docs.bullmq.io/classes/v5.Queue.html#ratelimit"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: setGlobalConcurrency
+    import_path: "bullmq"
+    description: >
+      Enables and sets the global concurrency value for the queue by writing
+      the concurrency field into the meta hash. Controls the maximum number
+      of simultaneous jobs that workers across the entire cluster process.
+    postconditions:
+      # Evidence: dist/esm/classes/queue.js — Queue.setGlobalConcurrency()
+      # does client.hset(this.keys.meta, { concurrency }).
+      # Evidence: https://api.docs.bullmq.io/classes/v5.Queue.html#setglobalconcurrency
+      - id: queue-setglobalconcurrency-redis-error
+        condition: "Redis connection fails during HSET on the meta hash"
+        throws: "Error with Redis connection failure details"
+        required_handling: "Caller SHOULD wrap setGlobalConcurrency() in try-catch. Failure means the global concurrency limit was never persisted — workers continue at the prior limit (or unbounded if it was never set). Common deployment failure: a startup hook calls setGlobalConcurrency() to clamp workers during a downstream incident; a swallowed Redis error means the clamp never takes effect and the downstream gets overrun."
+        sources:
+          - "https://api.docs.bullmq.io/classes/v5.Queue.html#setglobalconcurrency"
         severity: warning
         evidence_quality: confirmed
         business_impact:

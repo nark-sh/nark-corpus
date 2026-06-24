@@ -375,3 +375,97 @@ export async function retryJobsWithCatch() {
     await queue.close();
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. queue.promoteJobs() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function promoteJobsNoCatch() {
+  const queue = new Queue('jobs');
+  // SHOULD_FIRE: queue-promotejobs-redis-error — promoteJobs() iterates a Redis Lua loop; throws on Redis errors. No try-catch.
+  await queue.promoteJobs({ count: 100 });
+  await queue.close();
+}
+
+export async function promoteJobsWithCatch() {
+  const queue = new Queue('jobs');
+  try {
+    // SHOULD_NOT_FIRE: promoteJobs() inside try-catch
+    await queue.promoteJobs({ count: 100 });
+  } catch (err) {
+    console.error('Promote jobs failed:', err);
+  } finally {
+    await queue.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. queue.removeOrphanedJobs() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function removeOrphanedJobsNoCatch() {
+  const queue = new Queue('jobs');
+  // SHOULD_FIRE: queue-removeorphanedjobs-redis-error — SCAN-based iteration can fail mid-cleanup. No try-catch.
+  const removed = await queue.removeOrphanedJobs(1000, 10000);
+  console.log('Removed orphans:', removed);
+  await queue.close();
+}
+
+export async function removeOrphanedJobsWithCatch() {
+  const queue = new Queue('jobs');
+  try {
+    // SHOULD_NOT_FIRE: removeOrphanedJobs() inside try-catch
+    const removed = await queue.removeOrphanedJobs(1000, 10000);
+    console.log('Removed orphans:', removed);
+  } catch (err) {
+    console.error('Orphan cleanup failed:', err);
+  } finally {
+    await queue.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. queue.rateLimit() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function rateLimitNoCatch() {
+  const queue = new Queue('jobs');
+  // SHOULD_FIRE: queue-ratelimit-redis-error — Redis SET on limiter key throws on connection errors. No try-catch.
+  await queue.rateLimit(60_000);
+  await queue.close();
+}
+
+export async function rateLimitWithCatch() {
+  const queue = new Queue('jobs');
+  try {
+    // SHOULD_NOT_FIRE: rateLimit() inside try-catch
+    await queue.rateLimit(60_000);
+  } catch (err) {
+    console.error('Rate limit override failed:', err);
+  } finally {
+    await queue.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. queue.setGlobalConcurrency() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function setGlobalConcurrencyNoCatch() {
+  const queue = new Queue('jobs');
+  // SHOULD_FIRE: queue-setglobalconcurrency-redis-error — Redis HSET on meta hash throws on connection errors. No try-catch.
+  await queue.setGlobalConcurrency(8);
+  await queue.close();
+}
+
+export async function setGlobalConcurrencyWithCatch() {
+  const queue = new Queue('jobs');
+  try {
+    // SHOULD_NOT_FIRE: setGlobalConcurrency() inside try-catch
+    await queue.setGlobalConcurrency(8);
+  } catch (err) {
+    console.error('Set global concurrency failed:', err);
+  } finally {
+    await queue.close();
+  }
+}

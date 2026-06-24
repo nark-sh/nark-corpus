@@ -2,6 +2,16 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-23 — deepen pass — coverage 100% → 100% (surface +4)
+
+- **Profile:** `packages/bullmq/contract.yaml`
+- **Functions added:** Queue.promoteJobs, Queue.removeOrphanedJobs, Queue.rateLimit, Queue.setGlobalConcurrency (4 total)
+- **Postconditions added:** 4 (queue-promotejobs-redis-error, queue-removeorphanedjobs-redis-error, queue-ratelimit-redis-error, queue-setglobalconcurrency-redis-error)
+- **Functions intentionally omitted this pass:** Queue.setGlobalRateLimit, Queue.removeGlobalConcurrency, Queue.removeGlobalRateLimit, Queue.getGlobalRateLimit (identical HSET-on-meta error profile to setGlobalConcurrency, already covered); Queue.getMeta, Queue.getJobScheduler, Queue.getJobSchedulers, Queue.getJobSchedulersCount (read-only getters); Queue.removeDeduplicationKey, Queue.removeRateLimitKey, Queue.removeDebounceKey, Queue.trimEvents, Queue.removeDeprecatedPriorityKey (single-Redis-op cleanup methods, generic Redis-connection error already covered)
+- **Scanner concerns queued:** 4 (`concern-20260623-bullmq-deepen-1`, `concern-20260623-bullmq-deepen-2`, `concern-20260623-bullmq-deepen-3`, `concern-20260623-bullmq-deepen-4`)
+- **Scanner version used:** nark@3.1.0
+- **Sources fetched:** `node_modules/bullmq/dist/esm/classes/queue.js` (5.79.1 source), https://api.docs.bullmq.io/classes/v5.Queue.html, https://raw.githubusercontent.com/taskforcesh/bullmq/master/docs/gitbook/changelog.md
+- **Verified by:** bc-deepen-contract (pass on 2026-06-23 — drift-by-staleness re-enumeration vs 2026-04-04 deepen)
 
 ## 2026-06-18 — re-verified clean
 
