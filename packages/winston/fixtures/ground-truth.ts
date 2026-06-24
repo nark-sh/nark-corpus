@@ -162,3 +162,33 @@ try {
 }
 
 export { loggerForConfigureTest, loggerForAddTest };
+
+// =============================================================================
+// Phase 4 additions — deepen pass 2026-06-24 (pass 56)
+// New postconditions: cli, exceptions.handle, rejections.handle
+// =============================================================================
+
+const loggerForCliTest = winston.createLogger({ level: 'info', transports: [new winston.transports.Console()] });
+loggerForCliTest.on('error', (err: Error) => console.error(err));
+
+// SHOULD_FIRE: cli-throws-unconditionally
+(loggerForCliTest as any).cli();
+
+// SHOULD_NOT_FIRE: logger.cli() wrapped in try-catch — synchronous throw is handled
+try {
+  (loggerForCliTest as any).cli();
+} catch (err) {
+  console.error('Logger.cli() migration trap caught:', err);
+}
+
+// SHOULD_FIRE: exception-handler-constructor-requires-logger
+const orphanExceptionHandler = new (winston as any).ExceptionHandler(undefined);
+
+// SHOULD_NOT_FIRE: ExceptionHandler construction wrapped in try-catch
+try {
+  const orphanExceptionHandler2 = new (winston as any).ExceptionHandler(undefined);
+} catch (err) {
+  console.error('Orphan ExceptionHandler construction failed:', err);
+}
+
+export { loggerForCliTest, orphanExceptionHandler };

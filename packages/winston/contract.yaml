@@ -1,12 +1,12 @@
 package: winston
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.86
+coverage_score: 0.89
 # Evidence: 6 repos scanned in scan-winston-2026-04-04.json, 2 affected (33%), 2 violations
 # Top affected: seerr-team/seerr, santiq/bulletproof-nodejs
 # All violations are createLogger() without .on('error') listener
@@ -221,6 +221,140 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: cli
+    import_path: "winston"
+    description: >
+      Removed method that was a shorthand for CLI-style log formatting in winston@2.
+      Always throws synchronously in winston@3+, regardless of arguments. Commonly
+      encountered in projects migrating from winston@2 where the codebase still calls
+      logger.cli() during initialization, causing immediate startup failures.
+    postconditions:
+      # Evidence: logger.js source — cli() unconditionally throws "Logger.cli() was removed in winston@3.0.0"
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js
+      - id: cli-throws-unconditionally
+        condition: >
+          logger.cli() called on any logger instance in winston@3+. Throws synchronously
+          with "Logger.cli() was removed in winston@3.0.0\nUse a custom winston.formats.cli()
+          instead." This is a hard migration trap — winston@2 codebases that call
+          logger.cli() crash at startup after upgrade.
+        throws: "Error — Logger.cli() was removed in winston@3.0.0"
+        required_handling: >
+          Remove all logger.cli() calls when upgrading from winston@2 to @3. Replace with
+          winston.format.cli() composed into the logger's format chain:
+            createLogger({ format: winston.format.cli(), transports: [...] }).
+          If logger.cli() is called at startup, the synchronous throw will crash the
+          process before any error handler can attach. Audit migration paths carefully.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/logger.js"
+          - "https://github.com/winstonjs/winston/blob/master/UPGRADE-3.0.md"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: "exceptions.handle"
+    import_path: "winston"
+    description: >
+      Attaches transports as handlers for the Node.js process-level `uncaughtException`
+      event. Without `exceptions.handle()` (or the `handleExceptions: true` option on a
+      transport), uncaught exceptions are NOT routed to winston transports — they print
+      to stderr and the process exits. Logger.exceptions is an ExceptionHandler instance
+      auto-created on every logger. The handler installs a `process.on('uncaughtException', ...)`
+      listener that logs to the configured handler transports and then calls process.exit(1)
+      based on the logger's `exitOnError` setting (default true, with 3s timeout).
+    postconditions:
+      # Evidence: exception-handler.js source — process.on('uncaughtException', ...) + process.exit(1)
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/exception-handler.js
+      - id: exceptions-handle-installs-process-exit
+        condition: >
+          logger.exceptions.handle(transport) or createLogger({ exceptionHandlers: [...] }) registers
+          a `process.on('uncaughtException', ...)` listener. When an uncaught exception fires, the
+          handler logs to the registered transports AND calls process.exit(1) after a 3-second
+          timeout (when logger.exitOnError is true, the default). Code that relies on a long-running
+          process being kept alive after the log is written will be terminated.
+        required_handling: >
+          To prevent process termination on uncaught exception while still logging, set
+          `exitOnError: false` on the logger options OR pass a function: `exitOnError: (err) => false`.
+          For services where reliability matters, prefer setting up domain-specific error boundaries
+          (express error middleware, async-context try/catch, AbortController) rather than relying on
+          winston's exception handler as a safety net — winston exits the process regardless of
+          whether the log write succeeded.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/exception-handler.js"
+          - "https://github.com/winstonjs/winston#exceptions"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: exception-handler.js source — constructor throws "Logger is required to handle exceptions"
+      - id: exception-handler-constructor-requires-logger
+        condition: >
+          new winston.ExceptionHandler() called without a logger argument. Throws synchronously
+          with "Logger is required to handle exceptions". Encountered when users build a
+          standalone ExceptionHandler outside the auto-created `logger.exceptions` path
+          (e.g. shared exception capture across multiple loggers).
+        throws: "Error — Logger is required to handle exceptions"
+        required_handling: >
+          Always pass a valid Logger instance to `new winston.ExceptionHandler(logger)`. The
+          idiomatic path is to use the auto-created `logger.exceptions` accessor and call
+          `.handle(...transports)` on it — that path is guaranteed to have a logger bound.
+          Avoid manual ExceptionHandler construction unless you have a specific multi-logger
+          coordination requirement.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/exception-handler.js"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: "rejections.handle"
+    import_path: "winston"
+    description: >
+      Attaches transports as handlers for the Node.js process-level `unhandledRejection`
+      event. Mirrors `exceptions.handle()` but for unhandled Promise rejections — async
+      errors that escape every try/catch in a Promise chain. Same exit-on-error semantics
+      as the exception handler. Without `rejections.handle()`, unhandled rejections only
+      print to stderr; in Node 15+ they ALSO terminate the process (default
+      `--unhandled-rejections=throw` mode).
+    postconditions:
+      # Evidence: rejection-handler.js — process.on('unhandledRejection') + process.exit(1) via gracefulExit
+      # Source confirmed: https://github.com/winstonjs/winston/blob/master/lib/winston/rejection-handler.js
+      - id: rejections-handle-installs-process-exit
+        condition: >
+          logger.rejections.handle(transport) or createLogger({ rejectionHandlers: [...] }) registers a
+          `process.on('unhandledRejection', ...)` listener. On unhandled rejection, the handler logs
+          to the registered transports and calls process.exit(1) after a 3-second timeout when
+          `exitOnError` is true (default). Combined with Node 15+'s default `throw` mode on
+          unhandled rejections, this means promises that lose their .catch() WILL terminate the
+          service — even if the promise itself was fire-and-forget.
+        required_handling: >
+          Treat unhandled rejection capture as a last-resort observability tool, not a safety net.
+          Every async function MUST have explicit error handling at the awaiter / .catch(). If
+          you set `rejectionHandlers` to capture telemetry, set `exitOnError: false` to avoid
+          terminating long-lived services on a single stray promise. For Express/Koa/Nest stacks,
+          rely on framework-provided async error middleware and use `rejections.handle()` only
+          to capture the log of last resort.
+        sources:
+          - "https://github.com/winstonjs/winston/blob/master/lib/winston/rejection-handler.js"
+          - "https://github.com/winstonjs/winston#rejections"
+        severity: warning
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
 
 edge_cases:
   - id: uncaught-exception-handling
