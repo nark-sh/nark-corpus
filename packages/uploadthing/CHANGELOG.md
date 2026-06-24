@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass (re-verification) — coverage 80% -> 80% (no change)
+
+- **Profile:** `packages/uploadthing/contract.yaml`
+- **Mode:** drift-by-staleness re-verification (last_deepened 2026-04-17, 68 days old)
+- **Package version inspected:** uploadthing@7.7.4
+- **Functions added:** none (API surface unchanged since 2026-04-17 pass)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** none new (still 2: `getFileUrls` deprecated, `getSignedURL` deprecated in favor of `generateSignedURL`)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** local `node_modules/uploadthing/server/index.d.ts` (UTApi class)
+- **Verified by:** bc-deepen-contract via deepen-stream-2 pass 66 (2026-06-24T08:23:44Z)
+- **Notes:** UTApi class still exposes the same 10 async methods recorded in the 2026-04-17 pass: `uploadFiles`, `uploadFilesFromUrl`, `deleteFiles`, `getFileUrls` (deprecated, omitted), `listFiles`, `renameFiles`, `getUsageInfo`, `generateSignedURL`, `getSignedURL` (deprecated, omitted), `updateACL`. 8 contracted, 2 omitted, effective coverage 8/8 = 1.0. Bumped `last_verified` to today.
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** uploadthing@7.7.4
