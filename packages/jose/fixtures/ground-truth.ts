@@ -14,6 +14,7 @@
  *   - import-x509-no-try-catch (on function: importX509) [ADDED 2026-04-16]
  *   - generate-key-pair-no-try-catch (on function: generateKeyPair) [ADDED 2026-04-16]
  *   - compact-verify-no-try-catch (on function: compactVerify) [ADDED 2026-04-16]
+ *   - remote-jwks-reload-no-try-catch (on function: createRemoteJWKSet.reload) [ADDED 2026-06-24]
  */
 
 import {
@@ -23,6 +24,7 @@ import {
   EncryptJWT,
   compactDecrypt,
   compactVerify,
+  createRemoteJWKSet,
   importJWK,
   importSPKI,
   importPKCS8,
@@ -242,4 +244,26 @@ export async function generateKeyPairSafely() {
   } catch (e) {
     throw e;
   }
+}
+
+// ─── 21. createRemoteJWKSet().reload() without try-catch ──────────────────────
+
+export async function bareRemoteJWKSReload() {
+  const JWKS = createRemoteJWKSet(new URL('https://example.com/.well-known/jwks.json'));
+  // SHOULD_FIRE: remote-jwks-reload-no-try-catch — .reload() without try-catch; throws JWKSTimeout on AbortSignal timeout, JOSEError on non-200 response or bad JSON
+  await JWKS.reload();
+  return JWKS;
+}
+
+// ─── 22. createRemoteJWKSet().reload() with try-catch ─────────────────────────
+
+export async function remoteJWKSReloadSafely() {
+  const JWKS = createRemoteJWKSet(new URL('https://example.com/.well-known/jwks.json'));
+  try {
+    // SHOULD_NOT_FIRE: .reload() inside try-catch — JWKSTimeout / JOSEError handled
+    await JWKS.reload();
+  } catch {
+    // swallow stale-cache failure
+  }
+  return JWKS;
 }
