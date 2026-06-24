@@ -2,11 +2,11 @@ package: body-parser
 semver: '>=1.20.0 <3.0.0'
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: '2026-04-15'
+last_verified: '2026-06-23'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.95
+coverage_score: 0.98
 functions:
   - name: json
     import_path: body-parser
@@ -98,17 +98,22 @@ functions:
           visibility: catastrophic
           user_experience: service_unavailable
           incident_cost_range: high
-      # Evidence: https://github.com/expressjs/body-parser/blob/master/lib/read.js#L96-L103 (contentstream fn)
-      # Source confirmed: createError(415, 'content encoding unsupported', { type: 'encoding.unsupported' })
+      # Evidence: node_modules/body-parser/lib/read.js (v2.3.0) lines 188-200 (contentstream fn)
+      # createError(415, 'content encoding unsupported', { type: 'encoding.unsupported' }) for inflate=false case
+      # createError(415, 'unsupported content encoding "<enc>"', { type: 'encoding.unsupported' }) in createDecompressionStream switch default
       - id: json-encoding-unsupported
         condition: >
-          Request has a Content-Encoding header with an unsupported encoding (not 'gzip', 'deflate',
-          or 'identity'), OR inflate option is set to false but request uses gzip or deflate encoding.
+          Request has a Content-Encoding header with an unsupported encoding (anything other than
+          'gzip', 'deflate', 'br', or 'identity' — note that 'br' / Brotli was added as a supported
+          decompression encoding in body-parser v2.0.0), OR the inflate option is set to false but
+          the request uses gzip/deflate/br encoding.
         throws: Error with err.status === 415 and err.type === 'encoding.unsupported'
         required_handling: >
           Error-handling middleware MUST catch this and return 415. Common when APIs accept compressed
           requests (e.g. from CDNs or proxies) but inflate is disabled, or when clients send custom
-          Content-Encoding headers. Without handling, the server returns an unhandled error to the client.
+          Content-Encoding headers. Note that v1.x consumers upgrading to v2.x get implicit Brotli
+          support — applications that previously rejected 'br' explicitly need to revisit that
+          assumption. Without handling, the server returns an unhandled error to the client.
         sources:
           - https://github.com/expressjs/body-parser/blob/master/README.md#unsupported-content-encoding-bogus
           - https://github.com/expressjs/body-parser/blob/master/lib/read.js
@@ -117,6 +122,38 @@ functions:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
           visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      # Evidence: node_modules/body-parser/lib/types/json.js (v2.3.0) lines 73-89 (createJsonParser strict branch)
+      # Source confirmed: when options.strict is omitted or true (the DEFAULT), bodies whose first
+      # non-whitespace character is not '{' or '[' throw a strict SyntaxError BEFORE JSON.parse runs.
+      # createStrictSyntaxError() returns a SyntaxError with err.status === 400 and err.type === 'entity.parse.failed'
+      # via the same normalizeJsonSyntaxError path used by malformed-json-throws.
+      - id: json-strict-violation
+        condition: >
+          The strict option is not explicitly set to false (it defaults to true in v2.x), and the
+          request body's first non-whitespace character is not '{' or '['. Common when clients send
+          a bare JSON primitive ("hello", 42, true, null) instead of an object or array, or when a
+          proxy injects a UTF-8 BOM or leading whitespace-stripped content. RFC 8259 allows any
+          JSON value as a top-level body, but body-parser intentionally restricts to object/array
+          unless strict:false is set.
+        throws: SyntaxError with err.status === 400 and err.type === 'entity.parse.failed' (message contains 'strict violation' or the offending char)
+        required_handling: >
+          Error-handling middleware MUST catch this. The same Express error handler that catches
+          malformed-json-throws will catch this — both surface as 400 with type 'entity.parse.failed'.
+          If your API needs to accept bare JSON primitives (numbers, strings, booleans, null) as
+          request bodies, you MUST explicitly pass { strict: false } when constructing the json
+          middleware. Failing to do so silently rejects valid RFC 8259 bodies that clients in
+          other languages (Python's requests with json= param sending a string, Go's json.Marshal
+          of a primitive) will produce naturally.
+        sources:
+          - https://github.com/expressjs/body-parser/blob/master/README.md#strict
+          - https://github.com/expressjs/body-parser/blob/master/lib/types/json.js
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
       # Evidence: https://github.com/expressjs/body-parser/blob/master/README.md#request-size-did-not-match-content-length
@@ -284,13 +321,17 @@ functions:
           visibility: catastrophic
           user_experience: service_unavailable
           incident_cost_range: high
-      # Evidence: https://github.com/expressjs/body-parser/blob/master/README.md#unsupported-content-encoding-bogus
+      # Evidence: node_modules/body-parser/lib/read.js (v2.3.0) lines 188-200 + 215-230
+      # createDecompressionStream switch accepts 'gzip', 'deflate', 'br' (Brotli added v2.0.0); default throws 415.
       - id: urlencoded-encoding-unsupported
         condition: >
-          Request has an unsupported Content-Encoding value, or inflate is false and gzip/deflate is used.
+          Request has an unsupported Content-Encoding value (anything other than 'gzip', 'deflate',
+          'br', or 'identity' — note 'br' / Brotli added in body-parser v2.0.0), OR inflate is false
+          and gzip/deflate/br is used.
         throws: Error with err.status === 415 and err.type === 'encoding.unsupported'
         required_handling: |
-          Error-handling middleware MUST catch this and return 415.
+          Error-handling middleware MUST catch this and return 415. Applications upgrading from v1.x
+          may now receive Brotli-encoded form bodies that previously would have been rejected.
         sources:
           - https://github.com/expressjs/body-parser/blob/master/README.md#unsupported-content-encoding-bogus
           - https://github.com/expressjs/body-parser/blob/master/lib/read.js
@@ -365,6 +406,37 @@ functions:
         sources:
           - https://github.com/expressjs/body-parser/blob/master/README.md#the-input-exceeded-the-depth
         severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: catastrophic
+          user_experience: service_unavailable
+          incident_cost_range: medium
+      # Evidence: node_modules/body-parser/lib/types/urlencoded.js (v2.3.0) lines 38, 72, 76
+      # Three sync TypeError throw sites that fire at MIDDLEWARE-CONSTRUCTION time (not per-request):
+      #   - defaultCharset !== 'utf-8' && !== 'iso-8859-1' (line 38)
+      #   - parameterLimit NaN or < 1 (line 72)
+      #   - depth NaN or < 0 (line 76)
+      # These are sync throws OUTSIDE the request lifecycle — Express error-handling middleware
+      # cannot catch them because they execute during `bodyParser.urlencoded({...})` at app boot.
+      - id: urlencoded-config-type-error
+        condition: >
+          The urlencoded({ ... }) constructor is invoked with an invalid option value: defaultCharset
+          set to anything other than 'utf-8' or 'iso-8859-1'; parameterLimit set to a non-numeric
+          or non-positive value; depth set to a non-numeric or negative value. In v2.x these checks
+          run synchronously at middleware-construction time, NOT at request time. The TypeError
+          surfaces during `app.use(bodyParser.urlencoded({...}))` and crashes the Node process
+          before the server starts listening.
+        throws: TypeError with message 'option defaultCharset must be either utf-8 or iso-8859-1' | 'option parameterLimit must be a positive number' | 'option depth must be a zero or a positive number'
+        required_handling: >
+          DO NOT rely on Express error-handling middleware for these — they fire BEFORE any request.
+          Validate option values at the call site, or wrap the middleware factory in a try/catch
+          during boot to surface a clear startup error rather than an uncaught exception. Common
+          regression source: passing a string for parameterLimit from process.env without
+          parseInt(), or accidentally setting defaultCharset to 'UTF-8' (uppercase).
+        sources:
+          - https://github.com/expressjs/body-parser/blob/master/lib/types/urlencoded.js
+        severity: warning
         business_impact:
           incident_label: DOWNTIME
           production_behavior: immediate_exception
@@ -468,9 +540,11 @@ functions:
           visibility: catastrophic
           user_experience: service_unavailable
           incident_cost_range: high
-      # Evidence: https://github.com/expressjs/body-parser/blob/master/README.md#unsupported-content-encoding-bogus
+      # Evidence: node_modules/body-parser/lib/read.js (v2.3.0) createDecompressionStream — 'gzip', 'deflate', 'br', 'identity' accepted
       - id: raw-encoding-unsupported
-        condition: Request has unsupported Content-Encoding, or inflate is false but gzip/deflate is sent.
+        condition: >
+          Request has unsupported Content-Encoding (anything other than 'gzip', 'deflate', 'br', or
+          'identity' — 'br' / Brotli added in v2.0.0), or inflate is false but gzip/deflate/br is sent.
         throws: Error with err.status === 415 and err.type === 'encoding.unsupported'
         required_handling: |
           Error-handling middleware MUST catch this and return 415.
@@ -595,9 +669,11 @@ functions:
           visibility: catastrophic
           user_experience: service_unavailable
           incident_cost_range: high
-      # Evidence: https://github.com/expressjs/body-parser/blob/master/README.md#unsupported-content-encoding-bogus
+      # Evidence: node_modules/body-parser/lib/read.js (v2.3.0) createDecompressionStream — 'gzip', 'deflate', 'br', 'identity' accepted
       - id: text-encoding-unsupported
-        condition: Request has unsupported Content-Encoding, or inflate is false but gzip/deflate is sent.
+        condition: >
+          Request has unsupported Content-Encoding (anything other than 'gzip', 'deflate', 'br', or
+          'identity' — 'br' / Brotli added in v2.0.0), or inflate is false but gzip/deflate/br is sent.
         throws: Error with err.status === 415 and err.type === 'encoding.unsupported'
         required_handling: |
           Error-handling middleware MUST catch this and return 415.
