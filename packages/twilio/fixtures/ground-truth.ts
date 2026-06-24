@@ -151,3 +151,85 @@ export async function createVerifyServiceWithCatch(friendlyName: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. messages.create() depth: error.code 21610 (recipient opted out via STOP)
+// Postcondition: messages-create-opted-out-not-handled
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: messages-create-opted-out-not-handled
+export async function sendSmsGenericCatchNoOptOutCheck(to: string, body: string) {
+  const client = twilio(accountSid, authToken);
+  try {
+    // PENDING_DETECTOR: messages-create-opted-out-not-handled — detector not yet built
+    // (queued via concern-20260624-twilio-deepen-1). Postcondition asserts that catch
+    // around messages.create() should check error.code === 21610 (recipient STOP'd).
+    const message = await client.messages.create({ body, to, from: '+15551234567' });
+    return message.sid;
+  } catch (err) {
+    console.error('SMS failed:', err);
+    return null;
+  }
+}
+
+// @expect-clean
+export async function sendSmsHandlesOptOut(
+  to: string,
+  body: string,
+  markOptedOut: (n: string) => Promise<void>,
+) {
+  const client = twilio(accountSid, authToken);
+  try {
+    // SHOULD_NOT_FIRE: catch explicitly handles error.code 21610.
+    const message = await client.messages.create({ body, to, from: '+15551234567' });
+    return message.sid;
+  } catch (err: any) {
+    if (err.code === 21610) {
+      // Recipient opted out — mark in DB so we never retry; fall back to email.
+      await markOptedOut(to);
+      return null;
+    }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. messages.create() depth: error.code 21408 (geo-permission denied)
+// Postcondition: messages-create-geo-permission-not-handled
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: messages-create-geo-permission-not-handled
+export async function sendInternationalSmsNoGeoCheck(to: string, body: string) {
+  const client = twilio(accountSid, authToken);
+  try {
+    // PENDING_DETECTOR: messages-create-geo-permission-not-handled — detector not yet built
+    // (queued via concern-20260624-twilio-deepen-2). Postcondition asserts that catch
+    // around messages.create() should check error.code === 21408 (geo-permission blocked).
+    const message = await client.messages.create({ body, to, from: '+15551234567' });
+    return message.sid;
+  } catch (err) {
+    return null;
+  }
+}
+
+// @expect-clean
+export async function sendInternationalSmsHandlesGeo(
+  to: string,
+  body: string,
+  alertOps: (code: string) => Promise<void>,
+) {
+  const client = twilio(accountSid, authToken);
+  try {
+    // SHOULD_NOT_FIRE: catch explicitly handles error.code 21408.
+    const message = await client.messages.create({ body, to, from: '+15551234567' });
+    return message.sid;
+  } catch (err: any) {
+    if (err.code === 21408) {
+      // Geo-permission denied — alert ops to enable the country in Console
+      // and fall back to email verification.
+      await alertOps(to);
+      throw new Error('SMS unavailable in your region — please use email verification.');
+    }
+    throw err;
+  }
+}

@@ -2,7 +2,7 @@ package: twilio
 semver: ">=3.0.0 <7.0.0"
 contract_version: 1.0.0
 maintainer: corpus-team
-last_verified: 2026-04-15
+last_verified: 2026-06-24
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -12,6 +12,9 @@ coverage_score: 0.92
 # Functions contracted: messages.create, calls.create, verifications.create, verificationCheck.create,
 #   lookups.v2.phoneNumbers.fetch, twilio (constructor), validateRequest, calls.update,
 #   messages.fetch, calls.recordings.create, verify.services.create
+# Depth pass 2026-06-24 (deepen-stream-3): +2 postconditions on messages.create
+#   - messages-create-opted-out-not-handled (error.code 21610, recipient STOP'd)
+#   - messages-create-geo-permission-not-handled (error.code 21408, country blocked)
 
 detection:
   factory_methods:
@@ -81,6 +84,85 @@ functions:
         source: https://www.twilio.com/docs/api/errors
         sources:
           - https://www.twilio.com/docs/api/errors
+      # Evidence: https://www.twilio.com/docs/api/errors/21610 (fetched 2026-06-24)
+      # Confirmed: recipient previously replied STOP/UNSUBSCRIBE; subsequent
+      # messages.create() throws RestException with error.code === 21610.
+      # Twilio blocks all messages to opted-out numbers until they text START.
+      - id: messages-create-opted-out-not-handled
+        condition: messages.create() does not handle error code 21610 (recipient opted out)
+        throws: RestException with error.code 21610
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: |
+          Error 21610 occurs when the recipient phone number has previously
+          replied STOP (or another opt-out keyword) to your Twilio sender. The
+          message is blocked until the recipient texts START. In SaaS apps that
+          send transactional SMS (password resets, 2FA, order updates), a
+          generic catch that retries or logs-and-ignores this error means the
+          user never receives critical notifications and the operator has no
+          signal that the user is unreachable via SMS. This is a SILENT data
+          loss class — the API call succeeds (returns an exception), but the
+          downstream business outcome (delivery) never happens, and the user
+          state (opted-out) is not surfaced upstream so it can be marked in
+          the user's profile.
+        detector: |
+          If catch block around client.messages.create() does not check
+          error.code === 21610 to detect opted-out recipients
+        required_handling: |
+          SHOULD check error.code === 21610 in the catch block and either
+          (a) mark the recipient's profile as sms_opted_out so future messages
+          are not attempted, (b) fall back to an alternative channel (email
+          or push), or (c) surface the opt-out state to the operator UI. DO
+          NOT retry — Twilio will continue to reject until the user opts back
+          in via START.
+        source: https://www.twilio.com/docs/api/errors/21610
+        sources:
+          - https://www.twilio.com/docs/api/errors/21610
+      # Evidence: https://www.twilio.com/docs/api/errors/21408 (fetched 2026-06-24)
+      # Confirmed: destination country/region is not enabled in account's
+      # Messaging Geo Permissions OR the country code is unsupported for the
+      # chosen channel (e.g. +98 for WhatsApp/RCS). Common pitfall in
+      # SaaS apps that go international without provisioning the geo permission.
+      - id: messages-create-geo-permission-not-handled
+        condition: messages.create() does not handle error code 21408 (geo-permission denied)
+        throws: RestException with error.code 21408
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: |
+          Error 21408 occurs when the destination country is not enabled in the
+          Twilio account's Geo Permissions (Console -> Messaging -> Settings ->
+          Geo Permissions) or the recipient country code is unsupported for the
+          chosen channel (SMS / WhatsApp / RCS). In multi-region SaaS, this
+          shows up the first time a user from a new country signs up — their
+          2FA / verification SMS never arrives and the user is locked out of
+          signup. A generic catch that swallows the error blocks an entire
+          country's user acquisition without telemetry surfacing the cause.
+          Some destinations (Iran, Syria, Cuba) are absolutely blocked by
+          Twilio regulatory policy and cannot be enabled even with permission
+          changes.
+        detector: |
+          If catch block around client.messages.create() does not check
+          error.code === 21408 to detect geo-permission failures
+        required_handling: |
+          SHOULD check error.code === 21408 in the catch block and either
+          (a) surface to ops telemetry so the country can be enabled in Geo
+          Permissions, (b) reject the user-facing signup with a clear "SMS
+          not supported in your region — please use email verification"
+          message, or (c) fall back to an alternative verification channel.
+          DO NOT retry — the error is configuration-level, not transient.
+        source: https://www.twilio.com/docs/api/errors/21408
+        sources:
+          - https://www.twilio.com/docs/api/errors/21408
   - name: create
     import_path: twilio
     namespace: calls

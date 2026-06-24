@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 92% → 92% (depth not surface)
+
+- **Profile:** `packages/twilio/contract.yaml`
+- **Functions added:** none (already at 11/12 covered)
+- **Postconditions added:** 2 on existing `messages.create()`
+  - `messages-create-opted-out-not-handled` — catches `error.code === 21610` (recipient replied STOP)
+  - `messages-create-geo-permission-not-handled` — catches `error.code === 21408` (country blocked by Geo Permissions)
+- **Functions intentionally omitted this pass:** `incomingPhoneNumbers.create()` — provisioning is admin/setup, not runtime SaaS path (unchanged from prior passes)
+- **Scanner concerns queued:** 2 (`concern-20260624-twilio-deepen-1`, `concern-20260624-twilio-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://www.twilio.com/docs/api/errors/21610 , https://www.twilio.com/docs/api/errors/21408
+- **Verified by:** bc-deepen-contract pass 28 (deepen-stream-3, 2026-06-24T02:11Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** twilio@6.0.2
