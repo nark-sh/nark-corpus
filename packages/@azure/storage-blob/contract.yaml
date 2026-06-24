@@ -1,12 +1,12 @@
 package: '@azure/storage-blob'
 semver: '>=12.0.0'
-contract_version: 1.1.0
+contract_version: 1.2.0
 maintainer: corpus-team
-last_verified: '2026-04-16'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.76
+coverage_score: 0.88
 # Evidence: 0 violations across 5 repos scanned in scan-azure-storage-blob-2026-04-11.json
 # Repos: remotely-save/remotely-save (⭐ 7025), erxes/erxes (⭐ 3918), unjs/unstorage (⭐ 2536),
 #         Scale3-Labs/langtrace (⭐ 1187), zetaloop/desktop (⭐ 743)
@@ -1023,3 +1023,241 @@ functions:
           Caller MUST set options.expiresOn to an appropriate future time (typically
           15 minutes for upload forms, up to 1 hour for download links). Communicate
           expiry to end users and provide a mechanism to generate fresh URLs.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-exists
+  # Evidence: node_modules/@azure/storage-blob/dist/commonjs/Clients.js lines 381-401 (verified at @azure/storage-blob@12.32.0)
+  # The exists() implementation explicitly swallows ONLY statusCode 404 (returns false)
+  # and 409 BlobUsesCustomerSpecifiedEncryption/BlobDoesNotUseCustomerSpecifiedEncryption
+  # (returns true). Every other failure mode — auth/403, throttling/429, transient
+  # network errors — re-throws. Devs commonly assume "exists() returns boolean so it
+  # never throws" and use it without try-catch, which causes 403/429 to bubble as
+  # unhandled rejections in higher layers.
+  - name: exists
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Returns true if the blob exists. Internally calls getProperties() and catches
+      ONLY the 404 BlobNotFound response (returns false) and the 409 CPK-mismatch
+      responses (returns true). Auth errors, throttling, lease conflicts, and network
+      errors propagate as RestError. Distinct from ContainerClient.exists() which has
+      identical swallow-pattern at container scope.
+    postconditions:
+      - id: blob-exists-no-try-catch
+        condition: >
+          credential lacks read permission on the blob (statusCode 403), or the
+          storage service throttles the request (statusCode 429), or the account
+          enforces a network ACL the client violates (statusCode 403
+          AuthorizationFailure) — exists() re-throws RestError. The boolean return
+          contract misleads callers into omitting try-catch.
+        throws: 'RestError (from @azure/core-rest-pipeline) — statusCode 403 (auth/ACL), 429 (throttling), or network error code'
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-exists
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap exists() in try-catch and distinguish (a) the boolean false
+          result (truly missing) from (b) a thrown RestError (auth / throttling /
+          network). Do NOT treat a thrown error as equivalent to "blob does not exist"
+          — that produces silent data loss when permissions regress in production.
+
+      - id: blob-exists-race-condition
+        condition: >
+          another writer creates or deletes the blob between the exists() check and
+          a subsequent operation (download, delete, copy). exists() is a point-in-time
+          read; the result is stale the moment it returns. Time-of-check / time-of-use
+          (TOCTOU) bugs in cleanup jobs and migration scripts.
+        throws: >
+          Does NOT throw on race. The race manifests in the next operation as a
+          RestError 404 BlobNotFound on download/delete, or 409 BlobAlreadyExists on
+          upload.
+        sources:
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-exists
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/specifying-conditional-headers-for-blob-service-operations
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: delayed_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller SHOULD prefer single-call patterns over check-then-act. For deletes
+          use deleteIfExists(); for conditional uploads use If-None-Match or
+          If-Match conditional headers (options.conditions.ifMatch); for downloads
+          catch the RestError 404 directly. exists() is appropriate ONLY for read-only
+          telemetry / dashboards where staleness is acceptable.
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-deleteifexists
+  # Evidence: node_modules/@azure/storage-blob/dist/commonjs/Clients.js lines 476-497 (verified at @azure/storage-blob@12.32.0)
+  # The deleteIfExists() implementation swallows ONLY errorCode "BlobNotFound" (returns
+  # { succeeded: false }). 409 SnapshotsPresent — the killer production bug from
+  # blob-delete-snapshots-present above — still throws. Same applies to 412
+  # LeaseIdMissing, 403 auth, 429 throttling. The "If Exists" name is misleading.
+  - name: deleteIfExists
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Convenience wrapper around delete(). Returns { succeeded: false, ... } when the
+      blob does not exist (catches RestError with errorCode BlobNotFound), but
+      propagates EVERY OTHER error including 409 SnapshotsPresent — the exact
+      silent-bug case covered in blob-delete-snapshots-present. The "If Exists" name
+      misleads callers into omitting try-catch on the assumption that the wrapper
+      handles all delete failures.
+    postconditions:
+      - id: blob-deleteifexists-snapshots-present
+        condition: >
+          blob has one or more snapshots and deleteSnapshots option was NOT set —
+          deleteIfExists throws RestError statusCode 409 errorCode SnapshotsPresent
+          (forwarded from delete()). This is the same critical production bug as
+          BlobClient.delete() — succeeds in development without snapshots, fails in
+          production after Azure Backup or versioning policy creates snapshots.
+        throws: 'RestError with statusCode 409 and errorCode: SnapshotsPresent (not swallowed by the "if exists" wrapper)'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-deleteifexists
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST either pass { deleteSnapshots: 'include' } to delete blob and
+          snapshots together, or wrap deleteIfExists in try-catch and check
+          error.details?.errorCode === 'SnapshotsPresent'. The boolean succeeded
+          flag does NOT cover this case — the call throws before returning.
+
+      - id: blob-deleteifexists-lease-conflict
+        condition: >
+          blob has an active lease and no lease ID was provided — deleteIfExists
+          throws RestError statusCode 412 errorCode LeaseIdMissing or
+          LeaseIdMismatchWithBlobOperation. The wrapper does NOT swallow lease
+          errors.
+        throws: 'RestError with statusCode 412 and errorCode: LeaseIdMissing or LeaseIdMismatchWithBlobOperation'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-deleteifexists
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST provide the active lease ID via options.conditions.leaseId for
+          leased blobs. The "if exists" wrapper is NOT a replacement for try-catch
+          around the call.
+
+      - id: blob-deleteifexists-auth-and-throttling
+        condition: >
+          credential lacks delete permission on the blob (403), or the storage
+          service throttles the request (429 ServerBusy / TimeoutException) — the
+          wrapper re-throws RestError. Cleanup batch jobs that iterate large blob
+          counts commonly trigger throttling; without try-catch the batch halts
+          mid-iteration leaving an inconsistent dataset.
+        throws: 'RestError with statusCode 403 (auth) or 429 (throttling — ServerBusy / OperationTimedOut)'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/storage-service-throttle-warnings
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST wrap deleteIfExists in try-catch even though the name implies
+          safety. For batch cleanup jobs, implement retry-with-backoff on RestError
+          429 and surface 403 to the operator (RBAC regression, not a transient
+          fault).
+
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-settags
+  # Evidence: https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-gettags
+  # Evidence: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-tags
+  # 12.30.0 (2026-01-16) release added conditional-headers support on getTags() and
+  # setTags() — see Azure/azure-sdk-for-js CHANGELOG.md storage-blob entry. This
+  # introduced a NEW 412 PreconditionFailed scenario that 12.0-12.29.x callers do
+  # not encounter. Profile semver is >=12.0.0 so contract must cover the new modes.
+  - name: setTags
+    import_path: '@azure/storage-blob.BlobClient'
+    description: >
+      Sets the user-defined index tags on a blob. Tags are name/value strings used
+      for indexed lookup via findBlobsByTags. Each blob can have up to 10 tags; tag
+      name length 1-128 chars, value length 0-256 chars. setTags accepts options
+      with conditional headers (ifTags / ifMatch / ifNoneMatch — the conditional
+      header support on tag ops was added in 12.30.0). Common in compliance /
+      retention workflows and multi-tenant data classification.
+    postconditions:
+      - id: settags-precondition-failed
+        condition: >
+          options.conditions.ifTags or .ifMatch is provided and the current blob
+          state does not satisfy the predicate — throws RestError statusCode 412
+          errorCode ConditionNotMet (ifMatch) or TagConditionNotMet (ifTags). New
+          in 12.30.0; legacy callers pinned to <=12.29.x will not encounter this.
+        throws: 'RestError with statusCode 412 and errorCode: ConditionNotMet or TagConditionNotMet'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://github.com/Azure/azure-sdk-for-js/blob/main/sdk/storage/storage-blob/CHANGELOG.md
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        required_handling: >
+          Caller MUST catch RestError with statusCode 412 to detect conditional-write
+          races. Typical pattern is retry with a fresh ETag or back off and re-read
+          tags via getTags() before re-attempting setTags.
+
+      - id: settags-invalid-tag-value
+        condition: >
+          tag name violates the 1-128 char rule, value violates the 0-256 char rule,
+          tag name contains disallowed characters, or the blob already has 10 tags
+          and a new tag is being added — throws RestError statusCode 400 errorCode
+          InvalidXmlNodeValue / InvalidInput. Often triggered by serializing
+          user-supplied metadata directly into tags without validation.
+        throws: 'RestError with statusCode 400 and errorCode: InvalidInput or InvalidXmlNodeValue'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tags
+          - https://learn.microsoft.com/en-us/azure/storage/blobs/storage-manage-find-blobs
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST validate tag inputs against Azure's rules BEFORE calling
+          setTags, or catch RestError 400 and surface the validation error to the
+          end user. Storing user-supplied data as tags requires explicit allowlist
+          / sanitization.
+
+      - id: settags-blob-not-found
+        condition: >
+          target blob does not exist or is in a deleted state — throws RestError
+          statusCode 404 errorCode BlobNotFound. Often encountered after async
+          deletion in retention workflows.
+        throws: 'RestError with statusCode 404 and errorCode: BlobNotFound'
+        sources:
+          - https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
+          - https://learn.microsoft.com/en-us/javascript/api/@azure/storage-blob/blobclient#@azure-storage-blob-blobclient-settags
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+        required_handling: >
+          Caller MUST catch RestError statusCode 404 to handle the
+          deleted-between-list-and-tag race that retention pipelines hit. Skip
+          and log; do not abort the batch.
