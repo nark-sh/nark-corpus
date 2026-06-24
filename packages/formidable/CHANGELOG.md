@@ -3,6 +3,22 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (completeness fill)
+
+- **Profile:** `packages/formidable/contract.yaml`
+- **Functions added:** 0 (parse() remains the sole async surface)
+- **Postconditions added:** 1
+  - `formidable-uninitialized-parser` — FormidableError code 1004 (defensive guard inside write(); surfaces via parse() promise rejection when _parser was never bound)
+- **Functions intentionally omitted this pass:** unchanged from 2026-06-18 (use/pause/resume/write/onPart sync; writeHeaders internal — its rejections flow through parse())
+- **Scanner concerns queued:** 1 (`concern-20260624-formidable-deepen-1`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://github.com/node-formidable/formidable/blob/master/src/FormidableError.js (uninitializedParser = 1004 const confirmed at L7)
+  - https://github.com/node-formidable/formidable/blob/master/src/Formidable.js#L289-L295 (throw site inside write() with _error() routing to parse() promise rejection)
+  - npm pack formidable@3.5.4 inspection at /private/tmp/claude/_pass85/package/src/
+- **Notes:** Closes the last documented FormidableError code (1004) without a dedicated postcondition. All 19 numeric constants in FormidableError.js now have either a dedicated postcondition (15) or a documented sync-omission rationale (4: missingPlugin/pluginFunction sync constructor/use() throws, plus aborted/noParser shadowing). Coverage score remains 1.0; this is a completeness fill not a coverage promotion.
+- **Verified by:** bc-deepen-contract (pass 85 on 2026-06-24T14:14:06Z)
+
 ## 2026-06-18 — deepen pass — coverage 92% → 100%
 
 - **Profile:** `packages/formidable/contract.yaml`

@@ -93,6 +93,14 @@ async function noErrorHandlingFilenameNotString(req: IncomingMessage) {
   return files;
 }
 
+// SHOULD_FIRE: formidable-uninitialized-parser
+async function noErrorHandlingUninitializedParser(req: IncomingMessage) {
+  const form = formidable({});
+  // Defensive-guard error from write() when _parser was never set up; surfaces via parse() promise rejection.
+  const [fields, files] = await form.parse(req);
+  return files;
+}
+
 // ---------------------------------------------------------------------------
 // CLEAN CASES — scanner MUST NOT flag these
 // ---------------------------------------------------------------------------
@@ -229,6 +237,20 @@ async function filenameNotStringHandled(req: IncomingMessage) {
   } catch (err: any) {
     if (err.code === formidableErrors.filenameNotString) {
       return { error: 'Malformed Content-Disposition', httpCode: 400 };
+    }
+    throw err;
+  }
+}
+
+// @expect-clean
+async function uninitializedParserHandled(req: IncomingMessage) {
+  const form = formidable({});
+  try {
+    const [fields, files] = await form.parse(req);
+    return files;
+  } catch (err: any) {
+    if (err.code === formidableErrors.uninitializedParser) {
+      return { error: 'Internal parser inconsistency', httpCode: 500 };
     }
     throw err;
   }
