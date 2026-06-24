@@ -15,6 +15,8 @@
  *   subscribe-event-errors-unchecked — for-await loop on subscribe doesn't check event.errors
  *   buildschema-syntax-error         — buildSchema() without try-catch
  *   buildschema-semantic-validation-error — buildSchema() without try-catch
+ *   execute-subscription-event-defer-stream-rejection — executeSubscriptionEvent without try/catch for @defer/@stream
+ *   execute-subscription-event-abort-signal-rejection — executeSubscriptionEvent with abortSignal but no try/catch
  *
  * Scanner limitation note:
  *   validate() and execute() use the return-value-checker plugin which fires
@@ -212,6 +214,8 @@ import {
   execute as executeV17,
   experimentalExecuteIncrementally,
   legacyExecuteIncrementally,
+  executeSubscriptionEvent,
+  validateSubscriptionArgs,
   AbortedGraphQLExecutionError,
 } from 'graphql';
 
@@ -331,6 +335,69 @@ async function legacyIncremental_withAbortMissingHandling(s: GraphQLSchema, docu
   return result;
 }
 
+// ─── executeSubscriptionEvent tests (added 2026-06-24 deepen pass 95) ─────────
+// New v17 surface:
+//   executeSubscriptionEvent — lower-level subscription event executor backed by
+//   ExecutorThrowingOnIncremental. Throws a plain Error (not GraphQLError) when
+//   the subscription selection contains @defer or @stream directives. Also
+//   surfaces AbortedGraphQLExecutionError on abortSignal abort like execute().
+
+async function executeSubscriptionEvent_withDeferStreamProperHandling(s: GraphQLSchema, document: any) {
+  // SHOULD_NOT_FIRE: execute-subscription-event-defer-stream-rejection
+  // Awaited call is wrapped in try/catch and discriminates the plain-Error case.
+  const validated = validateSubscriptionArgs({ schema: s, document });
+  if (!('schema' in validated)) {
+    return { errors: validated };
+  }
+  try {
+    const eventResult = await executeSubscriptionEvent(validated);
+    return eventResult;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('unexpectedly produce multiple payloads')) {
+      return { errors: [new GraphQLError('@defer and @stream are not supported on subscriptions')] };
+    }
+    throw error;
+  }
+}
+
+async function executeSubscriptionEvent_withoutDeferStreamHandling(s: GraphQLSchema, document: any) {
+  // SHOULD_FIRE: execute-subscription-event-defer-stream-rejection
+  // No try/catch around the awaited call. Plain Error surfaces as unhandled rejection
+  // when document contains @defer / @stream on the subscription selection.
+  const validated = validateSubscriptionArgs({ schema: s, document });
+  if (!('schema' in validated)) {
+    return { errors: validated };
+  }
+  const eventResult = await executeSubscriptionEvent(validated);
+  return eventResult;
+}
+
+async function executeSubscriptionEvent_withAbortProperHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // SHOULD_NOT_FIRE: execute-subscription-event-abort-signal-rejection
+  const validated = validateSubscriptionArgs({ schema: s, document, abortSignal: signal });
+  if (!('schema' in validated)) {
+    return { errors: validated };
+  }
+  try {
+    return await executeSubscriptionEvent(validated);
+  } catch (error) {
+    if (error instanceof AbortedGraphQLExecutionError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function executeSubscriptionEvent_withAbortMissingHandling(s: GraphQLSchema, document: any, signal: AbortSignal) {
+  // SHOULD_FIRE: execute-subscription-event-abort-signal-rejection
+  // abortSignal is passed via validated args but the awaited call is not wrapped.
+  const validated = validateSubscriptionArgs({ schema: s, document, abortSignal: signal });
+  if (!('schema' in validated)) {
+    return { errors: validated };
+  }
+  return await executeSubscriptionEvent(validated);
+}
+
 export {
   parse_withTryCatch,
   parse_withoutTryCatch,
@@ -356,4 +423,8 @@ export {
   legacyIncremental_withDiscrimination,
   legacyIncremental_withoutDiscrimination,
   legacyIncremental_withAbortMissingHandling,
+  executeSubscriptionEvent_withDeferStreamProperHandling,
+  executeSubscriptionEvent_withoutDeferStreamHandling,
+  executeSubscriptionEvent_withAbortProperHandling,
+  executeSubscriptionEvent_withAbortMissingHandling,
 };

@@ -1,8 +1,8 @@
 package: graphql
 semver: ">=16.0.0 <18.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-18"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -51,7 +51,7 @@ evidence_quality: confirmed
 #   node_modules/graphql@17.0.1/execution/incremental/IncrementalPublisher.js lines 14-25
 #     (subsequentResults.throw(reason) on abort)
 #   https://github.com/graphql/graphql-spec/pull/742 (incremental delivery RFC)
-coverage_score: 0.80  # 8 contracted / 10 total callable async exports (2 intentionally omitted)
+coverage_score: 0.9  # 9 contracted / 10 total callable async exports (1 intentionally omitted: createSourceEventStream)
 
 detection:
   type_names:
@@ -639,6 +639,166 @@ functions:
           user_experience: lost_data
           incident_cost_range: low
 
+  # Added by bc-deepen-contract 2026-06-24 (pass 95 — deepen-stream-2).
+  # Source: graphql@17.0.1 — node_modules/graphql/execution/execute.d.ts lines 192-230,
+  # node_modules/graphql/execution/execute.js lines 120-122 (executeSubscriptionEvent
+  # wraps `new ExecutorThrowingOnIncremental(args).executeRootSelectionSet(false)`),
+  # node_modules/graphql/execution/ExecutorThrowingOnIncremental.d.ts +
+  # ExecutorThrowingOnIncremental.js (the class's executeCollectedRootFields,
+  # executeCollectedSubfields, and completeListValue overrides each throw a plain
+  # Error with message `Executing this GraphQL operation would unexpectedly produce
+  # multiple payloads (due to @defer or @stream directive)` when @defer / @stream
+  # is encountered on a subscription operation).
+  - name: executeSubscriptionEvent
+    import_path: "graphql"
+    description: >
+      Lower-level subscription primitive introduced in v17. Executes a subscription
+      operation once for a single source event, given pre-validated execution args
+      (output of validateSubscriptionArgs). Used by frameworks that build their own
+      subscription pipeline (custom server transports that manage the source event
+      stream manually and feed each event into executeSubscriptionEvent themselves)
+      instead of calling subscribe(). Distinct error surface from execute() — the
+      v17 implementation is backed by ExecutorThrowingOnIncremental, which throws a
+      plain Error (NOT GraphQLError) when the subscription selection contains
+      @defer or @stream directives. Resolver errors continue to be collected into
+      result.errors (same as execute), and AbortedGraphQLExecutionError still
+      applies when args.abortSignal aborts. The @defer/@stream-throwing behavior
+      is unique to this function and is what makes it a separate contract surface.
+    postconditions:
+      # Evidence: node_modules/graphql@17.0.1/execution/execute.js line 120-122
+      # function executeSubscriptionEvent(validatedExecutionArgs) {
+      #   return new ExecutorThrowingOnIncremental(validatedExecutionArgs)
+      #     .executeRootSelectionSet(false);
+      # }
+      # Evidence: node_modules/graphql@17.0.1/execution/ExecutorThrowingOnIncremental.js
+      # The three override methods (executeCollectedRootFields, executeCollectedSubfields,
+      # completeListValue) each detect @defer / @stream usage and:
+      #   const reason = new Error(UNEXPECTED_MULTIPLE_PAYLOADS);
+      #   this.abort(reason);
+      #   throw reason;
+      # Where UNEXPECTED_MULTIPLE_PAYLOADS = 'Executing this GraphQL operation would
+      # unexpectedly produce multiple payloads (due to @defer or @stream directive)'.
+      # This is a PLAIN Error instance — not a GraphQLError — and propagates as a
+      # Promise rejection from executeSubscriptionEvent (unlike resolver errors which
+      # are captured into result.errors).
+      - id: execute-subscription-event-defer-stream-rejection
+        condition: >
+          executeSubscriptionEvent() is called with validatedExecutionArgs whose
+          document contains @defer or @stream directives on the subscription
+          selection set. The Executor backing executeSubscriptionEvent
+          (ExecutorThrowingOnIncremental) does NOT support incremental delivery
+          on subscriptions and aborts the operation by throwing a plain Error.
+          Without try/catch around the awaited call, the rejection surfaces as
+          an UnhandledPromiseRejection and the subscription event is lost.
+        throws: >
+          A plain Error (NOT GraphQLError, NOT AbortedGraphQLExecutionError) with
+          message: 'Executing this GraphQL operation would unexpectedly produce
+          multiple payloads (due to @defer or @stream directive)'. The
+          ExecutorThrowingOnIncremental's abort() is called internally, which
+          also signals any registered AsyncWorkTracker — but the top-level
+          rejection is the plain Error.
+        required_handling: >
+          Wrap the awaited executeSubscriptionEvent() call in try/catch. The
+          @defer/@stream-on-subscription error indicates a CLIENT-side bug
+          (subscriptions don't accept incremental directives) — surface the
+          error to the client as a structured response, do NOT 500. Pattern:
+
+            import { executeSubscriptionEvent, validateSubscriptionArgs } from 'graphql';
+
+            const validated = validateSubscriptionArgs(args);
+            if (!('schema' in validated)) {
+              return { errors: validated }; // pre-validation failed
+            }
+
+            try {
+              const eventResult = await executeSubscriptionEvent(validated);
+              return eventResult;
+            } catch (error) {
+              if (error instanceof Error && error.message.includes('unexpectedly produce multiple payloads')) {
+                // Client used @defer/@stream on a subscription — protocol error
+                return { errors: [new GraphQLError(
+                  '@defer and @stream are not supported on subscription operations'
+                )] };
+              }
+              throw error;
+            }
+
+          DO NOT assume executeSubscriptionEvent shares execute()'s
+          errors-collected-into-result.errors model — the
+          @defer/@stream-on-subscription path is THROWN, not collected. This
+          is the one place in the graphql-js API where the executor surfaces a
+          plain Error as a Promise rejection for a document-shape issue
+          (everything else returns errors-in-result).
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/ExecutorThrowingOnIncremental.ts"
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/execute.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: ExecutorThrowingOnIncremental extends Executor (same Executor
+      # base class as execute() uses). The Executor.finish() implementation
+      # (node_modules/graphql@17.0.1/execution/Executor.js lines 159-168) checks
+      # this.aborted and throws AbortedGraphQLExecutionError when an abortSignal
+      # has fired. The error carries the partial subscription-event result via
+      # error.abortedResult — same partial-result-on-abort surface as execute().
+      - id: execute-subscription-event-abort-signal-rejection
+        condition: >
+          executeSubscriptionEvent() is called with validatedExecutionArgs whose
+          ExecutionArgs originally included an abortSignal (preserved through
+          validateSubscriptionArgs into ValidatedSubscriptionArgs). The signal
+          aborts mid-execution of the source event — typically because the
+          subscription's underlying transport (WebSocket / SSE / multipart
+          response) was closed by the client. The returned Promise rejects with
+          AbortedGraphQLExecutionError carrying the partial event result. Without
+          try/catch, the subscription event is treated as a server failure and
+          the partial data collected before the abort is discarded.
+        throws: >
+          AbortedGraphQLExecutionError (v17 class — extends Error). The
+          error.abortedResult property holds the partial ExecutionResult collected
+          for this subscription event before the abort fired. Distinct from the
+          plain-Error defer/stream rejection above.
+        required_handling: >
+          When executeSubscriptionEvent is used in a subscription pipeline that
+          honors a per-connection abortSignal (e.g. server tears down the
+          subscription when the WebSocket closes), wrap the awaited call in
+          try/catch and distinguish AbortedGraphQLExecutionError from other
+          errors:
+
+            import { executeSubscriptionEvent, AbortedGraphQLExecutionError } from 'graphql';
+
+            try {
+              const eventResult = await executeSubscriptionEvent(validatedArgs);
+              await transport.sendEvent(eventResult);
+            } catch (error) {
+              if (error instanceof AbortedGraphQLExecutionError) {
+                // Subscription connection closed mid-event — drop the partial
+                // result silently (the consumer is gone). Optionally log:
+                logger.debug('Subscription aborted mid-event', { reason: error.cause });
+                return; // do NOT propagate as a transport error
+              }
+              throw error; // genuine error
+            }
+
+          The partial result on `error.abortedResult` is generally NOT worth
+          sending — the transport is already torn down — but log it for
+          debugging if a subscription source has expensive side effects that
+          may have partially executed.
+        sources:
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/AbortedGraphQLExecutionError.ts"
+          - "https://github.com/graphql/graphql-js/blob/main/src/execution/Executor.ts"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+
 edge_cases:
   - id: resolver-error-masking
     description: "GraphQL resolvers should handle errors and return proper GraphQLError instances - uncaught errors expose internal stack traces to clients unless formatError is configured"
@@ -664,3 +824,37 @@ edge_cases:
 # above is now closed — execute() received an abort-signal postcondition, and the v17 incremental
 # delivery executors (experimentalExecuteIncrementally + legacyExecuteIncrementally) are
 # contracted as first-class functions with both discrimination and abort-signal postconditions.
+#
+# Depth pass 2026-06-24 (deepen-stream-2 pass 95 — re-enumeration against graphql@17.0.1):
+# Re-walked node_modules/graphql/index.d.ts + execution/execute.d.ts at v17.0.1 and identified
+# one additional v17 public async export that the 2026-06-18 enumeration treated as fully
+# substitutable by subscribe(): executeSubscriptionEvent. Re-inspection of execute.js + the
+# ExecutorThrowingOnIncremental class revealed a NEW error surface unique to this function —
+# a plain Error (NOT GraphQLError) thrown with message "Executing this GraphQL operation would
+# unexpectedly produce multiple payloads (due to @defer or @stream directive)" when the
+# subscription selection contains incremental-delivery directives. This is the only place in
+# the graphql-js public API where the executor throws a plain Error as a Promise rejection for
+# a document-shape issue (everything else captures errors into result.errors). Distinct enough
+# error surface to warrant contracting as a first-class function rather than omitting under the
+# subscribe() umbrella.
+# +1 function contracted: executeSubscriptionEvent
+# +2 postconditions added:
+#   - execute-subscription-event-defer-stream-rejection (plain-Error rejection on @defer/@stream)
+#   - execute-subscription-event-abort-signal-rejection (AbortedGraphQLExecutionError mirror)
+# API surface (re-revised): 10 async-callable exports
+#   contracted (9): graphql, execute, subscribe, parse, validate, buildSchema,
+#                   experimentalExecuteIncrementally, legacyExecuteIncrementally,
+#                   executeSubscriptionEvent
+#   omitted (1):    createSourceEventStream (lower-level primitive — its errors flow through
+#                   subscribe() which wraps it via subscribeImpl; remains intentionally omitted
+#                   because applications that need this primitive directly are already in
+#                   advanced custom-transport territory and accept the error model)
+# Coverage: 9/10 = 0.90 (was 8/10 = 0.80); effective contracted/non-omitted = 9/9 = 1.0
+# v17.0.1 evidence sources (all from installed package at /private/tmp/claude/bc-deepen-graphql-p95):
+#   node_modules/graphql/execution/execute.d.ts lines 192-230 (executeSubscriptionEvent decl + jsdoc)
+#   node_modules/graphql/execution/execute.js lines 120-122 (the ExecutorThrowingOnIncremental wrap)
+#   node_modules/graphql/execution/ExecutorThrowingOnIncremental.d.ts lines 7-32 (class signature)
+#   node_modules/graphql/execution/ExecutorThrowingOnIncremental.js (UNEXPECTED_MULTIPLE_PAYLOADS const
+#     + the three override methods that throw plain Error when newDeferUsages.length > 0 or streamUsage)
+#   node_modules/graphql/execution/Executor.js lines 159-168 (AbortedGraphQLExecutionError plumbing
+#     inherited by ExecutorThrowingOnIncremental)

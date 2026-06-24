@@ -2,6 +2,25 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-24 — deepen pass — coverage 80% → 90%
+
+- **Profile:** `packages/graphql/contract.yaml`
+- **Functions added:** executeSubscriptionEvent (1 total)
+- **Postconditions added:** 2
+  - `executeSubscriptionEvent()` +2: execute-subscription-event-defer-stream-rejection (plain Error on @defer/@stream — distinct surface from GraphQLError + AbortedGraphQLExecutionError), execute-subscription-event-abort-signal-rejection (AbortedGraphQLExecutionError mirror of execute-abort-signal-rejection for the subscription event pipeline)
+- **Functions intentionally omitted this pass:** createSourceEventStream (lower-level subscription primitive — errors flow through subscribe() via subscribeImpl; remains intentionally omitted as in prior passes)
+- **Scanner concerns queued:** 2 (`concern-20260624-graphql-deepen-1` and `concern-20260624-graphql-deepen-2`) — executeSubscriptionEvent plain-Error detection, executeSubscriptionEvent AbortedGraphQLExecutionError detection
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - node_modules/graphql@17.0.1/execution/execute.d.ts (lines 192-230 — executeSubscriptionEvent declaration and jsdoc)
+  - node_modules/graphql@17.0.1/execution/execute.js (lines 120-122 — executeSubscriptionEvent wraps `new ExecutorThrowingOnIncremental(args).executeRootSelectionSet(false)`)
+  - node_modules/graphql@17.0.1/execution/ExecutorThrowingOnIncremental.d.ts (lines 7-32 — class signature, extends Executor)
+  - node_modules/graphql@17.0.1/execution/ExecutorThrowingOnIncremental.js (UNEXPECTED_MULTIPLE_PAYLOADS const + the three override methods that throw plain Error when newDeferUsages.length > 0 or streamUsage is detected)
+  - node_modules/graphql@17.0.1/execution/Executor.js (lines 159-168 — AbortedGraphQLExecutionError plumbing inherited by ExecutorThrowingOnIncremental)
+- **Verified by:** bc-deepen-contract (pass 95, deepen-stream-2, 2026-06-24T14:13:25Z)
+
+Closes the previously-omitted-as-redundant-with-subscribe assessment for executeSubscriptionEvent. Re-inspection revealed a unique plain-Error throw mode (rather than the errors-into-result.errors capture pattern used everywhere else in graphql-js) that warrants first-class contracting. Effective coverage now 9/9 = 1.0 (only createSourceEventStream remains omitted).
+
 ## 2026-06-18 — deepen pass — coverage 75% → 80%
 
 - **Profile:** `packages/graphql/contract.yaml`
