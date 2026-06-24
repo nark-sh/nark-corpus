@@ -358,3 +358,126 @@ async function updatePullRequestWithErrorHandling() {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────
+// apps.createInstallationAccessToken (pass 47, 2026-06-24)
+// ─────────────────────────────────────────────────────────
+
+async function createInstallationAccessTokenMissingErrorHandling() {
+  // SHOULD_FIRE: apps-create-installation-token-no-try-catch
+  const response = await octokit.apps.createInstallationAccessToken({
+    installation_id: 12345,
+  });
+  return response.data.token;
+}
+
+async function createInstallationAccessTokenWithErrorHandling() {
+  try {
+    const response = await octokit.apps.createInstallationAccessToken({
+      installation_id: 12345,
+    });
+    return response.data.token;
+  } catch (error: any) {
+    if (error.status === 401) throw new Error('JWT expired or App private key rotated');
+    if (error.status === 403) throw new Error('Installation suspended');
+    if (error.status === 404) throw new Error('Installation not found (uninstalled)');
+    if (error.status === 422) throw new Error('Requested permissions exceed grant');
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// repos.compareCommitsWithBasehead (pass 47, 2026-06-24)
+// ─────────────────────────────────────────────────────────
+
+async function compareCommitsWithBaseheadMissingErrorHandling() {
+  // SHOULD_FIRE: repos-compare-commits-basehead-no-try-catch
+  const response = await octokit.repos.compareCommitsWithBasehead({
+    owner: 'octocat',
+    repo: 'hello-world',
+    basehead: 'main...feature-branch',
+  });
+  return response.data;
+}
+
+async function compareCommitsWithBaseheadWithErrorHandling() {
+  try {
+    const response = await octokit.repos.compareCommitsWithBasehead({
+      owner: 'octocat',
+      repo: 'hello-world',
+      basehead: 'main...feature-branch',
+    });
+    return response.data;
+  } catch (error: any) {
+    if (error.status === 404) throw new Error('One of the refs no longer exists');
+    if (error.status === 422) throw new Error('Refs are unrelated or basehead format invalid');
+    if (error.status === 403) throw new Error('Diff too large; fall back to paginated fetch');
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// issues.removeLabel (pass 47, 2026-06-24)
+// ─────────────────────────────────────────────────────────
+
+async function removeLabelMissingErrorHandling() {
+  // SHOULD_FIRE: issues-remove-label-no-try-catch
+  const response = await octokit.issues.removeLabel({
+    owner: 'octocat',
+    repo: 'hello-world',
+    issue_number: 42,
+    name: 'needs-triage',
+  });
+  return response.data;
+}
+
+async function removeLabelWithErrorHandling() {
+  try {
+    const response = await octokit.issues.removeLabel({
+      owner: 'octocat',
+      repo: 'hello-world',
+      issue_number: 42,
+      name: 'needs-triage',
+    });
+    return response.data;
+  } catch (error: any) {
+    if (error.status === 404) return null;
+    if (error.status === 410) throw new Error('Issue deleted; remove from work queue');
+    if (error.status === 403) throw new Error('Insufficient issues:write scope');
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// pulls.dismissReview (pass 47, 2026-06-24)
+// ─────────────────────────────────────────────────────────
+
+async function dismissReviewMissingErrorHandling() {
+  // SHOULD_FIRE: pulls-dismiss-review-no-try-catch
+  const response = await octokit.pulls.dismissReview({
+    owner: 'octocat',
+    repo: 'hello-world',
+    pull_number: 42,
+    review_id: 7654321,
+    message: 'Stale review; new commits pushed',
+  });
+  return response.data;
+}
+
+async function dismissReviewWithErrorHandling() {
+  try {
+    const response = await octokit.pulls.dismissReview({
+      owner: 'octocat',
+      repo: 'hello-world',
+      pull_number: 42,
+      review_id: 7654321,
+      message: 'Stale review; new commits pushed',
+    });
+    return response.data;
+  } catch (error: any) {
+    if (error.status === 422) return null;
+    if (error.status === 403) throw new Error('Branch protection forbids dismissal from non-admins');
+    if (error.status === 404) throw new Error('Review or PR not found');
+    throw error;
+  }
+}

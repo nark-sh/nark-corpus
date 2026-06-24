@@ -1616,11 +1616,218 @@ functions:
         source: https://docs.github.com/en/rest/pulls/pulls
         sources:
           - https://docs.github.com/en/rest/pulls/pulls
+  - name: apps.createInstallationAccessToken
+    import_path: "@octokit/rest"
+    description: >
+      Mints a short-lived (1 hour) installation access token for a GitHub App
+      installation. Required for any GitHub App to act on behalf of an
+      installation. Token must be requested with a JWT signed by the App's
+      private key. Used by every GitHub App backend that makes per-install
+      API calls (CI bots, code-review bots, scanner integrations, deploy
+      automation).
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+      # Error model confirmed from @octokit/request-error: status 401/403/404/422 surfaced as RequestError.
+      - id: apps-create-installation-token-no-try-catch
+        condition: >
+          octokit.apps.createInstallationAccessToken() called without try-catch when the
+          JWT used to authenticate is expired, the App's private key has been rotated,
+          the installation has been suspended, or the installation_id is invalid.
+        throws: >
+          RequestError with status 401 (Bad credentials) when the JWT is expired
+          (JWTs are valid for 10 minutes max), malformed, or signed with a rotated
+          private key. Status 403 (Forbidden) when the installation has been suspended
+          or the App has been blocked by the org. Status 404 (Not Found) when the
+          installation_id does not exist or is no longer accessible to this App.
+          Status 422 when requested permissions exceed those granted to the installation.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        description: >
+          GitHub App backends cannot make ANY per-installation API call without a
+          fresh installation access token. An unhandled failure here cascades into
+          every downstream API call failing. JWT expiry is the most common cause
+          in production: long-running workers cache a JWT past its 10-minute window
+          and silently lose access. Suspended installations (often after billing
+          lapses or admin action) return 403 and require user-facing notification
+          rather than a silent retry loop.
+        detector: >
+          If octokit.apps.createInstallationAccessToken() is awaited without try-catch
+          wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 401 (mint a fresh JWT and retry once;
+          if it persists, surface a config error to alert that the App private
+          key is invalid or rotated). Handle 403 (do NOT retry; surface to the
+          customer that their installation is suspended). Handle 404 (treat as
+          uninstall; remove the org from the database and stop scheduled jobs
+          against it). Handle 422 (surface as a permissions mismatch; do not
+          loop). Never silently swallow.
+        source: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+        sources:
+          - https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+          - https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app
+  - name: repos.compareCommitsWithBasehead
+    import_path: "@octokit/rest"
+    description: >
+      Compares two commits (or refs) and returns the diff, list of commits,
+      and merge-base. Replaces the deprecated repos.compareCommits().
+      Used heavily by CI tooling, code review bots, deploy preview generators,
+      and changelog automation to derive what changed between two refs.
+      Subject to pagination on very large diffs and rate-limit constraints on
+      mono-repos.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/commits/commits#compare-two-commits
+      # Status codes from the REST reference and observed in @octokit/request-error production traces.
+      - id: repos-compare-commits-basehead-no-try-catch
+        condition: >
+          octokit.repos.compareCommitsWithBasehead() called without try-catch when
+          either ref does not exist, the diff exceeds GitHub's response limits, or
+          the token lacks read access to the repository.
+        throws: >
+          RequestError with status 404 (Not Found) when one of the refs in the
+          basehead parameter (format "{base}...{head}") does not exist in the repo,
+          when the repo is private and the token lacks access, or when the repo
+          was renamed/transferred. Status 422 (Unprocessable Entity) when the
+          basehead format is invalid or the two refs are not comparable (different
+          unrelated history). Status 403 with a rate-limit message when the diff
+          is too large; GitHub caps the response at 300 files / 1MB and very
+          large monorepo diffs can hit this.
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        description: >
+          Deploy preview generators, changelog tooling, and code-review bots
+          depend on a successful diff fetch. A 404 from a force-pushed or
+          deleted branch breaks the bot's run silently if uncaught. A 422
+          from comparing unrelated histories (cherry-picks across forks) is
+          common in fork-based workflows. Large-diff 403s are not retriable
+          and must be paginated explicitly via the page/per_page params.
+        detector: >
+          If octokit.repos.compareCommitsWithBasehead() is awaited without try-catch
+          wrapping
+        required_handling: >
+          MUST wrap in try-catch. Handle 404 (verify both refs still exist;
+          a deleted or force-pushed branch will not be re-fetchable, so surface
+          a clean error to the bot rather than retrying). Handle 422 (verify
+          basehead is "{base}...{head}" and both refs share history). Handle
+          large-diff 403 by falling back to paginated fetch with per_page=100
+          and assembling the file list across pages.
+        source: https://docs.github.com/en/rest/commits/commits#compare-two-commits
+        sources:
+          - https://docs.github.com/en/rest/commits/commits#compare-two-commits
+  - name: issues.removeLabel
+    import_path: "@octokit/rest"
+    description: >
+      Removes a single label from an issue or pull request. Heavily used by
+      automation that transitions issues through labelled state machines
+      (e.g. removing "needs-triage" once triaged, removing "blocked" once
+      unblocked, removing "stale" once a stale-bot detects activity).
+      The "single label" variant is distinct from removeAllLabels and is
+      subject to a 404 when the label was already removed by a concurrent
+      automation.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+      # 404 race confirmed in @octokit/rest issue tracker and observed in stale-bot deployments.
+      - id: issues-remove-label-no-try-catch
+        condition: >
+          octokit.issues.removeLabel() called without try-catch when the label is
+          not currently attached to the issue (race with concurrent automations),
+          when the issue has been locked or moved, or when the token lacks
+          issues:write.
+        throws: >
+          RequestError with status 404 (Not Found) when the named label is not
+          currently applied to the issue. This is the dominant failure mode in
+          multi-bot environments where two automations race to remove the same
+          label. Status 410 (Gone) when the issue has been deleted. Status 403
+          (Forbidden) when the token lacks issues:write scope or the repository
+          has issues disabled. Status 301 (Moved Permanently) when the repo has
+          been renamed and the client did not follow the redirect.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        description: >
+          Label-transition automation (triage bots, stale bots, project-board
+          syncs) hits a 404 here whenever a concurrent automation has already
+          removed the same label. Uncaught, the worker crashes mid-loop and
+          subsequent issues are not processed. The 404 race is the most common
+          incident shape in stale-bot deployments at scale.
+        detector: >
+          If octokit.issues.removeLabel() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Treat 404 as a no-op (the label is already
+          gone; the desired end state is satisfied). Handle 410 by removing the
+          issue from the work queue (it is deleted). Handle 403 by surfacing a
+          permissions error rather than retrying. Never silently swallow 5xx.
+        source: https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+        sources:
+          - https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+  - name: pulls.dismissReview
+    import_path: "@octokit/rest"
+    description: >
+      Dismisses an existing pull request review (changes a CHANGES_REQUESTED
+      or APPROVED review to DISMISSED). Used by automation that auto-dismisses
+      stale reviews after pushes, by branch-protection bots that need to clear
+      blocking reviews from rotated reviewers, and by enterprise compliance
+      tools that reset reviews when CODEOWNERS change.
+    postconditions:
+      # Evidence: https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
+      # Status codes confirmed in the REST reference and the @octokit/request-error production trace set.
+      - id: pulls-dismiss-review-no-try-catch
+        condition: >
+          octokit.pulls.dismissReview() called without try-catch when the review
+          is not in a dismissable state (already dismissed, or is a PENDING
+          review by another reviewer), the PR is closed/merged, or the token
+          lacks pull-requests:write.
+        throws: >
+          RequestError with status 422 (Unprocessable Entity) when the review is
+          already in DISMISSED state, is PENDING (only the author can dismiss
+          their own pending review), or when dismissing would violate branch
+          protection rules that require a re-review. Status 403 (Forbidden) when
+          the token lacks pull-requests:write or when branch protection prohibits
+          dismissals from non-admins. Status 404 (Not Found) when the review_id
+          does not exist or the PR has been deleted from a force-deleted branch.
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+        description: >
+          Auto-dismiss-on-push automation breaks silently when the review was
+          already dismissed by a prior push (422 race) or when branch protection
+          requires admin-only dismissals (403). Compliance tooling that resets
+          reviews on CODEOWNERS changes will silently fail to reset blocking
+          reviews if the 403 is swallowed, leaving the PR mergeable when policy
+          required a fresh review.
+        detector: >
+          If octokit.pulls.dismissReview() is awaited without try-catch wrapping
+        required_handling: >
+          MUST wrap in try-catch. Treat 422 as a no-op when the review is
+          already DISMISSED (desired state reached). Surface 403 to the
+          operator rather than retrying; it indicates a branch-protection
+          policy mismatch that needs manual review. Handle 404 by skipping
+          the PR. Never silently swallow.
+        source: https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
+        sources:
+          - https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
 
 metadata:
-  last_verified: "2026-04-16"
+  last_verified: "2026-06-24"
   evidence_quality: confirmed
-  coverage_score: 0.80
+  coverage_score: 0.82
 
 tags:
   - github

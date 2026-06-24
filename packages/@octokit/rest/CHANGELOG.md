@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 80% → 82%
+
+- **Profile:** `packages/@octokit/rest/contract.yaml`
+- **Functions added:** apps.createInstallationAccessToken, repos.compareCommitsWithBasehead, issues.removeLabel, pulls.dismissReview (4 total)
+- **Postconditions added:** 4 (one per function, each covering 3-4 status codes)
+- **Functions intentionally omitted this pass:** none new (carried forward from pass 4)
+- **Scanner concerns queued:** 4 (`concern-20260624-octokit-rest-deepen-17` through `concern-20260624-octokit-rest-deepen-20`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+  - https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app
+  - https://docs.github.com/en/rest/commits/commits#compare-two-commits
+  - https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+  - https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
+- **Verified by:** bc-deepen-contract / deepen-stream-2 (pass 47 on 2026-06-24T05:02:39Z)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @octokit/rest@22.0.1
