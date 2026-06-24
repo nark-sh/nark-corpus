@@ -494,3 +494,113 @@ export async function submoduleUpdateWithCatch(cwd: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Depth pass 2026-06-24 (pass 69): applyPatch(), mirror(), mergeFromTo(),
+//   deleteLocalBranches(), checkoutLocalBranch()
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 25. applyPatch() — no try-catch
+// @expect-violation: simple-git-apply-patch-missing-try-catch
+export async function applyPatchNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-apply-patch-missing-try-catch
+  await git.applyPatch(['security-fix.patch']);
+}
+
+// @expect-clean
+export async function applyPatchWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.applyPatch(['security-fix.patch']);
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 26. mirror() — no try-catch (backup/replication clone)
+// @expect-violation: simple-git-mirror-missing-try-catch
+export async function mirrorNoCatch(repoUrl: string, localPath: string) {
+  const git = simpleGit();
+  // SHOULD_FIRE: simple-git-mirror-missing-try-catch
+  await git.mirror(repoUrl, localPath);
+}
+
+// @expect-clean
+export async function mirrorWithCatch(repoUrl: string, localPath: string) {
+  const git = simpleGit();
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.mirror(repoUrl, localPath);
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 27. mergeFromTo() — no try-catch (variant of merge)
+// @expect-violation: simple-git-merge-from-to-missing-try-catch
+export async function mergeFromToNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-merge-from-to-missing-try-catch
+  await git.mergeFromTo('origin', 'feature-branch');
+}
+
+// @expect-clean
+export async function mergeFromToWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with conflict handling
+    await git.mergeFromTo('origin', 'feature-branch');
+  } catch (err: any) {
+    if (err.git?.conflicts?.length > 0) {
+      console.error('Merge conflicts:', err.git.conflicts);
+    }
+    throw err;
+  }
+}
+
+// 28. deleteLocalBranches() — no try-catch (bulk delete)
+// @expect-violation: simple-git-delete-local-branches-missing-try-catch
+export async function deleteLocalBranchesNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-delete-local-branches-missing-try-catch
+  await git.deleteLocalBranches(['old-feature-1', 'old-feature-2']);
+}
+
+// @expect-clean
+export async function deleteLocalBranchesWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch, also checks result.errors
+    const result = await git.deleteLocalBranches(['old-feature-1', 'old-feature-2']);
+    if (result.errors.length > 0) {
+      console.warn('Some branches not deleted:', result.errors);
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+// 29. checkoutLocalBranch() — no try-catch (create + checkout new branch)
+// @expect-violation: simple-git-checkout-local-branch-missing-try-catch
+export async function checkoutLocalBranchNoCatch(cwd: string, branchName: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-checkout-local-branch-missing-try-catch
+  await git.checkoutLocalBranch(branchName);
+}
+
+// @expect-clean
+export async function checkoutLocalBranchWithCatch(cwd: string, branchName: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with reuse-on-collision
+    await git.checkoutLocalBranch(branchName);
+  } catch (err: any) {
+    if (err.message?.includes('already exists')) {
+      await git.checkout(branchName); // reuse existing
+    } else {
+      throw err;
+    }
+  }
+}

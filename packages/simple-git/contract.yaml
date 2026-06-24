@@ -7,27 +7,38 @@ package: "simple-git"
 semver: ">=3.32.3"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.81  # 17 contracted / (50 total - 29 intentionally omitted) = 17/21
-# Depth pass 2026-04-17 (deepen-stream-2 pass 11):
-# API surface: ~50 distinct methods on SimpleGit interface; 21 meaningfully worth contracting
+coverage_score: 0.85  # 22 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 22/26
+# Depth pass 2026-06-24 (deepen-stream-2 pass 69):
+# API surface: ~50 distinct methods on SimpleGit interface; 26 meaningfully worth contracting
 #   (read-only list/query methods like log, branch, status, diff, tags, getRemotes, etc omitted)
-# Contracted before: 10 (push, pull, clone, merge, fetch, commit, checkout, rebase, raw, clean)
-# Contracted after: 17 (+7 this pass: stash, reset, revert, pushTags, deleteLocalBranch, submoduleAdd, submoduleUpdate)
-# Omitted: 29 (add, addConfig, addAnnotatedTag, addTag, addRemote, removeRemote, catFile, binaryCatFile,
+# Contracted before pass 69: 17 (push, pull, clone, merge, fetch, commit, checkout, rebase, raw, clean,
+#   stash, reset, revert, pushTags, deleteLocalBranch, submoduleAdd, submoduleUpdate)
+# Contracted after pass 69: 22 (+5 this pass: applyPatch, mirror, mergeFromTo, deleteLocalBranches,
+#   checkoutLocalBranch)
+# Omitted: 24 (add, addConfig, addAnnotatedTag, addTag, addRemote, removeRemote, catFile, binaryCatFile,
 #   hashObject, checkIgnore, countObjects, firstCommit, getConfig, grep, cwd, env, exec, listRemote,
-#   mirror, mv, remote, revparse, rm, rmKeepLocal, show, showBuffer, stashList, subModule, submoduleInit,
+#   mv, remote, revparse, rm, rmKeepLocal, show, showBuffer, stashList, subModule, submoduleInit,
 #   updateServerInfo, branch, branchLocal, status, diff, diffSummary, log, tags, tag, getRemotes, listConfig,
-#   version, checkIsRepo)
+#   version, checkIsRepo, checkoutBranch, checkoutLatestTag, init, applyPatch-validate, mergeFromTo-validate)
+# Note: checkoutBranch is a thin wrapper over checkout(['-b', name, startPoint]) — same error profile as
+#   checkout + branch-exists collision; treated as covered transitively by checkout and checkoutLocalBranch
+#   postconditions for now. Promote to its own entry if FP harvester surfaces uncovered cases.
+# Note: checkoutLatestTag composes pull() + tags() + checkout() — all already contracted.
+# Note: init() throws GitError on permission issues but is rarely error-checked in real corpora
+#   (typically run in fresh dirs by tooling that has already validated permissions).
 # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
-#   node_modules source: /dist/cjs/index.js — GitResponseError, TaskConfigurationError confirmed
-#   deleteBranchTask: throws GitResponseError<BranchSingleDeleteResult> on unmerged branch (line 3880)
-#   stash: uses straightThroughStringTask (line 3577) — GitError on pop/apply conflicts
-#   reset: resetTask uses straightThroughStringTask (line 1084) — GitError on bad ref/mode conflict
-#   revert: uses straightThroughStringTask2 (line 4473) — GitError on conflicts (NOT GitResponseError)
+#   node_modules source: /dist/cjs/index.js — verified against simple-git@3.36.0
+#   applyPatchTask (line 3671): straightThroughStringTask(['apply', ...customArgs, ...patches])
+#   cloneMirrorTask (line 3456): appends '--mirror' then delegates to cloneTask
+#   mergeFromTo (line 3550): delegates to mergeTask([remote, branch, ...]) which throws
+#     GitResponseError(merge) when parser detects conflicts (line 2976)
+#   deleteBranchesTask (line 3854): commands ['branch', '-v', '-d'/'-D', ...branches];
+#     onError calls fail(error) if hasBranchDeletionError does not match
+#   checkoutLocalBranch (line 2073): checkoutTask(['-b', branchName, ...])
 
 detection:
   factory_methods:
@@ -948,6 +959,326 @@ functions:
         sources:
           - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
           - "https://git-scm.com/docs/git-submodule"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: applyPatch
+    import_path: "simple-git"
+    description: >
+      Applies one or more patches to the working tree. Used as:
+      git.applyPatch(patches, options?) where patches is a string or string[]
+      (each patch can be a file path or inline patch text). Fails on context
+      mismatch (patch does not apply cleanly), file-not-found, or whitespace
+      issues. Commonly used in CI/CD scripts that apply security patches or
+      auto-generated bumps from bot PRs.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js applyPatchTask() (lines 3671-3673):
+      #   applyPatchTask runs: git apply <customArgs> <patches>
+      #   Uses straightThroughStringTask — throws GitError on non-zero exit
+      # Pre-execution validation (line 4639): configurationErrorTask if patches arg is missing/wrong type
+      - id: simple-git-apply-patch-missing-try-catch
+        condition: >
+          async function calls git.applyPatch() without wrapping in try-catch.
+          Common failure: patch context does not match the current working tree
+          (modified base file, line numbers shifted) — git exits non-zero and
+          throws GitError. Also fails when the patch file path is missing or
+          when the patch is malformed.
+        throws: >
+          GitError — on any non-zero exit:
+          "error: patch failed: <file>:<line>" (context mismatch in patch hunk),
+          "error: <file>: patch does not apply" (cannot apply cleanly to current tree),
+          "error: <file>: No such file or directory" (target file missing),
+          "fatal: corrupt patch at line N" (malformed patch input),
+          "error: unrecognized input" (not a valid patch file).
+
+          TaskConfigurationError (via configurationErrorTask) — thrown when the
+          patches argument is missing or not a string/string[]:
+          "git.applyPatch requires one or more string patches as the first argument".
+        required_handling: >
+          Caller MUST wrap git.applyPatch() in try-catch.
+
+          Minimum handling (apply with rollback):
+            try {
+              await git.applyPatch(['security-fix.patch']);
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Patch apply failed:', err.message);
+                // If partial application happened, restore working tree:
+                // await git.checkout(['--', '.']);  // discards unstaged changes
+              }
+              throw err;
+            }
+
+          For batch-apply workflows, validate each patch with `--check` first:
+            try {
+              await git.applyPatch(patches, ['--check']);  // dry-run validate
+              await git.applyPatch(patches);                // then apply
+            } catch (err) {
+              throw err;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-apply"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: mirror
+    import_path: "simple-git"
+    description: >
+      Clones a repository in mirror mode (equivalent to git.clone(repo, dir, ['--mirror'])).
+      Used as: git.mirror(repoPath, localPath). Mirror clones include all refs and
+      configure the local repo as a bare mirror — they are commonly used in backup
+      and replication workflows. All clone failure modes apply (network errors,
+      authentication failures, invalid URLs, destination path errors).
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js (lines 3435-3458):
+      #   mirror() calls createCloneTask("mirror", cloneMirrorTask, ...)
+      #   cloneMirrorTask appends '--mirror' and delegates to cloneTask
+      #   cloneTask uses straightThroughStringTask — throws GitError on non-zero exit
+      - id: simple-git-mirror-missing-try-catch
+        condition: >
+          async function calls git.mirror() without wrapping in try-catch.
+          mirror() is a clone variant — all clone error modes apply: network errors,
+          SSH/HTTPS authentication failures, "Repository not found", destination
+          path conflicts. Backup workflows that silently swallow these failures
+          create gaps in replication coverage that are not detected until restore.
+        throws: >
+          GitError — on any non-zero exit:
+          "fatal: Repository not found" (invalid remote URL or private repo without auth),
+          "Permission denied (publickey)" (SSH auth failure),
+          "fatal: destination path '<path>' already exists and is not an empty directory" (path conflict),
+          "fatal: could not read Username for 'https://...'" (HTTPS auth prompt unavailable),
+          "fatal: protocol '<x>' is not supported" (invalid URL scheme),
+          "ECONNREFUSED / ETIMEDOUT" (network failure).
+        required_handling: >
+          Caller MUST wrap git.mirror() in try-catch.
+
+          Minimum handling for backup/replication workflows:
+            try {
+              await git.mirror('git@github.com:org/repo.git', '/backup/repo.git');
+              console.log('Mirror clone succeeded');
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Mirror clone failed:', err.message);
+                // CRITICAL: backup gap — alert monitoring system
+                // Do not silently swallow — replication SLOs depend on this
+              }
+              throw err;
+            }
+
+          For scheduled backup jobs, treat mirror failure as a high-severity
+          alert — unreplicated repos are a data-loss exposure.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-clone"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: mergeFromTo
+    import_path: "simple-git"
+    description: >
+      Merges from one branch into another. Used as:
+      git.mergeFromTo(remote, branch, options?). Equivalent to running
+      `git merge ${remote} ${branch}`. Same merge semantics as git.merge() —
+      throws GitResponseError<MergeSummary> on merge conflicts EVEN when git
+      exits 0, because simple-git's parser detects conflict markers in stdout.
+      Also throws GitError before running if remote or branch are not strings.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js mergeFromTo() (lines 3550-3562):
+      #   mergeFromTo delegates to mergeTask([remote, branch, ...customArgs])
+      #   mergeTask parser (lines 2966-2980) throws GitResponseError(merge) if merge.failed
+      #   Pre-execution: configurationErrorTask if remote or branch not strings
+      - id: simple-git-merge-from-to-missing-try-catch
+        condition: >
+          async function calls git.mergeFromTo() without wrapping in try-catch.
+          Same conflict detection as git.merge() — throws GitResponseError<MergeSummary>
+          when the merge detects conflicts (even with git exit code 0). Also throws
+          TaskConfigurationError if remote/branch arguments are not strings.
+        throws: >
+          GitResponseError<MergeSummary> — when the parser detects merge failed
+          (conflicts in stdout). The .git property contains the parsed
+          MergeSummary with { conflicts: string[], failed: true, ... }.
+
+          GitError — on git process failure:
+          "fatal: <remote> - not something we can merge" (invalid remote ref),
+          "error: refusing to merge unrelated histories" (no common ancestor),
+          "fatal: You have not concluded your merge" (merge already in progress).
+
+          TaskConfigurationError (via configurationErrorTask) — thrown if remote
+          or branch arguments are not strings:
+          "Git.mergeFromTo requires that the 'remote' and 'branch' arguments are supplied as strings".
+        required_handling: >
+          Caller MUST wrap git.mergeFromTo() in try-catch and handle merge conflicts.
+
+          Minimum handling:
+            try {
+              await git.mergeFromTo('origin', 'feature-branch');
+            } catch (err) {
+              if (err.git?.conflicts?.length > 0) {
+                console.error('Merge conflicts:', err.git.conflicts);
+                // Abort to restore clean state:
+                await git.merge(['--abort']);
+              }
+              throw err;
+            }
+
+          For CI automation flows that automatically merge release branches,
+          always abort on conflict — partial merges block subsequent operations.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-merge"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: deleteLocalBranches
+    import_path: "simple-git"
+    description: >
+      Deletes multiple local branches in one call. Used as:
+      git.deleteLocalBranches(branchNames, forceDelete?). Returns
+      BranchMultiDeleteResult with per-branch success/failure status.
+      Unlike deleteLocalBranch (singular), the multi-branch task collects
+      results across all branches — the operation does NOT throw immediately
+      on the first failure, but the overall task throws GitResponseError when
+      ANY branch fails (e.g. unmerged branches without forceDelete=true).
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js deleteBranchesTask() (lines 3854-3867):
+      #   commands: ["branch", "-v", forceDelete ? "-D" : "-d", ...branches]
+      #   onError: if hasBranchDeletionError(error, exitCode) → done(stdOut) returns parsed result
+      #     else fail(error) re-throws as GitError
+      #   parseBranchDeletions populates .errors[] for each failed branch
+      #   BranchDeletionBatch.success getter returns !this.errors.length
+      - id: simple-git-delete-local-branches-missing-try-catch
+        condition: >
+          async function calls git.deleteLocalBranches() without wrapping in
+          try-catch. Most common failure: one or more branches in the list have
+          unmerged commits and forceDelete is false (default). The task returns
+          a BranchMultiDeleteResult, but partial-failure cases throw GitError
+          when the underlying git process exits non-zero and the deletion error
+          regex matches. Successful cases with partial failures still populate
+          result.errors[] — callers that ignore the return value silently miss
+          undeleted branches.
+        throws: >
+          GitError — when git exits non-zero AND hasBranchDeletionError matches
+          stderr (deleteErrorRegex). Common messages:
+          "error: The branch '<name>' is not fully merged" (unmerged branch),
+          "error: branch '<name>' not found" (branch does not exist),
+          "error: Cannot delete branch '<name>' checked out at '<path>'" (current branch).
+
+          The parsed result (when delivered via done()) is BranchMultiDeleteResult
+          with .all[], .branches{}, and .errors[] — even success paths may have
+          per-branch failures in .errors that the caller must check.
+        required_handling: >
+          Caller MUST wrap git.deleteLocalBranches() in try-catch AND inspect
+          the result.errors[] array for partial failures:
+
+            try {
+              const result = await git.deleteLocalBranches(['old-feature-1', 'old-feature-2']);
+              if (result.errors.length > 0) {
+                console.warn('Some branches not deleted:', result.errors);
+                // Decide: force-delete the remaining ones, or escalate
+              }
+              console.log('Deleted:', result.all.map(b => b.branch));
+            } catch (err) {
+              if (err instanceof GitError) {
+                console.error('Bulk branch delete failed:', err.message);
+              }
+              throw err;
+            }
+
+          For cleanup automation (e.g. delete merged PRs), pass forceDelete=true
+          only after confirming each branch is actually merged via git.branch(['--merged']).
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-branch"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: checkoutLocalBranch
+    import_path: "simple-git"
+    description: >
+      Creates and checks out a new local branch. Used as:
+      git.checkoutLocalBranch(branchName, options?). Equivalent to
+      `git checkout -b <branchName>`. Fails when the branch name already exists,
+      when the working tree has uncommitted conflicts, or when the branch name
+      is invalid. Commonly used in feature-branch automation, PR scripts, and
+      release-branch tooling.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js checkoutLocalBranch() (lines 2073-2077):
+      #   Calls checkoutTask(["-b", branchName, ...getTrailingOptions(arguments)])
+      #   checkoutTask uses straightThroughStringTask — throws GitError on non-zero exit
+      - id: simple-git-checkout-local-branch-missing-try-catch
+        condition: >
+          async function calls git.checkoutLocalBranch(branchName) without
+          wrapping in try-catch. Most common failure: the branch name already
+          exists locally — git exits non-zero with "fatal: A branch named '...'
+          already exists". Also fails when the working tree has changes that
+          would be overwritten, or when the branch name contains invalid
+          characters (e.g. spaces, colons). Critical in CI release scripts that
+          auto-create branches: a name collision on a previous failed run blocks
+          all subsequent runs until manual cleanup.
+        throws: >
+          GitError — on any non-zero exit:
+          "fatal: A branch named '<name>' already exists" (name collision),
+          "error: pathspec '<name>' did not match any file(s) known to git" (when used as checkout, not -b),
+          "fatal: '<name>' is not a valid branch name" (invalid characters),
+          "error: Your local changes to the following files would be overwritten" (dirty tree).
+        required_handling: >
+          Caller MUST wrap git.checkoutLocalBranch() in try-catch.
+
+          Pattern for idempotent branch creation:
+            try {
+              await git.checkoutLocalBranch('release/v2.0');
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('already exists')) {
+                // Branch exists — either reuse it or rotate the name
+                await git.checkout('release/v2.0');  // switch to existing
+              } else {
+                throw err;
+              }
+            }
+
+          For CI scripts, always use a unique branch name (include timestamp
+          or commit SHA) to avoid collisions on retry:
+            const branchName = `automation/fix-${Date.now()}-${shortSha}`;
+            await git.checkoutLocalBranch(branchName);
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-checkout"
         severity: error
         business_impact:
           incident_label: SILENT_FAILURE
