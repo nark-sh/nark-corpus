@@ -1,8 +1,8 @@
 package: express-rate-limit
 semver: '>=6.0.0'
-contract_version: 1.3.0
+contract_version: 1.4.0
 maintainer: corpus-team
-last_verified: '2026-04-15'
+last_verified: '2026-06-24'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -11,7 +11,18 @@ coverage_score: 1.0
 # double-count, created-in-request-handler, rate-limit-invalid-store, async-callback-error-routes-to-handler
 # API surface: 5 distinct callable behaviors (rateLimit factory + 2 instance methods + 2 async/construction patterns)
 # Omitted: ipKeyGenerator (sync pure utility, no error contract), MemoryStore direct (pure memory, no I/O errors)
-# coverage_score: 0.14 → 1.0 (+12 postconditions across 4 function entries this combined pass)
+# coverage_score: 0.14 -> 1.0 (+12 postconditions across 4 function entries this combined pass)
+# Deepen pass 2026-06-24 (deepen-stream-3, pass 30, drift-by-staleness mode):
+# Re-verified against express-rate-limit@8.5.2 (current latest). semver >=6.0.0 still covers — no fork needed.
+# Surface check: MemoryStore class is now publicly exported but remains intentionally omitted (users interact via rateLimit
+# factory, not direct MemoryStore instantiation; per-instance MemoryStore methods are reachable only via custom store
+# wrapping which is itself an out-of-scope pattern for the deepen surface).
+# Added 3 postconditions to rateLimit() surfacing v7/v8 breaking-change hazards confirmed from
+# node_modules/express-rate-limit/dist/index.cjs source review:
+#   - store-init-failure-silently-logged (v8.5+ async init can reject and middleware still serves traffic)
+#   - limit-zero-blocks-all-on-major-upgrade (v7+ inverted limit:0 semantics; v6 codebases upgrading silently 429)
+#   - ipv6-subnet-mask-changes-key-shape-on-upgrade (v8 default /56 mask breaks out-of-band resetKey callers)
+# coverage_score stays at 1.0 (depth, not breadth). last_verified bumped 2026-04-15 -> 2026-06-24.
 functions:
   - name: rateLimit
     import_path: express-rate-limit
@@ -253,6 +264,127 @@ functions:
         evidence_quality: confirmed
         sources:
           - https://github.com/express-rate-limit/express-rate-limit/blob/main/source/rate-limit.ts
+          - https://express-rate-limit.mintlify.app/reference/configuration
+      # Evidence (v8.x deepen, 2026-06-23): node_modules/express-rate-limit@8.5.2/dist/index.cjs line 864-881
+      # if (typeof config.store.init === "function") {
+      #   try {
+      #     const storeInit = config.store.init(options);
+      #     if (storeInit instanceof Promise) {
+      #       storeInit.catch((error) => config.logger.error(error, "...async error during store initialization."));
+      #     }
+      #   } catch (error) { config.logger.error(error, "...error during store initialization."); }
+      # }
+      - id: store-init-failure-silently-logged
+        condition: >
+          A custom Store's init() method returns a rejected Promise (or throws synchronously) — e.g. Redis
+          connection failed, schema migration crashed, namespace not provisioned. rateLimit() is called
+          at app startup with this misconfigured store. (v8.5+ allows init() to be async.)
+        throws: >
+          No error is propagated to the rateLimit() caller. The init failure is logged via config.logger.error
+          and swallowed. The middleware is returned and registered as if init succeeded. Subsequent requests
+          invoke store.increment() against an uninitialized backend, which then fails per the configured
+          passOnStoreError mode (default: block ALL requests, fail-closed).
+        required_handling: >
+          Callers MUST NOT rely on rateLimit() to surface store-init failures. Either (1) await an explicit
+          health-check on the store BEFORE calling rateLimit() at startup, or (2) supply a custom logger that
+          escalates init errors to a process-crash or readiness-probe failure, or (3) accept that the first N
+          requests after deploy will either 500 (default fail-closed) or bypass rate-limiting entirely
+          (passOnStoreError: true). The default behavior — partial outage with only a log line — is the
+          dangerous case.
+        severity: error
+        description: >
+          v8.5.0 made init() async-capable, which paradoxically made init failures less visible: the rejection
+          is caught and logged but the middleware still returns. Apps that previously relied on a synchronous
+          throw in init() to crash startup now silently degrade. The store comment in index.d.ts explicitly
+          warns: "the result is not awaited — other store methods (such as increment) may be called before
+          init returns and/or after it throws/rejects."
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/express-rate-limit/express-rate-limit/blob/main/source/rate-limit.ts
+          - https://express-rate-limit.mintlify.app/reference/changelog
+      # Evidence (v8.x deepen, 2026-06-23): dist/index.cjs line 466-473
+      # limit(limit) { if (limit === 0) { throw new ChangeWarning("WRN_ERL_MAX_ZERO", "Setting limit or max to 0
+      #   disables rate limiting in express-rate-limit v6 and older, but will cause all requests to be blocked in v7"); } }
+      # The behavior shipped enforced in v7.0; v8 keeps it. Apps upgrading from v6 are most exposed.
+      - id: limit-zero-blocks-all-on-major-upgrade
+        condition: >
+          The limit (or legacy max) option is set to 0 in a codebase that was originally written against
+          express-rate-limit v6 or earlier, where limit: 0 meant "disable rate limiting." Common in
+          feature-flag-driven configs (LIMIT=0 in dev/staging) and in code paths that conditionally
+          disable rate-limiting via limit: featureFlagEnabled ? 5 : 0.
+        throws: >
+          ChangeWarning (WRN_ERL_MAX_ZERO) thrown during rateLimit() construction if the limit validation
+          check is enabled. With validations disabled (validate: false or validate.limit: false in
+          production), no warning fires — and limit: 0 now blocks every request with HTTP 429, where in
+          v6 it allowed every request through.
+        required_handling: >
+          Callers MUST audit any limit: 0 or max: 0 usage when upgrading from v6 or earlier. Replace with
+          either a sentinel (limit: Infinity for "allow everything") or skip the rate limiter entirely via
+          a conditional middleware registration. Do NOT disable the limit validation check in production —
+          it is the only signal that catches this footgun at startup.
+        severity: error
+        description: >
+          v7.0 inverted the semantics of limit: 0 from "disable" to "block all." v8 retains this behavior.
+          The deprecation message references v7, but v6 codebases upgrading directly to v8 hit the same
+          trap. Combined with feature-flag patterns that toggle limits via numeric values, this is a high-
+          probability silent-prod-outage source on major version bumps.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/express-rate-limit/express-rate-limit/blob/main/source/validations.ts
+          - https://express-rate-limit.mintlify.app/reference/error-codes
+      # Evidence (v8.x deepen, 2026-06-23): dist/index.cjs line 647-657 — keyGeneratorIpFallback validation,
+      # plus the v8.0 default ipv6Subnet=56 in dist/index.cjs line 822 and dist/index.d.ts line 451.
+      # The v8 breaking change: IPv6 client addresses are now masked to a /56 subnet by default before being
+      # used as a key. Apps upgrading from v7 that called resetKey/getKey with the raw IPv6 address now silently
+      # mismatch the stored key.
+      - id: ipv6-subnet-mask-changes-key-shape-on-upgrade
+        condition: >
+          v8 introduces a default ipv6Subnet of /56 — IPv6 client addresses are masked before keying. Apps
+          upgrading from v7 to v8 that stored hit counters keyed by raw IPv6 addresses (e.g. in Redis with
+          TTL) now have orphaned entries: the stored key is the raw address, but the v8 lookup key is the
+          /56 subnet. resetKey(rawIpv6) silently no-ops because the stored key now uses the masked subnet.
+          Existing per-IP allowlists keyed by raw v6 address also silently break.
+        throws: >
+          No error is thrown. Behavior changes silently. IPv6 clients that were previously rate-limited at
+          per-address granularity now share counters across an entire /56 subnet (which on a hosting
+          provider may span thousands of customers). Counter-resets via resetKey(rawAddr) silently fail
+          because the key never matches. The validation system raises ERR_ERL_IPV6_SUBNET only for
+          out-of-range manual ipv6Subnet values, NOT for the silent default-shift hazard.
+        required_handling: >
+          Apps upgrading v7 -> v8 with custom keyGenerator OR with admin endpoints that call resetKey()
+          MUST audit the key format. Either (1) explicitly call ipKeyGenerator(req.ip) when constructing
+          keys for resetKey/getKey lookups, OR (2) set ipv6Subnet: false to opt out of subnet masking
+          (acceptable on IPv4-only deployments only), OR (3) clear the store on deploy to drop the v7
+          raw-IPv6 keys before traffic resumes. The keyGeneratorIpFallback validation catches custom
+          keyGenerators that reference req.ip without going through ipKeyGenerator, but it does NOT catch
+          out-of-band callers of resetKey/getKey passing raw addresses.
+        severity: error
+        description: >
+          v8.0 was the IPv6-bypass-vulnerability fix (GHSA-46wh-pxpv-q5gq). The fix masks v6 clients to a
+          /56 subnet by default, which is correct security behavior but a silent breaking change for any
+          out-of-band code path that constructs the key independently of the middleware. The most common
+          such code path is admin "unlock account" endpoints that pass req.ip directly to resetKey().
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/express-rate-limit/express-rate-limit/security/advisories/GHSA-46wh-pxpv-q5gq
           - https://express-rate-limit.mintlify.app/reference/configuration
     edge_cases:
       - id: memory-store-not-for-clusters
