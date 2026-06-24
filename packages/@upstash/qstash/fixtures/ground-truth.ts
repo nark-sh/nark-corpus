@@ -578,3 +578,230 @@ export async function fetchAllLogsWithCatch() {
   } while (cursor);
   return allLogs;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 32. Bare urlGroups.addEndpoints() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function addUrlGroupEndpointsNoCatch() {
+  // SHOULD_FIRE: urlgroups-addendpoints-api-error
+  await qstash.urlGroups.addEndpoints({
+    name: "order-fanout",
+    endpoints: [{ url: "https://service-a.example.com/process" }],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 33. urlGroups.addEndpoints() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function addUrlGroupEndpointsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: urlGroups.addEndpoints() inside try-catch
+    await qstash.urlGroups.addEndpoints({
+      name: "order-fanout",
+      endpoints: [{ url: "https://service-a.example.com/process" }],
+    });
+  } catch (error) {
+    console.error("Failed to add url group endpoints:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 34. Bare urlGroups.removeEndpoints() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function removeUrlGroupEndpointsNoCatch() {
+  // SHOULD_FIRE: urlgroups-removeendpoints-api-error
+  await qstash.urlGroups.removeEndpoints({
+    name: "order-fanout",
+    endpoints: [{ url: "https://stale-service.example.com/process" }],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 35. urlGroups.removeEndpoints() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function removeUrlGroupEndpointsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: urlGroups.removeEndpoints() inside try-catch
+    await qstash.urlGroups.removeEndpoints({
+      name: "order-fanout",
+      endpoints: [{ url: "https://stale-service.example.com/process" }],
+    });
+  } catch (error) {
+    console.error("Failed to remove url group endpoints:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 36. Bare urlGroups.delete() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteUrlGroupNoCatch() {
+  // SHOULD_FIRE: urlgroups-delete-api-error
+  await qstash.urlGroups.delete("order-fanout");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 37. urlGroups.delete() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteUrlGroupWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: urlGroups.delete() inside try-catch
+    await qstash.urlGroups.delete("order-fanout");
+  } catch (error) {
+    console.error("Failed to delete url group:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 38. Bare dlq.listMessages() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function listDlqMessagesNoCatch() {
+  // SHOULD_FIRE: dlq-list-api-error
+  const result = await qstash.dlq.listMessages();
+  return result.messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 39. dlq.listMessages() inside try-catch with cursor loop → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function listAllDlqMessagesWithCatch() {
+  let cursor: string | undefined;
+  const all = [];
+  do {
+    try {
+      // SHOULD_NOT_FIRE: dlq.listMessages() inside try-catch with cursor pagination
+      const res = await qstash.dlq.listMessages({ count: 100, cursor });
+      all.push(...res.messages);
+      cursor = res.cursor;
+    } catch (error) {
+      console.error("Failed to list DLQ messages:", error);
+      throw error;
+    }
+  } while (cursor);
+  return all;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 40. Bare flowControl.pause() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function pauseFlowControlNoCatch() {
+  // SHOULD_FIRE: flowcontrol-pause-api-error
+  await qstash.flowControl.pause("payment-processor");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 41. flowControl.pause() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function pauseFlowControlWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flowControl.pause() inside try-catch
+    await qstash.flowControl.pause("payment-processor");
+  } catch (error) {
+    console.error("Failed to pause flow control:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 42. Bare flowControl.resume() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resumeFlowControlNoCatch() {
+  // SHOULD_FIRE: flowcontrol-resume-api-error
+  await qstash.flowControl.resume("payment-processor");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 43. flowControl.resume() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resumeFlowControlWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flowControl.resume() inside try-catch
+    await qstash.flowControl.resume("payment-processor");
+  } catch (error) {
+    console.error("Failed to resume flow control:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44. Bare flowControl.pin() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function pinFlowControlNoCatch() {
+  // SHOULD_FIRE: flowcontrol-pin-api-error
+  await qstash.flowControl.pin("payment-processor", { parallelism: 5 });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 45. flowControl.pin() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function pinFlowControlWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flowControl.pin() inside try-catch
+    await qstash.flowControl.pin("payment-processor", { parallelism: 5 });
+  } catch (error) {
+    console.error("Failed to pin flow control:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 46. Bare flowControl.unpin() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function unpinFlowControlNoCatch() {
+  // SHOULD_FIRE: flowcontrol-unpin-api-error
+  await qstash.flowControl.unpin("payment-processor", { parallelism: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 47. flowControl.unpin() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function unpinFlowControlWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flowControl.unpin() inside try-catch
+    await qstash.flowControl.unpin("payment-processor", { parallelism: true });
+  } catch (error) {
+    console.error("Failed to unpin flow control:", error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 48. Bare flowControl.resetRate() — no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resetRateFlowControlNoCatch() {
+  // SHOULD_FIRE: flowcontrol-resetrate-api-error
+  await qstash.flowControl.resetRate("payment-processor");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 49. flowControl.resetRate() inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resetRateFlowControlWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flowControl.resetRate() inside try-catch
+    await qstash.flowControl.resetRate("payment-processor");
+  } catch (error) {
+    console.error("Failed to reset flow control rate:", error);
+    throw error;
+  }
+}

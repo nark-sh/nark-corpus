@@ -8,11 +8,11 @@ package: "@upstash/qstash"
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.90
+coverage_score: 0.96
 
 detection:
   class_names:
@@ -895,6 +895,364 @@ functions:
           incident_cost_range: low
         evidence_quality: confirmed
 
+  - name: urlGroups.addEndpoints
+    import_path: "@upstash/qstash"
+    description: >
+      Creates a new URL group (a.k.a. "topic") with the given name and endpoints,
+      OR adds endpoints to an existing url group. Called on client.urlGroups. Used
+      during initial subscription setup or to grow fanout targets at runtime. Makes
+      an HTTPS POST to /v2/topics/{name}/endpoints. Adding endpoints is the wiring
+      step that determines where every subsequent publish to a url group is fanned
+      out — if this call silently fails, future publishes succeed at the publish
+      API level but no subscribers receive the message.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts
+      # Source confirmed in index.js: addEndpoints() awaits http.request() which throws QstashError on non-2xx
+      - id: urlgroups-addendpoints-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), invalid endpoint payload (400),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.urlGroups.addEndpoints() in try/catch. An uncaught failure
+          during subscription setup means the url group is left with missing or stale endpoints.
+          Subsequent publishes to the url group fan out to fewer subscribers than expected —
+          some subscribers silently miss every message because they were never wired up.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts"
+          - "https://upstash.com/docs/qstash/features/url-groups"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: urlGroups.removeEndpoints
+    import_path: "@upstash/qstash"
+    description: >
+      Removes one or more endpoints from a url group, stopping fanout delivery to
+      those subscribers. Called on client.urlGroups. Used when decommissioning a
+      subscriber, rotating handler URLs, or during phased rollouts. Makes an HTTPS
+      DELETE to /v2/topics/{name}/endpoints. If the call fails silently, the
+      decommissioned endpoint continues receiving messages — typically to a
+      service that no longer exists or no longer processes them.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts
+      # Source confirmed in index.js: removeEndpoints() awaits http.request() — same error path as addEndpoints
+      - id: urlgroups-removeendpoints-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), url group not found (404),
+          invalid endpoint payload (400), rate limit (429), or server error (5xx).
+          Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.urlGroups.removeEndpoints() in try/catch. An uncaught failure
+          during decommissioning leaves the stale endpoint subscribed — QStash continues
+          delivering messages to a service that may no longer exist or may be processing
+          stale data. Failed-delivery messages accumulate in the DLQ silently.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts"
+          - "https://upstash.com/docs/qstash/features/url-groups"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: urlGroups.delete
+    import_path: "@upstash/qstash"
+    description: >
+      Permanently deletes a url group by name. IRREVERSIBLE — all endpoints
+      associated with the url group are removed and any subsequent publish to that
+      url group name will fail. Called on client.urlGroups. Used during cleanup
+      or url group renames (delete + recreate). Makes an HTTPS DELETE to
+      /v2/topics/{name}.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts
+      # Source confirmed in index.js: delete() awaits http.request() — same error path
+      - id: urlgroups-delete-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), url group not found (404),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.urlGroups.delete() in try/catch. An uncaught failure in
+          a cleanup flow can leave a url group orphaned with stale endpoints. Subsequent
+          attempts to recreate the same-named url group may fail or merge with the leftover
+          configuration. In a 404 case the caller must decide whether to treat it as
+          idempotent success or failure.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/url-groups.ts"
+          - "https://upstash.com/docs/qstash/features/url-groups"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: dlq.listMessages
+    import_path: "@upstash/qstash"
+    description: >
+      Lists messages in the Dead Letter Queue (DLQ) with optional filters
+      (url, label, dlqIds) and cursor pagination. Called on client.dlq. Used in
+      DLQ inspection dashboards, error-recovery flows, and ops tooling to triage
+      failed deliveries. Makes an HTTPS GET to /v2/dlq. Returns up to `count`
+      messages per page (default 100) with a cursor for the next page.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts
+      # Source confirmed in index.js: listMessages() awaits http.request() — throws on non-2xx
+      - id: dlq-list-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), invalid filter parameter (400),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.dlq.listMessages() in try/catch. Uncaught errors in DLQ
+          dashboards or triage tooling abort the listing mid-page, producing incomplete
+          or empty results. Ops engineers may conclude the DLQ is empty when it is in
+          fact full, deferring action on a real incident.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+          - "https://upstash.com/docs/qstash/features/dlq"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      - id: dlq-list-cursor-not-checked
+        condition: >
+          dlq.listMessages() returns {messages: DlqMessage[], cursor?: string}. The
+          response is paginated — default 100 per page. If cursor is present, more
+          messages exist. Callers that don't loop until cursor is undefined silently
+          retrieve only the first page and miss the rest of the DLQ.
+        throws: >
+          Does not throw. Returns with cursor set when more messages remain.
+        required_handling: >
+          Callers performing full DLQ inspection MUST paginate:
+            let cursor: string | undefined;
+            const all: DlqMessage[] = [];
+            do {
+              const res = await client.dlq.listMessages({ count: 100, cursor });
+              all.push(...res.messages);
+              cursor = res.cursor;
+            } while (cursor);
+          Single-call implementations silently miss everything after the first page —
+          a partial view of a DLQ backlog leads to incomplete recovery actions.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/dlq.ts"
+          - "https://upstash.com/docs/qstash/features/dlq"
+        severity: warning
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: flowControl.pause
+    import_path: "@upstash/qstash"
+    description: >
+      Pauses message delivery for a flow-control key. Messages already in the
+      waitlist remain there; new incoming messages enter the waitlist directly
+      rather than being delivered. Called on client.flowControl. Used during
+      maintenance windows, incident response, or controlled-rate rollouts to
+      hold back delivery without losing messages. Makes an HTTPS POST to
+      /v2/flowControl/{key}/pause.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts
+      # Source confirmed in index.js (line 1332): pause() awaits http.request() — throws on non-2xx
+      - id: flowcontrol-pause-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), flow-control key not found (404),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.flowControl.pause() in try/catch. If uncaught during
+          a maintenance window, the flow-control key is NOT paused — messages continue
+          delivering to a handler that may be down or being deployed. Failed deliveries
+          accumulate in the DLQ and downstream services may receive partial traffic
+          during what should be a controlled pause.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts"
+          - "https://upstash.com/docs/qstash/features/flow-control"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: flowControl.resume
+    import_path: "@upstash/qstash"
+    description: >
+      Resumes message delivery for a paused flow-control key. Complement to
+      flowControl.pause(). Must be called after maintenance windows to restore
+      normal delivery — otherwise messages accumulate indefinitely in the waitlist
+      with no automatic recovery. Makes an HTTPS POST to /v2/flowControl/{key}/resume.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts
+      # Source confirmed in index.js (line 1342): resume() awaits http.request() — throws on non-2xx
+      - id: flowcontrol-resume-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), flow-control key not found (404),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.flowControl.resume() in try/catch. If uncaught, the
+          flow-control key remains paused after the maintenance window ends. Background
+          jobs accumulate in the waitlist indefinitely — the system silently stalls
+          without any error surfacing. Engineers may notice missing scheduled side
+          effects (emails not sent, syncs not run) hours later.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts"
+          - "https://upstash.com/docs/qstash/features/flow-control"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+
+  - name: flowControl.pin
+    import_path: "@upstash/qstash"
+    description: >
+      Pins a parallelism and/or rate configuration to a flow-control key. While
+      pinned, QStash ignores configurations provided by incoming messages and uses
+      the pinned configuration instead. Called on client.flowControl with
+      {parallelism, rate, period}. Used to enforce a stable delivery rate during
+      incidents or migrations regardless of what publishers request. Makes an
+      HTTPS POST to /v2/flowControl/{key}/pin.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts
+      # Source confirmed in index.js (line 1355): pin() awaits http.request() — throws on non-2xx
+      - id: flowcontrol-pin-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), flow-control key not found (404),
+          invalid parallelism or rate value (400), rate limit (429), or server error (5xx).
+          Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.flowControl.pin() in try/catch. If uncaught during an
+          incident-response flow that pins rate to protect a downstream service, the pin
+          silently fails and delivery proceeds at publisher-specified rates — typically
+          higher than the downstream can handle. The protection the operator intended
+          never took effect.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts"
+          - "https://upstash.com/docs/qstash/features/flow-control"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: flowControl.unpin
+    import_path: "@upstash/qstash"
+    description: >
+      Removes a pinned parallelism or rate configuration from a flow-control key.
+      After unpinning, QStash resumes updating configuration based on incoming
+      messages. Complement to flowControl.pin(). Must be called after incident
+      resolution to restore dynamic flow control. Makes an HTTPS POST to
+      /v2/flowControl/{key}/unpin.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts
+      # Source confirmed in index.js (line 1373): unpin() awaits http.request() — throws on non-2xx
+      - id: flowcontrol-unpin-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), flow-control key not found (404),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.flowControl.unpin() in try/catch. If uncaught after an
+          incident is resolved, the flow-control key remains pinned to the incident-time
+          configuration. Delivery continues at the restricted rate long after the
+          underlying issue is fixed — capacity is wasted and SLAs may be missed because
+          the pinned restriction is silently still in force.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts"
+          - "https://upstash.com/docs/qstash/features/flow-control"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: flowControl.resetRate
+    import_path: "@upstash/qstash"
+    description: >
+      Resets the rate configuration state for a flow-control key. Clears the
+      current rate count and ends the current period immediately — the current
+      timestamp becomes the start of a new rate period. Called on
+      client.flowControl. Used in ops tooling to release accumulated rate-counter
+      state without changing the rate configuration itself. Makes an HTTPS POST
+      to /v2/flowControl/{key}/resetRate.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts
+      # Source confirmed in index.js (line 1390): resetRate() awaits http.request() — throws on non-2xx
+      - id: flowcontrol-resetrate-api-error
+        condition: >
+          Any HTTP failure: invalid token (401), flow-control key not found (404),
+          rate limit (429), or server error (5xx). Network errors on connection failure.
+        throws: >
+          QstashError on HTTP failure (non-2xx responses). QstashRatelimitError (429 burst).
+          QstashDailyRatelimitError (429 daily limit). Network errors on connection failure.
+        required_handling: >
+          Caller MUST wrap client.flowControl.resetRate() in try/catch. If uncaught in
+          an ops tool that resets rate state after an incident, the reset silently fails
+          and accumulated counter state continues to throttle delivery. Operators may
+          conclude their reset worked when it did not — leading to repeated, ineffective
+          reset attempts while the queue continues to be throttled.
+        sources:
+          - "https://raw.githubusercontent.com/upstash/qstash-js/main/src/client/flow-control.ts"
+          - "https://upstash.com/docs/qstash/features/flow-control"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
 notes:
   - "publishJSON/publish make HTTPS calls to QStash API at publish time — always need try-catch"
   - "QStash's retry config (retries: N) applies to MESSAGE DELIVERY, not the publish call itself"
@@ -911,3 +1269,8 @@ notes:
   - "dlq.delete() and dlq.retry() return cursor when more messages remain — must loop until cursor is undefined"
   - "messages.cancel() returns {cancelled: 0} for empty arrays, not an exception"
   - "logs() is paginated — max 1000 per page; must loop on cursor for complete log retrieval"
+  - "urlGroups.addEndpoints()/removeEndpoints()/delete() all share the same QstashError path via http.request()"
+  - "flowControl.pause/resume/pin/unpin/resetRate all share the same QstashError path — pause/pin failures silently leave the system unprotected"
+  - "dlq.listMessages() is paginated like dlq.delete()/retry() — must loop on cursor for full DLQ inspection"
+  - "Deprecated and intentionally omitted (no postconditions): Client.events (alias of logs); Messages.delete/deleteMany/deleteAll (use cancel); DLQ.deleteMany; Chat.create/Chat.prompt (chat() removed in qstash-js 3.0)"
+  - "GETs intentionally omitted from depth pass 2026-06-24 (low-impact, generic HTTP error surface): Messages.get; Queue.get/list; Schedules.get/list; UrlGroups.get/list; FlowControlApi.get/getGlobalParallelism"
