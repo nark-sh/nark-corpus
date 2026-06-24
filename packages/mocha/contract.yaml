@@ -18,13 +18,30 @@
 
 package: mocha
 semver: ">=8.0.0 <12.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-20"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 9 contracted / (10 total - 1 intentionally omitted) = 9/9
+coverage_score: 1.0  # 11 contracted / (12 total - 1 intentionally omitted) = 11/11
+# Depth pass 2026-06-24 (deepen-stream-2 pass 81):
+# Verified against mocha@11.7.6. Added two async programmatic API methods that were
+# missing from the contract: Mocha.runGlobalSetup and Mocha.runGlobalTeardown.
+# Both are auto-invoked by mocha.run() and have no .catch() on their await call
+# inside runAsync() (intentional per mocha.js lines 1019-1023 — "errors are caught
+# by the process event listeners"). When called programmatically (outside run()),
+# the returned Promise rejects if any global fixture throws.
+# API surface: 12 callable-with-error-contract (BDD + TDD hooks + 5 programmatic API methods)
+# Contracted before this pass: 9
+# Contracted after this pass: 11 (+2: Mocha.runGlobalSetup, Mocha.runGlobalTeardown)
+# Evidence (added this pass):
+#   node_modules/mocha/lib/mocha.js — runGlobalSetup() lines 1161-1169, runGlobalTeardown() lines 1181-1191
+#   node_modules/mocha/lib/mocha.js — _runGlobalFixtures() lines 1200-1208 (awaits each fixtureFn)
+#   node_modules/mocha/lib/mocha.js — runAsync() lines 1004-1024 (no catch; intentional)
+#   https://legacy.mochajs.org/api/mocha — runGlobalSetup/runGlobalTeardown return Promise<object>
+#   https://mochajs.org/features/global-fixtures/
+#
 # Depth pass 2026-04-20 (deepen-stream-1 pass 6):
 # API surface: 10 callable-with-error-contract (BDD + TDD hooks, programmatic API)
 # Contracted before: 8 (it, before, after, beforeEach, afterEach, describe, Mocha.loadFilesAsync, Mocha.run)
@@ -534,6 +551,153 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: low
+
+  - name: Mocha.runGlobalSetup
+    import_path: "mocha"
+    description: >
+      Programmatic API method on the Mocha class. Runs any globalSetup fixtures
+      sequentially, if any are registered via mocha.globalSetup() or in the config.
+      Returns Promise<object> resolving with a context object that should be threaded
+      to runGlobalTeardown. Auto-invoked by mocha.run() unless enableGlobalSetup is
+      false. When any global fixture function throws or returns a rejecting Promise,
+      the returned Promise rejects with that error. Inside mocha.run(), the rejection
+      is intentionally unhandled (lines 1019-1023 of mocha.js comment: "no catch here
+      is intentional. errors are considered uncaught/unhandled and caught by the
+      process event listeners") — so a fixture failure during a real run becomes an
+      UnhandledPromiseRejection unless the host script handles it.
+    postconditions:
+      # Evidence: node_modules/mocha/lib/mocha.js lines 1161-1169
+      # async function runGlobalSetup — awaits this._runGlobalFixtures(globalSetup, context)
+      # _runGlobalFixtures (lines 1200-1208) iterates with `await fixtureFn.call(context)`
+      # Any throw in a fixtureFn rejects the outer Promise.
+      # Inside mocha.run(): runAsync(runner).then(done) at line 1024 has NO .catch() —
+      # this is intentional per the inline comment, so a fixture rejection becomes an
+      # unhandled promise rejection that the process exits on (Node default).
+      - id: run-global-setup-fixture-rejects
+        condition: >
+          A globalSetup fixture function throws synchronously or returns a rejecting
+          Promise. Mocha's runGlobalSetup() awaits each fixture in sequence inside
+          _runGlobalFixtures(); the first failing fixture propagates its rejection up
+          through the returned Promise. Inside mocha.run() the rejection is not
+          caught — it surfaces as an UnhandledPromiseRejection. Programmatic callers
+          (anyone awaiting mocha.runGlobalSetup() directly, e.g. custom CI runners
+          that want to separate setup from test execution) must attach .catch() or
+          wrap in try/catch.
+        throws: >
+          Whatever the failing fixture function threw — typically an Error (e.g.
+          "Failed to start test database", "Cannot connect to seed server").
+          Rejection origin is the first fixture in the registered order that fails;
+          subsequent fixtures are NOT executed (the for-await loop short-circuits).
+        required_handling: >
+          When calling runGlobalSetup() directly (programmatic CI runner), attach
+          .catch() or wrap in try/catch:
+
+            // CORRECT: programmatic, separated phases
+            const mocha = new Mocha({ globalSetup: [bootDb, seedFixtures] });
+            try {
+              const ctx = await mocha.runGlobalSetup();
+              mocha.addFile('./test/suite.spec.js');
+              await mocha.loadFilesAsync();
+              mocha.run(failures => process.exitCode = failures ? 1 : 0);
+            } catch (err) {
+              console.error('Global setup failed:', err);
+              process.exitCode = 1;
+            }
+
+          When using mocha.run() (which auto-invokes runGlobalSetup), register a
+          process-level unhandledRejection handler OR disable global setup if you
+          want to manage it yourself:
+
+            process.on('unhandledRejection', err => {
+              console.error('Mocha global setup/teardown failed:', err);
+              process.exitCode = 1;
+            });
+
+          Failing silently here means tests run against an uninitialized environment
+          (no DB, no seed data) and either crash or report misleading test failures
+          that obscure the real root cause.
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js"
+          - "https://legacy.mochajs.org/api/mocha"
+          - "https://mochajs.org/features/global-fixtures/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Mocha.runGlobalTeardown
+    import_path: "mocha"
+    description: >
+      Programmatic API method on the Mocha class. Runs any globalTeardown fixtures
+      sequentially, if any are registered via mocha.globalTeardown() or in the config.
+      Returns Promise<object>. Auto-invoked by mocha.run() after the test runner
+      completes, unless enableGlobalTeardown is false. When any teardown fixture
+      throws or returns a rejecting Promise, the returned Promise rejects. Inside
+      mocha.run(), the rejection is intentionally unhandled (same mechanism as
+      runGlobalSetup) — a teardown failure becomes an UnhandledPromiseRejection that
+      can leave resources (database connections, spawned processes, port bindings)
+      undrained even though the test results were already computed.
+    postconditions:
+      # Evidence: node_modules/mocha/lib/mocha.js lines 1181-1191
+      # async function runGlobalTeardown — awaits this._runGlobalFixtures(globalTeardown, context)
+      # Same _runGlobalFixtures helper as runGlobalSetup — same rejection propagation.
+      # mocha.run() calls it at line 1013-1015 inside runAsync; runAsync's .then(done)
+      # has no .catch() so a teardown rejection escapes to the process.
+      - id: run-global-teardown-fixture-rejects
+        condition: >
+          A globalTeardown fixture function throws synchronously or returns a rejecting
+          Promise. Mocha's runGlobalTeardown() awaits each fixture in sequence; the
+          first failing fixture propagates its rejection up through the returned
+          Promise. Inside mocha.run() the rejection becomes an
+          UnhandledPromiseRejection. Common in CI when teardown attempts to stop a
+          background service that has already crashed, or to disconnect a database
+          whose pool was already drained — the error is real but easy to ignore
+          because tests have already "passed".
+        throws: >
+          Whatever the failing fixture function threw — typically an Error like
+          "Connection already closed", "Container stop timed out", "ECONNREFUSED
+          while stopping seed server". Subsequent teardown fixtures are NOT executed,
+          which compounds the resource leak (e.g. if fixture #2 fails, fixture #3
+          which would have closed the DB pool never runs).
+        required_handling: >
+          When calling runGlobalTeardown() directly, attach .catch() or use
+          try/catch:
+
+            try {
+              await mocha.runGlobalTeardown(ctx);
+            } catch (err) {
+              console.error('Global teardown failed:', err);
+              // Force-kill any remaining resources you know about
+              await Promise.allSettled([db?.disconnect?.(), server?.close?.()]);
+              process.exitCode = 1;
+            }
+
+          When using mocha.run() (auto-invokes teardown), register a process-level
+          unhandledRejection handler so CI surfaces the failure instead of silently
+          succeeding with a green-tests-but-leaked-resources outcome:
+
+            process.on('unhandledRejection', err => {
+              console.error('Mocha global teardown failed:', err);
+              process.exitCode = 1;
+            });
+
+          Silent teardown failures are a classic "the test suite passed but my CI
+          runner hung for 6 minutes" symptom and an even more dangerous "tests
+          passed but the next job in the pipeline saw stale state" symptom.
+        sources:
+          - "https://github.com/mochajs/mocha/blob/main/lib/mocha.js"
+          - "https://legacy.mochajs.org/api/mocha"
+          - "https://mochajs.org/features/global-fixtures/"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
 
 edge_cases:
   - id: promise-not-returned

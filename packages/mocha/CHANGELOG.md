@@ -3,6 +3,20 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% -> 100%
+
+- **Profile:** `packages/mocha/contract.yaml`
+- **Functions added:** Mocha.runGlobalSetup, Mocha.runGlobalTeardown (2 total)
+- **Postconditions added:** 2 (run-global-setup-fixture-rejects, run-global-teardown-fixture-rejects)
+- **Functions intentionally omitted this pass:** TDD aliases (suiteSetup/suiteTeardown/setup/teardown) — identical contracts to before/after/beforeEach/afterEach
+- **Scanner concerns queued:** 2 (`concern-20260624-mocha-deepen-1`, `concern-20260624-mocha-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Verified against:** mocha@11.7.6
+- **Sources fetched:** https://legacy.mochajs.org/api/mocha, https://mochajs.org/features/global-fixtures/
+- **Source evidence:** node_modules/mocha/lib/mocha.js lines 1161-1208 (runGlobalSetup/runGlobalTeardown/_runGlobalFixtures), 1004-1024 (runAsync no-catch pattern)
+- **Coverage accounting:** contract had 9 contracted / 10 total / 1 omitted = 9/9 = 100%; this pass surfaced 2 previously-missed async methods (globalSetup/globalTeardown auto-invoked by run()), bringing totals to 11 contracted / 12 total / 1 omitted = 11/11 = 100%. The 100->100 reflects denominator + numerator both growing.
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T10:57:46Z, deepen-stream-2 pass 81)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** mocha@11.7.6

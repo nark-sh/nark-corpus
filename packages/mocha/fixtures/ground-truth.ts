@@ -245,3 +245,59 @@ async function enableParallelModeViaConstructor() {
 
   mocha.run(failures => { process.exitCode = failures ? 1 : 0; });
 }
+
+// ---------------------------------------------------------------------------
+// Mocha.runGlobalSetup() / Mocha.runGlobalTeardown() — VIOLATIONS
+// Added depth pass 2026-06-24 (deepen-stream-2 pass 81). These two methods are
+// auto-invoked by mocha.run(), but programmatic callers that invoke them
+// separately must handle rejection. The fixture body must `await` the call so
+// the analyzer's require_await_detection triggers.
+// ---------------------------------------------------------------------------
+
+// SHOULD_FIRE: run-global-setup-fixture-rejects
+async function runGlobalSetupWithoutErrorHandling() {
+  const mocha = new Mocha();
+  mocha.globalSetup([async () => { /* start DB, may throw */ }]);
+  // No try/catch around await — a failing fixture causes unhandled rejection
+  await mocha.runGlobalSetup();
+  mocha.addFile('./test/suite.test.ts');
+  mocha.run(failures => { process.exitCode = failures ? 1 : 0; });
+}
+
+// @expect-clean
+async function runGlobalSetupWithTryCatch() {
+  const mocha = new Mocha();
+  mocha.globalSetup([async () => { /* start DB, may throw */ }]);
+  try {
+    // ✅ Wrapped — fixture failure is handled before run() is even attempted
+    await mocha.runGlobalSetup();
+  } catch (err) {
+    console.error('Global setup failed:', err);
+    process.exitCode = 1;
+    return;
+  }
+  mocha.addFile('./test/suite.test.ts');
+  mocha.run(failures => { process.exitCode = failures ? 1 : 0; });
+}
+
+// SHOULD_FIRE: run-global-teardown-fixture-rejects
+async function runGlobalTeardownWithoutErrorHandling() {
+  const mocha = new Mocha();
+  mocha.globalTeardown([async () => { /* stop server, may throw */ }]);
+  mocha.addFile('./test/suite.test.ts');
+  // Imagine tests just ran via runner; now teardown:
+  // No catch — teardown rejection silently leaks resources
+  await mocha.runGlobalTeardown();
+}
+
+// @expect-clean
+async function runGlobalTeardownWithCatchChain() {
+  const mocha = new Mocha();
+  mocha.globalTeardown([async () => { /* stop server, may throw */ }]);
+  mocha.addFile('./test/suite.test.ts');
+  // ✅ .catch() handler is attached — teardown errors are surfaced
+  await mocha.runGlobalTeardown().catch(err => {
+    console.error('Global teardown failed:', err);
+    process.exitCode = 1;
+  });
+}
