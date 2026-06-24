@@ -2,11 +2,11 @@ package: googleapis
 semver: ">=39.1.0 <200.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.77  # 10 contracted functions / 13 meaningful async-callable API groups (3 intentionally omitted)
+coverage_score: 0.79  # 11 contracted functions / 14 meaningful async-callable API groups (3 intentionally omitted)
 
 # Detection rules for analyzer integration
 detection:
@@ -578,3 +578,103 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: medium
+
+  # ─── Google Drive Sharing API ────────────────────────────────────────────────
+
+  - name: permissions.create
+    import_path: "googleapis"
+    description: >
+      Creates a permission for a Drive file or shared drive (grants access to a
+      user, group, domain, or anyone). Called as drive.permissions.create().
+      Critical for SaaS apps that share generated documents (reports, exports,
+      collaborative templates) with end users or teams. Distinct from
+      files.create — permissions.create has its own sharing-specific quota
+      (sharingRateLimitExceeded) and a sharing-validation 400 (invalidSharingRequest)
+      that files.create cannot raise. Concurrent permission edits on the same
+      file are not supported (last-write-wins per Google docs).
+    patterns:
+      - 'drive.permissions.create('
+      - '.permissions.create('
+
+    postconditions:
+      # Evidence: https://developers.google.com/drive/api/guides/handle-errors
+      # Evidence: https://developers.google.com/drive/api/reference/rest/v3/permissions/create
+      # sharingRateLimitExceeded (403), insufficientFilePermissions (403),
+      # invalidSharingRequest (400), appNotAuthorizedToFile (403) confirmed from docs
+      - id: drive-permissions-create-sharing-rate-limit
+        condition: >
+          drive.permissions.create() called without try-catch in a loop that
+          shares many files (e.g., bulk onboarding, batch report distribution).
+          Drive enforces a per-user sharingRateLimitExceeded distinct from the
+          general rateLimitExceeded — it triggers on share velocity, not request
+          velocity, and is often linked to notification-email bursts.
+        throws: "GaxiosError with status 403, error.response.data.error.errors[0].reason === 'sharingRateLimitExceeded'"
+        required_handling: >
+          Wrap in try-catch. For 403 errors, inspect error.response.data.error.errors[0].reason.
+          When reason === 'sharingRateLimitExceeded', stop the bulk share loop and
+          back off significantly (minutes, not seconds). Consider setting
+          sendNotificationEmail: false during bulk shares — Google's docs flag
+          notification email volume as a primary trigger. For long-running
+          automation, use a service account with domain-wide delegation.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: drive-permissions-create-insufficient-permissions
+        condition: >
+          drive.permissions.create() called without try-catch when the authenticated
+          user lacks the right to grant access to the target file (e.g., the user
+          is a writer but not the owner, or attempting to share a file inside a
+          Shared Drive where the user lacks Manager role). Common in SaaS apps
+          that share files owned by an end user but accessed via a service account
+          without sufficient role.
+        throws: "GaxiosError with status 403, error.response.data.error.errors[0].reason === 'insufficientFilePermissions'"
+        required_handling: >
+          Wrap in try-catch. For 403 errors, inspect error.response.data.error.errors[0].reason.
+          When reason === 'insufficientFilePermissions', surface a clear error to the
+          user that they (or the service account) must be an owner / Shared Drive
+          Manager to grant new access. Do NOT retry — the call will continue to fail
+          until the underlying role is upgraded. Distinguish this from
+          'sharingRateLimitExceeded' and 'appNotAuthorizedToFile' which require
+          different remediation.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      - id: drive-permissions-create-invalid-sharing-request
+        condition: >
+          drive.permissions.create() called without try-catch with an invalid
+          permission body — most commonly an email address that doesn't exist, a
+          domain restriction that blocks the share, or an ACL combination
+          disallowed by the workspace admin (e.g., trying to share externally
+          when external sharing is disabled).
+        throws: "GaxiosError with status 400, error.response.data.error.errors[0].reason === 'invalidSharingRequest'"
+        required_handling: >
+          Wrap in try-catch. For 400 errors with reason === 'invalidSharingRequest',
+          read error.response.data.error.message — Google embeds the specific cause
+          (bad email, domain restriction, ACL conflict). Display this to the user
+          rather than failing silently. Do NOT retry without fixing the input.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: low

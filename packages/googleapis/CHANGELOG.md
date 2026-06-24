@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 77% → 79%
+
+- **Profile:** `packages/googleapis/contract.yaml`
+- **Functions added:** drive.permissions.create (1 total)
+- **Postconditions added:** 3 (drive-permissions-create-sharing-rate-limit, drive-permissions-create-insufficient-permissions, drive-permissions-create-invalid-sharing-request)
+- **Functions intentionally omitted this pass:** none new — 3 omitted groups carry forward from 2026-04-16 (admin.users.list Workspace admin ops; specialized infra APIs BigQuery/Pub-Sub/Analytics; narrow-adoption YouTube playlist features)
+- **Scanner concerns queued:** 3 (`concern-20260624-googleapis-deepen-1`, `concern-20260624-googleapis-deepen-2`, `concern-20260624-googleapis-deepen-3`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://developers.google.com/drive/api/guides/handle-errors, https://developers.google.com/drive/api/reference/rest/v3/permissions/create
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T03:43:12Z, deepen-stream-2 pass=40)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** googleapis@173.0.0

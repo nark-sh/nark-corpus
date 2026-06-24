@@ -23,6 +23,9 @@
  *   sheets-values-update-rate-limit
  *   sheets-values-update-not-found
  *   sheets-batch-update-atomic-failure
+ *   drive-permissions-create-sharing-rate-limit
+ *   drive-permissions-create-insufficient-permissions
+ *   drive-permissions-create-invalid-sharing-request
  */
 
 import { google } from 'googleapis';
@@ -320,6 +323,79 @@ export async function batchUpdateSheetWithCatch(spreadsheetId: string, requests:
     if (error instanceof GaxiosError && error.status === 400) {
       const msg = (error as any).response?.data?.error?.message ?? 'Invalid batch request';
       throw new Error(`Sheets batchUpdate failed: ${msg}`);
+    }
+    throw error;
+  }
+}
+
+// ─── Drive: permissions.create ───────────────────────────────────────────────
+
+export async function sharePermissionNoCatch(
+  fileId: string, emailAddress: string
+) {
+  const drive = google.drive({ version: 'v3', auth });
+  // SHOULD_FIRE: drive-permissions-create-sharing-rate-limit
+  const response = await drive.permissions.create({
+    fileId,
+    requestBody: { type: 'user', role: 'reader', emailAddress },
+    sendNotificationEmail: true,
+  });
+  return response.data.id;
+}
+
+export async function bulkSharePermissionNoCatch(
+  fileId: string, emails: string[]
+) {
+  const drive = google.drive({ version: 'v3', auth });
+  const ids: string[] = [];
+  for (const emailAddress of emails) {
+    // SHOULD_FIRE: drive-permissions-create-insufficient-permissions
+    const response = await drive.permissions.create({
+      fileId,
+      requestBody: { type: 'user', role: 'writer', emailAddress },
+    });
+    if (response.data.id) ids.push(response.data.id);
+  }
+  return ids;
+}
+
+export async function shareWithDomainNoCatch(
+  fileId: string, domain: string
+) {
+  const drive = google.drive({ version: 'v3', auth });
+  // SHOULD_FIRE: drive-permissions-create-invalid-sharing-request
+  const response = await drive.permissions.create({
+    fileId,
+    requestBody: { type: 'domain', role: 'reader', domain },
+  });
+  return response.data.id;
+}
+
+export async function sharePermissionWithCatch(
+  fileId: string, emailAddress: string
+) {
+  const drive = google.drive({ version: 'v3', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with specific reason handling
+    const response = await drive.permissions.create({
+      fileId,
+      requestBody: { type: 'user', role: 'reader', emailAddress },
+      sendNotificationEmail: false,
+    });
+    return response.data.id;
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      const reason = (error as any).response?.data?.error?.errors?.[0]?.reason;
+      if (reason === 'sharingRateLimitExceeded') {
+        throw new Error('Drive sharing rate limit — back off');
+      }
+      if (reason === 'insufficientFilePermissions') {
+        throw new Error('Caller lacks rights to grant access on this file');
+      }
+      if (reason === 'invalidSharingRequest') {
+        const msg = (error as any).response?.data?.error?.message ?? 'Invalid share';
+        throw new Error(`Drive share rejected: ${msg}`);
+      }
     }
     throw error;
   }
