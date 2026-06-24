@@ -19,6 +19,8 @@
  *   gettoken-null-not-checked: getToken() returns null without null guard
  *   gettoken-missing-req: getToken() throws TypeError when req is missing
  *   getsession-null-not-checked: getSession() returns null without null guard
+ *   getcsrftoken-undefined-not-checked: getCsrfToken() returns undefined on /api/auth/csrf fetch failure
+ *   getproviders-null-not-checked: getProviders() returns null on /api/auth/providers fetch failure
  *
  * Coverage:
  *   - Section 1: bare encode() → SHOULD_FIRE
@@ -31,11 +33,21 @@
  *   - Section 8: getToken() with null check → SHOULD_NOT_FIRE
  *   - Section 9: getSession() without null check → SHOULD_FIRE
  *   - Section 10: getSession() with null check → SHOULD_NOT_FIRE
+ *   - Section 11: getCsrfToken() without undefined check → SHOULD_FIRE
+ *   - Section 12: getCsrfToken() with undefined check → SHOULD_NOT_FIRE
+ *   - Section 13: getProviders() without null check → SHOULD_FIRE
+ *   - Section 14: getProviders() with null check → SHOULD_NOT_FIRE
  */
 
 import { encode, decode, getToken } from "next-auth/jwt";
 import { getServerSession } from "next-auth/next";
-import { signIn, signOut, getSession } from "next-auth/react";
+import {
+  signIn,
+  signOut,
+  getSession,
+  getCsrfToken,
+  getProviders,
+} from "next-auth/react";
 import type { NextApiRequest, NextApiResponse } from "next";
 import type { AuthOptions } from "next-auth";
 
@@ -217,4 +229,64 @@ export async function getClientSessionWithNullCheck() {
     return null;
   }
   return session.user;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. getCsrfToken() used without undefined check → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function submitCustomSignInWithoutCsrfCheck(
+  email: string,
+  password: string,
+) {
+  // SHOULD_FIRE: getcsrftoken-undefined-not-checked — token may be undefined on /api/auth/csrf fetch failure
+  const csrfToken = await getCsrfToken();
+  return fetch("/api/auth/callback/credentials", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ csrfToken: csrfToken!, email, password }),
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. getCsrfToken() with undefined check → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function submitCustomSignInWithCsrfCheck(
+  email: string,
+  password: string,
+) {
+  // SHOULD_NOT_FIRE: getCsrfToken() with explicit undefined guard before use
+  const csrfToken = await getCsrfToken();
+  if (!csrfToken) {
+    throw new Error("CSRF token unavailable — auth endpoint unreachable");
+  }
+  return fetch("/api/auth/callback/credentials", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ csrfToken, email, password }),
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. getProviders() used without null check → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderProviderButtonsWithoutNullCheck() {
+  // SHOULD_FIRE: getproviders-null-not-checked — providers may be null on /api/auth/providers fetch failure
+  const providers = await getProviders();
+  return Object.values(providers!).map((p) => p.name);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. getProviders() with null check → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function renderProviderButtonsWithNullCheck() {
+  // SHOULD_NOT_FIRE: getProviders() with explicit null guard before use
+  const providers = await getProviders();
+  if (!providers) {
+    return [];
+  }
+  return Object.values(providers).map((p) => p.name);
 }
