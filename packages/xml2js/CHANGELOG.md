@@ -3,6 +3,22 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — re-verified at 100% coverage
+
+- **Profile:** `packages/xml2js/contract.yaml`
+- **Functions added:** none (drift-by-staleness re-verification; full API surface re-enumerated against xml2js@0.6.2 + @types/xml2js@0.4.14, no new async-callable methods since prior pass)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** `Parser.reset` (sync void return, no error contract); `processors.*` 5 pure-sync transform utilities (parseNumbers, parseBooleans, normalize, firstCharLowerCase, stripPrefix); `defaults` (read-only constant export); `ValidationError` class (re-exported sentinel, not a callable)
+- **Scanner concerns queued:** 0 (pre-existing baseline concerns at fixture lines 189/197/206 still tracked under prior `concern-20260417-xml2js-deepen-3` / `concern-20260612-xml2js-deepen-1`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched (re-verification only):**
+  - node_modules/xml2js/lib/xml2js.js (top-level exports inspection)
+  - node_modules/@types/xml2js/index.d.ts (typed surface — confirms 5 async-callable methods unchanged)
+  - node_modules/xml2js/README.md (no new error-handling guidance vs prior pass)
+- **API surface verified against:** xml2js@0.6.2 + @types/xml2js@0.4.14
+- **Coverage:** 5/5 async-callable contracted; postcondition count unchanged at 9; effective coverage 1.0 holds
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24, deepen-stream-3 pass 78)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** xml2js@0.6.2
