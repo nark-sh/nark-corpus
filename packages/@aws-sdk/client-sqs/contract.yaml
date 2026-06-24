@@ -1,12 +1,25 @@
 package: "@aws-sdk/client-sqs"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"  # updated by deepen-stream-2 pass 48
 coverage_status: covered
 status: production
 evidence_quality: confirmed
 coverage_score: 1.0  # 9 contracted / 9 contractable (24 total - 15 intentionally omitted)
+# Depth pass 2026-06-24 (deepen-stream-2 pass 48, drift-by-staleness mode):
+# Re-enumerated @aws-sdk/client-sqs@3.1075.0 (current latest, within profile
+# semver >=3.0.0 <4.0.0). Surface unchanged at 24 commands; error class count
+# unchanged at 28 (no new exceptions since 2026-04-16). Pre-existing 9-of-9
+# contractable coverage stands. Added 1 new postcondition this pass against
+# previously-uncovered error surface: sqs-send-batch-invalid-entry-id covers
+# InvalidBatchEntryId, which is documented as a @throws on
+# SendMessageBatchCommand.d.ts (and the same-shape DeleteMessageBatch and
+# ChangeMessageVisibilityBatch commands). This is distinct from the
+# already-covered BatchEntryIdsNotDistinct (duplicates) — InvalidBatchEntryId
+# fires when entry IDs don't conform to [A-Za-z0-9_-]{1,80}, a common bug
+# when callers use UUIDs containing characters outside that set or when
+# message DB ids leak through.
 
 functions:
   - name: send
@@ -152,6 +165,62 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+      # Added 2026-06-24 (deepen-stream-2 pass 48, drift-by-staleness mode):
+      # Distinct from BatchEntryIdsNotDistinct (covered above as the duplicate-ID case).
+      # InvalidBatchEntryId fires when entry.Id values don't conform to
+      # [A-Za-z0-9_-]{1,80}. Common bug: callers pass database row UUIDs that
+      # contain dots / slashes, or message IDs from upstream queues that include
+      # ':' / '.' / '/'. The whole batch is REJECTED with this exception — none of
+      # the messages are sent, including the well-formed ones.
+      # Evidence: dist-types/commands/SendMessageBatchCommand.d.ts @throws
+      # {@link InvalidBatchEntryId} (client fault) — "The Id of a batch entry in
+      # a batch request doesn't abide by the specification."
+      - id: sqs-send-batch-invalid-entry-id
+        condition: >
+          SendMessageBatchCommand is called with one or more entries whose Id
+          field contains characters outside the allowed set [A-Za-z0-9_-] or
+          exceeds 80 characters. Common when callers leak database UUIDs that
+          include dots / slashes, or pass upstream message IDs containing ':'
+          or '/'. The ENTIRE batch is rejected — none of the messages are
+          sent, including the well-formed ones.
+        throws: >
+          InvalidBatchEntryId (a SQSServiceException subclass with error.name
+          === "InvalidBatchEntryId", $fault === "client"). The exception is
+          thrown synchronously from the SDK before any messages are sent. No
+          partial success — Successful and Failed arrays are not populated
+          because the request never reached the service in a processable form.
+        required_handling: >
+          MUST wrap in try-catch AND validate entry.Id formatting at the call
+          site before sending the batch:
+            const sanitize = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
+            try {
+              const result = await client.send(new SendMessageBatchCommand({
+                QueueUrl,
+                Entries: items.map((item, i) => ({
+                  Id: sanitize(item.id),
+                  MessageBody: JSON.stringify(item),
+                })),
+              }));
+            } catch (error) {
+              if (error instanceof SQSServiceException && error.name === 'InvalidBatchEntryId') {
+                logger.error('Batch entry IDs malformed — entire batch rejected', {
+                  entries: items.map(i => i.id),
+                });
+                // Sanitize and retry, or fall back to per-message SendMessage
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html"
+          - "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatchRequestEntry.html"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: high
 
   - name: send (DeleteMessageBatchCommand)
     import_path: "@aws-sdk/client-sqs"

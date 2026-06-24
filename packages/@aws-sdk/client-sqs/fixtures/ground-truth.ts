@@ -6,7 +6,7 @@
  *
  * Contracted functions (all via SQSClient imported from "@aws-sdk/client-sqs"):
  *   - sqsClient.send()                    postcondition: aws-service-error
- *   - send(SendMessageBatchCommand)        postconditions: sqs-send-batch-failed-not-checked, sqs-send-batch-no-try-catch
+ *   - send(SendMessageBatchCommand)        postconditions: sqs-send-batch-failed-not-checked, sqs-send-batch-no-try-catch, sqs-send-batch-invalid-entry-id
  *   - send(DeleteMessageBatchCommand)      postcondition: sqs-delete-batch-failed-not-checked
  *   - send(ReceiveMessageCommand)          postconditions: sqs-receive-no-try-catch, sqs-receive-messages-undefined
  *   - send(DeleteMessageCommand)           postcondition: sqs-delete-receipt-handle-invalid
@@ -532,3 +532,53 @@ export async function sendMessageFifoWithGroupId(payload: object) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. SendMessageBatchCommand — InvalidBatchEntryId (entry.Id malformed)
+// Added 2026-06-24 (deepen-stream-2 pass 48).
+// Entry IDs must match [A-Za-z0-9_-]{1,80}. Leaking DB UUIDs / upstream message
+// IDs that contain '.' / '/' / ':' rejects the entire batch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendBatchWithDatabaseUuidsAsEntryIds(rows: { id: string; payload: unknown }[]) {
+  // SHOULD_NOT_FIRE: scanner gap — input-validation postcondition sqs-send-batch-invalid-entry-id not implemented
+  try {
+    const result = await sqsClient.send(new SendMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: rows.map(r => ({
+        Id: r.id, // ← may be "550e8400-e29b-41d4-a716-446655440000" (ok) or "user.42:event" (BAD)
+        MessageBody: JSON.stringify(r.payload),
+      })),
+    }));
+    return result.Successful;
+  } catch (error) {
+    console.error('Batch send failed:', error);
+    throw error;
+  }
+}
+
+export async function sendBatchWithSanitizedEntryIds(rows: { id: string; payload: unknown }[]) {
+  // SHOULD_NOT_FIRE: entry IDs are sanitized to [A-Za-z0-9_-] before sending
+  const sanitize = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
+  try {
+    const result = await sqsClient.send(new SendMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries: rows.map((r, i) => ({
+        Id: `${i}_${sanitize(r.id)}`,
+        MessageBody: JSON.stringify(r.payload),
+      })),
+    }));
+    if (result.Failed && result.Failed.length > 0) {
+      for (const failure of result.Failed) {
+        console.error(`Message ${failure.Id} failed: ${failure.Code}`);
+      }
+    }
+    return result.Successful;
+  } catch (error) {
+    if (error instanceof Error && error.name === 'InvalidBatchEntryId') {
+      console.error('Batch entry IDs malformed — entire batch rejected');
+    }
+    throw error;
+  }
+}
+
