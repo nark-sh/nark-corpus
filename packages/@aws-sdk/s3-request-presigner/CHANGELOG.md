@@ -3,6 +3,22 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% -> 100% (function count); postcondition density 6 -> 7
+
+- **Profile:** `packages/@aws-sdk/s3-request-presigner/contract.yaml`
+- **Functions added:** none (all 3 surfaces already contracted)
+- **Postconditions added:** 1 (`getSignedUrl.presigner-not-valid-http-request`)
+- **Functions intentionally omitted this pass:** none (no read-only / pure-GET surfaces to omit)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/@aws-sdk/s3-request-presigner@3.1075.0/dist-es/getSignedUrl.js` (throw of `Error("Request to be presigned is not an valid HTTP request.")`)
+  - `node_modules/@aws-sdk/s3-request-presigner@3.1075.0/dist-es/presigner.js` (re-verified no new throws on presign/presignWithCredentials in this build)
+  - `node_modules/@aws-sdk/signature-v4-multi-region/dist-es/SignatureV4MultiRegion.js` (re-verified SigV4a / MRAP / CRT branch throws unchanged)
+  - `node_modules/@smithy/signature-v4/dist-es/SignatureV4.js` and `SignatureV4Base.js` (re-verified MAX_PRESIGNED_TTL and invalid-credential-object throws unchanged)
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T01:38:48Z, deepen-stream-2 pass 29)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @aws-sdk/s3-request-presigner@3.1072.0
