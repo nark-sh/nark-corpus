@@ -3,6 +3,28 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 73% → 73% (no new surface)
+
+- **Profile:** `packages/@sentry/node/contract.yaml`
+- **Functions added:** none — re-enumerated against @sentry/node@10.57.0, no new contractable async-callable functions vs the existing 8
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:**
+  - `disableAnrDetectionForCallback` — @deprecated in v10 source; Sentry redirects users to `eventLoopBlockIntegration` from `@sentry/node-native` (separate package)
+  - `profiler.startProfiler` / `profiler.stopProfiler` — synchronous void-returning controls
+  - `cron.instrumentCron` / `cron.instrumentNodeCron` / `cron.instrumentNodeSchedule` — synchronous wrappers; structural contract (wrap-before-register) with no async error profile distinct from the underlying cron library
+  - `withActiveSpan` / `withStreamedSpan` — sync scope-passing wrappers; transparent re-throw, no distinct error contract beyond `startSpan` (already covered)
+  - `trpcMiddleware` — middleware factory; the returned middleware re-throws callback errors transparently
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/@sentry/node/build/types/index.d.ts` (v10.57.0)
+  - `node_modules/@sentry/core/build/types/exports.d.ts`
+  - `node_modules/@sentry/core/build/types/tracing/trace.d.ts`
+  - `node_modules/@sentry/core/build/types/profiling.d.ts`
+  - `node_modules/@sentry/node-core/build/types/integrations/anr/index.d.ts` (confirmed @deprecated)
+  - `node_modules/@sentry/node-core/build/types/cron/*.d.ts`
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T11:24:51Z, deepen-stream-3 pass 73)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @sentry/node@10.58.0
