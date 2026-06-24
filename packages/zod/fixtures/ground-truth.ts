@@ -5,13 +5,15 @@
  * Derived from the contract spec, NOT V1 behavior.
  *
  * Contracted functions (from import "zod"):
- *   - schema.parse()         postconditions: parse-validation-error, parse-type-coercion-error,
- *                                            parse-async-schema-error
- *   - schema.parseAsync()    postconditions: parse-async-validation-error, parse-async-refinement-error
- *   - schema.safeParse()     postcondition: safe-parse-success-check
- *   - schema.safeParseAsync() postcondition: safe-parse-async-success-check
- *   - schema.encodeAsync()   postconditions: encode-async-unidirectional-transform, encode-async-validation-error
- *   - schema.decodeAsync()   postconditions: decode-async-validation-error, decode-async-refinement-error
+ *   - schema.parse()             postconditions: parse-validation-error, parse-type-coercion-error,
+ *                                                parse-async-schema-error
+ *   - schema.parseAsync()        postconditions: parse-async-validation-error, parse-async-refinement-error
+ *   - schema.safeParse()         postcondition: safe-parse-success-check
+ *   - schema.safeParseAsync()    postconditions: safe-parse-async-success-check, safe-parse-async-refinement-throw
+ *   - schema.encodeAsync()       postconditions: encode-async-unidirectional-transform, encode-async-validation-error
+ *   - schema.decodeAsync()       postconditions: decode-async-validation-error, decode-async-refinement-error
+ *   - schema.safeEncodeAsync()   postconditions: safe-encode-async-unidirectional-transform, safe-encode-async-refinement-throw
+ *   - schema.safeDecodeAsync()   postcondition: safe-decode-async-refinement-throw
  *
  * Detection path: z.object()/z.string()/etc. → schema instance →
  *   ThrowingFunctionDetector fires parse()/parseAsync()/encodeAsync()/decodeAsync() →
@@ -181,5 +183,94 @@ export async function decodeAsyncWithCatch(value: unknown) {
       throw new Error('Validation failed: ' + (refinementIssues[0]?.message ?? err.message));
     }
     throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. safeParseAsync() — async refinement throw (NOT a {success:false} case)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: safe-parse-async-refinement-throw
+export async function safeParseAsyncRefinementThrowNoCatch(value: unknown) {
+  const schema = z.string().refine(async (s) => {
+    // External call inside refinement — may throw on DB/network failure
+    throw new Error('DB connection lost');
+  });
+  // SHOULD_FIRE: safe-parse-async-refinement-throw — async refinement throw propagates as promise rejection, NOT a {success:false} result.
+  const result = await schema.safeParseAsync(value);
+  if (!result.success) {
+    return { error: result.error };
+  }
+  return { data: result.data };
+}
+
+// @expect-clean
+export async function safeParseAsyncRefinementThrowWithCatch(value: unknown) {
+  const schema = z.string().refine(async (s) => {
+    throw new Error('DB connection lost');
+  });
+  try {
+    // SHOULD_NOT_FIRE: try-catch covers the async-refinement promise rejection
+    const result = await schema.safeParseAsync(value);
+    return result;
+  } catch (err) {
+    return { rejected: true, message: (err as Error).message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. safeEncodeAsync() — unidirectional transform + refinement throw (v4 only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: safe-encode-async-unidirectional-transform
+// @expect-violation: safe-encode-async-refinement-throw
+export async function safeEncodeAsyncUnidirectionalNoCatch(value: string) {
+  const schema = z.string().transform((s: string) => s.toUpperCase());
+  // SHOULD_FIRE: safe-encode-async-unidirectional-transform — .transform() has no inverse, rejects with $ZodEncodeError.
+  const result = await schema.safeEncodeAsync(value);
+  return result;
+}
+
+// @expect-clean
+export async function safeEncodeAsyncUnidirectionalWithCatch(value: string) {
+  const schema = z.string().transform((s: string) => s.toUpperCase());
+  try {
+    // SHOULD_NOT_FIRE: try-catch covers the $ZodEncodeError rejection
+    const result = await schema.safeEncodeAsync(value);
+    return result;
+  } catch (err) {
+    return { encodeError: (err as Error).name };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. safeDecodeAsync() — async refinement throw (v4 only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: safe-decode-async-refinement-throw
+export async function safeDecodeAsyncRefinementThrowNoCatch(value: unknown) {
+  const schema = z.string().refine(async (s) => {
+    // DB call inside refinement — may throw
+    throw new Error('User service unavailable');
+  });
+  // SHOULD_FIRE: safe-decode-async-refinement-throw — async refinement throw propagates as promise rejection.
+  const result = await schema.safeDecodeAsync(value);
+  if (!result.success) {
+    return { error: result.error };
+  }
+  return { data: result.data };
+}
+
+// @expect-clean
+export async function safeDecodeAsyncRefinementThrowWithCatch(value: unknown) {
+  const schema = z.string().refine(async (s) => {
+    throw new Error('User service unavailable');
+  });
+  try {
+    // SHOULD_NOT_FIRE: try-catch covers the promise rejection from the async refinement
+    const result = await schema.safeDecodeAsync(value);
+    return result;
+  } catch (err) {
+    return { rejected: true, message: (err as Error).message };
   }
 }

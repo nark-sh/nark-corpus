@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 75% → 100%
+
+- **Profile:** `packages/zod/contract.yaml`
+- **Functions added:** safeEncodeAsync, safeDecodeAsync (2 total)
+- **Postconditions added:** 4 (safe-parse-async-refinement-throw, safe-encode-async-unidirectional-transform, safe-encode-async-refinement-throw, safe-decode-async-refinement-throw)
+- **Functions intentionally omitted this pass:** none — prior YAML marked safeEncodeAsync/safeDecodeAsync as intentionally-omitted with reason "no-throw discriminated union", but empirical verification against zod@4.4.3 showed both DO reject with non-ZodError exceptions ($ZodEncodeError on unidirectional transforms, original Error on async-refinement throws). Reclassified as covered.
+- **Scanner concerns queued:** 3 (concern-20260624-zod-deepen-1, concern-20260624-zod-deepen-2, concern-20260624-zod-deepen-3)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts, https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/schemas.ts
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** zod@4.4.3

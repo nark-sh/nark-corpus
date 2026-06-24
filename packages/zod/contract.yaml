@@ -2,15 +2,17 @@ package: zod
 semver: ">=3.0.0"
 contract_version: 1.0.0
 maintainer: behavioral-contracts
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.75  # 6 contracted / 8 total async-callable (2 intentionally omitted: safeEncodeAsync, safeDecodeAsync)
+coverage_score: 1.0  # 8 contracted / 8 total async-callable. safeEncodeAsync/safeDecodeAsync added 2026-06-24 after empirical confirmation that the "safe" wrapper does NOT cover $ZodEncodeError or async-refinement throws.
 description: |
   Zod is a TypeScript-first schema validation library. The parse() and parseAsync()
   methods throw ZodError on validation failure, requiring proper error handling.
-  safeParse() and safeParseAsync() return result objects instead of throwing.
+  safeParse() and safeParseAsync() return result objects instead of throwing for
+  validation failures, but DO propagate $ZodEncodeError and async-refinement throws
+  as promise rejections — the "safe" prefix is narrower than developers assume.
   Zod v4 adds encodeAsync() and decodeAsync() for bidirectional codec transforms.
 functions:
   - name: parse
@@ -194,6 +196,54 @@ functions:
           incident_cost_range: medium
         sources:
           - https://github.com/colinhacks/zod#safeparse
+
+      # Evidence: confirmed from zod@4.4.3 source: parse.cjs _safeParseAsync
+      # Confirmed via execution: schema.refine(async (s) => { throw new Error('boom'); }).safeParseAsync('x')
+      # REJECTS the promise with the original Error — NOT wrapped in a ZodError, NOT a {success:false} result.
+      # The "safe" naming covers validation-failure (becomes {success:false}); it does NOT cover throws
+      # inside async refinement bodies. The original error propagates as a promise rejection.
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: safe-parse-async-refinement-throw
+        condition: >
+          schema.safeParseAsync() is called on a schema whose async refinement
+          (.refine(async fn)) THROWS an error (rather than returning false). The
+          throw is NOT caught by the "safe" wrapper — it propagates as a promise
+          rejection with the original error type (not a ZodError, not a
+          {success:false} result).
+        throws: "Original Error from the throwing async refinement body (not wrapped in ZodError)"
+        description: >
+          Developers commonly assume safeParseAsync() never throws because of the
+          "safe" prefix. This is only true when async refinements RETURN false.
+          When an async refinement THROWS (e.g., a database call inside the
+          refinement rejects), the original error propagates as a promise
+          rejection. Code that only checks result.success and skips a catch
+          block will crash with an unhandled promise rejection. Database errors,
+          network errors, and any other thrown errors inside async refinements
+          bypass the safe wrapper entirely.
+        required_handling: |
+          Even when using safeParseAsync(), still wrap in try-catch when the
+          schema uses async refinements that can throw:
+            // wrong (assumes safeParseAsync never rejects)
+            const result = await schema.safeParseAsync(data);
+            if (!result.success) { /* handle ZodError */ }
+
+            // correct
+            try {
+              const result = await schema.safeParseAsync(data);
+              if (!result.success) { /* handle ZodError */ }
+            } catch (err) {
+              // async refinement threw (e.g., DB error)
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
   - name: encodeAsync
     import_path: zod
     description: |
@@ -382,6 +432,147 @@ functions:
           - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
           - "https://zod.dev/api?id=async-refinements"
         severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: safeEncodeAsync
+    import_path: zod
+    description: |
+      Zod v4 only. Async non-throwing variant of encode(). Despite the "safe"
+      naming, this function REJECTS the promise with $ZodEncodeError when called
+      on a schema with unidirectional transforms (.transform() without an inverse
+      encode fn). Only validation failures are wrapped in {success: false}.
+    usage_pattern: |
+      const schema = z.transform({ decode: (s: string) => s.toUpperCase(), encode: (s: string) => s.toLowerCase() });
+      const result = await schema.safeEncodeAsync('HELLO');
+      if (!result.success) { /* handle ZodError */ }
+    postconditions:
+      # Evidence: confirmed from zod@4.4.3 source: parse.cjs _safeEncodeAsync delegates to _safeParseAsync
+      # in backward direction. schema._zod.run() throws $ZodEncodeError synchronously when it traverses
+      # a unidirectional transform with direction=backward. Since _safeParseAsync is async, the
+      # synchronous throw becomes a promise rejection.
+      # Confirmed via execution: z.string().transform(s=>s.toUpperCase()).safeEncodeAsync('HELLO')
+      # rejects with: $ZodEncodeError: Encountered unidirectional transform during encode: ZodTransform
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: safe-encode-async-unidirectional-transform
+        condition: >
+          schema.safeEncodeAsync() is called on a schema containing a .transform()
+          with no inverse encode function. The "safe" prefix does NOT cover this
+          case — schema._zod.run() throws $ZodEncodeError synchronously inside the
+          async function, which propagates as a promise rejection.
+        throws: "$ZodEncodeError: Encountered unidirectional transform during encode: ZodTransform (promise rejection)"
+        description: >
+          Developers commonly assume safeEncodeAsync() never throws because of the
+          "safe" prefix. This is only true for validation failures. Schema-design
+          errors (unidirectional transforms) bypass the safe wrapper and reject
+          the promise with $ZodEncodeError. Code that only checks result.success
+          will crash with an unhandled promise rejection when the schema has
+          irreversible transforms.
+        required_handling: |
+          Use bidirectional codecs OR wrap safeEncodeAsync() in try-catch:
+            // wrong (unidirectional transform — rejects)
+            const result = await z.string().transform(s => s.toUpperCase()).safeEncodeAsync('HELLO');
+
+            // correct option 1: use bidirectional codec
+            const schema = z.transform({
+              decode: (s: string) => s.toUpperCase(),
+              encode: (s: string) => s.toLowerCase(),
+            });
+            const result = await schema.safeEncodeAsync('HELLO');
+
+            // correct option 2: wrap in try-catch
+            try {
+              const result = await schema.safeEncodeAsync(value);
+              if (!result.success) { /* validation issues */ }
+            } catch (err) {
+              // err.name === 'ZodEncodeError' — schema design bug
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/schemas.ts"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: confirmed from zod@4.4.3 source: parse.cjs _safeEncodeAsync
+      # Throws inside an async refinement (within an encode-direction schema) propagate as a
+      # promise rejection — same code path as safeParseAsync.
+      - id: safe-encode-async-refinement-throw
+        condition: >
+          schema.safeEncodeAsync() is called on a schema whose async refinement
+          throws an error (rather than returning false). The original error
+          propagates as a promise rejection — not wrapped in ZodError, not a
+          {success:false} result.
+        throws: "Original Error from the throwing async refinement body (not wrapped in ZodError)"
+        description: >
+          As with safeParseAsync, the "safe" wrapper only protects against
+          validation failures. Errors thrown inside async refinements (DB calls,
+          network calls, etc.) propagate as promise rejections.
+        required_handling: |
+          Wrap safeEncodeAsync() in try-catch when the schema has async
+          refinements that may throw.
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: safeDecodeAsync
+    import_path: zod
+    description: |
+      Zod v4 only. Async non-throwing variant of decode(). Aliases safeParseAsync
+      internally. Validation failures are wrapped in {success: false, error}.
+      However, errors thrown inside async refinements bypass the safe wrapper
+      and reject the promise with the original Error.
+    usage_pattern: |
+      const schema = z.string().refine(async (s) => await checkDB(s), { error: 'Not found' });
+      const result = await schema.safeDecodeAsync(inputValue);
+      if (!result.success) { /* handle ZodError */ }
+    postconditions:
+      # Evidence: confirmed from zod@4.4.3 source: parse.cjs _safeDecodeAsync delegates to _safeParseAsync.
+      # Confirmed via execution: z.string().refine(async () => { throw new Error('boom'); }).safeDecodeAsync('x')
+      # rejects with the original Error("boom"), not a ZodError, not a {success:false} result.
+      # Source: https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts
+      - id: safe-decode-async-refinement-throw
+        condition: >
+          schema.safeDecodeAsync() is called on a schema whose async refinement
+          (.refine(async fn)) THROWS an error rather than returning false. The
+          throw is NOT caught by the "safe" wrapper — it propagates as a promise
+          rejection with the original error type.
+        throws: "Original Error from the throwing async refinement body (not wrapped in ZodError)"
+        description: >
+          Async refinements often call external services (DB lookups, HTTP
+          checks). If those calls throw (rather than the refinement returning
+          false), the error propagates as a promise rejection. Code that only
+          inspects result.success and omits a try-catch will crash on the
+          unhandled rejection. The "safe" prefix only protects against
+          validation issues — NOT against thrown errors from refinement bodies.
+        required_handling: |
+          Wrap safeDecodeAsync() in try-catch when async refinements may throw:
+            try {
+              const result = await schema.safeDecodeAsync(data);
+              if (!result.success) { /* handle ZodError */ }
+            } catch (err) {
+              // async refinement threw (DB error, network error, etc.)
+            }
+        sources:
+          - "https://raw.githubusercontent.com/colinhacks/zod/main/packages/zod/src/v4/core/parse.ts"
+        severity: warning
         evidence_quality: confirmed
         business_impact:
           incident_label: SILENT_FAILURE
