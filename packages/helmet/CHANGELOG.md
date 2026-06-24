@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — no-action re-verification — coverage 100% → 100%
+
+- **Profile:** `packages/helmet/contract.yaml`
+- **Functions added:** none
+- **Postconditions added:** none
+- **Latest published:** helmet@8.2.0 (released 2026-05-22, unchanged since pass 12 on 2026-06-18)
+- **API surface re-enumerated against helmet@8.2.0 index.d.cts:** 15 exports total (helmet + contentSecurityPolicy + 13 individual middleware factories with their legacy aliases). Matches the previously enumerated surface exactly. No new exports, no removed exports.
+- **Throw-site re-enumeration against helmet@8.2.0 index.cjs:** 29 throw statements total. All 29 map to already-contracted postconditions: 11 CSP factory paths (`contentSecurityPolicy`), 3 single-policy-value rejections (`crossOriginEmbedderPolicy`/`OpenerPolicy`/`ResourcePolicy`), 3 referrer-policy paths, 3 HSTS validation paths, 2 xFrameOptions/xPermittedCrossDomainPolicies action-value paths, 8 helmet() duplicate-option-pair throws (collapsed under `helmet-duplicate-option-pair`), and 1 `app.use(helmet)` mis-invocation throw (`helmet-passed-as-middleware-not-factory`). Zero uncontracted throw sites.
+- **Functions intentionally omitted this pass:** unchanged from pass 12 (6 functions — originAgentCluster, xContentTypeOptions / noSniff, xDnsPrefetchControl / dnsPrefetchControl, xDownloadOptions / ieNoOpen, xPoweredBy / hidePoweredBy, xXssProtection / xssFilter). All six remain no-arg or option-less header-setter middleware with no throw paths at factory or request time.
+- **Scanner concerns queued:** 0 (none added — concerns from pass 12 remain pending in scanner backlog)
+- **Scanner version used:** nark@3.2.0
+- **Sources re-checked:**
+  - npm registry — confirmed helmet@8.2.0 is still the latest (no 8.3.x or 9.0.0 release since 2026-05-22)
+  - node_modules/helmet/index.d.cts (helmet@8.2.0 — full export list re-verified)
+  - node_modules/helmet/index.cjs (helmet@8.2.0 — 29 throw statements re-enumerated, all map to existing postconditions)
+- **Verified by:** bc-deepen-contract (pass 86, deepen-stream-3, on 2026-06-24T14:21:09Z)
+
 ## 2026-06-18 — deepen pass — coverage 89% → 100%
 
 - **Profile:** `packages/helmet/contract.yaml`
