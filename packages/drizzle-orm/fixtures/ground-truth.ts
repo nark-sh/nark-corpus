@@ -274,3 +274,60 @@ export async function batchWithCatch(name: string, email: string) {
     throw err;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. migrate() — applies pending SQL migrations (added 2026-06-24)
+//
+// migrate() is imported from a driver-specific entry point. The error
+// surface is identical across drivers — fs-missing, dialect error, and
+// the no-built-in-lock concurrent-startup race.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+
+export async function migrateNoCatch() {
+  // SHOULD_FIRE: migrate-missing-journal-or-sql-file — migrate() throws on missing journal or .sql files. No try-catch.
+  await migrate(db, { migrationsFolder: './drizzle' });
+}
+
+export async function migrateWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: migrate() inside try-catch — fs and driver errors handled.
+    await migrate(db, { migrationsFolder: './drizzle' });
+  } catch (err) {
+    console.error('migration failed; aborting startup:', err);
+    process.exit(1);
+  }
+}
+
+export async function migrateConcurrentStartupNoCatch() {
+  // SHOULD_FIRE: migrate-driver-error-rolls-back-pending — concurrent migrate() races throw duplicate-object errors. No try-catch.
+  await migrate(db, { migrationsFolder: './drizzle' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. db.$cache.invalidate() — cache invalidation (added 2026-06-24)
+//
+// $cache.invalidate is wired when DrizzleConfig.cache is supplied. When
+// omitted, NoopCache.onMutate silently returns — see
+// cache-invalidate-silent-noop-when-cache-not-configured.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function cacheInvalidateNoCatch() {
+  // SHOULD_FIRE: cache-invalidate-backend-error — invalidate() throws on Redis/Upstash backend errors. No try-catch.
+  await db.$cache.invalidate({ tables: usersTable });
+}
+
+export async function cacheInvalidateWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: $cache.invalidate inside try-catch — backend errors handled.
+    await db.$cache.invalidate({ tags: 'user-list' });
+  } catch (err) {
+    console.error('cache invalidation failed; serving stale until TTL:', err);
+  }
+}
+
+export async function cacheInvalidateNoopButNoCatch() {
+  // SHOULD_FIRE: cache-invalidate-backend-error — even if NoopCache is wired today, the same call site against a real cache backend can throw. No try-catch.
+  await db.$cache.invalidate({ tables: ['usersTable', 'postsTable'] });
+}

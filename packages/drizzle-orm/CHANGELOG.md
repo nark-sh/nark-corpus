@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 69% → 73% (raw); effective 100%
+
+- **Profile:** `packages/drizzle-orm/contract.yaml`
+- **Functions added:** migrate, invalidate (2 total)
+- **Postconditions added:** 5 (migrate-missing-journal-or-sql-file, migrate-driver-error-rolls-back-pending, migrate-no-built-in-lock-concurrent-startup-race, cache-invalidate-backend-error, cache-invalidate-silent-noop-when-cache-not-configured)
+- **Functions intentionally omitted this pass:** none new (the prior 4 omissions still hold: selectDistinct, selectDistinctOn, refreshMaterializedView, $count)
+- **Scanner concerns queued:** 4 (`concern-20260624-drizzle-orm-deepen-1`, `concern-20260624-drizzle-orm-deepen-2`, `concern-20260624-drizzle-orm-deepen-3`, plus `concern-20260624-scanner-deepen-4` for the unrelated effectiveName.endsWith beta-prefix bug noted in the pass prompt)
+- **Scanner version used:** nark@3.2.0
+- **Package version verified:** drizzle-orm@0.45.2
+- **Sources fetched:** https://orm.drizzle.team/docs/migrations, https://orm.drizzle.team/docs/cache, https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/migrator.ts, https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/pg-core/dialect.ts, https://raw.githubusercontent.com/drizzle-team/drizzle-orm/main/drizzle-orm/src/cache/upstash/cache.ts
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 76, 2026-06-24T12:22Z)
+- contract_version bumped 1.2.0 → 1.3.0; last_verified 2026-06-12 → 2026-06-24.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** drizzle-orm@0.45.2
