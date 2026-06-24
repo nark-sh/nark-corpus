@@ -13,6 +13,10 @@
  *   sns-subscribe-pending-confirmation-not-handled (SubscribeCommand — ARN value not checked)
  *   sns-create-topic-limit-exceeded              (CreateTopicCommand — topic limit not handled)
  *   sns-create-topic-concurrent-access-exception (CreateTopicCommand — transient race not retried)
+ *   sns-publish-endpoint-disabled-not-handled    (PublishCommand — EndpointDisabled not routed to dereg flow)
+ *   sns-publish-kms-error-not-handled            (PublishCommand — KMS* errors not split from auth errors)
+ *   sns-confirm-subscription-replay-limit-exceeded (ConfirmSubscriptionCommand — replay token not detected)
+ *   sns-confirm-subscription-token-invalid-not-handled (ConfirmSubscriptionCommand — expired token not surfaced)
  */
 import {
   SNSClient,
@@ -21,6 +25,7 @@ import {
   CreateTopicCommand,
   DeleteTopicCommand,
   SubscribeCommand,
+  ConfirmSubscriptionCommand,
   SNSServiceException,
 } from '@aws-sdk/client-sns';
 
@@ -265,3 +270,183 @@ async function gt_subscribe_pendingConfirmationChecked() {
     throw error;
   }
 }
+
+// ──────────────────────────────────────────────────
+// 9. PublishCommand — EndpointDisabled not routed to dereg flow (scanner gap, no detector yet)
+// ──────────────────────────────────────────────────
+
+// @expect-clean
+async function gt_publish_endpoint_disabled_swallowed() {
+  const endpointArn = 'arn:aws:sns:us-east-1:123456789:endpoint/APNS/MyApp/abc';
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — error-name-narrowing postcondition sns-publish-endpoint-disabled-not-handled not implemented
+    await snsClient.send(new PublishCommand({
+      TargetArn: endpointArn,
+      Message: 'push payload',
+    }));
+  } catch (error) {
+    // Generic catch — does not split EndpointDisabled or PlatformApplicationDisabled
+    console.error('publish failed:', error);
+  }
+}
+
+// @expect-clean
+async function gt_publish_endpoint_disabled_handled() {
+  const endpointArn = 'arn:aws:sns:us-east-1:123456789:endpoint/APNS/MyApp/abc';
+  try {
+    // SHOULD_NOT_FIRE: EndpointDisabled routed to deregistration flow
+    await snsClient.send(new PublishCommand({
+      TargetArn: endpointArn,
+      Message: 'push payload',
+    }));
+  } catch (error) {
+    if (error instanceof SNSServiceException) {
+      if (error.name === 'EndpointDisabled') {
+        await markEndpointDisabled(endpointArn);
+        return;
+      }
+      if (error.name === 'PlatformApplicationDisabled') {
+        await alertOps('Platform application disabled');
+        return;
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 10. PublishCommand — KMS error swallowed as generic auth error (scanner gap, no detector yet)
+// ──────────────────────────────────────────────────
+
+// @expect-clean
+async function gt_publish_kms_error_collapsed() {
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — error-name-narrowing postcondition sns-publish-kms-error-not-handled not implemented
+    await snsClient.send(new PublishCommand({
+      TopicArn: TOPIC_ARN,
+      Message: 'encrypted message',
+    }));
+  } catch (error) {
+    if (error instanceof SNSServiceException) {
+      // BAD: lumps KMS errors with authorization — operator chases SNS IAM
+      if (error.name === 'AuthorizationError' || error.name.startsWith('KMS')) {
+        throw new Error('permission error');
+      }
+    }
+    throw error;
+  }
+}
+
+// @expect-clean
+async function gt_publish_kms_error_handled() {
+  try {
+    // SHOULD_NOT_FIRE: KMS family split from auth and throttling retried
+    await snsClient.send(new PublishCommand({
+      TopicArn: TOPIC_ARN,
+      Message: 'encrypted message',
+    }));
+  } catch (error) {
+    if (error instanceof SNSServiceException) {
+      if (error.name.startsWith('KMS')) {
+        if (error.name === 'KMSThrottling') {
+          // transient — let caller retry
+          throw new Error('kms throttling');
+        }
+        await alertOps(`KMS key unavailable: ${error.name}`);
+        throw new Error('kms key unavailable');
+      }
+      if (error.name === 'AuthorizationError') {
+        throw new Error('sns publish permission denied');
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 11. ConfirmSubscriptionCommand — replay limit ignored (scanner gap, no detector yet)
+// ──────────────────────────────────────────────────
+
+// @expect-clean
+async function gt_confirm_replay_limit_ignored() {
+  const token = 'abc123';
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — error-name-narrowing postcondition sns-confirm-subscription-replay-limit-exceeded not implemented
+    await snsClient.send(new ConfirmSubscriptionCommand({
+      TopicArn: TOPIC_ARN,
+      Token: token,
+    }));
+  } catch (error) {
+    // Generic catch — does not split ReplayLimitExceeded; webhook returns 200 to SNS
+    console.error('confirm failed:', error);
+  }
+}
+
+// @expect-clean
+async function gt_confirm_replay_limit_handled() {
+  const token = 'abc123';
+  try {
+    // SHOULD_NOT_FIRE: ReplayLimitExceeded triggers re-subscription flow
+    await snsClient.send(new ConfirmSubscriptionCommand({
+      TopicArn: TOPIC_ARN,
+      Token: token,
+    }));
+  } catch (error) {
+    if (error instanceof SNSServiceException) {
+      if (error.name === 'ReplayLimitExceeded') {
+        await logSecurityEvent('replay limit hit', { TopicArn: TOPIC_ARN });
+        await triggerResubscriptionFlow(TOPIC_ARN);
+        return;
+      }
+      if (error.name === 'InvalidParameter') {
+        await notifyUser('Confirmation expired — please re-subscribe');
+        return;
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 12. ConfirmSubscriptionCommand — invalid/expired token swallowed (scanner gap, no detector yet)
+// ──────────────────────────────────────────────────
+
+// @expect-clean
+async function gt_confirm_invalid_token_swallowed() {
+  const token = 'expired-token';
+  try {
+    // SHOULD_NOT_FIRE: scanner gap — error-name-narrowing postcondition sns-confirm-subscription-token-invalid-not-handled not implemented
+    await snsClient.send(new ConfirmSubscriptionCommand({
+      TopicArn: TOPIC_ARN,
+      Token: token,
+    }));
+  } catch (error) {
+    // Generic catch — InvalidParameter on confirm = user must re-subscribe
+    console.error('confirm error:', error);
+  }
+}
+
+// @expect-clean
+async function gt_confirm_invalid_token_surfaced() {
+  const token = 'expired-token';
+  try {
+    // SHOULD_NOT_FIRE: InvalidParameter on confirm routed to "please re-subscribe" UX
+    await snsClient.send(new ConfirmSubscriptionCommand({
+      TopicArn: TOPIC_ARN,
+      Token: token,
+    }));
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof SNSServiceException && error.name === 'InvalidParameter') {
+      return { ok: false, reason: 'token_expired_or_invalid' };
+    }
+    throw error;
+  }
+}
+
+// Helper stubs for fixture compilation
+async function markEndpointDisabled(_arn: string) {}
+async function alertOps(_msg: string) {}
+async function logSecurityEvent(_msg: string, _ctx: Record<string, unknown>) {}
+async function triggerResubscriptionFlow(_arn: string) {}
+async function notifyUser(_msg: string) {}

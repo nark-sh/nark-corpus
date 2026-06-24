@@ -2,6 +2,28 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-24 — deepen pass — coverage 80% → 86%
+
+- **Profile:** `packages/@aws-sdk/client-sns/contract.yaml`
+- **Functions added:** PublishCommand, ConfirmSubscriptionCommand (2 total)
+- **Postconditions added:** 4
+  - `sns-publish-endpoint-disabled-not-handled` (PublishCommand — EndpointDisabled / PlatformApplicationDisabled routing to device-deregistration flow)
+  - `sns-publish-kms-error-not-handled` (PublishCommand — KMS error family split from AuthorizationError)
+  - `sns-confirm-subscription-replay-limit-exceeded` (ConfirmSubscriptionCommand — replay token must trigger re-subscription)
+  - `sns-confirm-subscription-token-invalid-not-handled` (ConfirmSubscriptionCommand — expired-token "please re-subscribe" UX)
+- **Functions intentionally omitted this pass:** none new (CreatePlatformEndpointCommand still omitted — generic SNSServiceException profile, niche SaaS adoption; see prior-pass omission rationale)
+- **Scanner concerns queued:** 4 (`concern-20260624-aws-sns-deepen-4`, `-5`, `-6`, `-7`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - https://docs.aws.amazon.com/sns/latest/api/API_Publish.html
+  - https://docs.aws.amazon.com/sns/latest/dg/sns-mobile-application-as-subscriber.html
+  - https://docs.aws.amazon.com/sns/latest/api/API_SetEndpointAttributes.html
+  - https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html
+  - https://docs.aws.amazon.com/kms/latest/developerguide/services-sns.html
+  - https://docs.aws.amazon.com/sns/latest/api/API_ConfirmSubscription.html
+  - https://docs.aws.amazon.com/sns/latest/dg/SendMessageToHttp.html
+- **@throws lists confirmed from:** `dist-types/commands/PublishCommand.d.ts` and `dist-types/commands/ConfirmSubscriptionCommand.d.ts` in @aws-sdk/client-sns@3.1075.0
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 37, drift-by-staleness, 2026-06-24)
 
 ## 2026-06-18 — re-verified clean
 

@@ -1,12 +1,12 @@
 package: "@aws-sdk/client-sns"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.80
+coverage_score: 0.86
 
 functions:
   - name: send
@@ -367,6 +367,247 @@ functions:
           transient). Do not propagate ConcurrentAccessException to end users.
         sources:
           - "https://docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html"
+
+  - name: PublishCommand
+    import_path: "@aws-sdk/client-sns"
+    description: >
+      Publishes a single message to an SNS topic, phone number (SMS), or mobile push endpoint.
+      The most-called SNS command in production SaaS code. Unlike PublishBatchCommand, all
+      failures are surfaced as thrown exceptions (no partial-success response pattern).
+      Distinguished from the generic send() postcondition by its unique error surface:
+      endpoint disabled, platform application disabled, and the full KMS error family for
+      encrypted topics.
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/sns/latest/api/API_Publish.html
+      # @throws list confirmed from dist-types/commands/PublishCommand.d.ts (sdk v3.1075.0):
+      # AuthorizationErrorException, EndpointDisabledException, InternalErrorException,
+      # InvalidParameterException, InvalidParameterValueException, InvalidSecurityException,
+      # KMSAccessDeniedException, KMSDisabledException, KMSInvalidStateException,
+      # KMSNotFoundException, KMSOptInRequired, KMSThrottlingException, NotFoundException,
+      # PlatformApplicationDisabledException, ValidationException, SNSServiceException
+      - id: sns-publish-endpoint-disabled-not-handled
+        severity: error
+        condition: >
+          PublishCommand throws EndpointDisabledException (HTTP 400) when the mobile push
+          endpoint (APNs / FCM device token) has been disabled by the push notification
+          service — typically because the token was revoked, the app was uninstalled, or
+          the provider (Apple/Google) flagged the endpoint as invalid. The endpoint must
+          be deleted and re-registered with a fresh token, OR re-enabled via
+          SetEndpointAttributes before retry.
+        description: >
+          EndpointDisabledException surfaces only when publishing to a mobile push endpoint
+          (Protocol=application). SNS automatically disables endpoints when the underlying
+          push provider returns a permanent-failure feedback (e.g. APNs Feedback Service,
+          FCM NotRegistered). Subsequent PublishCommand calls to that endpoint throw —
+          they do not silently succeed.
+
+          Naive retry loops that catch and re-throw will hammer SNS with guaranteed-failing
+          requests, burning API quota and SMS spend. Production push pipelines must either
+          (a) remove the EndpointArn from the user's device list on EndpointDisabled, or
+          (b) call SetEndpointAttributes({ Enabled: 'true', Token: <new-token> }) when a
+          new token is available from the client app.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Catch EndpointDisabledException specifically and route to the device-deregistration
+          flow. Do NOT propagate to user-facing error UI (the user didn't do anything wrong)
+          and do NOT blindly retry.
+
+          Pattern:
+            try {
+              await snsClient.send(new PublishCommand({ TargetArn: endpointArn, Message }));
+            } catch (error) {
+              if (error instanceof SNSServiceException) {
+                if (error.name === 'EndpointDisabled') {
+                  await markEndpointDisabled(endpointArn);
+                  return;
+                }
+                if (error.name === 'PlatformApplicationDisabled') {
+                  await alertOps('Platform application disabled — check APNs/FCM credentials');
+                  return;
+                }
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_Publish.html"
+          - "https://docs.aws.amazon.com/sns/latest/dg/sns-mobile-application-as-subscriber.html"
+          - "https://docs.aws.amazon.com/sns/latest/api/API_SetEndpointAttributes.html"
+
+      - id: sns-publish-kms-error-not-handled
+        severity: error
+        condition: >
+          PublishCommand throws one of the KMS error family — KMSAccessDeniedException,
+          KMSDisabledException, KMSInvalidStateException, KMSNotFoundException,
+          KMSOptInRequired, or KMSThrottlingException — when the destination topic is
+          encrypted at rest with a KMS customer master key and the key is unavailable to
+          the publishing principal. Distinct from generic AuthorizationError because the
+          failure is on the KMS key, NOT the SNS topic.
+        description: >
+          Server-side encryption (SSE) is enabled when a topic's KmsMasterKeyId attribute
+          is set. Every PublishCommand to an SSE-enabled topic requires that the publishing
+          IAM principal have kms:GenerateDataKey AND kms:Decrypt on that key, AND that the
+          key be enabled, in the right state, in the right region, and not throttled.
+
+          KMSDisabledException: customer disabled the key (often during rotation).
+          KMSAccessDeniedException: key policy or IAM does not grant kms:GenerateDataKey.
+          KMSInvalidStateException: key is PendingDeletion or PendingImport.
+          KMSNotFoundException: key was scheduled for deletion and removed.
+          KMSOptInRequired: AWS account hasn't opted into the region the key lives in.
+          KMSThrottlingException: KMS request rate exceeded (high-volume notification streams).
+
+          These errors are mis-diagnosed as SNS permission errors in postmortems because
+          the error message references SNS:Publish, but the underlying cause is the KMS key.
+          Production runbooks that only check SNS IAM will spin for hours on a disabled key.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        required_handling: >
+          Catch KMS* error names separately from AuthorizationErrorException. Surface the
+          KMS error code to operators so they investigate the KMS key, not the SNS topic.
+          For KMSThrottlingException specifically, retry with exponential backoff (it is
+          transient).
+
+          Pattern:
+            try {
+              await snsClient.send(new PublishCommand({ TopicArn, Message }));
+            } catch (error) {
+              if (error instanceof SNSServiceException) {
+                if (error.name.startsWith('KMS')) {
+                  if (error.name === 'KMSThrottling') {
+                    return retryWithBackoff(() => snsClient.send(...));
+                  }
+                  await alertOps(`SNS topic encrypted with disabled/inaccessible KMS key: ${error.name}`);
+                  throw new InfrastructureError('SNS topic KMS key unavailable', error);
+                }
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_Publish.html"
+          - "https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html"
+          - "https://docs.aws.amazon.com/kms/latest/developerguide/services-sns.html"
+
+  - name: ConfirmSubscriptionCommand
+    import_path: "@aws-sdk/client-sns"
+    description: >
+      Confirms a pending subscription using a token sent to the endpoint by the prior
+      SubscribeCommand call. Required for HTTP/S endpoint and email subscriptions to
+      transition from "pending confirmation" to active. Tokens expire after 2 days.
+      Unique error: ReplayLimitExceededException (token reused too many times).
+
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/sns/latest/api/API_ConfirmSubscription.html
+      # @throws list confirmed from dist-types/commands/ConfirmSubscriptionCommand.d.ts (sdk v3.1075.0):
+      # AuthorizationErrorException, FilterPolicyLimitExceededException, InternalErrorException,
+      # InvalidParameterException, NotFoundException, ReplayLimitExceededException,
+      # SubscriptionLimitExceededException, SNSServiceException
+      - id: sns-confirm-subscription-replay-limit-exceeded
+        severity: error
+        condition: >
+          ConfirmSubscriptionCommand throws ReplayLimitExceededException when the same
+          confirmation token has been replayed more times than the AWS-imposed limit allows.
+          Indicates either a misbehaving client retry loop or an attempted token-replay
+          attack. The token becomes permanently unusable; a fresh SubscribeCommand call is
+          required to issue a new one.
+        description: >
+          SNS imposes a per-token replay cap to prevent confirmation-token abuse. When a
+          confirmation endpoint repeatedly POSTs the same token (e.g. due to a buggy webhook
+          retry that doesn't respect 200 responses), SNS throws ReplayLimitExceededException
+          instead of silently accepting the duplicate.
+
+          Once this error fires, the original SubscribeCommand pending state is dead — the
+          endpoint will never become active using that token. The subscription flow must
+          restart from SubscribeCommand to get a new token. A confirmation webhook that
+          catches and ignores this error will leave the subscription permanently pending.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        required_handling: >
+          Catch ReplayLimitExceededException specifically and trigger a re-subscription
+          flow rather than retrying ConfirmSubscription. Log the event for security review
+          (may indicate token-replay probing) and notify the endpoint owner that
+          re-subscription is required.
+
+          Pattern:
+            try {
+              await snsClient.send(new ConfirmSubscriptionCommand({ TopicArn, Token }));
+            } catch (error) {
+              if (error instanceof SNSServiceException) {
+                if (error.name === 'ReplayLimitExceeded') {
+                  await logSecurityEvent('SNS confirmation token replay limit hit', { TopicArn });
+                  await triggerResubscriptionFlow(TopicArn);
+                  return;
+                }
+                if (error.name === 'InvalidParameter') {
+                  await notifyUser('Confirmation token expired or invalid — please re-subscribe');
+                  return;
+                }
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_ConfirmSubscription.html"
+
+      - id: sns-confirm-subscription-token-invalid-not-handled
+        severity: warning
+        condition: >
+          ConfirmSubscriptionCommand throws InvalidParameterException when the token is
+          malformed, expired (older than 2 days), or does not match the TopicArn. The
+          subscription remains in pending state — no exception during SubscribeCommand
+          flagged the problem because confirmation is async.
+        description: >
+          The confirmation token is a short-lived (2-day) opaque value sent to the
+          subscription endpoint. Common failure modes that surface as InvalidParameterException
+          at confirmation time:
+
+          - Endpoint took longer than 2 days to confirm (user ignored the email).
+          - The token was truncated by an intermediate URL handler.
+          - The subscription was deleted between SubscribeCommand and ConfirmSubscription.
+          - TopicArn mismatch (confirmation routed to wrong topic in multi-topic systems).
+
+          Callers that catch InvalidParameterException generically (alongside auth errors,
+          parameter validation, etc.) lose the signal that the user needs to be prompted
+          to re-initiate subscription. The webhook returns 200 to SNS, but the subscription
+          never becomes active and the user receives nothing.
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: low
+        evidence_quality: confirmed
+        required_handling: >
+          When InvalidParameterException is thrown by ConfirmSubscriptionCommand
+          specifically, surface a clear "your subscription confirmation expired, please
+          re-subscribe" message to the end user. Do not retry with the same token.
+
+          Pattern:
+            try {
+              await snsClient.send(new ConfirmSubscriptionCommand({ TopicArn, Token }));
+            } catch (error) {
+              if (error instanceof SNSServiceException && error.name === 'InvalidParameter') {
+                return { ok: false, reason: 'token_expired_or_invalid' };
+              }
+              throw error;
+            }
+        sources:
+          - "https://docs.aws.amazon.com/sns/latest/api/API_ConfirmSubscription.html"
+          - "https://docs.aws.amazon.com/sns/latest/dg/SendMessageToHttp.html"
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
