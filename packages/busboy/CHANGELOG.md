@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 90% → 91%
+
+- **Profile:** `packages/busboy/contract.yaml`
+- **Functions added:** Busboy factory — no new top-level function (single export); refined existing entry with one new postcondition
+- **Postconditions added:** 1 (`busboy-010` — mid-stream `Malformed part header` runtime emit, distinct from busboy-001 generic error-listener and busboy-008 synchronous constructor throw)
+- **Functions intentionally omitted this pass:** Malformed urlencoded form (carried forward — internal stream mechanism subsumed by busboy-001 generic error listener; no real-world client triggers)
+- **Scanner concerns queued:** 1 (`concern-20260624-busboy-deepen-1`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** lib/types/multipart.js@1.6.0 line 398 confirms `this.emit('error', new Error('Malformed part header'))` from the header sub-parser; https://github.com/mscdex/busboy/blob/master/lib/types/multipart.js ; https://github.com/mscdex/busboy/issues/171
+- **Verified by:** bc-deepen-contract (drift-by-staleness pass 43 on 2026-06-24T04:23:53Z, deepen-stream-2)
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** busboy@1.6.0

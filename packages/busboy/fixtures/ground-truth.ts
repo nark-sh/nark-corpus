@@ -465,3 +465,78 @@ function handleUploadWithDisconnectRecovery(req: IncomingMessage, res: ServerRes
   });
   req.pipe(bb);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// busboy-010: Mid-stream 'Malformed part header' — Missing error listener
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: busboy-010
+// VIOLATES: constructor try/catch handles the synchronous throws (busboy-002 / busboy-008)
+// but no 'error' event listener is attached, so a mid-stream 'Malformed part header'
+// (emitted from lib/types/multipart.js line 398 when a part's headers fail to parse)
+// crashes the Node process via the unhandled error-event mechanism.
+function handleUploadMalformedPartHeaderMissingErrorListener(req: IncomingMessage, res: ServerResponse) {
+  let bb;
+  try {
+    bb = busboy({ headers: req.headers });
+  } catch (err) {
+    res.writeHead(400);
+    res.end('Bad request');
+    return;
+  }
+  // NO bb.on('error', ...) — Malformed part header will crash the worker
+  bb.on('file', (name, file) => {
+    file.resume();
+  });
+  bb.on('field', (name, value) => {
+    console.log(`Field: ${name} = ${value}`);
+  });
+  bb.on('close', () => {
+    res.writeHead(200);
+    res.end('Done');
+  });
+  req.pipe(bb);
+}
+
+// @expect-clean
+// CORRECT: handles 'Malformed part header' explicitly by branching on err.message
+// so metrics can distinguish client-malformed-body bugs from transient network errors.
+function handleUploadWithMalformedPartHeaderSplit(req: IncomingMessage, res: ServerResponse) {
+  let bb;
+  try {
+    bb = busboy({ headers: req.headers });
+  } catch (err) {
+    res.writeHead(400);
+    res.end('Bad request');
+    return;
+  }
+  bb.on('error', (err: Error) => {
+    if (err.message === 'Malformed part header') {
+      // Deterministic client bug — emit a counter and return 400
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'malformed_part_header', retryable: false }));
+      return;
+    }
+    if (err.message.startsWith('Unexpected end of')) {
+      // Likely transient — could be retried
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'upload_interrupted', retryable: true }));
+      return;
+    }
+    res.writeHead(400);
+    res.end('Upload error');
+  });
+  bb.on('file', (name, file) => {
+    file.resume();
+  });
+  bb.on('field', (name, value) => {
+    console.log(`Field: ${name} = ${value}`);
+  });
+  bb.on('close', () => {
+    if (!res.headersSent) {
+      res.writeHead(200);
+      res.end('Done');
+    }
+  });
+  req.pipe(bb);
+}
