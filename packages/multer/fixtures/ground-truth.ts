@@ -286,6 +286,62 @@ function setupDiskStorageRouteWithWriteErrorHandling(app: any) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// fields() — field-name DoS / field-limit VIOLATION (added 2026-06-24 pass 46)
+// ---------------------------------------------------------------------------
+
+// SHOULD_FIRE: fields-throws-multer-error-field-limits
+function setupFieldsRouteNoFieldLimitGuards(app: any) {
+  // No fieldNestingDepth, no parts limit, no fields limit. A hostile client can
+  // send "a[b][c][d][e]..." or thousands of parts and crash request handling.
+  const upload = multer({ dest: 'uploads/' });
+  app.post('/upload-fields-unsafe',
+    upload.fields([{ name: 'avatar', maxCount: 1 }]),
+    (req: Request, res: Response) => {
+      res.json({ files: req.files });
+    }
+  );
+}
+
+// @expect-clean
+function setupFieldsRouteWithFieldLimitGuards(app: any) {
+  const upload = multer({
+    dest: 'uploads/',
+    limits: {
+      fileSize: 5 * 1024 * 1024,
+      fieldNestingDepth: 3,
+      parts: 50,
+      fields: 20,
+    },
+  });
+
+  function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
+    if (err instanceof multer.MulterError) {
+      if (
+        err.code === 'LIMIT_FIELD_NESTING' ||
+        err.code === 'LIMIT_PART_COUNT' ||
+        err.code === 'LIMIT_FIELD_COUNT' ||
+        err.code === 'LIMIT_FIELD_KEY' ||
+        err.code === 'LIMIT_FIELD_VALUE' ||
+        err.code === 'MISSING_FIELD_NAME'
+      ) {
+        return res.status(400).json({ error: `Bad request: ${err.code}` });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+    if (err) return res.status(500).json({ error: 'Upload failed' });
+    next();
+  }
+
+  app.post('/upload-fields-safe',
+    upload.fields([{ name: 'avatar', maxCount: 1 }]),
+    errorHandler,
+    (req: Request, res: Response) => {
+      res.json({ files: req.files });
+    }
+  );
+}
+
 export {
   setupFieldsRouteNoErrorHandling,
   setupFieldsRouteWithErrorHandling,
@@ -298,4 +354,6 @@ export {
   createDiskStorageWithErrorHandling,
   setupDiskStorageRouteNoWriteErrorHandling,
   setupDiskStorageRouteWithWriteErrorHandling,
+  setupFieldsRouteNoFieldLimitGuards,
+  setupFieldsRouteWithFieldLimitGuards,
 };
