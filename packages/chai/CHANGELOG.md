@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 67% -> 67% (effective 100%)
+
+- **Profile:** `packages/chai/contract.yaml`
+- **Functions added:** none (re-verification pass)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** use (sync plugin registration, propagates plugin errors synchronously); Should (class export, not directly callable as a function)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.0.0
+- **Sources fetched:** https://www.chaijs.com/api/assert/ (confirmed no async/Promise-returning methods documented)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 90, 2026-06-24T12:53:58Z)
+- **Notes:** Re-validated against chai@6.2.2 (still latest on npm — same version as 2026-06-12 pass). grep'd bundled node_modules/chai/index.js for `async function` declarations: ZERO matches. Public exports unchanged: Assertion, AssertionError, Should, assert, config, expect, should, use, util. Effective coverage 4/4 = 1.0; raw coverage 4/6 = 0.67. Bumped contract_version 1.1.1 -> 1.1.2 and last_verified 2026-06-12 -> 2026-06-24.
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** chai@6.2.2
