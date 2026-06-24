@@ -7,11 +7,11 @@ package: postmark
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.82  # 9 contracted / 11 applicable (52 total - 41 intentionally omitted: all read-only GETs, analytics, webhook admin, message stream admin, AccountClient admin ops)
+coverage_score: 0.83  # 10 contracted / 12 applicable (52 total - 40 intentionally omitted: read-only GETs, analytics, webhook admin, message stream admin, AccountClient admin ops)
 
 detection:
   class_names:
@@ -462,6 +462,93 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: deleteTemplate
+    import_path: "postmark"
+    description: >
+      Permanently deletes an existing template from the server. Called as
+      client.deleteTemplate(idOrAlias). Makes a DELETE request to /templates/{idOrAlias}.
+      Two destructive-by-design failure modes: (1) the template/idOrAlias does not
+      exist — server returns HTTP 404 which the SDK maps to a generic PostmarkError
+      (NOT ApiInputError) because no 404 mapping exists in errors/Errors.ts;
+      (2) the template is a LAYOUT template with dependent standard templates
+      using it — the server returns ErrorCode 1130 ("The layout template cannot
+      be deleted because it has dependent templates using it.") on HTTP 422,
+      mapped to ApiInputError. Callers that omit try-catch corrupt provisioning
+      flows: a thrown 404 on a missing template aborts a "tear down all templates"
+      migration mid-run, leaving the server in a half-cleaned state; a thrown
+      ErrorCode 1130 silently breaks all standard templates that still depend on
+      the layout being deleted.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/templates-api (fetched 2026-06-24)
+      # Evidence: https://postmarkapp.com/developer/api/overview (fetched 2026-06-24) — ErrorCode 1130 cascade
+      # Error types confirmed from postmark@4.0.7 source: errors/ErrorHandler.js
+      # 404 → PostmarkError (no specialized class — no 404 entry in buildErrorByHttpStatusCode)
+      # 422 → ApiInputError (covers ErrorCode 1130 layout-cascade and invalid-alias-format)
+      # 401 → InvalidAPIKeyError, 429 → RateLimitExceededError, 500 → InternalServerError
+      - id: delete-template-no-try-catch
+        severity: error
+        throws: "PostmarkError (404 not-found generic PostmarkError, 422 ApiInputError ErrorCode 1130 layout-cascade, 401 InvalidAPIKeyError, 429 RateLimitExceededError, 500 InternalServerError)"
+        condition: >
+          deleteTemplate() called in async context without surrounding try/catch.
+          Two distinct destructive-failure paths: (1) template not found — server
+          returns HTTP 404 mapped to a generic PostmarkError (NOT ApiInputError —
+          there is no 404 mapping in errors/ErrorHandler.js, so callers that only
+          catch ApiInputError still crash on missing templates); (2) layout
+          template with dependent standard templates — server returns ErrorCode
+          1130 on HTTP 422 mapped to ApiInputError ("The layout template cannot
+          be deleted because it has dependent templates using it.").
+        description: >
+          deleteTemplate() makes a DELETE request that throws PostmarkError
+          subclasses on API or network failure. The most common silent-corruption
+          path is the LAYOUT-CASCADE constraint: layout templates cannot be deleted
+          while standard templates still reference them — the server returns
+          ErrorCode 1130 (HTTP 422) and the SDK maps it to ApiInputError. Callers
+          without try-catch crash mid-cleanup, leaving the server with a partial
+          deletion of standard templates but the layout intact (or vice-versa,
+          depending on iteration order in a migration script). Additionally,
+          template-not-found returns HTTP 404 which postmark.js maps to the
+          generic PostmarkError — callers that only catch the more specific
+          ApiInputError subclass still crash on missing templates. In
+          re-provisioning flows (tear-down + recreate), an unhandled 404 mid-script
+          aborts the recreate phase, breaking every future
+          sendEmailWithTemplate() call for those aliases until manually re-run.
+        required_handling: >
+          Caller MUST wrap deleteTemplate() in try-catch AND handle both the
+          generic PostmarkError (for 404 not-found) and ApiInputError (for the
+          ErrorCode 1130 layout-cascade case) explicitly. Tear-down scripts
+          must order layout deletion AFTER all dependent standard templates,
+          OR catch the 1130 ApiInputError and re-queue the layout for a
+          second pass:
+
+            try {
+              const result = await client.deleteTemplate('welcome-v1');
+              console.log('Deleted:', result.Message);
+            } catch (error) {
+              if (error instanceof Errors.ApiInputError) {
+                // ErrorCode 1130: layout still has dependent standard templates
+                console.error('Layout cascade blocked:', error.message);
+                // Re-queue or delete dependent templates first
+              } else if (error instanceof Errors.PostmarkError) {
+                // 404 template-not-found arrives here (no specialized class)
+                console.warn('Template already absent:', error.message);
+              } else {
+                throw error;
+              }
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/templates-api"
+          - "https://postmarkapp.com/developer/api/overview"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/errors/ErrorHandler.ts"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/ServerClient.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "All ServerClient methods make HTTPS calls to the Postmark API — all can throw"
   - "No auto-retry logic — all errors thrown immediately to caller"
@@ -472,3 +559,5 @@ notes:
   - "createSuppressions/deleteSuppressions return 200 OK with per-item Status — check Status field even on success"
   - "SpamComplaint suppressions cannot be deleted — deleteSuppressions returns Status: Failed silently"
   - "Server limit: 100 templates per server — createTemplate throws ApiInputError when exceeded"
+  - "deleteTemplate 404 maps to GENERIC PostmarkError (no specialized class — no 404 entry in ErrorHandler.buildErrorByHttpStatusCode)"
+  - "deleteTemplate ErrorCode 1130 (layout-cascade) maps to 422 ApiInputError — tear-down order matters"

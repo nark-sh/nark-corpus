@@ -15,6 +15,7 @@
  *   - deleteSuppressions()         → SHOULD_FIRE if no try-catch (postcondition: delete-suppressions-no-try-catch)
  *   - createTemplate()             → SHOULD_FIRE if no try-catch (postcondition: create-template-no-try-catch)
  *   - editTemplate()               → SHOULD_FIRE if no try-catch (postcondition: edit-template-no-try-catch)
+ *   - deleteTemplate()             → SHOULD_FIRE if no try-catch (postcondition: delete-template-no-try-catch)
  *   - Any of the above inside try-catch → SHOULD_NOT_FIRE
  *   - .catch() chain → SHOULD_NOT_FIRE
  *   - try-finally without catch → SHOULD_FIRE
@@ -441,5 +442,37 @@ export async function editTemplateWithTryCatch(alias: string) {
       console.error('Template update failed:', error);
     }
     throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. deleteTemplate() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareDeleteTemplateNoCatch(alias: string) {
+  // SHOULD_FIRE: delete-template-no-try-catch — deleteTemplate() throws on 404 not-found, 422 ErrorCode 1130 layout-cascade, 401, 429, 5xx
+  const result = await client.deleteTemplate(alias);
+  return result.Message;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. deleteTemplate() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteTemplateWithTryCatch(alias: string) {
+  try {
+    // SHOULD_NOT_FIRE: delete-template-no-try-catch — deleteTemplate() inside try-catch
+    const result = await client.deleteTemplate(alias);
+    return result.Message;
+  } catch (error) {
+    if (error instanceof Errors.ApiInputError) {
+      // ErrorCode 1130: layout-cascade — re-queue after dependent templates are removed
+      console.error('Layout cascade blocked:', (error as Error).message);
+    } else if (error instanceof Errors.PostmarkError) {
+      // 404 template-not-found arrives here (no specialized class for 404)
+      console.warn('Template already absent:', (error as Error).message);
+    } else {
+      throw error;
+    }
   }
 }
