@@ -326,3 +326,153 @@ export async function backchannelAuth_withTryCatch() {
     throw new Error('Backchannel authentication failed or was denied');
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passkey.register — added in v4.22.0 (2026-06-01)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passkeyRegister_noTryCatch(email: string, name: string) {
+  // SHOULD_FIRE: auth0-passkey-register-not-enabled — passkey.register throws PasskeyRegisterError when passkeys disabled, no try-catch
+  const challenge = await auth0.passkey.register({ email, name } as any);
+  return challenge;
+}
+
+export async function passkeyRegister_withTryCatch(email: string, name: string) {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    const challenge = await auth0.passkey.register({ email, name } as any);
+    return challenge;
+  } catch (error) {
+    return { error: 'Passkey signup unavailable' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passkey.challenge — added in v4.22.0
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passkeyChallenge_noTryCatch() {
+  // SHOULD_FIRE: auth0-passkey-challenge-no-credential — passkey.challenge throws PasskeyChallengeError when no passkey registered, no try-catch
+  const challenge = await auth0.passkey.challenge();
+  return challenge;
+}
+
+export async function passkeyChallenge_withTryCatch() {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    const challenge = await auth0.passkey.challenge();
+    return challenge;
+  } catch (error) {
+    return { error: 'Passkey login unavailable, please use password' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passkey.getToken — v4.23.0 BREAKING adds MfaRequiredError
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passkeyGetToken_noTryCatch(authSession: string, authResponse: any) {
+  // SHOULD_FIRE: auth0-passkey-gettoken-invalid-assertion — passkey.getToken throws PasskeyGetTokenError or MfaRequiredError, no try-catch
+  await auth0.passkey.getToken({ authSession, authResponse } as any);
+}
+
+export async function passkeyGetToken_withTryCatch(authSession: string, authResponse: any) {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    await auth0.passkey.getToken({ authSession, authResponse } as any);
+  } catch (error) {
+    throw new Error('Passkey login failed or MFA required');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passkey.enrollmentChallenge — added in v4.22.0
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passkeyEnrollmentChallenge_noTryCatch() {
+  // SHOULD_FIRE: auth0-passkey-enrollment-challenge-missing-scope — passkey.enrollmentChallenge throws PasskeyEnrollmentChallengeError when missing scope, no try-catch
+  const challenge = await auth0.passkey.enrollmentChallenge();
+  return challenge;
+}
+
+export async function passkeyEnrollmentChallenge_withTryCatch() {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    const challenge = await auth0.passkey.enrollmentChallenge();
+    return challenge;
+  } catch (error) {
+    return { error: 'Re-authenticate to enroll passkey' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passkey.enrollmentVerify — added in v4.22.0
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passkeyEnrollmentVerify_noTryCatch(
+  authenticationMethodId: string,
+  authSession: string,
+  authResponse: any,
+) {
+  // SHOULD_FIRE: auth0-passkey-enrollment-verify-duplicate-or-rejected — passkey.enrollmentVerify throws PasskeyEnrollmentVerifyError silently failing enrollment, no try-catch
+  const passkey = await auth0.passkey.enrollmentVerify({
+    authenticationMethodId,
+    authSession,
+    authResponse,
+  } as any);
+  return passkey;
+}
+
+export async function passkeyEnrollmentVerify_withTryCatch(
+  authenticationMethodId: string,
+  authSession: string,
+  authResponse: any,
+) {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    const passkey = await auth0.passkey.enrollmentVerify({
+      authenticationMethodId,
+      authSession,
+      authResponse,
+    } as any);
+    return passkey;
+  } catch (error) {
+    return { error: 'Enrollment failed, please retry' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passwordless.start — added in v4.21.0 (2026-05-22)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passwordlessStart_noTryCatch(email: string) {
+  // SHOULD_FIRE: auth0-passwordless-start-rate-limit-or-disabled — passwordless.start throws PasswordlessStartError silently when rate-limited or connection disabled, no try-catch
+  await auth0.passwordless.start({ connection: 'email', email, send: 'code' } as any);
+}
+
+export async function passwordlessStart_withTryCatch(email: string) {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    await auth0.passwordless.start({ connection: 'email', email, send: 'code' } as any);
+  } catch (error) {
+    return { error: 'Could not send code, please try again' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4 Auth0Client.passwordless.verify — v4.23.0 BREAKING adds MfaRequiredError
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function passwordlessVerify_noTryCatch(email: string, verificationCode: string) {
+  // SHOULD_FIRE: auth0-passwordless-verify-invalid-otp — passwordless.verify throws PasswordlessVerifyError or MfaRequiredError on bad OTP, no try-catch
+  await auth0.passwordless.verify({ connection: 'email', email, verificationCode } as any);
+}
+
+export async function passwordlessVerify_withTryCatch(email: string, verificationCode: string) {
+  // SHOULD_NOT_FIRE: properly wrapped in try-catch
+  try {
+    await auth0.passwordless.verify({ connection: 'email', email, verificationCode } as any);
+  } catch (error) {
+    return { error: 'Invalid or expired code' };
+  }
+}

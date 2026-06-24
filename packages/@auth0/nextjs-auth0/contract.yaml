@@ -1,12 +1,12 @@
 package: "@auth0/nextjs-auth0"
 semver: ">=2.0.0"
-contract_version: "2.0.0"
+contract_version: "2.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-16"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83
+coverage_score: 0.88
 
 functions:
   - name: getAccessToken
@@ -865,6 +865,488 @@ functions:
           user_experience: authentication_failure
           incident_cost_range: medium
 
+  - name: Auth0Client.passkey.register
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Requests a WebAuthn credential creation challenge for a NEW user signup
+      via passkey. Calls Auth0 POST /passkey/register and returns
+      PasskeyRegisterResponse with authSession + authnParamsPublicKey to pass
+      to navigator.credentials.create() in the browser. Added in v4.22.0
+      (2026-06-01). Throws PasskeyRegisterError when passkeys are not enabled
+      on the application, the application configuration is invalid, or the
+      Auth0 API returns any other error.
+    postconditions:
+      - id: auth0-passkey-register-not-enabled
+        severity: error
+        condition: >
+          Passkey grants are not enabled on the Auth0 application, the
+          tenant has no passkey-capable connection configured, or the request
+          fails the discovery / configuration check. Auth0 returns an error
+          body which is rewrapped into PasskeyRegisterError. This is the very
+          first call in the signup flow — if it throws, the entire signup
+          screen breaks for every user.
+        throws: >
+          PasskeyRegisterError with .error / .error_description from the Auth0
+          API response (e.g. "unauthorized_client", "invalid_request"). Catch-all:
+          when the network call itself fails (DNS, timeout, 5xx), the wrapper
+          throws PasskeyRegisterError("unexpected_error", ...).
+        required_handling: >
+          Must wrap in try-catch — there is no fallback if the challenge call
+          fails. The browser cannot proceed to navigator.credentials.create()
+          without authnParamsPublicKey. Surface a user-actionable error so
+          users can fall back to a different signup method.
+
+            try {
+              const challenge = await auth0.passkey.register({ email, name });
+              return NextResponse.json(challenge);
+            } catch (error) {
+              if (error instanceof PasskeyRegisterError) {
+                return NextResponse.json(
+                  { error: error.error_description, code: error.code },
+                  { status: 400 }
+                );
+              }
+              throw error;
+            }
+
+          Import: import { PasskeyRegisterError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passkey-errors.ts"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/passkey/server-passkey-client.ts"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/EXAMPLES.md"
+          - "https://auth0.com/docs/authenticate/database-connections/passkeys"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: Auth0Client.passkey.challenge
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Requests a WebAuthn credential assertion challenge for EXISTING user
+      login via passkey. Calls Auth0 POST /passkey/challenge and returns
+      PasskeyChallengeResponse with authSession + authnParamsPublicKey to pass
+      to navigator.credentials.get() in the browser. Added in v4.22.0
+      (2026-06-01). Throws PasskeyChallengeError when no passkey is registered
+      for the user, passkeys are disabled, or the Auth0 API returns any other
+      error.
+    postconditions:
+      - id: auth0-passkey-challenge-no-credential
+        severity: error
+        condition: >
+          The user has not registered any passkey on their account, passkeys
+          are disabled on the connection, or the Auth0 API returns an error
+          during the discovery / configuration phase. Unhandled, the login UI
+          hangs waiting for authnParamsPublicKey that never arrives.
+        throws: >
+          PasskeyChallengeError with .error / .error_description from the Auth0
+          API response. Wrapper also throws PasskeyChallengeError("unexpected_error", ...)
+          when the underlying fetch fails (network, timeout, 5xx).
+        required_handling: >
+          Must wrap in try-catch and surface a typed error so the login UI can
+          fall back to password login or magic link. A bare unhandled rejection
+          here renders the entire passkey-login button useless without telling
+          the user why.
+
+            try {
+              const challenge = await auth0.passkey.challenge();
+              return NextResponse.json(challenge);
+            } catch (error) {
+              if (error instanceof PasskeyChallengeError) {
+                return NextResponse.json(
+                  { error: 'Passkey not available, please use password', code: error.code },
+                  { status: 400 }
+                );
+              }
+              throw error;
+            }
+
+          Import: import { PasskeyChallengeError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passkey-errors.ts"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/passkey/server-passkey-client.ts"
+          - "https://github.com/auth0/nextjs-auth0/pull/2676"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: Auth0Client.passkey.getToken
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Completes a passkey signup or login by exchanging the WebAuthn assertion
+      for an Auth0 session. Calls Auth0 POST /oauth/token with the WebAuthn
+      grant type (urn:okta:params:oauth:grant-type:webauthn) and sets the
+      session cookie automatically. Added in v4.22.0 (2026-06-01). v4.23.0
+      (2026-06-22) added a BREAKING change — getToken can now also throw
+      MfaRequiredError when the tenant requires step-up MFA. Callers that
+      previously only caught PasskeyGetTokenError will now see uncaught
+      MfaRequiredError after upgrading.
+    postconditions:
+      - id: auth0-passkey-gettoken-mfa-required
+        severity: error
+        condition: >
+          The Auth0 tenant requires multi-factor authentication for this user
+          after a successful passkey assertion (step-up MFA). v4.23.0 surfaces
+          this as MfaRequiredError with an encrypted mfa_token that must be
+          passed to auth0.mfa.challenge() / auth0.mfa.verify(). Callers
+          upgrading from v4.22 who only catch PasskeyGetTokenError now have an
+          uncaught MfaRequiredError that crashes the auth route.
+        throws: >
+          MfaRequiredError (added v4.23.0 BREAKING) with .mfaToken (encrypted),
+          .mfaRequirements, and .cause (OAuth2Error). The mfa_token must be
+          passed as-is into the MFA challenge / verify methods — the SDK
+          encrypts and rotates it internally.
+        required_handling: >
+          Upgrading to v4.23+: must catch MfaRequiredError separately from
+          PasskeyGetTokenError. Redirect to MFA challenge flow rather than
+          treating as a generic auth failure.
+
+            try {
+              await auth0.passkey.getToken({ authSession, authResponse });
+              return new Response(null, { status: 204 });
+            } catch (error) {
+              if (error instanceof MfaRequiredError) {
+                // Persist encrypted mfa_token, redirect to MFA challenge UI
+                return NextResponse.redirect(`/mfa?token=${error.mfaToken}`);
+              }
+              if (error instanceof PasskeyGetTokenError) {
+                return NextResponse.json({ error: error.error_description }, { status: 401 });
+              }
+              throw error;
+            }
+
+          Import: import { MfaRequiredError, PasskeyGetTokenError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://github.com/auth0/nextjs-auth0/pull/2702"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/CHANGELOG.md"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: auth0-passkey-gettoken-invalid-assertion
+        severity: error
+        condition: >
+          The WebAuthn assertion sent by the browser was rejected by Auth0 —
+          invalid or expired authSession (the challenge has a short TTL,
+          typically 5 minutes), credential signature verification failed, the
+          passkey is not recognized for this user, or the id_token returned has
+          a mismatched issuer/audience. All of these become PasskeyGetTokenError
+          with distinct .code values (invalid_grant, invalid_issuer,
+          invalid_audience, missing_id_token).
+        throws: >
+          PasskeyGetTokenError with .error_description detailing the rejection.
+          Specific known .code values:
+          - "invalid_issuer": ID token issuer mismatch (AUTH0_DOMAIN config drift)
+          - "invalid_audience": ID token audience mismatch (AUTH0_CLIENT_ID config drift)
+          - "missing_id_token": openid scope was not requested
+          - Auth0 OAuth error.error pass-through for credential rejection cases
+        required_handling: >
+          Must catch to provide actionable feedback — config errors
+          (invalid_issuer / invalid_audience) signal env var drift between
+          deploys and need ops alerts, not user-facing retry. Credential
+          rejection means the user should re-authenticate via a different
+          method (the passkey may have been deleted on the device or revoked).
+
+            try {
+              await auth0.passkey.getToken({ authSession, authResponse });
+            } catch (error) {
+              if (error instanceof PasskeyGetTokenError) {
+                if (error.code === 'invalid_issuer' || error.code === 'invalid_audience') {
+                  console.error('Auth0 config drift', error);
+                  return NextResponse.json({ error: 'Server misconfiguration' }, { status: 500 });
+                }
+                return NextResponse.json({ error: 'Passkey rejected, please retry' }, { status: 401 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passkey-errors.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: Auth0Client.passkey.enrollmentChallenge
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Requests a WebAuthn credential creation challenge to enroll a NEW
+      passkey for an ALREADY-AUTHENTICATED user (via the Auth0 MyAccount API:
+      POST /me/v1/authentication-methods). Added in v4.22.0 (2026-06-01).
+      Requires an active session and the create:me:authentication_methods
+      scope. Throws PasskeyEnrollmentChallengeError when the user is not
+      authenticated, lacks the required scope, or passkeys are not enabled on
+      the tenant.
+    postconditions:
+      - id: auth0-passkey-enrollment-challenge-missing-scope
+        severity: error
+        condition: >
+          The user does not have an active session, the access token lacks
+          the create:me:authentication_methods scope, or passkeys are not
+          enabled on the Auth0 tenant. The MyAccount API returns an RFC 7807
+          problem detail which is rewrapped into PasskeyEnrollmentChallengeError.
+        throws: >
+          PasskeyEnrollmentChallengeError with .error / .error_description and
+          .cause containing the RFC 7807 problem detail. .code values include
+          "insufficient_scope", "unauthorized", "passkey_not_enabled".
+        required_handling: >
+          Must catch to differentiate "user must re-authenticate with broader
+          scope" from "feature not enabled by admin". These need different UX
+          (re-login vs contact admin):
+
+            try {
+              const challenge = await auth0.passkey.enrollmentChallenge();
+              return NextResponse.json(challenge);
+            } catch (error) {
+              if (error instanceof PasskeyEnrollmentChallengeError) {
+                if (error.code === 'insufficient_scope' || error.code === 'unauthorized') {
+                  return NextResponse.json({ error: 'Re-authenticate to enroll passkey' }, { status: 401 });
+                }
+                return NextResponse.json({ error: 'Passkey enrollment unavailable' }, { status: 400 });
+              }
+              throw error;
+            }
+
+          Import: import { PasskeyEnrollmentChallengeError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passkey-errors.ts"
+          - "https://github.com/auth0/nextjs-auth0/pull/2680"
+          - "https://auth0.com/docs/api/myaccount/passkey-enrollment"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: Auth0Client.passkey.enrollmentVerify
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Completes a passkey enrollment by verifying the WebAuthn attestation
+      against the MyAccount API (POST /me/v1/authentication-methods/{id}/verify).
+      Added in v4.22.0 (2026-06-01). Throws PasskeyEnrollmentVerifyError when
+      the authSession is invalid/expired, credential creation is rejected by
+      Auth0, or the passkey is a duplicate (already enrolled). Unhandled, the
+      passkey enrollment screen silently fails and users believe a passkey is
+      registered when none was actually persisted.
+    postconditions:
+      - id: auth0-passkey-enrollment-verify-duplicate-or-rejected
+        severity: error
+        condition: >
+          The authSession from enrollmentChallenge has expired (default 5min
+          TTL), the WebAuthn attestation signature does not validate against
+          the Auth0 RP-ID, or the credential is a duplicate (already enrolled
+          on this account). The MyAccount API returns an RFC 7807 problem
+          detail which is rewrapped into PasskeyEnrollmentVerifyError.
+        throws: >
+          PasskeyEnrollmentVerifyError with .error / .error_description.
+          Common .code values: "invalid_grant" (expired session),
+          "duplicate_credential", "attestation_rejected".
+        required_handling: >
+          Must catch — silent enrollment failure is the worst-case here.
+          Users believe they have set up a passkey but the next login fails.
+          Return a typed error so the UI can prompt to retry or report
+          duplicates clearly:
+
+            try {
+              const passkey = await auth0.passkey.enrollmentVerify({
+                authenticationMethodId,
+                authSession,
+                authResponse,
+              });
+              return NextResponse.json(passkey);
+            } catch (error) {
+              if (error instanceof PasskeyEnrollmentVerifyError) {
+                if (error.code === 'duplicate_credential') {
+                  return NextResponse.json({ error: 'Passkey already enrolled' }, { status: 409 });
+                }
+                return NextResponse.json({ error: 'Enrollment failed, please retry' }, { status: 400 });
+              }
+              throw error;
+            }
+
+          Import: import { PasskeyEnrollmentVerifyError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passkey-errors.ts"
+          - "https://github.com/auth0/nextjs-auth0/pull/2680"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  - name: Auth0Client.passwordless.start
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Starts a passwordless authentication flow by sending an OTP code or
+      magic link to the user's email or phone number. Calls Auth0 POST
+      /passwordless/start. Added in v4.21.0 (2026-05-22). Throws
+      PasswordlessStartError when the passwordless connection is not enabled,
+      the identifier (email/phone) is invalid, or the send rate limit is
+      exceeded. Unhandled, the user clicks "Send code" and sees nothing — no
+      code arrives and no error is shown.
+    postconditions:
+      - id: auth0-passwordless-start-rate-limit-or-disabled
+        severity: error
+        condition: >
+          The Auth0 passwordless connection (email or sms) is not enabled on
+          the application, the email/phoneNumber is missing or malformed,
+          Auth0's send rate limit for this identifier has been exceeded
+          (default 5 sends per hour per identifier), or the underlying SMS
+          provider rejected the number.
+        throws: >
+          PasswordlessStartError with .error / .error_description from the
+          Auth0 API response. Specific .error values include:
+          - "bad.connection" / "connection_disabled": connection not enabled
+          - "bad.email" / "bad.phone_number": invalid identifier
+          - "too_many_requests" / "rate_limit_exceeded": send rate limit hit
+          - "unexpected_error": network failure or 5xx
+        required_handling: >
+          Must catch — silent failure here is the #1 passwordless bug. The
+          user clicks "Send" expecting a code; if start() throws unhandled,
+          the form posts but no code arrives. Distinguish rate-limit from
+          validation errors so the UI can show "Please wait 1 minute" vs
+          "Please check your email address":
+
+            try {
+              await auth0.passwordless.start({ connection: 'email', email, send: 'code' });
+              return NextResponse.json({ sent: true });
+            } catch (error) {
+              if (error instanceof PasswordlessStartError) {
+                if (error.code === 'too_many_requests' || error.error === 'rate_limit_exceeded') {
+                  return NextResponse.json({ error: 'Please wait before trying again' }, { status: 429 });
+                }
+                return NextResponse.json({ error: 'Could not send code, check your email' }, { status: 400 });
+              }
+              throw error;
+            }
+
+          Import: import { PasswordlessStartError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passwordless-errors.ts"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://github.com/auth0/nextjs-auth0/pull/2634"
+          - "https://auth0.com/docs/authenticate/passwordless"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: Auth0Client.passwordless.verify
+    import_path: "@auth0/nextjs-auth0/server"
+    description: >
+      Verifies the OTP code entered by the user and establishes an
+      authenticated session. Calls Auth0 POST /oauth/token with the
+      passwordless OTP grant
+      (http://auth0.com/oauth/grant-type/passwordless/otp). Added in v4.21.0
+      (2026-05-22). v4.23.0 (2026-06-22) added a BREAKING change — verify can
+      now also throw MfaRequiredError when the tenant requires step-up MFA
+      after successful OTP. Callers that previously only caught
+      PasswordlessVerifyError will see uncaught MfaRequiredError after upgrading.
+    postconditions:
+      - id: auth0-passwordless-verify-mfa-required
+        severity: error
+        condition: >
+          The Auth0 tenant requires multi-factor authentication for this user
+          after a successful passwordless OTP verification. v4.23.0 surfaces
+          this as MfaRequiredError (BREAKING) with an encrypted mfa_token to
+          pass to the MFA challenge/verify flow. Callers upgrading from
+          v4.21/4.22 who only catch PasswordlessVerifyError now have an
+          uncaught MfaRequiredError that crashes the verify route after the
+          user entered the correct OTP.
+        throws: >
+          MfaRequiredError (added v4.23.0 BREAKING) with .mfaToken (encrypted),
+          .mfaRequirements, and .cause (OAuth2Error). The mfa_token must be
+          passed into the MFA challenge / verify methods.
+        required_handling: >
+          Upgrading to v4.23+: must catch MfaRequiredError separately. Redirect
+          to MFA challenge UI rather than showing a generic "Login failed"
+          error (which would make users re-request a passwordless code they
+          already used successfully):
+
+            try {
+              await auth0.passwordless.verify({ connection: 'email', email, verificationCode });
+              return NextResponse.redirect('/dashboard');
+            } catch (error) {
+              if (error instanceof MfaRequiredError) {
+                return NextResponse.redirect(`/mfa?token=${error.mfaToken}`);
+              }
+              if (error instanceof PasswordlessVerifyError) {
+                return NextResponse.json({ error: error.error_description }, { status: 401 });
+              }
+              throw error;
+            }
+
+          Import: import { MfaRequiredError, PasswordlessVerifyError } from '@auth0/nextjs-auth0/errors'
+        sources:
+          - "https://github.com/auth0/nextjs-auth0/pull/2702"
+          - "https://github.com/auth0/nextjs-auth0/blob/main/CHANGELOG.md"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: auth0-passwordless-verify-invalid-otp
+        severity: error
+        condition: >
+          The OTP code entered by the user is invalid, expired (default 3min
+          TTL on Auth0), already-used, or the connection/identifier combination
+          does not match the original start() call. Also includes the
+          openid-scope misconfiguration cases (missing_id_token, invalid_issuer,
+          invalid_audience) that surface as typed PasswordlessVerifyError.
+        throws: >
+          PasswordlessVerifyError with .error / .error_description. Known
+          .code values:
+          - Auth0 OAuth error pass-through for "invalid_grant" (wrong/expired OTP)
+          - "missing_id_token": openid scope was not requested
+          - "invalid_issuer": ID token issuer mismatch (AUTH0_DOMAIN config drift)
+          - "invalid_audience": ID token audience mismatch (AUTH0_CLIENT_ID config drift)
+          - "discovery_error": OIDC discovery endpoint failed
+          - "unexpected_error": network failure or 5xx
+        required_handling: >
+          Must catch — without it, an unhandled rejection on a typo in the OTP
+          field is a 500 error to the user. Show a typed message so the user
+          can re-enter the code or request a new one:
+
+            try {
+              await auth0.passwordless.verify({ connection: 'email', email, verificationCode });
+            } catch (error) {
+              if (error instanceof PasswordlessVerifyError) {
+                if (error.code === 'invalid_issuer' || error.code === 'invalid_audience') {
+                  console.error('Auth0 config drift', error);
+                  return NextResponse.json({ error: 'Server misconfiguration' }, { status: 500 });
+                }
+                return NextResponse.json({ error: 'Invalid or expired code' }, { status: 401 });
+              }
+              throw error;
+            }
+        sources:
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/server/auth-client.ts"
+          - "https://raw.githubusercontent.com/auth0/nextjs-auth0/main/src/errors/passwordless-errors.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
 notes:
   - "v2.x and v3.x share the same standalone function API — first 4 functions in this contract"
   - "v4.x uses Auth0Client instance methods (auth0.getSession(), etc.) — added in contract v2.0.0"
@@ -878,3 +1360,7 @@ notes:
   - "createFetcher() is intentionally omitted — it wraps getAccessToken errors, covered by parent postconditions"
   - "startInteractiveLogin() is intentionally omitted — returns redirect response, no distinct error contract"
   - "connectAccount() is intentionally omitted — low adoption, similar pattern to getAccessTokenForConnection"
+  - "Passkey methods (register, challenge, getToken, enrollmentChallenge, enrollmentVerify) added in v4.22.0 (2026-06-01) — accessed via auth0.passkey.method() — chained multi-level property access"
+  - "Passwordless methods (start, verify) added in v4.21.0 (2026-05-22) — accessed via auth0.passwordless.method()"
+  - "BREAKING in v4.23.0 (2026-06-22): passkey.getToken() and passwordless.verify() can throw MfaRequiredError in addition to their own typed errors — catch MfaRequiredError separately to handle step-up MFA"
+  - "Passkey/passwordless error classes all extend abstract PasskeyError/PasswordlessError → SdkError — the .code getter returns a stable enum-like identifier (.error from the Auth0 API)"
