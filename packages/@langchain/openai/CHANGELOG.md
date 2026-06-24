@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 83% → 86%
+
+- **Profile:** `packages/@langchain/openai/contract.yaml`
+- **Functions added:** OpenAI.invoke (1 total)
+- **Postconditions added:** 1 (llm-invoke-network-error)
+- **Functions intentionally omitted this pass:** none new (carried forward: getNumTokensFromMessages — pure local tiktoken token counting, no API calls)
+- **Scanner concerns queued:** 1 (`concern-20260624-langchain-openai-deepen-1`)
+- **Scanner version used:** nark@3.2.0
+- **Installed package version:** @langchain/openai@1.5.3
+- **Sources fetched:**
+  - `dist/llms.d.ts` (legacy OpenAI LLM class declaration)
+  - `dist/llms.js` (completionWithRetry implementation, wrapOpenAIClientError funnel)
+  - `dist/azure/llms.d.ts` (AzureOpenAI extends OpenAI legacy LLM)
+- **Verified by:** bc-deepen-contract (drift-by-staleness re-verify against @1.5.3, deepen-stream-3 pass 55, 2026-06-24T08:20:47Z)
+- **Key finding:** legacy `OpenAI` / `AzureOpenAI` LLM classes (extend BaseLLM, NOT BaseChatModel) are still exported from @langchain/openai@1.5.3 but were missed in the 2026-04-17 deepen pass because the existing `BaseChatOpenAI` patterns array doesn't match them. They sit in a separate inheritance tree and need their own scanner pattern entry (`OpenAI`, `AzureOpenAI`). Same error model as ChatOpenAI.invoke (TimeoutError / AuthenticationError / RateLimitError / NotFoundError / ContextOverflowError via wrapOpenAIClientError).
+
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** @langchain/openai@1.5.1

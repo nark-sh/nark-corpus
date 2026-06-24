@@ -7,7 +7,7 @@
  *
  * Each annotation applies to the NEXT line (the call site detected by the scanner).
  */
-import { ChatOpenAI, OpenAIEmbeddings, DallEAPIWrapper } from '@langchain/openai';
+import { ChatOpenAI, OpenAI, AzureOpenAI, OpenAIEmbeddings, DallEAPIWrapper } from '@langchain/openai';
 import { HumanMessage } from '@langchain/core/messages';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 
@@ -160,4 +160,36 @@ async function moderateContentWithTryCatch() {
     // Fail safe — block content on moderation failure
     throw new Error('Content moderation failed — content blocked for safety');
   }
+}
+
+// ─── OpenAI (legacy text-completion LLM) — no try-catch ───────────────────
+
+async function legacyOpenAIInvokeNoTryCatch() {
+  const llm = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  // SHOULD_FIRE: llm-invoke-network-error
+  const response = await llm.invoke('Tell me a joke.');
+  return response;
+}
+
+async function legacyOpenAIInvokeWithTryCatch() {
+  const llm = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  try {
+    // SHOULD_NOT_FIRE: legacy OpenAI.invoke() inside try-catch
+    const response = await llm.invoke('Tell me a joke.');
+    return response;
+  } catch (error) {
+    throw error;
+  }
+}
+
+// ─── AzureOpenAI (legacy LLM, extends OpenAI) — no try-catch ──────────────
+
+async function azureLegacyOpenAIInvokeNoTryCatch() {
+  const llm = new AzureOpenAI({
+    azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
+    azureOpenAIApiDeploymentName: 'gpt-35-turbo-instruct',
+    azureOpenAIApiVersion: '2024-02-01',
+  });
+  // SHOULD_FIRE: llm-invoke-network-error
+  return await llm.invoke('Summarize this text.');
 }

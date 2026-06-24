@@ -1,12 +1,12 @@
 package: "@langchain/openai"
 semver: ">=0.1.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-17"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83  # 5 contracted / 6 total async-callable (1 intentionally omitted: getNumTokensFromMessages)
+coverage_score: 0.86  # 6 contracted / 7 total async-callable surface classes (1 intentionally omitted: getNumTokensFromMessages)
 # Audit 2026-04-13: 15 repos scanned, 1 violation across 1 repo (invoke).
 # scan-langchain-openai-2026-04-13.json. FP check: 0/20 type-A FPs (0% rate). Confirmed.
 # Depth pass 2026-04-17 (deepen-stream-1 pass 3):
@@ -24,6 +24,18 @@ coverage_score: 0.83  # 5 contracted / 6 total async-callable (1 intentionally o
 #     dist/chat_models/completions.js — completionWithRetry(), _streamResponseChunks()
 #     dist/chat_models/base.js — moderateContent(), wrapOpenAIClientError calls
 #     dist/utils/client.js — wrapOpenAIClientError() error type mapping
+# Depth pass 2026-06-24 (deepen-stream-3 pass 55, drift-by-staleness re-verify @1.5.3):
+#   Re-enumerated API surface against installed @langchain/openai@1.5.3.
+#   New since 2026-04-17: legacy OpenAI/AzureOpenAI LLM classes were not in the pre-2026-04-17 surface
+#   inventory (they extend BaseLLM, a separate inheritance tree from BaseChatOpenAI). They expose the
+#   same runnable interface (invoke/stream/generate) but require their own pattern array because
+#   ChatOpenAI patterns do not match them. Added: OpenAI.invoke (1 postcondition covering same
+#   wrapOpenAIClientError() error model as ChatOpenAI.invoke).
+#   Coverage: 6/7 = 0.86 (5 chat-side + 1 legacy-LLM-side / 6 total + 1 omitted)
+#   Evidence sources confirmed from installed package source:
+#     dist/llms.js — completionWithRetry() wraps with wrapOpenAIClientError, same as chat_models.
+#     dist/llms.d.ts — class OpenAI extends BaseLLM (NOT BaseChatModel); separate scanner pattern needed.
+#     dist/azure/llms.d.ts — class AzureOpenAI extends OpenAI (legacy LLM); inherits same error model.
 
 description: >
   OpenAI integrations for LangChain.js. Provides ChatOpenAI, OpenAIEmbeddings,
@@ -321,3 +333,81 @@ functions:
           visibility: silent
           user_experience: security_breach
           incident_cost_range: high
+
+  - name: OpenAI.invoke
+    import_path: "@langchain/openai"
+    description: >
+      Legacy text-completion LLM wrapper for OpenAI. Distinct from ChatOpenAI:
+      class OpenAI extends BaseLLM (not BaseChatModel) and calls the legacy
+      /v1/completions endpoint via client.completions.create(). The runnable
+      interface exposes invoke(), stream(), and generate(). All API calls flow
+      through completionWithRetry() in dist/llms.js which wraps errors with
+      wrapOpenAIClientError() — same error type mapping as ChatOpenAI but
+      requires a separate scanner pattern array because OpenAI/AzureOpenAI
+      do not extend BaseChatOpenAI and the existing ChatOpenAI patterns do
+      not match them.
+    patterns:
+      - "OpenAI"
+      - "AzureOpenAI"
+    postconditions:
+      # Evidence: confirmed from @langchain/openai@1.5.3 installed package source.
+      # dist/llms.js — async completionWithRetry(request, options) {
+      #   return this.caller.call(async () => {
+      #     try { return await this.client.completions.create(request, requestOptions); }
+      #     catch (e) { throw wrapOpenAIClientError(e); }
+      #   });
+      # }
+      # dist/llms.d.ts — declare class OpenAI$2 extends BaseLLM { ... }
+      # dist/azure/llms.d.ts — declare class AzureOpenAI$1 extends OpenAI$2 { ... }
+      # dist/utils/client.js — wrapOpenAIClientError() error type mapping (shared with ChatOpenAI).
+      - id: llm-invoke-network-error
+        condition: >
+          OpenAI.invoke() (or .generate(), or .stream() on the legacy LLM class)
+          is called without wrapping in try-catch. The legacy LLM class is still
+          exported in @langchain/openai@1.5.3 and re-exported as AzureOpenAI for
+          Azure deployments. Error vectors are identical to ChatOpenAI.invoke
+          because both paths funnel through wrapOpenAIClientError().
+        throws: >
+          TimeoutError (name === 'TimeoutError', wraps APIConnectionTimeoutError) —
+          connection timeout before completion returned.
+          openai.AuthenticationError (status === 401, lc_error_code: 'MODEL_AUTHENTICATION') —
+          invalid or missing OPENAI_API_KEY (or AZURE_OPENAI_API_KEY for AzureOpenAI).
+          openai.RateLimitError (status === 429, lc_error_code: 'MODEL_RATE_LIMIT') —
+          API rate limit exceeded.
+          openai.NotFoundError (status === 404, lc_error_code: 'MODEL_NOT_FOUND') —
+          invalid model name (legacy text-completion models like gpt-3.5-turbo-instruct
+          are still supported but newer models route here through deprecation paths).
+          ContextOverflowError (extends Error, from @langchain/core/errors) —
+          input exceeds context window. All confirmed from wrapOpenAIClientError().
+        required_handling: >
+          Wrap await llm.invoke(prompt) (or await llm.generate([prompts]),
+          or the stream() call site) in a try-catch block. Handle
+          error.lc_error_code values for normalized error routing, or fall back
+          to error.status checks. For AzureOpenAI specifically, also handle
+          deployment-not-found errors (HTTP 404 with 'DeploymentNotFound' in
+          message) as a distinct case from MODEL_NOT_FOUND.
+
+            try {
+              const llm = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+              const result = await llm.invoke("Tell me a joke.");
+              return result;
+            } catch (error) {
+              if (error.name === 'TimeoutError') {
+                console.error('LLM timeout');
+              } else if (error.lc_error_code === 'MODEL_RATE_LIMIT') {
+                console.error('Rate limited — retry with backoff');
+              } else if (error.lc_error_code === 'MODEL_AUTHENTICATION') {
+                console.error('Invalid API key');
+              }
+              throw error;
+            }
+        sources:
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/llms.ts"
+          - "https://github.com/langchain-ai/langchainjs/blob/main/libs/langchain-openai/src/utils/client.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
