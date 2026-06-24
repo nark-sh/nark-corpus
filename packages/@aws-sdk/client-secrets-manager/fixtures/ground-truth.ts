@@ -39,6 +39,10 @@
  *   tag-resource-no-try-catch                      (TagResourceCommand without try-catch)
  *   tag-resource-limit-exceeded                    (LimitExceededException for 50-tag quota)
  *   get-random-password-no-try-catch               (GetRandomPasswordCommand without try-catch)
+ *   untag-resource-no-try-catch                    (UntagResourceCommand without try-catch)
+ *   untag-resource-self-lockout                    (AccessDeniedException via tag-based IAM)
+ *   stop-replication-no-try-catch                  (StopReplicationToReplicaCommand without try-catch)
+ *   stop-replication-wrong-region-invocation       (InvalidRequestException for wrong-region client)
  */
 import {
   SecretsManagerClient,
@@ -58,6 +62,8 @@ import {
   ValidateResourcePolicyCommand,
   TagResourceCommand,
   GetRandomPasswordCommand,
+  UntagResourceCommand,
+  StopReplicationToReplicaCommand,
   SecretsManagerServiceException,
 } from '@aws-sdk/client-secrets-manager';
 
@@ -667,6 +673,75 @@ async function gt_getRandomPassword_safe() {
   } catch (error) {
     if (error instanceof SecretsManagerServiceException) {
       console.error(`GetRandomPassword failed [${error.name}]: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 17. UntagResourceCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: untag-resource-no-try-catch
+async function gt_untagResource_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, untag-resource-no-try-catch
+  await smClient.send(new UntagResourceCommand({
+    SecretId: SECRET_ID,
+    TagKeys: ['StaleEnvironmentTag', 'LegacyCostCenter'],
+  }));
+}
+
+// @expect-clean
+async function gt_untagResource_safe() {
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    await smClient.send(new UntagResourceCommand({
+      SecretId: SECRET_ID,
+      TagKeys: ['StaleEnvironmentTag', 'LegacyCostCenter'],
+    }));
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'AccessDeniedException') {
+        console.error('Refusing to remove tag — would lock caller out of secret');
+      } else if (error.name === 'ResourceNotFoundException') {
+        console.error('Secret not found while untagging:', error.message);
+      }
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────
+// 18. StopReplicationToReplicaCommand — no try/catch (SHOULD_FIRE)
+// ──────────────────────────────────────────────────
+
+// @expect-violation: stop-replication-no-try-catch
+async function gt_stopReplication_missing() {
+  // SHOULD_FIRE: aws-secrets-manager-service-error, stop-replication-no-try-catch
+  const replicaClient = new SecretsManagerClient({ region: 'us-west-2' });
+  const result = await replicaClient.send(new StopReplicationToReplicaCommand({
+    SecretId: SECRET_ID,
+  }));
+  return result.ARN;
+}
+
+// @expect-clean
+async function gt_stopReplication_safe() {
+  const replicaClient = new SecretsManagerClient({ region: 'us-west-2' });
+  try {
+    // SHOULD_NOT_FIRE: send has try-catch
+    const result = await replicaClient.send(new StopReplicationToReplicaCommand({
+      SecretId: SECRET_ID,
+    }));
+    if (!result.ARN) {
+      throw new Error('StopReplicationToReplica returned no ARN — promotion may be incomplete');
+    }
+    return result.ARN;
+  } catch (error) {
+    if (error instanceof SecretsManagerServiceException) {
+      if (error.name === 'InvalidRequestException') {
+        console.error('StopReplicationToReplica must be called from the replica Region');
+      }
     }
     throw error;
   }

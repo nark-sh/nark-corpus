@@ -1,26 +1,47 @@
 package: "@aws-sdk/client-secrets-manager"
 semver: ">=3.0.0 <4.0.0"
-contract_version: "1.2.0"
+contract_version: "1.3.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-12"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-# Depth pass 2026-06-12 (deepen-stream-2 pass 1):
-# API surface: 24 commands, all via client.send(command) pattern
-# Contracted before this pass: 12 (send + 11 commands; coverage_score 0.50)
-# Contracted after this pass: 17 (added DescribeSecretCommand, ReplicateSecretToRegionsCommand,
-#   ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand)
-# Intentionally omitted: 7 commands (read-only/admin/idempotent inverses with no
-#   distinct behavioral contracts beyond generic SecretsManagerServiceException)
-# Coverage: 17/24 commands = 0.71 raw
-# Effective coverage: 17/17 runtime-critical commands = 1.0
+# Depth pass 2026-06-24 (deepen-stream-3 pass 83):
+# API surface: 24 commands (re-confirmed via dist-types/commands/*.d.ts).
+# Contracted before this pass: 17 (send + 16 commands; coverage_score 0.71)
+# Contracted after this pass:  19 (added UntagResourceCommand, StopReplicationToReplicaCommand)
+# Pattern catalog match: parity-gap fills.
+#   UntagResourceCommand pairs with already-contracted TagResourceCommand (the
+#     idempotent-inverse omission rationale missed the AccessDeniedException
+#     self-lockout case documented in the operation's @throws/description).
+#   StopReplicationToReplicaCommand pairs with already-contracted
+#     ReplicateSecretToRegionsCommand (the omission rationale treated the
+#     replication-admin commands as symmetric, but StopReplicationToReplica is
+#     an IRREVERSIBLE primary promotion and must be invoked from the replica
+#     Region — a distinct behavioral contract from ReplicateSecretToRegions).
+# Intentionally omitted (5 remaining):
+#   ListSecretsCommand, ListSecretVersionIdsCommand — read-only pagination,
+#     no documented errors beyond generic InvalidNextTokenException.
+#   GetResourcePolicyCommand — read-only GET paired with already-contracted
+#     PutResourcePolicyCommand.
+#   DeleteResourcePolicyCommand — paired with PutResourcePolicyCommand;
+#     deleting a non-existent policy throws ResourceNotFoundException but the
+#     operation is rarely called in untrusted call paths; revisit if real-world
+#     usage emerges.
+#   RemoveRegionsFromReplicationCommand — paired with already-contracted
+#     ReplicateSecretToRegionsCommand; per-region success/failure surfaces in
+#     the same response.ReplicationStatus[] shape covered by
+#     replicate-secret-per-region-failure-unchecked.
+# Coverage: 19/24 commands = 0.79 raw
+# Effective coverage: 19/19 runtime-critical commands = 1.0 (5 omissions documented above)
 # Prior depth passes:
 # - 2026-04-18 (stream-1 pass 4): added GetSecretValueCommand, BatchGetSecretValueCommand,
 #   CreateSecretCommand, PutSecretValueCommand, UpdateSecretCommand,
 #   DeleteSecretCommand, RotateSecretCommand
 # - 2026-06-11 (stream-2): added UpdateSecretVersionStageCommand, CancelRotateSecretCommand,
 #   PutResourcePolicyCommand, RestoreSecretCommand
+# - 2026-06-12 (stream-2 pass 1): added DescribeSecretCommand, ReplicateSecretToRegionsCommand,
+#   ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand
 # Evidence confirmed from:
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_BatchGetSecretValue.html
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
@@ -28,10 +49,12 @@ evidence_quality: confirmed
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_PutSecretValue.html
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DeleteSecret.html
 #   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_RotateSecret.html
-#   @aws-sdk/client-secrets-manager@3.600.0 dist-types/models/models_0.d.ts (exception class hierarchy)
-#   @aws-sdk/client-secrets-manager@3.600.0 dist-types/commands/*.d.ts (@throws annotations)
+#   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UntagResource.html
+#   https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_StopReplicationToReplica.html
+#   @aws-sdk/client-secrets-manager@3.x dist-types/models/models_0.d.ts (exception class hierarchy)
+#   @aws-sdk/client-secrets-manager@3.x dist-types/commands/*.d.ts (@throws annotations)
 # v1.1.1: fixed schema — renamed description->condition, converted business_impact to objects, added sources
-coverage_score: 0.71
+coverage_score: 0.79
 
 detection:
   type_names:
@@ -1345,6 +1368,164 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: UntagResourceCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Removes specific tags from a secret. This is the parity inverse of
+      TagResourceCommand and is documented as idempotent: missing tags do NOT
+      throw. The risk surface is NOT the missing-tag case — it is silent loss of
+      access when tags are part of an IAM policy condition (the AWS docs warn:
+      "If you use tags as part of your security strategy, then removing a tag
+      can change permissions. If successfully completing this operation would
+      result in you losing your permissions for this secret, then the operation
+      is blocked and returns an Access Denied error"). Compliance and
+      cost-allocation pipelines that strip stale tags without try-catch
+      silently fail when the calling principal's IAM permissions depend on the
+      very tag being removed.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UntagResource.html
+      # @throws confirmed from UntagResourceCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException, ResourceNotFoundException
+      # AccessDeniedException additionally documented in the operation description
+      # (removing a tag that an IAM policy condition depends on locks the caller
+      # out of subsequent operations on the same secret).
+      - id: untag-resource-self-lockout
+        severity: warning
+        condition: >
+          caller removes a tag whose key appears in an IAM policy condition that
+          grants the caller access to the secret; the operation is blocked and
+          AWS returns AccessDeniedException; subsequent calls on the same secret
+          from the same principal will also fail
+        throws: >
+          AccessDeniedException (error.name === "AccessDeniedException") when the
+          tag removal would strip the calling principal's own access; the secret
+          remains tagged but the caller can no longer act on it
+        required_handling: >
+          Before calling UntagResourceCommand in automated compliance scripts,
+          enumerate the IAM policies governing the secret (or maintain a list of
+          tag keys that participate in access control) and refuse to remove tags
+          whose keys appear in those conditions. Catch AccessDeniedException
+          explicitly and surface it as a configuration error, NOT a generic
+          retry-able failure — retrying will fail identically and add noise.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UntagResource.html"
+          - "https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_examples.html"
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+      - id: untag-resource-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new UntagResourceCommand(...)) without
+          a wrapping try-catch; while missing tags are idempotent, the operation
+          still throws on ResourceNotFoundException (wrong secret ARN),
+          InvalidRequestException (secret scheduled for deletion or managed by
+          another service), and AccessDeniedException (self-lockout via tag-based
+          IAM condition); network errors also propagate
+        throws: >
+          ResourceNotFoundException, InvalidRequestException, AccessDeniedException,
+          InvalidParameterException, InternalServiceError, and network errors
+          propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Compliance scripts that strip stale tags from
+          hundreds of secrets must surface per-secret failures; an unhandled
+          rejection in a batch tag-cleanup job leaves the secret partially
+          re-tagged and the report partially populated, which is worse than
+          a clean failure because the operator believes the cleanup succeeded.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_UntagResource.html"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: StopReplicationToReplicaCommand
+    import_path: "@aws-sdk/client-secrets-manager"
+    description: >
+      Removes the link between a replica secret and its primary secret and
+      promotes the replica to a primary secret in the replica Region. This is
+      an IRREVERSIBLE one-way action — once the replica is promoted, the link
+      to the original primary is severed and the new primary diverges
+      immediately on the next PutSecretValue. Must be called FROM the Region
+      where promotion is desired, not from the primary's Region. Used in
+      disaster recovery (the primary Region is unavailable) and in deliberate
+      replica-to-primary migrations. Failure to handle errors here can leave
+      the replication topology in a half-promoted state where the
+      "old primary" and "new primary" both believe they own the secret,
+      causing rotation conflicts and data divergence.
+    postconditions:
+      # Evidence: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_StopReplicationToReplica.html
+      # @throws confirmed from StopReplicationToReplicaCommand.d.ts:
+      #   InternalServiceError, InvalidParameterException, InvalidRequestException, ResourceNotFoundException
+      # The "must be called from the replica Region" constraint is documented in the
+      # operation description ("You must call this operation from the Region in which
+      # you want to promote the replica to a primary secret").
+      - id: stop-replication-wrong-region-invocation
+        severity: error
+        condition: >
+          caller invokes StopReplicationToReplicaCommand from the primary
+          Region's client (not the replica Region's client); AWS rejects the
+          call with InvalidRequestException because the operation only
+          succeeds when issued against the replica's own regional endpoint
+        throws: >
+          InvalidRequestException (error.name === "InvalidRequestException") with
+          a message indicating the operation must be invoked from the replica's
+          Region; the topology is unchanged but disaster-recovery automation
+          believes promotion has begun
+        required_handling: >
+          Always construct a NEW SecretsManagerClient pinned to the replica
+          Region for this call (e.g. `new SecretsManagerClient({ region: replicaRegion })`)
+          — do NOT reuse the primary-region client. Catch InvalidRequestException
+          and verify the client's resolved region matches the intended replica
+          before retrying. Treat this as a programming error, not a transient
+          failure; retrying with the same client will fail identically.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_StopReplicationToReplica.html"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: stop-replication-no-try-catch
+        severity: error
+        condition: >
+          caller invokes await smClient.send(new StopReplicationToReplicaCommand(...))
+          without a wrapping try-catch; this is an IRREVERSIBLE promotion of the
+          replica to a primary — any unhandled rejection in disaster-recovery
+          automation aborts the failover with no rollback path, leaving the
+          original primary still authoritative while operators believe failover
+          has begun
+        throws: >
+          InvalidRequestException (wrong-region call, secret managed by another
+          service, secret scheduled for deletion), ResourceNotFoundException,
+          InvalidParameterException, InternalServiceError, and network errors
+          propagate as unhandled rejections
+        required_handling: >
+          Wrap in try-catch. Disaster recovery runbooks MUST log the exact
+          error before retrying and MUST NOT proceed to dependent steps (e.g.
+          updating Route53 to point at the new primary Region) until the
+          promotion is confirmed via DescribeSecretCommand showing
+          ReplicationStatus is empty / PrimaryRegion is the replica's region.
+          Treat StopReplicationToReplica failure as a STOP-THE-LINE event in
+          failover automation — silent retries can produce split-brain
+          topologies where two regions both believe they own the secret.
+        sources:
+          - "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_StopReplicationToReplica.html"
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
 
 notes:
   - "AWS SDK v3 uses command pattern: client.send(new XxxCommand(params)). All operations use the same send() entry point."
@@ -1358,4 +1539,4 @@ notes:
   - "RotateSecretCommand is ASYNCHRONOUS — returns before the Lambda function completes rotation"
   - "PutSecretValue rate limit: max once per 10 minutes per secret to avoid version quota exhaustion"
   - "ResourceExistsException on CreateSecretCommand means secret already exists — use UpdateSecretCommand instead"
-  - "Intentionally omitted: ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination with generic InvalidNextTokenException only), GetResourcePolicyCommand, DeleteResourcePolicyCommand (admin reads/idempotent deletes paired with PutResourcePolicy already contracted), UntagResourceCommand (idempotent inverse of TagResourceCommand - missing tags do not throw), RemoveRegionsFromReplicationCommand, StopReplicationToReplicaCommand (replication admin paired with ReplicateSecretToRegions - per-region success/failure on the same response.ReplicationStatus shape) - no unique behavioral contracts beyond generic error handling. (Promoted from omitted 2026-06-12: DescribeSecretCommand, ReplicateSecretToRegionsCommand, ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand. Promoted 2026-06-11: CancelRotateSecretCommand, PutResourcePolicyCommand, RestoreSecretCommand, UpdateSecretVersionStageCommand)"
+  - "Intentionally omitted (5 remaining): ListSecretsCommand, ListSecretVersionIdsCommand (read-only/pagination with generic InvalidNextTokenException only), GetResourcePolicyCommand (read-only GET paired with already-contracted PutResourcePolicyCommand), DeleteResourcePolicyCommand (admin delete paired with PutResourcePolicyCommand — revisit if real-world usage emerges), RemoveRegionsFromReplicationCommand (per-region success/failure surfaces in response.ReplicationStatus[] already covered by replicate-secret-per-region-failure-unchecked) - no unique behavioral contracts beyond generic error handling. (Promoted from omitted 2026-06-24: UntagResourceCommand — AccessDeniedException self-lockout when removing tags participating in IAM conditions; StopReplicationToReplicaCommand — irreversible primary promotion, wrong-region invocation hazard. Promoted 2026-06-12: DescribeSecretCommand, ReplicateSecretToRegionsCommand, ValidateResourcePolicyCommand, TagResourceCommand, GetRandomPasswordCommand. Promoted 2026-06-11: CancelRotateSecretCommand, PutResourcePolicyCommand, RestoreSecretCommand, UpdateSecretVersionStageCommand)"
