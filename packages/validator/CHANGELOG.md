@@ -3,6 +3,19 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (re-verification, no content change)
+
+- **Profile:** `packages/validator/contract.yaml`
+- **Functions added:** none (0 total)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** none (existing 54 omissions confirmed against validator@13.15.35)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** runtime enumeration of `/tmp/claude/bc-deepen/validator/node_modules/validator` (validator@13.15.35)
+- **API surface verified:** 104 callable functions (Object.keys filtered by `typeof === 'function'`) + 8 data exports (ibanLocales, isAlphaLocales, isAlphanumericLocales, isFloatLocales, isMobilePhoneLocales, isPostalCodeLocales, passportNumberLocales, version)
+- **Contracted (50) ∪ omitted (54) = full API (104):** no drift. Effective coverage 50/50 = 1.0 unchanged.
+- **Verified by:** bc-deepen-contract (pass 79 on 2026-06-24T12:54:38Z, deepen-stream-3)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** validator@13.15.35
