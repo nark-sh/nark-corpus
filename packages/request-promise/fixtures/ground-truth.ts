@@ -12,6 +12,8 @@
  *   - rp.patch()         postconditions: http-error-4xx-5xx, network-failure
  *   - rp.del()           postconditions: http-error-4xx-5xx, network-failure
  *   - rp.head()          postconditions: http-error-4xx-5xx, network-failure, head-resolves-with-headers-not-body
+ *   - rp.options()       postconditions: http-error-4xx-5xx, network-failure   (added 2026-06-24)
+ *   - rp.delete()        postconditions: http-error-4xx-5xx, network-failure   (added 2026-06-24)
  *
  * Detection path: rp imported from request-promise →
  *   ThrowingFunctionDetector fires direct call rp() / rp.get() / etc. →
@@ -161,6 +163,46 @@ export async function headRequestWithCatch(url: string) {
     return headers;
   } catch (err) {
     console.error('HEAD failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. rp.options() — OPTIONS shortcut (added 2026-06-24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function optionsRequestNoCatch(url: string) {
+  // SHOULD_FIRE: http-error-4xx-5xx — rp.options() rejects with StatusCodeError on 405 Method Not Allowed (common when probing CORS or capability). No try-catch.
+  const headers = await rp.options(url);
+  return headers;
+}
+
+export async function optionsRequestWithCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: rp.options() inside try-catch satisfies error handling
+    const headers = await rp.options(url);
+    return headers;
+  } catch (err) {
+    console.error('OPTIONS failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. rp.delete() — DELETE alias (added 2026-06-24; same behavior as rp.del())
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function deleteAliasNoCatch(url: string) {
+  // SHOULD_FIRE: http-error-4xx-5xx — rp.delete() (alias for rp.del()) rejects with StatusCodeError on non-2xx. No try-catch.
+  await rp.delete(url);
+}
+
+export async function deleteAliasWithCatch(url: string) {
+  try {
+    // SHOULD_NOT_FIRE: rp.delete() inside try-catch satisfies error handling
+    await rp.delete(url);
+  } catch (err) {
+    console.error('DELETE (alias) failed:', err);
     throw err;
   }
 }

@@ -1,30 +1,39 @@
 package: request-promise
 semver: ">=4.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-20"
+last_verified: "2026-06-24"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
 deprecated: true
 deprecated_reason: "The request package is unmaintained since February 2020. Use axios, node-fetch, or undici instead."
 deprecated_date: "2020-02-11"
-# Depth pass 2026-04-20 (deepen-stream-1 pass 3):
-# API surface: 11 callable exports (default, get, post, put, patch, del/delete, head,
-#              defaults [factory], forever [agent factory], jar [sync], cookie [sync])
-# Contracted before: 3 (default, get, post) — missing put, patch, del/delete, head
-# Contracted after: 8 (+5: put, patch, del, head, and added TransformError postcondition to default)
-# Intentionally omitted: 3 (defaults — sync factory; jar — sync; cookie — sync)
-# Coverage: 8/11 total = 0.73; effective (contracted/non-omitted) = 8/8 = 1.0
-# Key new finding: TransformError is a THIRD distinct error type never documented in
-#   previous contract — thrown when options.transform() throws inside the callback.
-#   Source confirmed: request-promise-core/lib/plumbing.js lines 100, 117.
+# Depth pass 2026-06-24 (deepen-stream-3 pass 72, drift-by-staleness re-verification):
+# API surface re-enumerated against installed v4.2.6:
+#   Object.keys(rp) = [Request, bindCLS, cookie, defaults, del, delete, forever,
+#     get, head, initParams, jar, options, patch, post, put]
+#   Async-callable HTTP verb shortcuts = 8 (default + get/post/put/patch/del/delete/head/options)
+#   Previously contracted = 6 (default, get, post, put, patch, del, head — 7 distinct entries,
+#     "default" = rp() itself as callable, separate from named verbs)
+#   Newly contracted = 2 (options, delete — both verified empirically: rp.options('http://localhost:1')
+#     and rp.delete('http://localhost:1') both return Bluebird thenables that reject with
+#     RequestError on network failure)
+#   Coverage before this pass: 8 contracted functions, 11-total surface count (per 2026-04-20 pass)
+#   Coverage after: 10 contracted (+2: options, delete), 13-total surface count
+#     (+2 newly enumerated async fns; bindCLS/initParams/Request/forever are non-async or sync utilities)
+#   Intentionally omitted: 5 (defaults, jar, cookie — sync per prior pass; bindCLS — throws synchronously
+#     per request-promise/lib/rp.js line 47-49; forever — sync factory returning defaults-configured API)
+#   initParams excluded from surface count entirely (internal helper, not part of the documented API).
+# Coverage: 10/15 total surface = 0.67; effective (10 contracted / 10 non-omitted async) = 1.0
+# Re-verification confirmed: contract for default/get/post/put/patch/del/head still accurate against v4.2.6.
 # Evidence confirmed from:
-#   node_modules/request-promise-core/lib/plumbing.js (error dispatch logic, lines 85-127)
-#   node_modules/request-promise-core/lib/errors.js (error class definitions)
-#   node_modules/@types/request/index.d.ts (RequestAPI interface — put/patch/del/head/head)
-#   https://github.com/request/request-promise (official README — method shortcuts, error types)
-coverage_score: 0.73
+#   node_modules/request/index.js (lines 66-73 — verb table, including options + delete alias)
+#   node_modules/request-promise-core/configure/request2.js (Request.prototype.init interception)
+#   node_modules/request-promise/lib/rp.js (bindCLS sync throw at line 47-49)
+#   Empirical: typeof rp.options === 'function', .then exists, rejects with RequestError
+# Prior depth pass (2026-04-20) findings preserved: TransformError still wraps transform() throws.
+coverage_score: 0.67
 
 detection:
   type_names: []
@@ -389,3 +398,102 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: low
+
+  - name: options
+    import_path: "request-promise"
+    description: >
+      HTTP OPTIONS shortcut. Used for CORS preflight checks and discovering supported
+      methods/headers on a resource. Returns a Bluebird promise with the same error
+      profile as other HTTP method shortcuts. Rejects with StatusCodeError on non-2xx
+      responses (default simple: true), RequestError on network failures.
+      Empirically verified 2026-06-24: rp.options('http://localhost:1') rejects with
+      RequestError whose .cause.code is EPERM/ECONNREFUSED (depending on sandbox).
+    postconditions:
+      # Evidence: node_modules/request/index.js line 68 — request.options = verbFunc('options')
+      # Evidence: request-promise-core/configure/request2.js — Request.prototype.init is
+      #   intercepted for ALL verbs, exposing then/catch/finally via _rp_promise
+      # Evidence: empirical — typeof rp.options === 'function'; rp.options(url).then exists;
+      #   rejection produces RequestError on network failure (verified 2026-06-24)
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.options(). CORS preflight
+          checks against endpoints that do not implement OPTIONS will reject with 405
+          Method Not Allowed by default. A 404 OPTIONS response on an unknown route
+          will also reject — common when probing API capability.
+        sources:
+          - "https://github.com/request/request"
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L104"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error in .cause"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.options().
+          Check err.cause.code for ECONNREFUSED, ENOTFOUND, ETIMEDOUT, EPERM, etc.
+        sources:
+          - "https://github.com/request/request-promise"
+          - "https://github.com/request/request-promise-core/blob/master/lib/plumbing.js#L87"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: delete
+    import_path: "request-promise"
+    description: >
+      HTTP DELETE shortcut — the modern alias for rp.del(). Both rp.delete() and rp.del()
+      are first-class methods on the request-promise export (request/index.js lines 72-73:
+      `request.del = verbFunc('delete'); request['delete'] = verbFunc('delete')`). The
+      `delete` name was added when the `delete` reserved-word restriction was lifted; both
+      remain supported. Same error profile as rp.del(): StatusCodeError on non-2xx,
+      RequestError on network failure.
+    postconditions:
+      # Evidence: node_modules/request/index.js line 73 — request['delete'] = verbFunc('delete')
+      # Evidence: empirical — typeof rp.delete === 'function' (verified 2026-06-24)
+      # Evidence: request-promise-core/lib/plumbing.js — shared callback, identical
+      #   error behavior across all HTTP verb shortcuts
+      - id: http-error-4xx-5xx
+        condition: "response status is 4xx or 5xx and options.simple is true (default)"
+        throws: "StatusCodeError with statusCode, error, options, and response properties"
+        required_handling: >
+          Caller MUST catch StatusCodeError when using rp.delete(). DELETE on a
+          missing resource (404) or one the caller lacks permission for (403) will
+          reject by default. A 404 on a repeated DELETE is common — check err.statusCode
+          before retrying.
+        sources:
+          - "https://github.com/request/request"
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: network-failure
+        condition: "network error, DNS failure, timeout, or connection refused"
+        throws: "RequestError wrapping the underlying Node.js error in .cause"
+        required_handling: >
+          Caller MUST catch RequestError for network failures when using rp.delete().
+        sources:
+          - "https://github.com/request/request-promise"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
