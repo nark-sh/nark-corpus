@@ -3,6 +3,17 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 89% → 91%
+
+- **Profile:** `packages/nock/contract.yaml`
+- **Functions added:** define, recorder.rec (2 total)
+- **Postconditions added:** 4 (define-method-required, define-reply-not-numeric, define-mismatched-port, rec-already-in-progress)
+- **Functions intentionally omitted this pass:** isActive / isDone (top-level) / pendingMocks / activeMocks (sync read accessors, no throws); enableNetConnect (defaults to /.*/ for invalid args); removeInterceptor (sync boolean, no throws); abortPendingRequests (sync void, no throws); recorder.clear / recorder.play (sync, no throws); Scope.persist / Scope.filteringPath / Scope.filteringRequestBody (arg-validation throws at builder level)
+- **Scanner concerns queued:** 2 (`concern-20260624-nock-deepen-1`, `concern-20260624-nock-deepen-2`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://github.com/nock/nock#saving-and-loading-interceptors, https://github.com/nock/nock#recording, https://github.com/nock/nock/blob/main/lib/recorder.js (cross-referenced against installed nock@14.0.15 source: lib/scope.js define() and lib/recorder.js record())
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 68 on 2026-06-24T10:26Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** nock@14.0.15

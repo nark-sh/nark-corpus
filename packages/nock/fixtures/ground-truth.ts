@@ -144,3 +144,85 @@ function setKnownNockBackMode() {
   }
   nock.back.setMode(mode as 'wild' | 'dryrun' | 'record' | 'update' | 'lockdown');
 }
+
+// ─── nock.define() ──────────────────────────────────────────────────────────
+// Postconditions added in the 2026-06-24 deepen pass.
+
+// SHOULD_FIRE: define-method-required
+function defineWithoutMethodNoErrorHandling() {
+  // No try-catch: define() throws "Method is required" if any def has no method.
+  const defs = [{ scope: 'https://api.example.com', path: '/data', status: 200 } as any];
+  return nock.define(defs);
+}
+
+// @expect-clean
+function defineWithMethodValidated() {
+  const defs = [{ scope: 'https://api.example.com', method: 'GET', path: '/data', status: 200 }];
+  try {
+    return nock.define(defs);
+  } catch (err) {
+    nock.cleanAll();
+    if (err instanceof Error && err.message === 'Method is required') {
+      throw new Error('Fixture has missing method field — re-record fixture');
+    }
+    throw err;
+  }
+}
+
+// SHOULD_FIRE: define-reply-not-numeric
+function defineWithNonNumericReplyNoErrorHandling() {
+  // No try-catch: define() throws "`reply`, when present, must be a numeric string"
+  const defs = [{ scope: 'https://api.example.com', method: 'GET', path: '/data', reply: 'OK' } as any];
+  return nock.define(defs);
+}
+
+// SHOULD_FIRE: define-mismatched-port
+function defineWithMismatchedPortNoErrorHandling() {
+  // No try-catch: define() throws "Mismatched port numbers in scope and port properties..."
+  const defs = [
+    { scope: 'https://api.example.com:8080', method: 'GET', path: '/data', port: 9090, status: 200 } as any,
+  ];
+  return nock.define(defs);
+}
+
+// @expect-clean
+function defineWithErrorHandling() {
+  const defs = [{ scope: 'https://api.example.com', method: 'GET', path: '/data', status: 200 }];
+  try {
+    return nock.define(defs);
+  } catch (err) {
+    nock.cleanAll();
+    if (err instanceof Error) {
+      throw new Error(`nock.define failed: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ─── nock.recorder.rec() ────────────────────────────────────────────────────
+// Postcondition added in the 2026-06-24 deepen pass.
+
+// SHOULD_FIRE: rec-already-in-progress
+function startRecordingTwiceNoErrorHandling() {
+  nock.recorder.rec({ dont_print: true, output_objects: true });
+  // No try-catch: second call throws "Nock recording already in progress"
+  nock.recorder.rec({ dont_print: true, output_objects: true });
+}
+
+// @expect-clean
+function startRecordingWithCleanupBetween() {
+  nock.recorder.rec({ dont_print: true, output_objects: true });
+  // Capture output, then tear down before starting again
+  const captured = nock.recorder.play();
+  nock.restore();
+  nock.recorder.clear();
+  try {
+    nock.recorder.rec({ dont_print: true, output_objects: true });
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already in progress')) {
+      throw new Error('recorder.rec() called while previous session still active — call nock.restore() + recorder.clear() first');
+    }
+    throw err;
+  }
+  return captured;
+}
