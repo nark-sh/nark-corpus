@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% (14/14) → 100% (15/15)
+
+- **Profile:** `packages/resend/contract.yaml`
+- **Functions added:** contacts.imports.create (1 total)
+- **Postconditions added:** 1 (contacts-imports-create-no-error-check)
+- **Functions intentionally omitted this pass:** contacts.imports.list (read-only inspection, generic { data, error } pattern); contacts.imports.get (read-only poll, generic pattern)
+- **Scanner concerns queued:** 1 (`concern-20260624-resend-deepen-imports-create` — needs detection rule for 3-level property chain `client.contacts.imports.create()`)
+- **Scanner version used:** nark@3.2.0
+- **Package version verified against:** resend@6.14.0 (ContactImports class introduced in v6.13.0; v6.14.0 added no new public API surface beyond v6.13.0)
+- **Sources fetched:** package/dist/index.d.mts (resend@6.14.0 npm tarball), https://github.com/resend/resend-node/releases/tag/v6.13.0, https://resend.com/docs/api-reference/errors
+- **Verified by:** bc-deepen-contract (deepen-stream-3 pass 74, 2026-06-24)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** resend@6.14.0

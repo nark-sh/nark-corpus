@@ -13,6 +13,7 @@
  *   - resend.broadcasts.send()   postcondition: broadcasts-send-no-error-check
  *   - resend.events.send()       postcondition: events-send-no-error-check (added 2026-06-11 pass 7)
  *   - resend.automations.stop()  postcondition: automations-stop-no-error-check (added 2026-06-11 pass 7)
+ *   - resend.contacts.imports.create() postcondition: contacts-imports-create-no-error-check (added 2026-06-24 pass 74)
  *
  * Detection pattern:
  *   - Resend is imported from 'resend'
@@ -410,4 +411,43 @@ export async function stopAutomationWithCheck(automationId: string) {
     throw new Error(`Automation stop returned unexpected status: ${data!.status}`);
   }
   return data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. contacts.imports.create() — bulk CSV contact ingest (resend@6.13.0+)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function importContactsNoCheck(csvBuffer: Buffer, segmentId: string) {
+  // SHOULD_FIRE: contacts-imports-create-no-error-check
+  const file = new Blob([csvBuffer], { type: 'text/csv' });
+  return await resend.contacts.imports.create({
+    file,
+    columnMap: { email: 'Email', firstName: 'First Name' },
+    segments: [{ id: segmentId }],
+  });
+}
+
+export async function importContactsAssignNoCheck(csvBuffer: Buffer, segmentId: string) {
+  // SHOULD_FIRE: contacts-imports-create-no-error-check
+  const file = new Blob([csvBuffer], { type: 'text/csv' });
+  const result = await resend.contacts.imports.create({
+    file,
+    segments: [{ id: segmentId }],
+  });
+  return result.data;
+}
+
+export async function importContactsWithCheck(csvBuffer: Buffer, segmentId: string) {
+  // SHOULD_NOT_FIRE: result.error is checked before using data
+  const file = new Blob([csvBuffer], { type: 'text/csv' });
+  const { data, error } = await resend.contacts.imports.create({
+    file,
+    columnMap: { email: 'Email', firstName: 'First Name' },
+    segments: [{ id: segmentId }],
+  });
+  if (error) {
+    console.error('Contact import create failed', { error });
+    throw new Error(`Contact import failed: ${error.message}`);
+  }
+  return data!.id;
 }
