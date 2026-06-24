@@ -252,3 +252,193 @@ export async function shutdownWithCatch() {
     console.error('Destroy failed:', err);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. db.schema.dropTable() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function dropTableNoCatch() {
+  // SHOULD_FIRE: schema-drop-table-no-try-catch — throws on FK violation, missing table, perms
+  await db.schema.dropTable('users');
+}
+
+export async function dropTableWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: dropTable inside try-catch
+    await db.schema.dropTable('users');
+  } catch (err) {
+    console.error('Drop table failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. db.schema.alterTable() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function alterTableNoCatch() {
+  // SHOULD_FIRE: schema-alter-table-no-try-catch — throws on lock timeout, type incompat, duplicate column
+  await db.schema.alterTable('users', (t) => {
+    t.string('email').notNullable();
+  });
+}
+
+export async function alterTableWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: alterTable inside try-catch
+    await db.schema.alterTable('users', (t) => {
+      t.string('email').notNullable();
+    });
+  } catch (err) {
+    console.error('Alter table failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. db.schema.hasTable() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function hasTableNoCatch() {
+  // SHOULD_FIRE: schema-has-table-no-try-catch — KnexTimeoutError on pool exhaustion
+  const exists = await db.schema.hasTable('users');
+  console.log(exists);
+}
+
+export async function hasTableWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: hasTable inside try-catch
+    const exists = await db.schema.hasTable('users');
+    console.log(exists);
+  } catch (err) {
+    console.error('hasTable failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. db.schema.hasColumn() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function hasColumnNoCatch() {
+  // SHOULD_FIRE: schema-has-column-no-try-catch — KnexTimeoutError on pool exhaustion
+  const exists = await db.schema.hasColumn('users', 'email');
+  console.log(exists);
+}
+
+export async function hasColumnWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: hasColumn inside try-catch
+    const exists = await db.schema.hasColumn('users', 'email');
+    console.log(exists);
+  } catch (err) {
+    console.error('hasColumn failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. db.migrate.up() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function migrateUpNoCatch() {
+  // SHOULD_FIRE: migrate-up-no-try-catch — LockError, script error, KnexTimeoutError
+  await db.migrate.up();
+}
+
+export async function migrateUpWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: migrate.up inside try-catch
+    await db.migrate.up();
+  } catch (err) {
+    console.error('migrate.up failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. db.migrate.down() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function migrateDownNoCatch() {
+  // SHOULD_FIRE: migrate-down-no-try-catch — LockError, script error
+  await db.migrate.down();
+}
+
+export async function migrateDownWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: migrate.down inside try-catch
+    await db.migrate.down();
+  } catch (err) {
+    console.error('migrate.down failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. db.migrate.forceFreeMigrationsLock() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function forceFreeLockNoCatch() {
+  // SHOULD_FIRE: migrate-force-free-lock-no-try-catch — throws on UPDATE failure, perms
+  await db.migrate.forceFreeMigrationsLock();
+}
+
+export async function forceFreeLockWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: forceFreeMigrationsLock inside try-catch
+    await db.migrate.forceFreeMigrationsLock();
+  } catch (err) {
+    console.error('forceFreeMigrationsLock failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. db.seed.run() — without try-catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function seedRunNoCatch() {
+  // SHOULD_FIRE: seed-run-no-try-catch — Error wraps any error thrown from seed file
+  await db.seed.run();
+}
+
+export async function seedRunWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: seed.run inside try-catch
+    await db.seed.run();
+  } catch (err) {
+    console.error('seed.run failed (original):', (err as any).original);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. db(table).stream() — without 'error' listener
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function streamPipeNoErrorListener(out: NodeJS.WritableStream) {
+  // SHOULD_FIRE: stream-error-event-not-registered — pipe without on('error', ...) crashes process on mid-stream error
+  const stream = db('users').stream();
+  stream.pipe(out);
+}
+
+export async function streamPipeWithErrorListener(out: NodeJS.WritableStream) {
+  // SHOULD_NOT_FIRE: 'error' listener registered before pipe
+  const stream = db('users').stream();
+  stream.on('error', (err) => console.error('Stream error:', err));
+  stream.pipe(out);
+}
+
+export async function streamForAwaitWithTryCatch() {
+  try {
+    // SHOULD_NOT_FIRE: for-await-of inside try-catch propagates errors and auto-destroys stream on throw
+    const stream = db('users').stream();
+    for await (const row of stream) {
+      console.log(row);
+    }
+  } catch (err) {
+    console.error('Stream consumption failed:', err);
+    throw err;
+  }
+}

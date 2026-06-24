@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-23 — deepen pass — coverage 1.0 (legacy) → 0.83 effective
+
+- **Profile:** `packages/knex/contract.yaml`
+- **Functions added:** schema.dropTable, schema.alterTable, schema.hasTable, schema.hasColumn, migrate.up, migrate.down, migrate.forceFreeMigrationsLock, seed.run, stream (9 total)
+- **Postconditions added:** 11
+- **Functions intentionally omitted this pass:** count/sum/avg/min/max (share select error surface), pluck (same as select), columnInfo (read-only metadata), migrate.status/currentVersion/list (read-only), migrate.make/seed.make (filesystem-only), trx.commit/rollback (covered transitively by transactionProvider lifecycle), trx.savepoint (advanced TXN, low adoption), createView/dropView/createSchema/dropSchema (covered transitively by createTable family), renameTable (rare), forUpdate/forShare (modifiers), truncate (lower priority), asCallback (deprecated promise/callback bridge)
+- **Scanner concerns queued:** 7 (`concern-20260623-knex-deepen-1` through `concern-20260623-knex-deepen-7`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+    - https://knexjs.org/guide/schema-builder.html (dropTable, alterTable, hasTable, hasColumn)
+    - https://knexjs.org/guide/migrations.html (migrate.up, migrate.down, forceFreeMigrationsLock, lock contract)
+    - https://knexjs.org/guide/interfaces.html (stream error events, abort cleanup)
+    - https://knexjs.org/guide/transactions.html (transaction lifecycle baseline)
+    - https://github.com/knex/knex/blob/master/lib/migrations/seed/Seeder.js (seed.run wrapping behavior)
+    - knex@3.2.10 types/index.d.ts (full async surface enumeration)
+- **Verified by:** bc-deepen-contract (pass 25 on 2026-06-23T01:19:58Z, deepen-stream-3)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** knex@3.2.10

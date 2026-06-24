@@ -1,8 +1,8 @@
 package: knex
 semver: '>=3.0.0 <4.0.0'
-contract_version: 1.0.0
+contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-04-11'
+last_verified: '2026-06-23'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -655,6 +655,470 @@ functions:
           In deployment automation, check for "already exists" errors to handle idempotent
           re-deployments. Use knex migration system (migrate.latest) rather than manually
           calling createTable() for idempotent DDL management.
+
+  - name: schema.dropTable
+    import_path: knex
+    description: >
+      Executes a DROP TABLE DDL statement. Returns a SchemaBuilder (awaitable). Throws if
+      the table does not exist (unless dropTableIfExists is used), if the table is referenced
+      by foreign keys from other tables (without CASCADE), or if the connected user lacks
+      DROP privilege. Common in down() migrations and test teardown.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/schema-builder.html
+      # Source: lib/schema/builder.js — dropTable pushed into _sequence, run via SchemaBuilder.then()
+      - id: schema-drop-table-no-try-catch
+        condition: |
+          await knex.schema.dropTable(...) called without try-catch
+        throws: >
+          Error if table does not exist ("relation does not exist" in PostgreSQL,
+          "Unknown table" in MySQL);
+          Error if FK constraints reference the table from another table without CASCADE
+          ("cannot drop table X because other objects depend on it" in PostgreSQL);
+          Error if user lacks DROP privilege;
+          KnexTimeoutError on pool exhaustion
+        severity: error
+        description: >
+          dropTable() sends a DROP TABLE DDL statement. Three documented failure modes:
+          (1) table-does-not-exist when a previous migration already dropped it or the
+          down() runs against a fresh database; (2) foreign-key-violation when another
+          table still references the target via FK without CASCADE; (3) permission denied.
+          In down() migrations called during a failed deploy rollback, unhandled errors
+          leave the database in a partially-rolled-back state.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/schema-builder.html
+        required_handling: >
+          Caller MUST wrap await knex.schema.dropTable() in try-catch. Prefer
+          dropTableIfExists() for idempotent down() migrations to avoid the
+          "does-not-exist" error on re-runs.
+
+  - name: schema.alterTable
+    import_path: knex
+    description: >
+      Executes one or more ALTER TABLE DDL statements. Returns a SchemaBuilder (awaitable).
+      Often the highest-risk DDL: type changes can fail on existing data, ADD COLUMN NOT NULL
+      without a default fails on non-empty tables, and ALTER acquires an ACCESS EXCLUSIVE
+      lock on PostgreSQL that blocks all reads/writes for the duration. Common deploy outage
+      source.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/schema-builder.html
+      - id: schema-alter-table-no-try-catch
+        condition: |
+          await knex.schema.alterTable(...) called without try-catch
+        throws: >
+          Error on type-incompatible conversions ("cannot cast type X to type Y" in PostgreSQL,
+          "Incorrect integer value" in MySQL);
+          Error when ADD COLUMN NOT NULL without default is applied to a non-empty table
+          ("column contains null values");
+          Error on lock timeout when another transaction holds a conflicting lock on the
+          target table (PostgreSQL lock_timeout setting, MySQL lock_wait_timeout);
+          Error on duplicate column name when ADD COLUMN targets an existing column;
+          KnexTimeoutError on pool exhaustion
+        severity: error
+        description: >
+          alterTable() applies the requested column/index/constraint changes via ALTER TABLE
+          DDL. It can throw on: type-conversion failures (data does not fit the new type),
+          NOT NULL additions on non-empty tables without a default, lock acquisition timeout
+          (PostgreSQL ACCESS EXCLUSIVE blocks all concurrent queries), duplicate column on
+          ADD COLUMN, and FK validation errors when adding a FOREIGN KEY constraint to a
+          table with existing orphan rows. Unhandled errors in migration scripts halt the
+          deployment with the database in a partially-altered state.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/schema-builder.html
+        required_handling: >
+          Caller MUST wrap await knex.schema.alterTable() in try-catch. For production
+          deploys against a live table, set a lock_timeout (PostgreSQL) or
+          innodb_lock_wait_timeout (MySQL) and handle the timeout error explicitly rather
+          than blocking writes indefinitely.
+
+  - name: schema.hasTable
+    import_path: knex
+    description: >
+      Executes a metadata query against the database catalog (information_schema or
+      sqlite_master) to check whether a named table exists. Returns Promise<boolean>.
+      Commonly used in idempotent migrations and bootstrap code. Despite being read-only,
+      it can still throw on connection failure, pool exhaustion, and permission denied
+      against the system catalog.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/schema-builder.html
+      # The method is declared `hasTable(tableName: string): Promise<boolean>` in
+      # types/index.d.ts line 2406 — returns boolean, no schema mutation.
+      - id: schema-has-table-no-try-catch
+        condition: |
+          await knex.schema.hasTable(...) called without try-catch
+        throws: >
+          KnexTimeoutError on connection pool exhaustion (60s default);
+          Error on connection failure to the database;
+          Error on permission denied if the connected user lacks SELECT on the system catalog
+        severity: warning
+        description: >
+          hasTable() runs a metadata SELECT against the catalog. While safer than DDL, it
+          still acquires a pool connection and can throw KnexTimeoutError under pool
+          pressure. In bootstrap code that runs before the app accepts traffic, an
+          unhandled rejection here crashes the startup process. Failure to handle this
+          error in idempotent-migration helper code (if (!(await knex.schema.hasTable(...)))
+          ...) prevents the migration from running and the service from starting.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/schema-builder.html
+        required_handling: >
+          Caller MUST wrap await knex.schema.hasTable() in try-catch in bootstrap and
+          migration code. Treat connection failures as a startup error and surface them
+          before the app starts accepting traffic.
+
+  - name: schema.hasColumn
+    import_path: knex
+    description: >
+      Executes a metadata query to check whether a column exists on a named table. Returns
+      Promise<boolean>. Same error surface as hasTable(). Commonly used to make
+      additive ALTER TABLE migrations idempotent.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/schema-builder.html
+      # types/index.d.ts line 2421 — `hasColumn(tableName, columnName): Promise<boolean>`.
+      - id: schema-has-column-no-try-catch
+        condition: |
+          await knex.schema.hasColumn(...) called without try-catch
+        throws: >
+          KnexTimeoutError on pool exhaustion;
+          Error on connection failure;
+          Error on permission denied against the system catalog
+        severity: warning
+        description: >
+          hasColumn() runs a SELECT against the catalog (information_schema.columns or
+          PRAGMA on SQLite). Identical error contract to hasTable(): connection failures,
+          pool exhaustion, and permission errors. Used inside idempotent ALTER TABLE
+          migrations — unhandled errors prevent the migration from progressing.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/schema-builder.html
+        required_handling: >
+          Caller MUST wrap await knex.schema.hasColumn() in try-catch in migration
+          guard-code.
+
+  - name: migrate.up
+    import_path: knex
+    description: >
+      Runs the next chronological pending migration (or a specific migration when
+      config.name is passed). Takes the same migration lock as migrate.latest() —
+      LockError is thrown if another process is migrating. Single-step variant of
+      migrate.latest() commonly used in development and dry-run workflows.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/migrations.html — "Runs the specified (by
+      # config.name parameter) or the next chronological migration that has not yet be run".
+      # types/index.d.ts line 3210 — `up(config?: ...): Promise<any>`.
+      - id: migrate-up-no-try-catch
+        condition: |
+          await knex.migrate.up(...) called without try-catch
+        throws: >
+          LockError("Migration table is already locked") if another process holds the lock;
+          Error from the migration script's up() function;
+          Error("Migration X was not found") if config.name references a missing migration;
+          KnexTimeoutError on connection pool exhaustion
+        severity: error
+        description: >
+          migrate.up() acquires the same migration lock as migrate.latest() and runs a
+          single pending migration. Identical failure modes to migrate.latest():
+          LockError on concurrent migration attempts, propagated errors from the
+          migration script, KnexTimeoutError on connection issues. Additionally throws if
+          config.name references a migration that doesn't exist on disk. Unhandled errors
+          in CI/CD pipelines fail the deploy step silently if the error is swallowed.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: >
+          Caller MUST wrap await knex.migrate.up() in try-catch in deploy scripts.
+          Distinguish LockError (concurrent deploy — retry/wait) from script errors
+          (genuine migration failure — alert and rollback).
+
+  - name: migrate.down
+    import_path: knex
+    description: >
+      Rolls back the most recently run migration (or a specific migration when config.name
+      is passed). Takes the same migration lock as migrate.latest() and migrate.up().
+      Single-step variant of migrate.rollback() commonly used to revert exactly one
+      problematic migration.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/migrations.html — "Will undo the specified (by
+      # config.name parameter) or the last migration that was run".
+      # types/index.d.ts line 3211 — `down(config?: ...): Promise<any>`.
+      - id: migrate-down-no-try-catch
+        condition: |
+          await knex.migrate.down(...) called without try-catch
+        throws: >
+          LockError("Migration table is already locked");
+          Error from the migration script's down() function;
+          Error("Migration X was not run") if the specified name refers to a migration that
+          was never applied;
+          KnexTimeoutError on pool exhaustion
+        severity: error
+        description: >
+          migrate.down() acquires the migration lock and runs a single migration's down()
+          step. Failure modes include LockError on concurrent runs, errors propagated from
+          the migration script's down() function (especially if the down() logic was never
+          actually exercised against production data), and "Migration was not run" if the
+          named migration is unknown to the migration table. Unhandled errors during a
+          rollback procedure leave the database in a half-rolled-back state.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: >
+          Caller MUST wrap await knex.migrate.down() in try-catch. In rollback automation,
+          surface the underlying script error rather than retrying — a failing down() step
+          usually indicates the migration's down() logic is broken or the data has drifted.
+
+  - name: migrate.forceFreeMigrationsLock
+    import_path: knex
+    description: >
+      Forcibly clears the migration lock table, leaving exactly one row with is_locked=0.
+      The escape hatch when a previous migration process crashed and left the lock acquired
+      indefinitely. Dangerous in production because it can race against an actually-running
+      migration; intended for operator recovery, not routine use.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/migrations.html — "Forcibly unlocks the
+      # migrations lock table, and ensures that there is only one row in it".
+      # types/index.d.ts line 3212 — `forceFreeMigrationsLock(...): Promise<any>`.
+      - id: migrate-force-free-lock-no-try-catch
+        condition: |
+          await knex.migrate.forceFreeMigrationsLock(...) called without try-catch
+        throws: >
+          Error on UPDATE failure against the lock table;
+          KnexTimeoutError on pool exhaustion;
+          Error on permission denied against the migration lock table
+        severity: warning
+        description: >
+          forceFreeMigrationsLock() runs an UPDATE/DELETE against the migration lock table
+          to clear is_locked. It can throw on connection failure, pool exhaustion, or
+          permission denied (the migration user must have UPDATE on the lock table).
+          Unhandled errors in recovery scripts leave the service stuck in a "migration
+          already locked" state until an operator intervenes manually.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: >
+          Caller MUST wrap await knex.migrate.forceFreeMigrationsLock() in try-catch.
+          Surface failures loudly — a failed unlock means the service cannot recover its
+          ability to migrate.
+      - id: migrate-force-free-lock-races-active-migration
+        condition: >
+          forceFreeMigrationsLock() called while another process is actively running a
+          migration (rather than the documented recovery case of a crashed migration)
+        throws: does not throw — silently clears the lock and allows a concurrent migration
+        severity: error
+        description: >
+          The documented use case is recovery from a crashed migration. If an operator
+          mistakenly runs forceFreeMigrationsLock() while a healthy migration is still in
+          progress, the lock is cleared and a second migration process can begin running
+          the same migrations concurrently. This violates the lock's whole purpose
+          (preventing duplicate migration runs) and can corrupt the migration state and
+          schema. The function does not detect or refuse to clear an actively-held lock.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/migrations.html
+        required_handling: >
+          Operator MUST verify no other migration process is running before calling
+          forceFreeMigrationsLock(). Treat this function as a manual operator tool, never
+          wire it into automated deploy scripts that run unconditionally.
+
+  - name: seed.run
+    import_path: knex
+    description: >
+      Runs all seed files (or a specific one via config.specific) in alphabetical order.
+      Each seed file is invoked sequentially — there is no transaction wrapping. If a seed
+      throws, execution halts immediately and the error is re-thrown with context. Commonly
+      used in test setup and local-environment bootstrapping.
+    postconditions:
+      # Evidence: https://github.com/knex/knex/blob/master/lib/migrations/seed/Seeder.js —
+      # Seeder._waterfallBatch wraps each seed call in try/catch and re-throws with
+      # "Error while executing \"${seedPath}\" seed: ${originalError.message}".
+      # The original error is attached as `.original` on the wrapper.
+      # types/index.d.ts line 3240 — `run(config?: SeederConfig): Promise<[string[]]>`.
+      - id: seed-run-no-try-catch
+        condition: |
+          await knex.seed.run(...) called without try-catch
+        throws: >
+          Error("Invalid seed file: <path> must have a seed function") if a file is
+          missing the seed export;
+          Error("Error while executing \"<path>\" seed: <original-message>") wrapping any
+          error thrown from inside the seed function (including all knex query errors:
+          insert constraint violations, connection failures, KnexTimeoutError);
+          Error if the seed directory does not exist
+        severity: error
+        description: >
+          seed.run() iterates seed files sequentially and catches per-file errors to
+          re-throw with the file path attached. The wrapped error carries the original
+          via .original. Because seeds are NOT wrapped in a transaction by knex itself,
+          a failure halfway through leaves the database in a partially-seeded state. In
+          CI test setup, an unhandled rejection from seed.run() typically aborts the test
+          run with an unclear error message unless the wrapper is caught and the
+          .original error is inspected.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/knex/knex/blob/master/lib/migrations/seed/Seeder.js
+        required_handling: >
+          Caller MUST wrap await knex.seed.run() in try-catch in test setup hooks and
+          bootstrap scripts. Inspect err.original to recover the underlying knex error
+          when reporting failures.
+      - id: seed-run-partial-state-on-failure
+        condition: >
+          seed.run() throws partway through a multi-file seed sequence without the caller
+          rolling back already-inserted rows or truncating the affected tables
+        throws: does not throw — leaves database in partially-seeded state
+        severity: warning
+        description: >
+          Seeds run sequentially without an enclosing transaction (knex does not wrap them
+          for the user). When seed file 3 of 5 throws, files 1 and 2 have already
+          committed their inserts. The next test run that re-seeds will hit unique
+          constraint violations on rows already inserted. The safe pattern in test setup
+          is to TRUNCATE the relevant tables (or knex.migrate.rollback + latest) before
+          re-running seeds, OR to wrap seed.run() in an explicit transaction so a failure
+          rolls everything back.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+        evidence_quality: confirmed
+        sources:
+          - https://github.com/knex/knex/blob/master/lib/migrations/seed/Seeder.js
+        required_handling: >
+          Caller SHOULD wrap seed.run() in an explicit transaction (or truncate-and-retry
+          on failure) when partial-state recovery matters. At minimum, treat a failed
+          seed.run() as a signal that the database needs cleanup before the next attempt.
+
+  - name: stream
+    import_path: knex
+    description: >
+      Returns a readable Node.js stream (PassThrough) for a query. Used to iterate large
+      result sets without loading them all into memory. Errors during stream consumption
+      (mid-stream connection drop, malformed row, downstream backpressure) are emitted as
+      'error' events on the stream — they do NOT throw from the original .stream() call.
+      Silent failure mode if the caller does not register an 'error' listener.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/interfaces.html — "If called with a callback,
+      # the callback is passed the stream and a promise is returned. Otherwise, the
+      # readable stream is returned." Also: "On an HTTP server, make sure to manually
+      # close your streams if a request is aborted."
+      # types/index.d.ts line 2299-2306 — three overloads, callback form returns
+      # Promise<any> and pure form returns PassThrough.
+      - id: stream-error-event-not-registered
+        condition: >
+          knex(...).stream() (or chained .stream()) consumed without registering an
+          'error' listener on the returned stream (or without try/catch around a
+          for-await-of loop consuming it)
+        throws: >
+          does not throw from the .stream() call — errors are emitted asynchronously
+          on the stream's 'error' event; an unhandled 'error' event terminates the
+          Node.js process with an uncaught exception
+        severity: error
+        description: >
+          knex streams emit query errors (mid-stream connection drop, driver-level
+          parse errors, query cancellation) as 'error' events on the returned readable
+          stream rather than rejecting the original Promise. If the caller pipes the
+          stream into a writable destination without registering a stream.on('error', ...)
+          handler, an emitted 'error' event becomes an uncaught exception and crashes
+          the Node process. The for-await-of consumption form bridges the error into
+          the for-loop's rejection (so try/catch around the loop works), but the
+          callback and raw-pipe forms do not.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/interfaces.html
+        required_handling: >
+          Caller MUST either (1) consume the stream with for-await-of inside try/catch,
+          OR (2) register stream.on('error', handler) before piping, OR (3) use the
+          callback form which returns a Promise that rejects on stream errors. Never
+          .pipe() a knex stream without an 'error' listener.
+      - id: stream-not-destroyed-on-request-abort
+        condition: >
+          knex stream piped into an HTTP response is not explicitly destroyed when the
+          HTTP request is aborted by the client
+        throws: >
+          does not throw — the database connection is held open and remains in the pool
+          as in-use until either query completion or KnexTimeoutError
+        severity: warning
+        description: >
+          The knex docs explicitly warn: "On an HTTP server, make sure to manually close
+          your streams if a request is aborted." When a client disconnects mid-stream
+          (closes the browser, mobile request times out), the underlying database query
+          continues running and the connection stays checked out of the pool. Under load,
+          this leaks pool connections rapidly and triggers KnexTimeoutError on every
+          subsequent request. Documented at https://knexjs.org/guide/interfaces.html.
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+        sources:
+          - https://knexjs.org/guide/interfaces.html
+        required_handling: >
+          Caller MUST listen for the HTTP request's 'aborted' / 'close' event and call
+          stream.destroy() to release the pooled connection. The for-await-of consumption
+          form handles this automatically (the docs state: "if the loop terminates with a
+          break, return, or a throw, the stream will be destroyed"). The raw-pipe form
+          does not.
 
 edge_cases:
   - id: connection-pool-exhaustion
