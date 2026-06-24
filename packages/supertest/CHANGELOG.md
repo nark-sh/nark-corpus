@@ -3,6 +3,18 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% -> 100% (re-verify, no surface change)
+
+- **Profile:** `packages/supertest/contract.yaml`
+- **Installed version inspected:** supertest@7.2.2 (within `>=4.0.0 <8.0.0`)
+- **Functions added:** none (0 total) — API surface unchanged from 2026-04-18 pass
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** unchanged from prior pass (HTTP verb aliases on Test/TestAgent, synchronous cookies assertion helpers, TestAgent.host/del aliases, bearer header setter)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** node_modules/supertest/index.js, node_modules/supertest/lib/agent.js, node_modules/supertest/lib/test.js, node_modules/supertest/lib/cookies/{index,assertion}.js
+- **Verified by:** bc-deepen-contract (pass on 2026-06-24T10:43:42Z, deepen-stream-3 pass 69)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** supertest@7.2.2
