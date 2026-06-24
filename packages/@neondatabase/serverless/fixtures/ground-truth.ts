@@ -270,3 +270,58 @@ export async function neonTransactionWithTryCatch(name: string, email: string) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. sql.query() — bare calls (no try-catch)
+//   Introduced in @neondatabase/serverless v1.0.0 (2025-03-25) as the explicit-
+//   parameterized-query escape hatch on the neon() result function.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function neonSqlQueryBareNoCatch(userId: string) {
+  // SHOULD_FIRE: neon-db-error — sql.query() can throw NeonDbError, no try-catch
+  const rows = await sqlFn.query('SELECT * FROM users WHERE id = $1', [userId]);
+  return rows;
+}
+
+export async function neonSqlQueryWithOptionsNoCatch(userId: string) {
+  // SHOULD_FIRE: neon-db-error — sql.query() with fetchOptions can still throw, no try-catch
+  const rows = await sqlFn.query(
+    'SELECT * FROM users WHERE id = $1',
+    [userId],
+    { fetchOptions: { priority: 'high' } },
+  );
+  return rows;
+}
+
+export async function neonSqlQueryInsertNoCatch(name: string, email: string) {
+  // SHOULD_FIRE: neon-db-error — sql.query() insert can throw on unique violation, no try-catch
+  await sqlFn.query('INSERT INTO users (name, email) VALUES ($1, $2)', [name, email]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. sql.query() — properly wrapped
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function neonSqlQueryWithTryCatch(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: neon-db-error — sql.query() wrapped in try-catch
+    const rows = await sqlFn.query('SELECT * FROM users WHERE id = $1', [userId]);
+    return rows;
+  } catch (error) {
+    console.error('Query failed:', error);
+    throw error;
+  }
+}
+
+export async function neonSqlQueryOuterTryCatch(userId: string) {
+  try {
+    // SHOULD_NOT_FIRE: neon-db-error — outer try-catch covers sql.query()
+    const rows = await sqlFn.query('SELECT * FROM users WHERE id = $1', [userId]);
+    return rows;
+  } catch (error) {
+    if (error instanceof Error && (error as { code?: string }).code === '23505') {
+      throw new Error('Duplicate user');
+    }
+    throw error;
+  }
+}
