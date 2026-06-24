@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100% (drift-by-staleness re-verify)
+
+- **Profile:** `packages/jwt-decode/contract.yaml`
+- **Latest published:** jwt-decode@4.0.0
+- **Profile semver:** `>=3.0.0 <5.0.0` (unchanged — 4.0.0 satisfies)
+- **API surface re-enumerated:** 1 callable function (`jwtDecode`) — synchronous, no async surface; types/interfaces (`InvalidTokenError`, `JwtHeader`, `JwtPayload`, `JwtDecodeOptions`) are non-callable.
+- **Functions added:** none (API surface unchanged since 2026-04-16 pass)
+- **Postconditions added:** 0 (`invalid-token` + `no-signature-validation` both still cover the full surface)
+- **Functions intentionally omitted this pass:** none
+- **Scanner concerns queued:** 0 (`concern-20260416-jwt-decode-deepen-1` already `implemented`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** built declarations at `node_modules/jwt-decode/build/esm/index.d.ts` (jwt-decode@4.0.0)
+- **Ground-truth tests:** 9/9 passed (`src/v2/fixtures/jwt-decode.ground-truth.test.ts`)
+- **Verified by:** bc-deepen-contract pass 53 deepen-stream-3 (2026-06-24T07:56:40Z)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** jwt-decode@4.0.0
