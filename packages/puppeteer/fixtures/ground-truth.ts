@@ -17,6 +17,9 @@
  *   - page.type()                  postcondition: type-element-not-found
  *   - page.$eval()                 postcondition: eval-element-not-found
  *   - puppeteer.connect()          postcondition: connect-websocket-error
+ *   - puppeteer.executablePath()   postcondition: executablepath-async-rejection (v25.0.0)
+ *   - puppeteer.defaultArgs()      postcondition: defaultargs-async-rejection (v25.0.0)
+ *   - puppeteer.trimCache()        postcondition: trimcache-unsupported-platform-error
  *
  * Detection path: puppeteer imported → method call →
  *   ThrowingFunctionDetector fires → ContractMatcher checks try-catch →
@@ -411,5 +414,63 @@ export async function connectWithCatch(wsUrl: string) {
     await browser.close();
   } catch (err) {
     console.error('Connect failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. puppeteer.executablePath() — v25 async migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function executablePathNoCatch() {
+  // SHOULD_FIRE: executablepath-async-rejection — rejects when no browser binary cached / unknown channel. No try-catch.
+  const path = await puppeteer.executablePath('chrome');
+  console.log('Chrome binary at:', path);
+}
+
+export async function executablePathWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: executablePath inside try-catch
+    const path = await puppeteer.executablePath('chrome');
+    console.log('Chrome binary at:', path);
+  } catch (err) {
+    console.error('No Chrome binary cached:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. puppeteer.defaultArgs() — v25 async migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function defaultArgsNoCatch() {
+  // SHOULD_FIRE: defaultargs-async-rejection — rejects when browser type unresolvable. No try-catch.
+  const args = await puppeteer.defaultArgs();
+  console.log('Default args:', args.join(' '));
+}
+
+export async function defaultArgsWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: defaultArgs inside try-catch
+    const args = await puppeteer.defaultArgs();
+    console.log('Default args:', args.join(' '));
+  } catch (err) {
+    console.error('defaultArgs failed:', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. puppeteer.trimCache() — platform detection / permission failure
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function trimCacheNoCatch() {
+  // SHOULD_FIRE: trimcache-unsupported-platform-error — rejects on unsupported platform or fs.rm permission error. No try-catch.
+  await puppeteer.trimCache();
+}
+
+export async function trimCacheWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: trimCache inside try-catch
+    await puppeteer.trimCache();
+  } catch (err) {
+    console.warn('trimCache skipped:', err);
   }
 }

@@ -1,12 +1,12 @@
 package: puppeteer
 semver: ">=1.0.0"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-04-04"
+last_verified: "2026-06-23"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0  # 16 contracted / 16 non-omitted async functions (24 intentionally omitted)
+coverage_score: 1.0  # 19 contracted / 19 non-omitted async functions (24 intentionally omitted)
 
 detection:
   type_names:
@@ -34,6 +34,15 @@ detection:
     - ".type("
     - ".$eval("
     - ".connect("
+    - ".executablePath("
+    - ".defaultArgs("
+    - ".trimCache("
+  named_imports:
+    - connect
+    - launch
+    - executablePath
+    - defaultArgs
+    - trimCache
 
 functions:
   - name: launch
@@ -493,6 +502,113 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  - name: executablePath
+    import_path: "puppeteer"
+    description: >
+      Returns the default executable path for the resolved browser binary.
+      Became async in puppeteer v25.0.0 (was sync in 24.x and earlier).
+      Used by deployment scripts, CI pipelines, and serverless wrappers that
+      must locate Chrome before launching.
+    postconditions:
+      # Evidence: https://pptr.dev/api/puppeteer.puppeteernode.executablepath
+      # Source: packages/puppeteer-core/src/node/PuppeteerNode.ts — async executablePath()
+      # Breaking change: v25.0.0 — "return a Promise for executablePath, defaultArgs"
+      - id: executablepath-async-rejection
+        condition: "Underlying launcher cannot resolve a browser binary for the host (binary missing from cache, platform unsupported, channel not installed)"
+        throws: "Promise rejection with Error when the launcher's executablePath resolution fails (e.g. unknown ChromeReleaseChannel, no binary cached, unsupported platform)"
+        required_handling: >
+          Caller MUST wrap puppeteer.executablePath() in try-catch. CRITICAL
+          breaking change: was synchronous in puppeteer <=24.x, became async
+          in v25.0.0. Code that previously read the return value directly will
+          now receive a Promise<string> and silently treat it as a path string
+          like "[object Promise]" — passing it to spawn()/launch() fails with
+          ENOENT. Callers that just upgraded to v25 MUST either await the
+          result or use Promise.then. In CI/deployment scripts this is the #1
+          v25 migration footgun. Pattern:
+          try { const path = await puppeteer.executablePath('chrome'); } catch (error) { /* handle */ }
+        sources:
+          - "https://pptr.dev/api/puppeteer.puppeteernode.executablepath"
+          - "https://github.com/puppeteer/puppeteer/blob/main/packages/puppeteer-core/CHANGELOG.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: defaultArgs
+    import_path: "puppeteer"
+    description: >
+      Returns the default Chromium command-line arguments for the configured
+      browser/channel. Became async in puppeteer v25.0.0 (was sync). Used by
+      orchestration code that customizes Chrome flags before calling launch().
+    postconditions:
+      # Evidence: https://pptr.dev/api/puppeteer.puppeteernode.defaultargs
+      # Source: packages/puppeteer-core/src/node/PuppeteerNode.ts — async defaultArgs(options)
+      # Breaking change: v25.0.0 — same family as executablePath
+      - id: defaultargs-async-rejection
+        condition: "Browser launcher cannot resolve the requested browser (unknown browser type, lastLaunchedBrowser unresolvable for no-arg call)"
+        throws: "Promise rejection with Error when the underlying launcher cannot determine default args"
+        required_handling: >
+          Caller MUST wrap puppeteer.defaultArgs() in try-catch. Same v25.0.0
+          breaking change as executablePath() — was sync, now returns a
+          Promise<string[]>. Code that does:
+            const args = [...puppeteer.defaultArgs(), '--my-flag'];
+          breaks silently on v25.x — spreading a Promise yields no array items
+          and Chrome launches with only "--my-flag". Always await:
+            const baseArgs = await puppeteer.defaultArgs();
+            const args = [...baseArgs, '--my-flag'];
+        sources:
+          - "https://pptr.dev/api/puppeteer.puppeteernode.defaultargs"
+          - "https://github.com/puppeteer/puppeteer/blob/main/packages/puppeteer-core/CHANGELOG.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: trimCache
+    import_path: "puppeteer"
+    description: >
+      Removes non-current Firefox and Chrome binaries from the Puppeteer
+      cache directory while preserving the currently configured browser
+      version. Used by deployment pipelines and Docker images that want
+      to shrink disk usage after upgrades.
+    postconditions:
+      # Evidence: https://pptr.dev/api/puppeteer.puppeteernode.trimcache
+      # Source: packages/puppeteer-core/src/node/PuppeteerNode.ts —
+      #   trimCache(): "throw new Error('The current platform is not supported.')"
+      #   when detectBrowserPlatform() returns null
+      - id: trimcache-unsupported-platform-error
+        condition: "Host platform is not one of the platforms @puppeteer/browsers recognizes (e.g. exotic ARM64 Linux distros, unusual containers)"
+        throws: "Promise rejection with Error('The current platform is not supported.') OR Error from fs.rm on permission failures while pruning cache directories"
+        required_handling: >
+          Caller MUST wrap puppeteer.trimCache() in try-catch. Two distinct
+          failure modes: (1) platform detection fails — common in minimal
+          containers without /etc/os-release or on uncommon ARM variants;
+          (2) cache directory traversal hits a permission error (running as
+          unprivileged user against a cache populated by root, or NFS-mounted
+          cache with stale handles). In Docker build pipelines, an unhandled
+          rejection here kills the whole build with no useful log line.
+          Pattern:
+            try { await puppeteer.trimCache(); }
+            catch (error) { console.warn('trimCache skipped:', error); }
+        sources:
+          - "https://pptr.dev/api/puppeteer.puppeteernode.trimcache"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 edge_cases:
   - id: zombie-process-prevention
