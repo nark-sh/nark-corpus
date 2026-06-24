@@ -3,6 +3,24 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-24 — deepen pass — coverage 100% → 100%
+
+- **Profile:** `packages/rxjs/contract.yaml`
+- **Mode:** drift-by-staleness re-verification (last_deepened was 2026-04-16, oldest in public tier)
+- **Functions added:** none (API surface unchanged)
+- **Postconditions added:** 0
+- **Functions intentionally omitted this pass:** none (all 5 async-callable still contracted)
+- **Scanner concerns queued:** 0
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `node_modules/rxjs/dist/types/internal/firstValueFrom.d.ts` (signature unchanged)
+  - `node_modules/rxjs/dist/types/internal/lastValueFrom.d.ts` (signature unchanged)
+  - `node_modules/rxjs/dist/types/internal/Observable.d.ts` (forEach, toPromise unchanged)
+  - `node_modules/rxjs/dist/types/internal/observable/dom/fetch.d.ts` (fromFetch unchanged)
+  - `node_modules/rxjs/CHANGELOG.md` (7.7.0 → 7.8.2 are bug fixes only)
+- **Verdict:** rxjs@7.8.2 is the latest within the declared semver `>=7.0.0 <8.0.0`. No new async-callable functions since 2026-04-16. ajax/webSocket exports return Observables (not Promises), not relevant. Contract re-verified accurate. `contract_version` bumped 1.1.0 -> 1.1.1.
+- **Verified by:** bc-deepen-contract (pass 54 on 2026-06-24T06:28:22Z, deepen-stream-2)
+
 ## 2026-06-18 — re-verified clean
 
 - **Latest published:** rxjs@7.8.2
