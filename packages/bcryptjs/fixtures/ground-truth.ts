@@ -5,8 +5,15 @@
  * Derived from the contract spec, NOT V1 behavior.
  *
  * Contracted functions (from import "bcryptjs"):
- *   - bcrypt.hash()     postcondition: hash-type-error
- *   - bcrypt.compare()  postcondition: compare-type-error
+ *   - bcrypt.hash()        postcondition: hash-type-error (async)
+ *   - bcrypt.compare()     postcondition: compare-type-error (async)
+ *   - bcrypt.genSalt()     postcondition: gensalt-invalid-rounds (async)
+ *   - bcrypt.hashSync()    postcondition: hash-sync-type-error (sync)
+ *   - bcrypt.compareSync() postcondition: compare-sync-type-error (sync)
+ *   - bcrypt.genSaltSync() postcondition: gensalt-sync-invalid-rounds (sync)
+ *   - bcrypt.getRounds()   postcondition: get-rounds-type-error (sync)
+ *   - bcrypt.getSalt()     postcondition: get-salt-type-error (sync)
+ *   - bcrypt.truncates()   postcondition: truncates-type-error (sync)
  *
  * Detection path: direct import → ThrowingFunctionDetector fires hash()/compare() →
  *   ContractMatcher checks try-catch → postcondition fires
@@ -113,5 +120,85 @@ export function truncatesWithCatch(password: string) {
   } catch (err) {
     console.error('truncates failed:', err);
     return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. bcrypt.genSalt() — async Promise-returning (added 2026-06-25 pass 19)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function genSaltNoCatch(rounds: number) {
+  // SHOULD_FIRE: gensalt-invalid-rounds — throws on invalid rounds. No try-catch.
+  const salt = await bcrypt.genSalt(rounds);
+  return salt;
+}
+
+export async function genSaltWithCatch(rounds: number) {
+  try {
+    // SHOULD_NOT_FIRE: genSalt() inside try-catch satisfies error handling
+    return await bcrypt.genSalt(rounds);
+  } catch (err) {
+    console.error('genSalt failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. bcrypt.hashSync() — sync throw-bearing (added 2026-06-25 pass 19)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function hashSyncNoCatch(password: string) {
+  // SHOULD_FIRE: hash-sync-type-error — throws synchronously if password is not a string. No try-catch.
+  const hash = bcrypt.hashSync(password, 10);
+  return hash;
+}
+
+export function hashSyncWithCatch(password: string) {
+  try {
+    // SHOULD_NOT_FIRE: hashSync() inside try-catch satisfies error handling
+    return bcrypt.hashSync(password, 10);
+  } catch (err) {
+    console.error('hashSync failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. bcrypt.compareSync() — sync throw-bearing (added 2026-06-25 pass 19)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function compareSyncNoCatch(password: string, stored: string) {
+  // SHOULD_FIRE: compare-sync-type-error — throws if password or hash is not a string. No try-catch.
+  const match = bcrypt.compareSync(password, stored);
+  return match;
+}
+
+export function compareSyncWithCatch(password: string, stored: string) {
+  try {
+    // SHOULD_NOT_FIRE: compareSync() inside try-catch satisfies error handling
+    return bcrypt.compareSync(password, stored);
+  } catch (err) {
+    console.error('compareSync failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. bcrypt.genSaltSync() — sync throw-bearing (added 2026-06-25 pass 19)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function genSaltSyncNoCatch(rounds: number) {
+  // SHOULD_FIRE: gensalt-sync-invalid-rounds — throws on invalid rounds. No try-catch.
+  const salt = bcrypt.genSaltSync(rounds);
+  return salt;
+}
+
+export function genSaltSyncWithCatch(rounds: number) {
+  try {
+    // SHOULD_NOT_FIRE: genSaltSync() inside try-catch satisfies error handling
+    return bcrypt.genSaltSync(rounds);
+  } catch (err) {
+    console.error('genSaltSync failed:', err);
+    throw err;
   }
 }

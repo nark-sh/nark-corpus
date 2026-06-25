@@ -3,6 +3,21 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-25 — deepen pass — coverage 75% → 75% (fixture completeness pass)
+
+- **Profile:** `packages/bcryptjs/contract.yaml`
+- **Functions added:** none (all 9 contractable functions already contracted)
+- **Postconditions added:** 0
+- **Fixture annotations added:** 4 SHOULD_FIRE/SHOULD_NOT_FIRE pairs in `fixtures/ground-truth.ts`:
+  `genSalt`, `hashSync`, `compareSync`, `genSaltSync` — all previously contracted but lacking ground-truth test cases
+- **Functions intentionally omitted this pass:** `setRandomFallback` (config-only), `encodeBase64` (internal), `decodeBase64` (internal) — same as previous pass
+- **Scanner concerns queued:** 0 (all prior bcryptjs concerns are status:implemented)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** bcryptjs@3.0.3 `types.d.ts` (re-verified full API surface: 12 exports, no changes since 3.0.3)
+- **Verified by:** bc-deepen-contract (pass 19, deepen-stream-1, 2026-06-25)
+- **Coverage score fix:** contract.yaml `coverage_score` corrected from `1.0` (effective) to `0.75` (raw 9/12) for consistency with deepen-index
+
+
 ## 2026-06-19 — deepen pass — coverage 50% → 75% (effective 100%)
 
 - **Profile:** `packages/bcryptjs/contract.yaml`
