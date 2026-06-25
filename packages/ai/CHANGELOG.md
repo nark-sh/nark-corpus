@@ -1,6 +1,15 @@
 # CHANGELOG — ai
 
-## 2026-06-25 — re-verified clean
+## 2026-06-25 — extends-fork created for v7+
+
+- **Latest published:** ai@7.0.0
+- **New profile:** `packages/ai-v7/contract.yaml` (extends `../ai/contract.yaml`)
+- **Parent narrowed to:** `>=2.0.0 <7.0.0` — already correct, no change needed
+- **Diverged postconditions overridden:** none
+- **New postconditions added:** `tool-context-schema-validation` (TypeValidationError from contextSchema validation, new in v7 CHANGELOG f319fde)
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+## 2026-06-25 — re-verified clean (pre-v7 release)
 
 - **Latest published:** ai@6.0.209
 - **Profile semver:** >=2.0.0 <7.0.0 (unchanged)
