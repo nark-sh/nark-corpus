@@ -1,5 +1,14 @@
 # CHANGELOG — @elastic/elasticsearch
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** @elastic/elasticsearch@9.4.2
+- **Profile semver:** >=7.0.0 <10.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 

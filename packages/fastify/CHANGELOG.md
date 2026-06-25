@@ -1,5 +1,14 @@
 # CHANGELOG — fastify
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** fastify@5.8.5
+- **Profile semver:** >=5.0.0 <6.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 ## 2026-06-24 — deepen pass — coverage 91% → 100%

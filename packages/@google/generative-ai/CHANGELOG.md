@@ -1,5 +1,14 @@
 # CHANGELOG — @google/generative-ai
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** @google/generative-ai@0.24.1
+- **Profile semver:** >=0.11.0 <1.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 ## 2026-06-24 — deepen pass — coverage 83% → 93%

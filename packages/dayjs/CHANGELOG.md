@@ -1,5 +1,14 @@
 # CHANGELOG — dayjs
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** dayjs@1.11.21
+- **Profile semver:** >=1.10.0 <2.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 

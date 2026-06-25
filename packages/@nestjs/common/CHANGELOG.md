@@ -1,5 +1,14 @@
 # CHANGELOG — @nestjs/common
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** @nestjs/common@11.1.27
+- **Profile semver:** >=10.0.0 <12.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 

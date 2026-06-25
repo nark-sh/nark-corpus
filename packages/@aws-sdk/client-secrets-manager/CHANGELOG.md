@@ -1,5 +1,14 @@
 # Changelog — @aws-sdk/client-secrets-manager
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** @aws-sdk/client-secrets-manager@3.1075.0
+- **Profile semver:** >=3.0.0 <4.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 Created by bc-deepen-contract Phase 6.4 — pre-CHANGELOG history not preserved.
 
 ## 2026-06-24 — deepen pass — coverage 71% → 79%

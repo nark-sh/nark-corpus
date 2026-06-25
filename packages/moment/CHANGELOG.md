@@ -1,5 +1,14 @@
 # CHANGELOG — moment
 
+## 2026-06-25 — re-verified clean
+
+- **Latest published:** moment@2.30.1
+- **Profile semver:** >=2.29.0 <3.0.0 (unchanged)
+- **Verdict:** no changes — latest satisfies declared semver (or drift is benign; new major covered by existing fork profile where applicable)
+- **Scanner version used:** nark@3.2.0
+- **Verified by:** bc-version-drift (sweep 2026-06-25)
+
+
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
