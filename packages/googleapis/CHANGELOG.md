@@ -1,5 +1,16 @@
 # CHANGELOG — googleapis
 
+## 2026-06-25 — deepen pass — coverage 79% → 89%
+
+- **Profile:** `packages/googleapis/contract.yaml`
+- **Functions added:** messages.watch, files.delete, files.export, events.delete, values.append (5 total)
+- **Postconditions added:** 7 (gmail-watch-pubsub-permission-missing, gmail-watch-expiry-not-renewed, drive-files-delete-no-try-catch, drive-files-delete-folder-cascade, drive-files-export-no-try-catch, calendar-events-delete-no-try-catch, sheets-values-append-no-try-catch)
+- **Functions intentionally omitted this pass:** none new — 3 omitted groups carry forward from prior passes (admin.users.list Workspace admin ops; specialized infra APIs BigQuery/Pub-Sub/Analytics; narrow-adoption YouTube playlist features)
+- **Scanner concerns queued:** 5 (`concern-20260625-googleapis-deepen-1` through `concern-20260625-googleapis-deepen-5`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** https://developers.google.com/gmail/api/guides/push, https://developers.google.com/drive/api/guides/handle-errors, https://developers.google.com/drive/api/reference/rest/v3/files/delete, https://developers.google.com/drive/api/reference/rest/v3/files/export, https://developers.google.com/calendar/api/guides/errors, https://developers.google.com/sheets/api/limits
+- **Verified by:** bc-deepen-contract (pass on 2026-06-25T05:05:21Z, deepen-stream-2 pass=2)
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** googleapis@173.0.0

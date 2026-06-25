@@ -2,11 +2,11 @@ package: googleapis
 semver: ">=39.1.0 <200.0.0"
 contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-24"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.79  # 11 contracted functions / 14 meaningful async-callable API groups (3 intentionally omitted)
+coverage_score: 0.89  # 16 contracted functions / 18 meaningful async-callable API groups (3 intentionally omitted: admin.users.list, youtube.playlists.insert, analytics/bigquery/pubsub infra)
 
 # Detection rules for analyzer integration
 detection:
@@ -678,3 +678,239 @@ functions:
           visibility: silent
           user_experience: lost_transaction
           incident_cost_range: low
+
+  - name: messages.watch
+    import_path: googleapis
+    description: >
+      Registers a Gmail push notification watch on a user's mailbox, routing
+      change notifications to a Google Cloud Pub/Sub topic. Used by SaaS apps
+      that need real-time email sync (read/unread state, new messages, label
+      changes). The watch subscription expires after 7 days and MUST be renewed.
+    postconditions:
+      # Evidence: https://developers.google.com/gmail/api/reference/rest/v1/users/watch
+      # Evidence: https://developers.google.com/gmail/api/guides/push
+      # Error types confirmed from gaxios GaxiosError (status + response.data.error.errors[0].reason)
+      - id: gmail-watch-pubsub-permission-missing
+        condition: >
+          gmail.users.watch() called without try-catch when the Pub/Sub topic
+          does not exist or the Gmail push service account
+          (gmail-api-push@system.gserviceaccount.com) has not been granted
+          Publish permission on the topic. This is the most common misconfiguration
+          in production deployments.
+        throws: "GaxiosError with status 403, error.response.data.error.message contains 'topic'"
+        required_handling: >
+          Wrap in try-catch. A 403 with 'topic' in the error message indicates
+          Pub/Sub topic misconfiguration — the topic may not exist, or the
+          Gmail push service account lacks Publish rights. Do NOT retry until
+          the IAM permissions are fixed. Log the full error.response.data.error
+          for diagnosis — the message details which condition failed.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/push"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded
+          incident_cost_range: high
+
+      - id: gmail-watch-expiry-not-renewed
+        condition: >
+          gmail.users.watch() is set up once at startup but never re-called.
+          The watch expires after 7 days. After expiration, no push notifications
+          are delivered but the app receives no error — notifications simply stop
+          arriving. This is the primary "works in staging, fails in production after
+          first week" pattern for Gmail integrations.
+        throws: "No error thrown — silent failure: notifications stop arriving after ~7 days"
+        required_handling: >
+          Schedule a daily or weekly job to call watch() again (every 1-3 days is
+          safe). The watch() call is idempotent — re-registering before expiry
+          simply resets the timer. Store expiration from response.expiration and
+          alert if the renewal job fails. Implement periodic history.list() fallback
+          polling to catch missed notifications.
+        sources:
+          - "https://developers.google.com/gmail/api/guides/push"
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_incorrect
+          visibility: silent
+          user_experience: degraded
+          incident_cost_range: high
+
+  - name: files.delete
+    import_path: googleapis
+    description: >
+      Permanently deletes a file from Google Drive WITHOUT moving it to trash.
+      This is irreversible — there is no confirmation step and no undo.
+      For Shared Drive files, the caller must be an organizer on the parent folder.
+      When deleting a folder, all descendant files owned by the caller are also
+      permanently deleted.
+    postconditions:
+      # Evidence: https://developers.google.com/drive/api/guides/handle-errors
+      # Evidence: https://developers.google.com/drive/api/reference/rest/v3/files/delete
+      # Error types confirmed: GaxiosError with status codes per Drive error documentation
+      - id: drive-files-delete-no-try-catch
+        condition: >
+          drive.files.delete() called without try-catch. The file may not exist
+          (404), the user may lack delete rights (403 insufficientFilePermissions),
+          or the file may be in a Shared Drive where the user is not an organizer.
+        throws: "GaxiosError with status 403 (reason: 'insufficientFilePermissions') or 404 (reason: 'notFound')"
+        required_handling: >
+          Wrap in try-catch. For 404 errors, the file was already deleted or
+          was never accessible — treat as idempotent success for cleanup jobs.
+          For 403 errors with reason === 'insufficientFilePermissions', the
+          caller lacks delete rights (may be a writer or commenter, not owner).
+          For Shared Drive files (403 with 'teamDriveMembershipRequired' or
+          lacking organizer role), surface the error clearly rather than retrying.
+          IMPORTANT: because this operation is irreversible, confirm the correct
+          fileId before calling — there is no trash to recover from.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+      - id: drive-files-delete-folder-cascade
+        condition: >
+          drive.files.delete() called on a folder without try-catch. All
+          descendant files owned by the user are permanently deleted in a
+          single operation. There is no confirmation, no progress event,
+          and no partial failure indication — either all owned files are
+          deleted or the call fails entirely.
+        throws: "GaxiosError with status 4xx/5xx if the folder itself cannot be deleted, but descendant deletion is atomic and irreversible on success"
+        required_handling: >
+          Wrap in try-catch. Before deleting a folder, enumerate its contents
+          with drive.files.list() to confirm the scope of deletion. For batch
+          cleanup jobs, prefer moving to trash first (files.update with trashed=true)
+          to allow a recovery window, then permanent delete after confirmation.
+        sources:
+          - "https://developers.google.com/drive/api/reference/rest/v3/files/delete"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: high
+
+  - name: files.export
+    import_path: googleapis
+    description: >
+      Exports a Google Workspace document (Docs, Sheets, Slides, Drawings) to
+      a binary format such as PDF, DOCX, XLSX, or CSV. Commonly used in SaaS
+      apps that generate reports by creating a Google Sheet and then exporting
+      as PDF. Exports are subject to a hard 10 MB size limit per file.
+    postconditions:
+      # Evidence: https://developers.google.com/drive/api/guides/handle-errors
+      # Evidence: https://developers.google.com/drive/api/reference/rest/v3/files/export
+      # Error types confirmed: GaxiosError with status codes per Drive docs
+      - id: drive-files-export-no-try-catch
+        condition: >
+          drive.files.export() called without try-catch. The exported file may
+          exceed 10 MB (returns 403 with fileNotExportable), the MIME type may
+          be unsupported for the document type, or the user may lack read access
+          to the file.
+        throws: "GaxiosError with status 403 (reason: 'fileNotExportable') for size/format violations, or 404 (reason: 'notFound') for missing files"
+        required_handling: >
+          Wrap in try-catch. For 403 with reason === 'fileNotExportable', the
+          document is too large (>10 MB) or the requested MIME type is unsupported
+          for the document type — do NOT retry with the same parameters. For
+          large documents, use the Google Workspace export API with pagination
+          or split the document before export. Always validate the mimeType
+          parameter against the supported export formats for the source document type.
+        sources:
+          - "https://developers.google.com/drive/api/guides/handle-errors"
+          - "https://developers.google.com/drive/api/reference/rest/v3/files/export"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: events.delete
+    import_path: googleapis
+    description: >
+      Permanently deletes a Google Calendar event. If the event has attendees,
+      cancellation emails are sent to them. For recurring event series, deleting
+      the base event deletes ALL instances. For Shared Calendars, the caller
+      must have writer or owner access.
+    postconditions:
+      # Evidence: https://developers.google.com/calendar/api/guides/errors
+      # Evidence: https://developers.google.com/calendar/api/reference/rest/v3/events/delete
+      # Error types confirmed: GaxiosError with status codes per Calendar error guide
+      - id: calendar-events-delete-no-try-catch
+        condition: >
+          calendar.events.delete() called without try-catch. The event may not
+          exist (404 notFound), the caller may lack writer access to the calendar
+          (403 forbiddenForNonOrganizer for shared events), or rate limits may
+          be exceeded (403 rateLimitExceeded / userRateLimitExceeded).
+        throws: "GaxiosError with status 404 (reason: 'notFound'), 403 (reason: 'rateLimitExceeded' or 'forbiddenForNonOrganizer')"
+        required_handling: >
+          Wrap in try-catch. For 404 errors, the event was already deleted —
+          treat as idempotent success for cleanup jobs. For 403 with reason ===
+          'forbiddenForNonOrganizer', the caller is not the event organizer and
+          the calendar owner has restricted modifications to organizers only.
+          For 403 rate limit errors, implement exponential backoff per the
+          Calendar API quota documentation (60 writes per user per minute).
+        sources:
+          - "https://developers.google.com/calendar/api/guides/errors"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+  - name: values.append
+    import_path: googleapis
+    description: >
+      Appends values to a Google Sheet by finding the last row in a table
+      within the specified range and writing new rows immediately after.
+      Distinct from values.update (which overwrites a specific range) in that
+      append auto-detects the table extent and extends it. Subject to Sheets
+      quota limits (60 write requests per user per minute, 300 per project
+      per minute).
+    postconditions:
+      # Evidence: https://developers.google.com/sheets/api/limits
+      # Evidence: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/append
+      # Error types confirmed: GaxiosError with 429 when quota exceeded
+      - id: sheets-values-append-no-try-catch
+        condition: >
+          sheets.spreadsheets.values.append() called without try-catch in a
+          high-frequency write path (logging, event streaming, bulk data import).
+          Write quota is 60 requests/user/minute and 300/project/minute.
+          Exceeding quota results in 429 Too Many Requests responses that must
+          be retried with backoff.
+        throws: "GaxiosError with status 429 (rateLimitExceeded) when write quota exceeded; GaxiosError with status 403 (reason: 'insufficientFilePermissions') when caller lacks edit access to the spreadsheet"
+        required_handling: >
+          Wrap in try-catch. For 429 errors, implement exponential backoff with
+          jitter (start at 1 second, double each retry, max 32 seconds). For
+          high-volume append jobs, batch multiple rows into a single append call
+          rather than one call per row. For 403 insufficientFilePermissions,
+          the service account or OAuth user lacks editor access to the sheet —
+          do NOT retry until permissions are fixed.
+        sources:
+          - "https://developers.google.com/sheets/api/limits"
+          - "https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/append"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium

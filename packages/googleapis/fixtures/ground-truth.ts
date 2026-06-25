@@ -26,6 +26,13 @@
  *   drive-permissions-create-sharing-rate-limit
  *   drive-permissions-create-insufficient-permissions
  *   drive-permissions-create-invalid-sharing-request
+ *   gmail-watch-pubsub-permission-missing
+ *   gmail-watch-expiry-not-renewed (silent — no error thrown on expiry)
+ *   drive-files-delete-no-try-catch
+ *   drive-files-delete-folder-cascade
+ *   drive-files-export-no-try-catch
+ *   calendar-events-delete-no-try-catch
+ *   sheets-values-append-no-try-catch
  */
 
 import { google } from 'googleapis';
@@ -395,6 +402,192 @@ export async function sharePermissionWithCatch(
       if (reason === 'invalidSharingRequest') {
         const msg = (error as any).response?.data?.error?.message ?? 'Invalid share';
         throw new Error(`Drive share rejected: ${msg}`);
+      }
+    }
+    throw error;
+  }
+}
+
+// ─── Gmail: messages.watch (push notifications) ───────────────────────────────
+
+export async function setupGmailWatchNoCatch(topicName: string) {
+  const gmail = google.gmail({ version: 'v1', auth });
+  // SHOULD_FIRE: gmail-watch-pubsub-permission-missing — Pub/Sub permission misconfiguration unhandled
+  const response = await gmail.users.watch({
+    userId: 'me',
+    requestBody: {
+      topicName,
+      labelIds: ['INBOX'],
+      labelFilterAction: 'include',
+    },
+  });
+  return response.data;
+}
+
+export async function setupGmailWatchWithCatch(topicName: string) {
+  const gmail = google.gmail({ version: 'v1', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with Pub/Sub permission error handling
+    const response = await gmail.users.watch({
+      userId: 'me',
+      requestBody: {
+        topicName,
+        labelIds: ['INBOX'],
+        labelFilterAction: 'include',
+      },
+    });
+    return response.data;
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      if (error.status === 403) {
+        const msg = (error as any).response?.data?.error?.message ?? '';
+        if (msg.toLowerCase().includes('topic')) {
+          throw new Error(`Gmail push setup failed — Pub/Sub topic permission missing: ${msg}`);
+        }
+        throw new Error(`Gmail watch setup forbidden: ${error.message}`);
+      }
+    }
+    throw error;
+  }
+}
+
+// ─── Drive: files.delete ─────────────────────────────────────────────────────
+
+export async function deleteDriveFileNoCatch(fileId: string) {
+  const drive = google.drive({ version: 'v3', auth });
+  // SHOULD_FIRE: drive-files-delete-no-try-catch — permanent irreversible delete, no error handling
+  await drive.files.delete({ fileId });
+}
+
+export async function deleteFolderNoCatch(folderId: string) {
+  const drive = google.drive({ version: 'v3', auth });
+  // SHOULD_FIRE: drive-files-delete-folder-cascade — all owned descendants permanently deleted
+  await drive.files.delete({ fileId: folderId });
+}
+
+export async function deleteDriveFileWithCatch(fileId: string) {
+  const drive = google.drive({ version: 'v3', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with 404 idempotency handling
+    await drive.files.delete({ fileId });
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      if (error.status === 404) {
+        return; // already deleted — treat as success for cleanup jobs
+      }
+      if (error.status === 403) {
+        const reason = (error as any).response?.data?.error?.errors?.[0]?.reason;
+        if (reason === 'insufficientFilePermissions') {
+          throw new Error('Cannot delete: caller is not the file owner or Shared Drive organizer');
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+// ─── Drive: files.export ─────────────────────────────────────────────────────
+
+export async function exportDriveFileNoCatch(fileId: string, mimeType: string) {
+  const drive = google.drive({ version: 'v3', auth });
+  // SHOULD_FIRE: drive-files-export-no-try-catch — 10 MB limit and format errors unhandled
+  const response = await drive.files.export({ fileId, mimeType });
+  return response.data;
+}
+
+export async function exportDriveFileWithCatch(fileId: string, mimeType: string) {
+  const drive = google.drive({ version: 'v3', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with format/size error handling
+    const response = await drive.files.export({ fileId, mimeType });
+    return response.data;
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      if (error.status === 403) {
+        const reason = (error as any).response?.data?.error?.errors?.[0]?.reason;
+        if (reason === 'fileNotExportable') {
+          throw new Error('File cannot be exported: exceeds 10 MB limit or unsupported MIME type');
+        }
+      }
+      if (error.status === 404) {
+        throw new Error('File not found for export');
+      }
+    }
+    throw error;
+  }
+}
+
+// ─── Calendar: events.delete ─────────────────────────────────────────────────
+
+export async function deleteCalendarEventNoCatch(calendarId: string, eventId: string) {
+  const calendar = google.calendar({ version: 'v3', auth });
+  // SHOULD_FIRE: calendar-events-delete-no-try-catch — 404, 403 organizer restriction unhandled
+  await calendar.events.delete({ calendarId, eventId });
+}
+
+export async function deleteCalendarEventWithCatch(calendarId: string, eventId: string) {
+  const calendar = google.calendar({ version: 'v3', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with idempotency and organizer handling
+    await calendar.events.delete({ calendarId, eventId });
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      if (error.status === 404) {
+        return; // already deleted — treat as success for cleanup jobs
+      }
+      if (error.status === 403) {
+        const reason = (error as any).response?.data?.error?.errors?.[0]?.reason;
+        if (reason === 'forbiddenForNonOrganizer') {
+          throw new Error('Only the event organizer can delete this shared event');
+        }
+        if (reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded') {
+          throw new Error('Calendar API rate limit exceeded — use exponential backoff');
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+// ─── Sheets: values.append ───────────────────────────────────────────────────
+
+export async function appendSheetRowsNoCatch(
+  spreadsheetId: string, range: string, values: string[][]
+) {
+  const sheets = google.sheets({ version: 'v4', auth });
+  // SHOULD_FIRE: sheets-values-append-no-try-catch — 429 rate limit, 403 permissions unhandled
+  const response = await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range,
+    valueInputOption: 'RAW',
+    requestBody: { values },
+  });
+  return response.data.updates;
+}
+
+export async function appendSheetRowsWithCatch(
+  spreadsheetId: string, range: string, values: string[][]
+) {
+  const sheets = google.sheets({ version: 'v4', auth });
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch with rate limit backoff handling
+    const response = await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range,
+      valueInputOption: 'RAW',
+      requestBody: { values },
+    });
+    return response.data.updates;
+  } catch (error) {
+    if (error instanceof GaxiosError) {
+      if (error.status === 429) {
+        throw new Error('Sheets write quota exceeded (60 writes/user/min) — implement exponential backoff');
+      }
+      if (error.status === 403) {
+        const reason = (error as any).response?.data?.error?.errors?.[0]?.reason;
+        if (reason === 'insufficientFilePermissions') {
+          throw new Error('Caller lacks editor access to the spreadsheet');
+        }
       }
     }
     throw error;
