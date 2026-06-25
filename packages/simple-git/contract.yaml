@@ -11,7 +11,12 @@ last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.88  # 23 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 23/26
+coverage_score: 0.96  # 25 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 25/26
+# Depth pass 2026-06-25 (deepen-stream-1 pass 1):
+# Added: init() — GitError on permission denied or invalid template directory
+# Added: checkoutLatestTag() — GitError when no tags (tags.latest===undefined), or pull/checkout fails
+# Contracted after this pass: 25 (+2: init, checkoutLatestTag)
+# Note: coverage_score was 0.88 with 23/26; now 0.96 with 25/26.
 # Depth pass 2026-06-25 (deepen-stream-2 pass 1):
 # Phase 1.5 sweep (pattern 3 — sync-factory-with-error): simpleGit() factory throws
 #   GitConstructError synchronously when baseDir doesn't exist. This corrects the
@@ -30,13 +35,11 @@ coverage_score: 0.88  # 23 contracted / 26 worth-contracting (50 total - 24 inte
 #   hashObject, checkIgnore, countObjects, firstCommit, getConfig, grep, cwd, env, exec, listRemote,
 #   mv, remote, revparse, rm, rmKeepLocal, show, showBuffer, stashList, subModule, submoduleInit,
 #   updateServerInfo, branch, branchLocal, status, diff, diffSummary, log, tags, tag, getRemotes, listConfig,
-#   version, checkIsRepo, checkoutBranch, checkoutLatestTag, init, applyPatch-validate, mergeFromTo-validate)
+#   version, checkIsRepo, checkoutBranch, applyPatch-validate, mergeFromTo-validate)
 # Note: checkoutBranch is a thin wrapper over checkout(['-b', name, startPoint]) — same error profile as
 #   checkout + branch-exists collision; treated as covered transitively by checkout and checkoutLocalBranch
 #   postconditions for now. Promote to its own entry if FP harvester surfaces uncovered cases.
-# Note: checkoutLatestTag composes pull() + tags() + checkout() — all already contracted.
-# Note: init() throws GitError on permission issues but is rarely error-checked in real corpora
-#   (typically run in fresh dirs by tooling that has already validated permissions).
+# Note: init() and checkoutLatestTag() contracted 2026-06-25 (deepen-stream-1 pass 1).
 # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
 #   node_modules source: /dist/cjs/index.js — verified against simple-git@3.36.0
 #   applyPatchTask (line 3671): straightThroughStringTask(['apply', ...customArgs, ...patches])
@@ -1357,6 +1360,150 @@ functions:
         sources:
           - "https://github.com/steveukx/git-js/blob/simple-git%403.36.0/simple-git/src/lib/errors/git-construct-error.ts"
           - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: init
+    import_path: "simple-git"
+    description: >
+      Initializes a new Git repository or reinitializes an existing one in the
+      given directory. Used as: git.init() or git.init(true) for a bare repo,
+      or git.init(options?) with an options map.
+      Returns a Promise<InitResult> that throws GitError when git cannot create
+      the .git directory (e.g., permission denied) or when an explicitly passed
+      --template directory does not exist.
+    postconditions:
+      # Evidence: dist/cjs/index.js line 2315 — initTask builds ['init', ...customArgs]
+      #   using straightThroughStringTask — no custom onError; relies on default GitError
+      #   on non-zero git exit.
+      # Common real-world error: "fatal: cannot mkdir <path>/.git: Permission denied"
+      #   (user does not have write access to the target directory)
+      # Template error: "fatal: template directory '<dir>' does not exist or is not a
+      #   directory" when --template=<dir> points to a non-existent path
+      # Source: https://github.com/steveukx/git-js/blob/simple-git%403.36.0/simple-git/src/lib/tasks/init.ts
+      - id: simple-git-init-missing-try-catch
+        condition: >
+          async function calls git.init() without wrapping in try-catch.
+          Most common in CLI tooling and scaffold scripts that create repos in
+          paths supplied by the user or from environment variables.
+          Throws GitError when git exits non-zero: permission denied creating .git/,
+          invalid template directory, or when the path has already been initialized
+          as a bare repo and a conflicting init type is requested.
+        throws: >
+          GitError — on any non-zero git exit code.
+          "fatal: cannot mkdir '<path>/.git': Permission denied" — write access denied
+            to the target directory (running as wrong user, read-only filesystem, etc.).
+          "fatal: template directory '<dir>' does not exist or is not a directory" —
+            options.template or --template=<dir> CLI option points to a missing path.
+          Most init failures are terminal: the repository cannot be created, so the
+          caller's downstream git operations (add, commit, push) will all fail.
+        required_handling: >
+          Caller MUST wrap git.init() in try-catch when the target directory path
+          is derived from user input, environment variables, or external config.
+
+          Minimum handling:
+            try {
+              await git.init();
+            } catch (err) {
+              console.error('Failed to initialize git repository:', err.message);
+              throw err;
+            }
+
+          For tooling that creates repos in arbitrary directories:
+            try {
+              await git.init(false, { '--initial-branch': 'main' });
+            } catch (err) {
+              if (err instanceof GitError && err.message.includes('Permission denied')) {
+                throw new Error(`Cannot create repository: permission denied at ${repoPath}`);
+              }
+              throw err;
+            }
+        sources:
+          - "https://github.com/steveukx/git-js/blob/simple-git%403.36.0/simple-git/src/lib/tasks/init.ts"
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-init"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: checkoutLatestTag
+    import_path: "simple-git"
+    description: >
+      Legacy callback-style method that checks out the latest tag. Internally
+      composes three operations: pull() → tags() → checkout(tags.latest).
+      If the repository has no tags, tags.latest is undefined, causing
+      checkout(undefined) which runs `git checkout undefined` — a GitError.
+      Not documented in the readme; this is a legacy method inherited from
+      the early simple-git API.
+    postconditions:
+      # Evidence: dist/cjs/index.js line 4412-4420 (legacy Git2.prototype.checkoutLatestTag):
+      #   Git2.prototype.checkoutLatestTag = function(then) {
+      #     var git = this;
+      #     return this.pull(function() {
+      #       git.tags(function(err, tags) {
+      #         git.checkout(tags.latest, then);
+      #       });
+      #     });
+      #   };
+      # When tags.latest is undefined (repo has no tags), checkout(undefined)
+      #   runs `git checkout undefined` which fails: "error: pathspec 'undefined'
+      #   did not match any file(s) known to git"
+      - id: simple-git-checkout-latest-tag-missing-try-catch
+        condition: >
+          async function calls git.checkoutLatestTag() without wrapping in
+          try-catch. Composes pull() + tags() + checkout(tags.latest) internally.
+          Any step can throw: pull() throws GitError on network failures,
+          tags() throws GitError when git ls-remote fails, and checkout() throws
+          GitError when tags.latest is undefined (no tags in repo) or when the
+          tag's commit is not reachable.
+          Particularly dangerous because the method silently consumes intermediate
+          errors in its callback chain — if pull() fails, tags() is never called,
+          leaving the repo in an inconsistent state.
+        throws: >
+          GitError — propagated from any of the three composed operations.
+          From pull(): "fatal: couldn't find remote ref" (no upstream), network errors.
+          From checkout(): "error: pathspec 'undefined' did not match any file(s)
+            known to git" — when repository has no tags (tags.latest === undefined).
+          From checkout(): "error: Your local changes to the following files would
+            be overwritten by checkout" — dirty working tree.
+          Note: this is a callback-style legacy method; the Promise it returns
+          resolves/rejects based on the innermost callback's completion.
+        required_handling: >
+          Caller MUST wrap git.checkoutLatestTag() in try-catch.
+
+          Minimum handling:
+            try {
+              await git.checkoutLatestTag();
+            } catch (err) {
+              console.error('Checkout of latest tag failed:', err.message);
+              throw err;
+            }
+
+          Guard for empty repos (no tags):
+            const tagList = await git.tags();
+            if (!tagList.latest) {
+              throw new Error('Repository has no tags to check out');
+            }
+            try {
+              await git.checkoutLatestTag();
+            } catch (err) {
+              throw err;
+            }
+
+          Prefer git.checkout(tags.latest) directly over this method —
+          it's more explicit and avoids the hidden pull() + undefined-tag pitfall.
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-checkout"
         severity: error
         business_impact:
           incident_label: SILENT_FAILURE

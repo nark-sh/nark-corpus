@@ -9,6 +9,8 @@
  *   - git.fetch(), git.commit(), git.checkout(), git.rebase(), git.raw(), git.clean() too
  *   - git.stash(), git.reset(), git.revert(), git.pushTags(), git.deleteLocalBranch() too
  *   - git.submoduleAdd(), git.submoduleUpdate() too (network calls)
+ *   - git.init() throws GitError on permission denied or invalid template directory
+ *   - git.checkoutLatestTag() throws GitError when no tags exist (tags.latest===undefined)
  *   - All async git calls MUST be wrapped in try-catch
  *   - merge() is special: throws GitResponseError<MergeSummary> even when git exits 0
  *   - rebase() throws GitError (not GitResponseError) on conflict — always abort in catch
@@ -644,6 +646,86 @@ export function createGitWithCatch(repoDir: string): ReturnType<typeof simpleGit
       console.error(`Git directory not found: ${repoDir}`);
       return null;
     }
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. init() — GitError on permission denied or invalid template directory
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: simple-git-init-missing-try-catch
+export async function initNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-init-missing-try-catch — git.init() throws GitError
+  // "fatal: cannot mkdir <path>/.git: Permission denied" when target dir is read-only
+  await git.init();
+}
+
+// @expect-violation: simple-git-init-missing-try-catch
+export async function initBareNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-init-missing-try-catch — git.init(true) for bare repo
+  await git.init(true);
+}
+
+// @expect-violation: simple-git-init-missing-try-catch
+export async function initWithTemplateNoCatch(cwd: string, templateDir: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-init-missing-try-catch — template dir may not exist
+  // "fatal: template directory '<dir>' does not exist or is not a directory"
+  await git.init(false, { '--template': templateDir });
+}
+
+// @expect-clean
+export async function initWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.init();
+  } catch (err) {
+    console.error('Failed to init git repo:', (err as Error).message);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. checkoutLatestTag() — GitError when no tags or pull/checkout fails
+// ─────────────────────────────────────────────────────────────────────────────
+
+// @expect-violation: simple-git-checkout-latest-tag-missing-try-catch
+export async function checkoutLatestTagNoCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-checkout-latest-tag-missing-try-catch
+  // Composes pull() + tags() + checkout(tags.latest). If no tags exist,
+  // tags.latest === undefined and checkout(undefined) throws GitError:
+  // "error: pathspec 'undefined' did not match any file(s) known to git"
+  await git.checkoutLatestTag();
+}
+
+// @expect-clean
+export async function checkoutLatestTagWithCatch(cwd: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.checkoutLatestTag();
+  } catch (err) {
+    console.error('Checkout latest tag failed:', (err as Error).message);
+    throw err;
+  }
+}
+
+// @expect-clean
+export async function checkoutLatestTagWithGuard(cwd: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_NOT_FIRE: explicit tags check before calling checkoutLatestTag
+  const tagList = await git.tags();
+  if (!tagList.latest) {
+    throw new Error('Repository has no tags to check out');
+  }
+  try {
+    await git.checkoutLatestTag();
+  } catch (err) {
     throw err;
   }
 }

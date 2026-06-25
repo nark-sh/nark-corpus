@@ -3,6 +3,24 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-25 — deepen pass — coverage 88% → 96%
+
+- **Profile:** `packages/simple-git/contract.yaml`
+- **Functions added:** `init`, `checkoutLatestTag` (2 total)
+- **Postconditions added:** 2 (`simple-git-init-missing-try-catch`, `simple-git-checkout-latest-tag-missing-try-catch`)
+- **Key findings:**
+  - `init()` throws GitError on permission denied ("fatal: cannot mkdir <path>/.git: Permission denied") and on invalid template directory ("fatal: template directory '<dir>' does not exist or is not a directory"). Source: `initTask` in `dist/cjs/index.js` line 2315 uses `straightThroughStringTask` — no custom `onError`, relies on default GitError.
+  - `checkoutLatestTag()` is a legacy callback-style method (not in readme). Composes `pull()` + `tags()` + `checkout(tags.latest)`. When repo has no tags, `tags.latest` is `undefined` — `checkout(undefined)` throws GitError: "error: pathspec 'undefined' did not match any file(s) known to git". Source: `dist/cjs/index.js` line 4412-4420.
+- **Functions intentionally omitted this pass:** none (checkoutBranch remains covered transitively)
+- **Scanner concerns queued:** none (both functions detected via existing InstanceTrackerPlugin await_patterns)
+- **Fixture changes:** `ground-truth.ts` — added sections 24 (init) and 25 (checkoutLatestTag) with @expect-violation and @expect-clean variants
+- **Sources fetched:**
+  - `simple-git@3.36.0 dist/cjs/index.js` lines 2315 (initTask), 4412-4420 (checkoutLatestTag legacy)
+  - `https://github.com/steveukx/git-js/blob/simple-git%403.36.0/simple-git/src/lib/tasks/init.ts`
+  - `https://git-scm.com/docs/git-init`
+- **Verified by:** bc-deepen-contract (deepen-stream-1 pass 1 on 2026-06-25)
+
+
 ## 2026-06-25 — deepen pass — coverage 85% → 88%
 
 - **Profile:** `packages/simple-git/contract.yaml`
