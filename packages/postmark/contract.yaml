@@ -7,11 +7,11 @@ package: postmark
 semver: ">=2.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-24"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83  # 10 contracted / 12 applicable (52 total - 40 intentionally omitted: read-only GETs, analytics, webhook admin, message stream admin, AccountClient admin ops)
+coverage_score: 1.0  # 12 contracted / 12 applicable (83 total [58 ServerClient + 25 AccountClient] - 71 intentionally omitted: read-only GETs, analytics, admin CRUD, AccountClient admin ops; 12 applicable all contracted)
 
 detection:
   class_names:
@@ -549,6 +549,183 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: createWebhook
+    import_path: "postmark"
+    description: >
+      Creates a new webhook endpoint on the associated server. Called as
+      client.createWebhook(options). Registers a URL that Postmark will POST to
+      when email events occur (deliveries, bounces, spam complaints, opens, clicks,
+      subscription changes). Requires a publicly accessible HTTPS URL. Throws
+      ApiInputError (422) if the webhook URL is invalid, contains an internal IP range,
+      or is otherwise unreachable from Postmark's infrastructure. If webhook creation
+      fails silently (e.g., error swallowed), all future email events go undelivered
+      to the application — bounce handling, unsubscribe processing, and delivery
+      tracking pipelines stop functioning without alerting.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/webhooks-api (fetched 2026-06-25)
+      # Evidence: https://postmarkapp.com/developer/api/overview#error-codes (fetched 2026-06-25)
+      # Error code 606: "The webhook URL you're trying to use is invalid or contains an internal IP range."
+      # HTTP 422 → ApiInputError (via buildErrorByHttpStatusCode → ApiInputError.buildSpecificError)
+      # HTTP 401 → InvalidAPIKeyError, 429 → RateLimitExceededError, 500 → InternalServerError
+      - id: create-webhook-no-try-catch
+        severity: error
+        throws: "PostmarkError (ApiInputError 422 ErrorCode 606 invalid-url, InvalidAPIKeyError 401, RateLimitExceededError 429, InternalServerError 500)"
+        condition: >
+          createWebhook() called in async context without surrounding try/catch.
+          Throws ApiInputError (422 ErrorCode 606) when the webhook URL is invalid,
+          unreachable, or contains a private/internal IP range (Postmark blocks
+          localhost, 127.0.0.1, 10.x.x.x, 192.168.x.x). Throws InvalidAPIKeyError (401)
+          on auth failure. Throws RateLimitExceededError (429) under load.
+        description: >
+          createWebhook() makes a POST /webhooks call that throws PostmarkError
+          subclasses on API or network failure. The most common production path is
+          ErrorCode 606 (ApiInputError 422) when the provided webhook URL fails
+          Postmark's reachability/IP-range checks — e.g., a staging URL accidentally
+          passed to production, an internal URL leaking through config, or a new
+          deployment before the endpoint is live. If the error is swallowed, the
+          webhook is never registered. All subsequent email events (bounce, delivery,
+          spam complaint, open, click) are sent nowhere — the application has no
+          visibility into email delivery outcomes and cannot process unsubscribes,
+          which creates legal exposure under CAN-SPAM/GDPR.
+        required_handling: >
+          Caller MUST wrap createWebhook() in try-catch. Webhook provisioning code
+          typically runs at server startup or first-install — any thrown error must
+          be caught and surfaced to the operator:
+
+            try {
+              const webhook = await client.createWebhook({
+                Url: process.env.WEBHOOK_URL!,
+                HttpAuth: { Username: 'user', Password: process.env.WEBHOOK_SECRET! },
+                Triggers: {
+                  Delivery: { Enabled: true },
+                  Bounce: { Enabled: true, IncludeContent: false },
+                },
+              });
+              console.log('Webhook registered:', webhook.ID);
+            } catch (error) {
+              if (error instanceof Errors.ApiInputError) {
+                // ErrorCode 606: URL invalid or contains internal IP range
+                console.error('Webhook URL rejected by Postmark:', error.message);
+                // Alert ops — email events will not be delivered until resolved
+              } else {
+                console.error('Webhook creation failed:', error.message);
+              }
+              throw error; // Re-throw — startup should fail if webhook not provisioned
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/webhooks-api"
+          - "https://postmarkapp.com/developer/api/overview#error-codes"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/errors/ErrorHandler.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+  - name: createMessageStream
+    import_path: "postmark"
+    description: >
+      Creates a new message stream on the associated server. Called as
+      client.createMessageStream(options). Message streams are Postmark's channel
+      abstraction — every email must be sent via a message stream (e.g., "outbound",
+      "broadcasts"). Servers allow at most 10 streams (including the default
+      transactional and inbound). createMessageStream() throws ApiInputError (422)
+      on a range of unique validation errors: invalid stream ID format, stream ID
+      already exists, max 10 streams per server reached, only one inbound stream
+      allowed, reserved ID prefix. These errors are NOT interchangeable with the
+      generic sendEmail error codes — they are stream-provisioning-specific. If
+      createMessageStream() fails silently (error swallowed in a provisioning script),
+      the missing stream causes every future sendEmail() call targeting that stream
+      to throw StreamNotFound (ErrorCode 1235) — a cascade failure that breaks ALL
+      email delivery for that stream type until manually corrected.
+
+    postconditions:
+      # Evidence: https://postmarkapp.com/developer/api/message-streams-api (fetched 2026-06-25)
+      # Evidence: https://postmarkapp.com/developer/api/overview#error-codes (fetched 2026-06-25)
+      # Unique error codes confirmed from Postmark API docs:
+      #   1221: invalid MessageStreamType
+      #   1223: Name required
+      #   1224: Name too long (>100 chars)
+      #   1225: Max 10 streams per server reached
+      #   1227: ID must be lowercase letters/numbers/hyphens/underscores, start with letter, max 30 chars
+      #   1228: Only one inbound stream allowed per server
+      #   1230: ID already exists on this server
+      #   1233: ID must not start with 'pm-' prefix (reserved)
+      #   1237: ID is reserved
+      # HTTP 422 → ApiInputError; HTTP 401 → InvalidAPIKeyError
+      - id: create-message-stream-no-try-catch
+        severity: error
+        throws: "PostmarkError (ApiInputError 422 ErrorCodes 1221/1223/1224/1225/1227/1228/1230/1233/1237, InvalidAPIKeyError 401, RateLimitExceededError 429, InternalServerError 500)"
+        condition: >
+          createMessageStream() called in async context without surrounding try/catch.
+          Throws ApiInputError (422) with unique stream-provisioning error codes:
+          1225 (max 10 streams per server), 1227 (invalid ID format — must be lowercase
+          letters/numbers/hyphens/underscores, start with letter, max 30 chars),
+          1228 (already have one inbound stream), 1230 (ID already exists),
+          1233 (ID starts with reserved 'pm-' prefix), 1237 (ID is reserved).
+          These error codes are DISTINCT from sendEmail error codes — callers catching
+          generic PostmarkError still see them but cannot distinguish the provisioning
+          error from a runtime email error without checking the error code.
+        description: >
+          createMessageStream() makes a POST /message-streams call that throws
+          PostmarkError subclasses with unique stream-provisioning error codes.
+          The most operationally dangerous failure is ErrorCode 1225 (max 10 streams
+          per server) — when a server has exhausted its stream quota, the call throws
+          and no new streams can be added without deleting existing ones. If the error
+          is swallowed in a provisioning/migration script, the stream is never created.
+          All subsequent sendEmail() calls that target this missing stream ID receive
+          ErrorCode 1235 (stream not found) — a cascade that breaks ALL email delivery
+          for that channel. The cascade is invisible if error handling is generic.
+          ErrorCode 1227 (invalid ID format) is the other common path — a stream ID
+          containing uppercase letters, spaces, or special characters throws 422 on
+          creation; since IDs are used as keys in subsequent calls, this is a
+          permanent configuration error until corrected manually.
+        required_handling: >
+          Caller MUST wrap createMessageStream() in try-catch with error-code checking
+          for the unique stream-provisioning codes. Provisioning scripts that call
+          this at deploy time should surface ALL errors to the operator:
+
+            try {
+              const stream = await client.createMessageStream({
+                ID: 'marketing-outbound',
+                Name: 'Marketing Outbound',
+                MessageStreamType: 'Broadcasts',
+              });
+              console.log('Stream created:', stream.ID);
+            } catch (error) {
+              if (error instanceof Errors.ApiInputError) {
+                const code = (error as any).code;
+                if (code === 1225) {
+                  console.error('Max 10 message streams reached — delete unused streams first');
+                } else if (code === 1227) {
+                  console.error('Invalid stream ID format — use lowercase letters/numbers/hyphens only, start with letter, max 30 chars');
+                } else if (code === 1228) {
+                  console.error('Only one inbound stream is allowed per server');
+                } else if (code === 1230) {
+                  console.error('Stream ID already exists — choose a different ID');
+                } else {
+                  console.error('Message stream creation failed:', error.message);
+                }
+              } else {
+                console.error('Stream creation failed:', error.message);
+              }
+              throw error; // Re-throw — all downstream email for this channel will fail
+            }
+        sources:
+          - "https://postmarkapp.com/developer/api/message-streams-api"
+          - "https://postmarkapp.com/developer/api/overview#error-codes"
+          - "https://github.com/ActiveCampaign/postmark.js/blob/main/src/client/errors/ErrorHandler.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+
 notes:
   - "All ServerClient methods make HTTPS calls to the Postmark API — all can throw"
   - "No auto-retry logic — all errors thrown immediately to caller"
@@ -561,3 +738,5 @@ notes:
   - "Server limit: 100 templates per server — createTemplate throws ApiInputError when exceeded"
   - "deleteTemplate 404 maps to GENERIC PostmarkError (no specialized class — no 404 entry in ErrorHandler.buildErrorByHttpStatusCode)"
   - "deleteTemplate ErrorCode 1130 (layout-cascade) maps to 422 ApiInputError — tear-down order matters"
+  - "createWebhook ErrorCode 606 (invalid URL or internal IP range) maps to 422 ApiInputError"
+  - "createMessageStream error codes 1225/1227/1228/1230/1233/1237 — stream-provisioning-specific, distinct from sendEmail codes"

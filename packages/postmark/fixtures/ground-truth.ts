@@ -43,6 +43,12 @@
  *   - Section 20: createTemplate() in try-catch → SHOULD_NOT_FIRE
  *   - Section 21: editTemplate() bare → SHOULD_FIRE
  *   - Section 22: editTemplate() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 23: deleteTemplate() bare → SHOULD_FIRE
+ *   - Section 24: deleteTemplate() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 25: createWebhook() bare → SHOULD_FIRE
+ *   - Section 26: createWebhook() in try-catch → SHOULD_NOT_FIRE
+ *   - Section 27: createMessageStream() bare → SHOULD_FIRE
+ *   - Section 28: createMessageStream() in try-catch → SHOULD_NOT_FIRE
  *
  * Design: spec-driven, NOT based on V1 behavior.
  */
@@ -440,6 +446,97 @@ export async function editTemplateWithTryCatch(alias: string) {
       console.error('Template not found or validation failed:', (error as Error).message);
     } else {
       console.error('Template update failed:', error);
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. createWebhook() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateWebhookNoCatch() {
+  // SHOULD_FIRE: create-webhook-no-try-catch — createWebhook() throws ApiInputError (ErrorCode 606) if URL is
+  // invalid or contains internal IP range; throws InvalidAPIKeyError, RateLimitExceededError on API failure
+  const webhook = await client.createWebhook({
+    Url: 'https://example.com/webhooks/email',
+    Triggers: {
+      Delivery: { Enabled: true },
+      Bounce: { Enabled: true, IncludeContent: false },
+    },
+  });
+  return webhook.ID;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. createWebhook() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createWebhookWithTryCatch() {
+  try {
+    // SHOULD_NOT_FIRE: create-webhook-no-try-catch — createWebhook() inside try-catch
+    const webhook = await client.createWebhook({
+      Url: 'https://example.com/webhooks/email',
+      Triggers: {
+        Delivery: { Enabled: true },
+        Bounce: { Enabled: true, IncludeContent: false },
+      },
+    });
+    return webhook.ID;
+  } catch (error) {
+    if (error instanceof Errors.ApiInputError) {
+      // ErrorCode 606: URL invalid or internal IP — alert ops immediately
+      console.error('Webhook URL rejected by Postmark:', (error as Error).message);
+    } else {
+      console.error('Webhook creation failed:', error);
+    }
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. createMessageStream() — bare call, no try-catch → SHOULD_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCreateMessageStreamNoCatch() {
+  // SHOULD_FIRE: create-message-stream-no-try-catch — createMessageStream() throws ApiInputError (ErrorCode 1225
+  // max 10 streams, 1227 invalid ID format, 1228 only one inbound, 1230 ID exists, etc.) if provisioning fails;
+  // missing stream causes all sendEmail() calls to that stream to throw ErrorCode 1235 (cascade failure)
+  const stream = await client.createMessageStream({
+    ID: 'marketing-outbound',
+    Name: 'Marketing Outbound',
+    MessageStreamType: 'Broadcasts',
+  });
+  return stream.ID;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. createMessageStream() — inside try-catch → SHOULD_NOT_FIRE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createMessageStreamWithTryCatch() {
+  try {
+    // SHOULD_NOT_FIRE: create-message-stream-no-try-catch — createMessageStream() inside try-catch
+    const stream = await client.createMessageStream({
+      ID: 'marketing-outbound',
+      Name: 'Marketing Outbound',
+      MessageStreamType: 'Broadcasts',
+    });
+    return stream.ID;
+  } catch (error) {
+    if (error instanceof Errors.ApiInputError) {
+      const code = (error as any).code;
+      if (code === 1225) {
+        console.error('Max 10 message streams reached — delete unused streams first');
+      } else if (code === 1227) {
+        console.error('Invalid stream ID format');
+      } else if (code === 1230) {
+        console.error('Stream ID already exists');
+      } else {
+        console.error('Message stream creation failed:', (error as Error).message);
+      }
+    } else {
+      console.error('Stream creation failed:', error);
     }
     throw error;
   }
