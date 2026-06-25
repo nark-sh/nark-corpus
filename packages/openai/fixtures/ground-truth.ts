@@ -1278,6 +1278,7 @@ async function imagesEditStreamAbortNotChecked(file: any, prompt: string) {
   const stream = await openai.images.edit({ image: file, prompt, stream: true });
   try {
     // SHOULD_FIRE: images-edit-stream-abort-silent-termination — for-await exits silently on abort with no completion check
+    // SKIP-CLEANUP: concern-20260626-openai-images-edit-stream-abort-detection-1 — scanner gap, completion-flag detection NYI
     for await (const event of stream) {
       if (event.type === 'image_edit.partial_image') {
         // update UI
