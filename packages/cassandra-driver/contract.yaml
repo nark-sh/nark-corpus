@@ -2,11 +2,11 @@ package: cassandra-driver
 semver: ">=4.0.0 <5.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-23"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.94
+coverage_score: 1.0
 
 detection:
   class_names: ["Client", "Mapper", "ResultSet"]
@@ -21,6 +21,7 @@ detection:
 
     # Query operations
     - ".execute("
+    - ".executeGraph("
     - ".batch("
     - ".stream("
 
@@ -733,6 +734,67 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: medium
+
+  # Client.executeGraph — DataStax Graph traversal (DSE / Astra Graph Engine)
+  - name: executeGraph
+    import_path: "cassandra-driver"
+    namespace: "Client"
+    description: >
+      Executes a Gremlin traversal or DSE Graph query against a DataStax Enterprise or
+      DataStax Astra Graph. Accessed via client.executeGraph(). Returns a GraphResultSet
+      iterable of Traverser objects. Distinct from Client.execute() in two critical ways:
+      (1) uses FallthroughRetryPolicy by default — no automatic retry on any failure type,
+      (2) accepts parameters as Object only (Array input throws TypeError synchronously).
+    postconditions:
+      # Evidence: lib/datastax/graph/graph-executor.js send() and _executeGraphQuery()
+      # confirmed from cassandra-driver@4.9.0 node_modules source inspection
+      # FallthroughRetryPolicy confirmed from lib/policies/retry.js lines 209-258:
+      # "A retry policy that never retries nor ignores — all methods unconditionally
+      # return rethrowResult()". Assigned to graph queries in graph-executor.js constructor.
+      - id: execute-graph-no-try-catch
+        condition: "Client.executeGraph() called without try-catch"
+        throws: "NoHostAvailableError when no cluster node is reachable; OperationTimedOutError when graph traversal exceeds timeout; ResponseError for Gremlin syntax errors or server-side traversal failures"
+        required_handling: >
+          Caller MUST wrap client.executeGraph() in try-catch. Unlike client.execute(),
+          graph queries use FallthroughRetryPolicy — the driver NEVER automatically
+          retries on read_timeout, unavailable, or request_error. Every transient
+          failure propagates immediately to the caller. This is by design (graph
+          traversals may mutate state and are not assumed idempotent), but it means
+          callers must implement their own retry/backoff logic for transient failures.
+          Handle: NoHostAvailableError (cluster unreachable or graph service down),
+          OperationTimedOutError (traversal took too long — common for full-graph scans),
+          ResponseError (Gremlin syntax error code 0x2000, or traversal step failure).
+        sources:
+          - "lib/datastax/graph/graph-executor.js (cassandra-driver@4.9.0 node_modules — FallthroughRetryPolicy assignment in constructor; send() error propagation in _executeGraphQuery)"
+          - "lib/policies/retry.js (cassandra-driver@4.9.0 node_modules — FallthroughRetryPolicy.prototype.onReadTimeout/onRequestError/onUnavailable/onWriteTimeout all return rethrowResult)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: execute-graph-array-params
+        condition: "Client.executeGraph() called with Array as parameters argument (common porting mistake from Client.execute() where Arrays are valid)"
+        throws: "TypeError: 'Parameters must be a Object instance as an associative array' — thrown synchronously before any network call"
+        required_handling: >
+          Caller MUST pass parameters as a plain Object (associative array), not an Array.
+          executeGraph() rejects Arrays in graph-executor.js send() before any network call:
+          `if (Array.isArray(parameters)) { throw new TypeError('Parameters must be a Object instance...') }`
+          This is a porting bug when migrating from client.execute() (where params can be Array)
+          to client.executeGraph(). The fix: convert `['value']` to `{ paramName: 'value' }`.
+          Reference parameters in Gremlin as named bindings: `g.V().has('id', id)` with
+          `{ id: 'actual-value' }`.
+        sources:
+          - "lib/datastax/graph/graph-executor.js (cassandra-driver@4.9.0 node_modules — send() lines 1-4: Array.isArray check + throw)"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
 
 edge_cases:
   - id: prepared-statements

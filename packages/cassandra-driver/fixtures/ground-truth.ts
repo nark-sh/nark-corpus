@@ -8,6 +8,7 @@
  *   Client class:
  *   - client.connect()          postcondition: connection-failure, authentication-failure
  *   - client.execute()          postcondition: syntax-error, unavailable, timeout, write-timeout, read-timeout, overloaded, invalid-query
+ *   - client.executeGraph()     postcondition: execute-graph-no-try-catch, execute-graph-array-params
  *   - client.batch()            postcondition: batch-failure, write-timeout
  *   - client.shutdown()         postcondition: shutdown-error
  *   - client.stream()           postcondition: stream-error
@@ -432,4 +433,36 @@ export async function refreshKeyspacesWithCatch() {
     console.error('Schema refresh failed:', error);
     throw error;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. Client.executeGraph() — DataStax Graph / Gremlin traversal
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function executeGraphNoCatch() {
+  // SHOULD_FIRE: execute-graph-no-try-catch — executeGraph() without try-catch;
+  // uses FallthroughRetryPolicy (never retries), propagates NoHostAvailableError,
+  // OperationTimedOutError, ResponseError immediately to caller
+  const result = await client.executeGraph('g.V().count()');
+  return result.first();
+}
+
+export async function executeGraphWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: try-catch present; all error types caught
+    const result = await client.executeGraph('g.V().count()');
+    return result.first();
+  } catch (error) {
+    console.error('Graph traversal failed:', error);
+    throw error;
+  }
+}
+
+export async function executeGraphWithParams() {
+  // SHOULD_FIRE: execute-graph-no-try-catch — executeGraph() with object params, no try-catch
+  const result = await client.executeGraph(
+    'g.V().has("label", label)',
+    { label: 'person' }
+  );
+  return result.toArray();
 }

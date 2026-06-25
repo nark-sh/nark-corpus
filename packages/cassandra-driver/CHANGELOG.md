@@ -1,5 +1,19 @@
 # CHANGELOG — cassandra-driver
 
+## 2026-06-25 — deepen pass — coverage 94% -> 100%
+
+- **Profile:** `packages/cassandra-driver/contract.yaml`
+- **Functions added:** Client.executeGraph (1 total)
+- **Postconditions added:** 2 (execute-graph-no-try-catch, execute-graph-array-params)
+- **Functions intentionally omitted this pass:** none (0)
+- **Scanner concerns queued:** 2 (`concern-20260625-cassandra-driver-deepen-1` executeGraph detection, `concern-20260625-cassandra-driver-deepen-2` executeGraph array-params detection)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:** lib/datastax/graph/graph-executor.js (cassandra-driver@4.9.0 node_modules — FallthroughRetryPolicy assignment; send() TypeError for Array params; _executeGraphQuery error propagation), lib/policies/retry.js (cassandra-driver@4.9.0 node_modules — FallthroughRetryPolicy.prototype.onReadTimeout/onRequestError/onUnavailable/onWriteTimeout all unconditionally return rethrowResult())
+- **Verified by:** bc-deepen-contract (deepen-stream-1 pass 2 on 2026-06-25T05:00:00.000Z)
+
+Key finding: executeGraph() is the only cassandra-driver Client method using FallthroughRetryPolicy — no auto-retry on any error type. All network errors propagate immediately. Also discovered a common porting bug: execute() accepts Array params but executeGraph() requires Object and throws TypeError synchronously for Arrays.
+
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** cassandra-driver@4.9.0
