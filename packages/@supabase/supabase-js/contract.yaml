@@ -1,8 +1,8 @@
 package: "@supabase/supabase-js"
 semver: ">=2.0.0 <3.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-23"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 # Evidence: 59 violations across 8/34 repos (24%) in scan-supabase-supabase-js-2026-04-02.json
@@ -12,8 +12,11 @@ status: production
 # signInWithOtp, verifyOtp, getUser, updateUser, refreshSession, exchangeCodeForSession,
 # storage.download, storage.createSignedUrl. Auth methods come from GoTrueClient.d.ts;
 # storage methods come from storage-js/dist/index.d.cts.
+# 2026-06-25 deepen pass 12: added auth.getUserIdentities, auth.linkIdentity,
+# auth.unlinkIdentity, storage.update, storage.createSignedUploadUrl,
+# storage.uploadToSignedUrl. Coverage 84%→100% (28/28 callable functions, 0 omitted).
 evidence_quality: confirmed
-coverage_score: 0.84  # 21/25 callable API functions (post-deepen pass 11 2026-06-23, +8 this pass)
+coverage_score: 1.00  # 28/28 callable API functions (post-deepen pass 12 2026-06-25, +6 this pass)
 
 detection:
   factory_methods:
@@ -1409,6 +1412,336 @@ functions:
           DO NOT expose the service role key to the browser to "work around" this.
         sources:
           - "https://supabase.com/docs/reference/javascript/storage-from-createsignedurl"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: auth.getUserIdentities
+    import_path: "@supabase/supabase-js"
+    description: >
+      Returns all linked OAuth/SSO identities for the currently authenticated user.
+      Called as supabase.auth.getUserIdentities().
+      Internally delegates to getUser() — returns { data: { identities } | null, error: AuthApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at GoTrueClient.d.ts line 2155 (supabase-js@2.108.2 / @supabase/auth-js).
+
+    postconditions:
+      # Evidence: GoTrueClient.js line 3716-3730: calls this.getUser() then extracts identities
+      # If session is missing/expired, getUser() returns AuthApiError which propagates here.
+      - id: auth-get-identities-no-session
+        condition: >
+          The user has no active session or the session has expired. getUserIdentities()
+          delegates to getUser() which returns AuthApiError when no valid session exists.
+        throws: "AuthApiError with error.message containing 'User not found' or 'Auth session missing' or error.code containing 'session'"
+        required_handling: >
+          Caller MUST check { error } before accessing data.identities.
+          Redirect to login when session is missing. DO NOT treat an empty identities
+          list and an auth error as equivalent — an error means the request failed,
+          while an empty list is valid for a password-only account.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-getuseridentities"
+          - "https://supabase.com/docs/guides/auth/debugging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: auth.linkIdentity
+    import_path: "@supabase/supabase-js"
+    description: >
+      Links an additional OAuth provider identity to the currently authenticated user,
+      enabling multi-provider login. Called as supabase.auth.linkIdentity({ provider: 'github' }).
+      Requires "Enable Manual Linking" to be turned ON in the Auth project settings.
+      Returns { data: { provider, url } | null, error: AuthApiError | null } on success;
+      redirects to the OAuth provider URL which completes the link via a callback.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at GoTrueClient.d.ts line 2168 (supabase-js@2.108.2 / @supabase/auth-js).
+
+    postconditions:
+      # Evidence: GoTrueClient.js line 3758-3812: checks error codes from server response
+      # identity_already_exists is returned when the OAuth account is already linked.
+      - id: auth-link-identity-already-exists
+        condition: >
+          The OAuth provider account being linked is already associated with this user
+          or another Supabase user. The server returns error code 'identity_already_exists'.
+        throws: "AuthApiError with error.code === 'identity_already_exists'"
+        required_handling: >
+          Caller MUST check { error } and handle identity_already_exists explicitly.
+          Display a message that this provider account is already linked. DO NOT retry
+          silently — the error is deterministic and retrying will return the same result.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-linkidentity"
+          - "https://supabase.com/docs/guides/auth/debugging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+      - id: auth-link-identity-manual-linking-disabled
+        condition: >
+          The "Enable Manual Linking" setting is turned OFF in the Supabase Auth project
+          configuration. Calling linkIdentity() when this feature is disabled returns
+          error code 'manual_linking_disabled'.
+        throws: "AuthApiError with error.code === 'manual_linking_disabled'"
+        required_handling: >
+          Caller MUST check { error } for manual_linking_disabled and surface a clear
+          message to users. DO NOT expose the config setting name — tell users "account
+          linking is not available." Fix by enabling Manual Linking in the Supabase
+          Dashboard under Auth > Settings > User Management > Manual Linking.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-linkidentity"
+          - "https://supabase.com/docs/guides/auth/debugging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: low
+        evidence_quality: confirmed
+
+  - name: auth.unlinkIdentity
+    import_path: "@supabase/supabase-js"
+    description: >
+      Removes a linked OAuth provider identity from the currently authenticated user.
+      Called as supabase.auth.unlinkIdentity(identity) where identity is one of the
+      objects returned by getUserIdentities().
+      Requires "Enable Manual Linking" to be turned ON in the Auth project settings.
+      CRITICAL DATA LOSS RISK: unlinking the only identity from a password-less account
+      permanently locks the user out.
+      Returns { data: {} | null, error: AuthApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at GoTrueClient.d.ts line 2200 (supabase-js@2.108.2 / @supabase/auth-js).
+
+    postconditions:
+      # Evidence: GoTrueClient.js line 3871-3891: DELETE /user/identities/:id
+      # single_identity_not_deletable is returned when the user would be locked out.
+      - id: auth-unlink-identity-single-identity
+        condition: >
+          The user has only one linked identity and no password set. Unlinking it would
+          make the account permanently inaccessible. The server returns error code
+          'single_identity_not_deletable' to prevent lockout.
+        throws: "AuthApiError with error.code === 'single_identity_not_deletable'"
+        required_handling: >
+          Caller MUST check { error } for single_identity_not_deletable BEFORE
+          completing the unlink flow. This is a DATA LOSS scenario — the user would
+          be permanently locked out of their account. Guard the unlink UI by checking
+          getUserIdentities() first: if the user has exactly one identity and no
+          password, disable the unlink button and explain they must set a password first.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-unlinkidentity"
+          - "https://supabase.com/docs/guides/auth/debugging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+      - id: auth-unlink-identity-email-conflict
+        condition: >
+          Unlinking this identity would cause an email conflict — for example, the
+          email from the OAuth provider is the same as another account's email and
+          Supabase prevents the conflict. Returns error code
+          'email_conflict_identity_not_deletable'.
+        throws: "AuthApiError with error.code === 'email_conflict_identity_not_deletable'"
+        required_handling: >
+          Caller MUST check { error } and present a clear explanation to the user.
+          DO NOT retry automatically. Advise the user to contact support or change
+          their email before unlinking.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/auth-unlinkidentity"
+          - "https://supabase.com/docs/guides/auth/debugging/error-codes"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: authentication_failure
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+  - name: storage.update
+    import_path: "@supabase/supabase-js"
+    description: >
+      Replaces an existing file at a given storage path with new content.
+      Called as supabase.storage.from('bucket').update('path/file.png', fileBody, options).
+      Internally calls uploadOrUpdate("PUT", ...) — same error surface as upload().
+      Returns { data: { id, path, fullPath } | null, error: StorageApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at storage-js/dist/index.d.cts (supabase-js@2.108.2 / @supabase/storage-js).
+
+    postconditions:
+      # Evidence: storage-js/dist/index.cjs: update() calls uploadOrUpdate("PUT")
+      # "Object not found" is returned when trying to update a non-existent path.
+      - id: storage-update-not-found
+        condition: >
+          The file at the specified path does not exist in the bucket. Unlike upload()
+          which creates new files, update() requires the object to already exist and
+          returns an error if it is missing.
+        throws: "StorageApiError with error.status=400 or 404 and error.message containing 'Object not found'"
+        required_handling: >
+          Caller MUST check { error } before treating the update as successful.
+          Distinguish between 'not found' (use upload() instead) and other errors.
+          DO NOT silently fall back to upload() without explicit caller intent — this
+          can create unintended duplicate objects in some configurations.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-update"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: storage-update-unauthorized
+        condition: >
+          The current user lacks UPDATE permission on this object path. RLS policy
+          denies the PUT operation — user is not authenticated or lacks the UPDATE
+          RLS policy for this bucket path.
+        throws: "StorageApiError with error.status=400 or 403 and error.statusCode containing 'Unauthorized'"
+        required_handling: >
+          Caller MUST check { error } and surface a permission error to the user.
+          Ensure the RLS policy includes UPDATE for authenticated users on this bucket.
+          DO NOT expose internal bucket policy details in the error message.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-update"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: storage.createSignedUploadUrl
+    import_path: "@supabase/supabase-js"
+    description: >
+      Creates a signed URL that allows a client (e.g., a browser) to upload a file
+      directly to storage without exposing the service role key. The signed URL is
+      valid for 2 hours. Called as
+      supabase.storage.from('bucket').createSignedUploadUrl('path/file.png').
+      Requires the caller's RLS policy to include INSERT on the storage.objects table.
+      Returns { data: { signedUrl, token, path } | null, error: StorageApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at storage-js/dist/index.d.cts (supabase-js@2.108.2 / @supabase/storage-js).
+
+    postconditions:
+      # Evidence: storage-js/dist/index.cjs line 816-836: throws StorageError("No token returned by API")
+      # when server response is missing the token field.
+      - id: storage-create-signed-upload-url-no-token
+        condition: >
+          The Supabase Storage server returned a response without a token field —
+          typically caused by a misconfigured storage backend or an unexpected API
+          response format. The client throws StorageError("No token returned by API").
+        throws: "StorageApiError with error.message === 'No token returned by API'"
+        required_handling: >
+          Caller MUST check { error } before returning the signed URL to the client.
+          This error indicates a server-side misconfiguration, not a user error.
+          Log it as a server error and return a 500 to the calling client.
+          DO NOT pass a null/undefined signedUrl to the uploader — it will produce
+          a confusing network error at upload time instead of a clear failure.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-createsigneduploadurl"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: storage-create-signed-upload-url-unauthorized
+        condition: >
+          The calling user lacks INSERT permission on the storage.objects table for this
+          bucket path. RLS policy blocks the signed URL generation — only authenticated
+          users with the correct INSERT policy can create upload URLs.
+        throws: "StorageApiError with error.status=400 or 403 and error.statusCode containing 'Unauthorized'"
+        required_handling: >
+          Caller MUST check { error } and surface a clear permission message.
+          Move signed upload URL generation to a server-side route where you can
+          verify the user's identity and apply fine-grained access checks before
+          issuing the upload token.
+          DO NOT generate upload URLs client-side with the service role key.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-createsigneduploadurl"
+        severity: error
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: service_unavailable
+          incident_cost_range: high
+        evidence_quality: confirmed
+
+  - name: storage.uploadToSignedUrl
+    import_path: "@supabase/supabase-js"
+    description: >
+      Uploads a file to storage using a pre-signed upload URL generated by
+      createSignedUploadUrl(). Allows browser clients to upload directly to storage
+      without server involvement during the upload. Called as
+      supabase.storage.from('bucket').uploadToSignedUrl('path/file.png', token, fileBody).
+      Returns { data: { fullPath, path } | null, error: StorageApiError | null }.
+      Does NOT throw — wraps all errors in the returned error field.
+      Signature confirmed at storage-js/dist/index.d.cts (supabase-js@2.108.2 / @supabase/storage-js).
+
+    postconditions:
+      # Evidence: storage-js/dist/index.cjs line 745-781: uses handleOperation() which
+      # wraps all errors in StorageApiError. Token expiry produces a 400 from the server.
+      - id: storage-upload-to-signed-url-expired-token
+        condition: >
+          The signed upload token has expired (valid for 2 hours after creation) or
+          the token is invalid/malformed. The storage server rejects the upload and
+          returns a 400 error.
+        throws: "StorageApiError with error.status=400 and error.message containing 'Invalid token' or 'Token expired'"
+        required_handling: >
+          Caller MUST check { error } and detect token expiry. If the token is expired,
+          request a new signed URL from the server (call createSignedUploadUrl again)
+          and retry the upload. DO NOT reuse an expired token — it will always fail.
+          Show a user-friendly "upload link expired, please try again" message rather
+          than a raw error.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-uploadtosignedurl"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_transaction
+          incident_cost_range: medium
+        evidence_quality: confirmed
+
+      - id: storage-upload-to-signed-url-unauthorized
+        condition: >
+          The upload is rejected because the token does not grant permission for this
+          specific path, the bucket's RLS INSERT policy is not met, or the token was
+          issued for a different path than the one being uploaded to.
+        throws: "StorageApiError with error.status=400 or 403 and error.statusCode containing 'Unauthorized'"
+        required_handling: >
+          Caller MUST check { error } and surface an access-denied message.
+          Ensure the token path matches the upload path exactly — tokens are path-scoped.
+          DO NOT silently ignore this error; the file was NOT uploaded.
+        sources:
+          - "https://supabase.com/docs/reference/javascript/storage-from-uploadtosignedurl"
         severity: error
         business_impact:
           incident_label: SECURITY_RISK

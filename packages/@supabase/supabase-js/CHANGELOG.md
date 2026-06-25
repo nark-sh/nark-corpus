@@ -1,5 +1,17 @@
 # CHANGELOG — @supabase/supabase-js
 
+## 2026-06-25 — deepen pass — coverage 84% → 100%
+
+- **Profile:** `packages/@supabase/supabase-js/contract.yaml`
+- **Functions added:** auth.getUserIdentities, auth.linkIdentity, auth.unlinkIdentity, storage.update, storage.createSignedUploadUrl, storage.uploadToSignedUrl (6 total)
+- **Postconditions added:** 12 (2 per new function avg: auth-get-identities-no-session, auth-link-identity-already-exists, auth-link-identity-manual-linking-disabled, auth-unlink-identity-single-identity, auth-unlink-identity-email-conflict, storage-update-not-found, storage-update-unauthorized, storage-create-signed-upload-url-no-token, storage-create-signed-upload-url-unauthorized, storage-upload-to-signed-url-expired-token, storage-upload-to-signed-url-unauthorized — note: auth.getUserIdentities has 1 postcondition)
+- **Coverage:** 22/25 (84%) → 28/28 (100%) effective and raw
+- **Scanner concerns queued:** 6 (concern-20260625-supabase-js-deepen-1 through concern-20260625-supabase-js-deepen-6)
+- **Contract version:** 1.0.0 → 1.1.0
+- **Sources fetched:** GoTrueClient.d.ts + GoTrueClient.js (@supabase/auth-js@2.x, bundled in supabase-js@2.108.2); storage-js/dist/index.cjs (@supabase/storage-js, bundled in supabase-js@2.108.2); https://supabase.com/docs/reference/javascript/auth-getuseridentities; https://supabase.com/docs/reference/javascript/auth-linkidentity; https://supabase.com/docs/reference/javascript/auth-unlinkidentity; https://supabase.com/docs/guides/auth/debugging/error-codes; https://supabase.com/docs/reference/javascript/storage-from-update; https://supabase.com/docs/reference/javascript/storage-from-createsigneduploadurl; https://supabase.com/docs/reference/javascript/storage-from-uploadtosignedurl
+- **Key data-loss finding:** auth.unlinkIdentity with single identity on password-less account causes permanent user lockout (single_identity_not_deletable — DATA_LOSS incident_label, high cost)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 1 on 2026-06-25)
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** @supabase/supabase-js@2.108.2
