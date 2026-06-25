@@ -5,13 +5,20 @@
 # git exits 0). Without try-catch, unhandled errors crash the async call chain.
 package: "simple-git"
 semver: ">=3.32.3"
-contract_version: "1.1.0"
+contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-24"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.85  # 22 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 22/26
+coverage_score: 0.88  # 23 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 23/26
+# Depth pass 2026-06-25 (deepen-stream-2 pass 1):
+# Phase 1.5 sweep (pattern 3 — sync-factory-with-error): simpleGit() factory throws
+#   GitConstructError synchronously when baseDir doesn't exist. This corrects the
+#   previously incorrect note that said "errors occur on first async call, not at construction."
+#   Source confirmed: dist/cjs/index.js line 4719-4722, git-construct-error.d.ts JSDoc.
+# Contracted after pass 1: 23 (+1: simpleGit factory GitConstructError)
+# Note: coverage_score was 0.85 with 22/26; now 0.88 with 23/26.
 # Depth pass 2026-06-24 (deepen-stream-2 pass 69):
 # API surface: ~50 distinct methods on SimpleGit interface; 26 meaningfully worth contracting
 #   (read-only list/query methods like log, branch, status, diff, tags, getRemotes, etc omitted)
@@ -1287,6 +1294,77 @@ functions:
           user_experience: service_unavailable
           incident_cost_range: medium
 
+  - name: simpleGit
+    import_path: "simple-git"
+    description: >
+      Factory function that creates a SimpleGit instance bound to the specified baseDir.
+      Used as: const git = simpleGit('/path/to/repo') or simpleGit({ baseDir: dir }).
+      IMPORTANT: simpleGit() throws GitConstructError SYNCHRONOUSLY (not as a Promise)
+      when the baseDir does not exist or cannot be read. This is NOT an async error —
+      it fires at object creation time, before any git command runs. Callers who
+      initialize simpleGit from dynamic config or environment variables MUST wrap
+      the factory call in a try-catch, not just the subsequent git.push()/git.pull() calls.
+    postconditions:
+      # Evidence: dist/cjs/index.js line 4719-4722 — verified against simple-git@3.36.0:
+      #   if (!folderExists(config.baseDir)) {
+      #     throw new GitConstructError(config, `Cannot use simple-git on a directory that does not exist`);
+      #   }
+      # Declaration: dist/src/lib/errors/git-construct-error.d.ts:
+      #   "Most commonly as a result of using a `baseDir` option that points to a folder
+      #    that either does not exist, or cannot be read by the user the node script is running as."
+      - id: simple-git-construct-missing-try-catch
+        condition: >
+          Code calls simpleGit(baseDir) or simpleGit({ baseDir }) without wrapping
+          in a try-catch. Throws GitConstructError synchronously (not as a Promise rejection)
+          when the baseDir does not exist or cannot be read. Common in production code
+          where baseDir comes from an environment variable, user config, or database value
+          that may point to a non-existent or deleted directory.
+        throws: >
+          GitConstructError extends GitError — thrown SYNCHRONOUSLY from the factory,
+          not as a Promise rejection. Message: "Cannot use simple-git on a directory
+          that does not exist". The .config property contains the options passed to the factory.
+          This error class is exported from simple-git and can be imported:
+            import { GitConstructError } from 'simple-git';
+        required_handling: >
+          Caller MUST wrap simpleGit() in try-catch when baseDir is dynamic.
+
+          Minimum handling:
+            let git: SimpleGit;
+            try {
+              git = simpleGit(repoDir);
+            } catch (err) {
+              if (err instanceof GitConstructError) {
+                console.error(`Git repo directory not found: ${repoDir}`);
+                throw new Error(`Repository directory does not exist: ${repoDir}`);
+              }
+              throw err;
+            }
+
+          For config-driven repos (environment variables):
+            const repoDir = process.env.REPO_DIR;
+            if (!repoDir) {
+              throw new Error('REPO_DIR environment variable not set');
+            }
+            try {
+              const git = simpleGit(repoDir);
+            } catch (err) {
+              // GitConstructError: directory doesn't exist
+              throw new Error(`Cannot initialize git at ${repoDir}: ${err.message}`);
+            }
+
+          DO NOT rely on catching errors from git.push() / git.pull() to detect
+          construction errors — GitConstructError fires before any method call.
+        sources:
+          - "https://github.com/steveukx/git-js/blob/simple-git%403.36.0/simple-git/src/lib/errors/git-construct-error.ts"
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
 notes:
   - "All SimpleGit async methods can throw GitError (base) or GitResponseError<T> (with parsed git output)"
   - "GitResponseError extends GitError and adds .git property with parsed content"
@@ -1299,7 +1377,7 @@ notes:
   - "stash(['pop']) can produce conflicts — throws GitError, leaves conflict markers in working tree"
   - "reset(ResetMode.HARD) is irreversibly destructive — always wrap in try-catch, never call without intent"
   - "CVE-2026-28292 (CVSS 9.8): RCE via case-sensitivity bypass in protocol.allow — affected 3.15.0-3.32.2, fixed in 3.32.3"
-  - "simpleGit() factory function is synchronous — errors occur on first async call, not at construction"
+  - "simpleGit() factory throws GitConstructError SYNCHRONOUSLY when baseDir doesn't exist — NOT deferred to first async call (corrected 2026-06-25: prior note was incorrect)"
   - "Real-world evidence: activepieces/git-sync-handler.ts calls git.push() without try-catch"
   - "clean() requires FORCE or DRY_RUN mode — omitting throws TaskConfigurationError (synchronous, before git runs)"
   - "rebase conflicts leave repo in rebasing state — always call git.rebase(['--abort']) in catch block"

@@ -604,3 +604,46 @@ export async function checkoutLocalBranchWithCatch(cwd: string, branchName: stri
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. simpleGit() factory — GitConstructError on invalid baseDir
+//     NOTE: This is a SYNCHRONOUS throw (not a Promise rejection).
+//     The scanner's current await_patterns approach does NOT detect this —
+//     see scanner concern concern-20260625-simple-git-deepen-1.
+//     These fixtures document the contract for future detection support.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { GitConstructError } from 'simple-git';
+
+// NO_DETECTOR_YET: simple-git-construct-missing-try-catch
+// simpleGit() throws GitConstructError SYNCHRONOUSLY when baseDir doesn't exist.
+// Current scanner uses await_patterns — only detects awaited call sites.
+// Detection of sync factory calls requires a different pattern (see scanner concern
+// concern-20260625-simple-git-deepen-1). The @expect-violation annotation is intentionally
+// removed until the detector is implemented; the postcondition is documented in contract.yaml.
+export function createGitNoCatch(repoDir: string): void {
+  // SHOULD_FIRE (no detector yet): simpleGit() without try-catch — throws GitConstructError synchronously
+  // if repoDir doesn't exist. Common when repoDir comes from env vars or user config.
+  const git = simpleGit(repoDir);
+}
+
+// NO_DETECTOR_YET: simple-git-construct-missing-try-catch
+export async function operateOnGitNoCatch(repoDir: string): Promise<void> {
+  // SHOULD_FIRE (no detector yet): simpleGit() factory called without try-catch inside async function
+  const git = simpleGit(repoDir);
+  await git.push('origin', 'main');
+}
+
+// @expect-clean
+export function createGitWithCatch(repoDir: string): ReturnType<typeof simpleGit> | null {
+  // SHOULD_NOT_FIRE: factory wrapped in try-catch
+  try {
+    return simpleGit(repoDir);
+  } catch (err) {
+    if (err instanceof GitConstructError) {
+      console.error(`Git directory not found: ${repoDir}`);
+      return null;
+    }
+    throw err;
+  }
+}

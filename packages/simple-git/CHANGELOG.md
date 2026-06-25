@@ -3,6 +3,23 @@
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 
+## 2026-06-25 — deepen pass — coverage 85% → 88%
+
+- **Profile:** `packages/simple-git/contract.yaml`
+- **Functions added:** `simpleGit` factory — GitConstructError on invalid baseDir (1 total)
+- **Postconditions added:** 1 (`simple-git-construct-missing-try-catch`)
+- **Functions intentionally omitted this pass:** none
+- **Key finding:** Phase 1.5 sweep (pattern 3 — sync-factory-with-error) discovered that the `simpleGit()` factory throws `GitConstructError` SYNCHRONOUSLY when `baseDir` doesn't exist. A prior note in the contract incorrectly stated "errors occur on first async call, not at construction" — this has been corrected.
+- **Scanner concerns queued:** 1 (`concern-20260625-simple-git-deepen-1`)
+  - New scanner pattern needed: detect `simpleGit(dynamicDir)` factory calls not wrapped in try-catch. The current `await_patterns` approach only catches async call sites — sync factory detection requires a new pattern.
+- **Fixture changes:** `ground-truth.ts` — added `createGitNoCatch`, `operateOnGitNoCatch` (NO_DETECTOR_YET), `createGitWithCatch` (clean). `missing-error-handling.ts` — added `createGitWithoutCatch`.
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `simple-git@3.36.0 dist/cjs/index.js` lines 4719-4722 (GitConstructError throw site)
+  - `simple-git@3.36.0 dist/src/lib/errors/git-construct-error.d.ts` (JSDoc)
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 70 on 2026-06-25)
+
+
 ## 2026-06-24 — deepen pass — coverage 81% → 85%
 
 - **Profile:** `packages/simple-git/contract.yaml`

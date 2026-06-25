@@ -29,4 +29,11 @@ async function mergeWithoutErrorHandling(cwd: string, sourceBranch: string) {
   await git.merge([sourceBranch, '--no-edit']); // should trigger violation
 }
 
-export { pushWithoutErrorHandling, pullWithoutErrorHandling, cloneWithoutErrorHandling, mergeWithoutErrorHandling };
+// ❌ Missing try-catch on simpleGit() factory — GitConstructError when baseDir missing
+// NOTE: This is a SYNCHRONOUS throw, not a Promise rejection.
+function createGitWithoutCatch(repoDir: string) {
+  const git = simpleGit(repoDir); // throws GitConstructError if repoDir doesn't exist
+  return git;
+}
+
+export { pushWithoutErrorHandling, pullWithoutErrorHandling, cloneWithoutErrorHandling, mergeWithoutErrorHandling, createGitWithoutCatch };
