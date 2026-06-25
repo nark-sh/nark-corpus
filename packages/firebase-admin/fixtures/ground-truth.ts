@@ -806,3 +806,241 @@ async function gt_verifyToken_proper(jwt: string) {
     throw error;
   }
 }
+
+// ──────────────────────────────────────────────
+// 32. Cloud Functions / TaskQueue — enqueue / delete — added 2026-06-25 depth pass 3 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getFunctions } from 'firebase-admin/functions';
+
+// @expect-violation: task-queue-enqueue-already-exists
+// @expect-violation: task-queue-enqueue-permission-denied
+// @expect-violation: task-queue-enqueue-not-found
+async function gt_taskQueueEnqueue_missing(payload: object) {
+  const functions = getFunctions();
+  const queue = functions.taskQueue('processOrder');
+  // SHOULD_FIRE: task-queue-enqueue-already-exists / permission-denied / not-found
+  await queue.enqueue(payload, { id: 'order-123' });
+}
+
+// @expect-clean
+async function gt_taskQueueEnqueue_proper(payload: object) {
+  const functions = getFunctions();
+  const queue = functions.taskQueue('processOrder');
+  try {
+    // SHOULD_NOT_FIRE: enqueue inside try-catch
+    await queue.enqueue(payload, { id: 'order-123' });
+  } catch (error) {
+    if ((error as any).code === 'functions/task-already-exists') {
+      // Idempotent — task is already queued, no action needed
+      return;
+    }
+    if ((error as any).code === 'functions/permission-denied') {
+      throw new Error('Missing cloudtasks.tasks.create IAM permission on service account.');
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: task-queue-delete-not-found
+async function gt_taskQueueDelete_missing(taskId: string) {
+  const functions = getFunctions();
+  const queue = functions.taskQueue('processOrder');
+  // SHOULD_FIRE: task-queue-delete-not-found
+  await queue.delete(taskId);
+}
+
+// @expect-clean
+async function gt_taskQueueDelete_proper(taskId: string) {
+  const functions = getFunctions();
+  const queue = functions.taskQueue('processOrder');
+  try {
+    // SHOULD_NOT_FIRE: delete inside try-catch
+    await queue.delete(taskId);
+  } catch (error) {
+    if ((error as any).code === 'functions/not-found') {
+      // Idempotent — task may have already executed; treat as success
+      return;
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 33. Eventarc — Channel.publish — added 2026-06-25 depth pass 3 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getEventarc } from 'firebase-admin/eventarc';
+
+// @expect-violation: eventarc-publish-invalid-argument
+// @expect-violation: eventarc-publish-permission-denied
+async function gt_eventarcPublish_missing() {
+  const eventarc = getEventarc();
+  const channel = eventarc.channel('my-channel');
+  // SHOULD_FIRE: eventarc-publish-invalid-argument / permission-denied
+  await channel.publish({
+    type: 'com.example.order.created',
+    subject: 'order/123',
+  } as any);
+}
+
+// @expect-clean
+async function gt_eventarcPublish_proper() {
+  const eventarc = getEventarc();
+  const channel = eventarc.channel('my-channel');
+  try {
+    // SHOULD_NOT_FIRE: publish inside try-catch
+    await channel.publish({
+      type: 'com.example.order.created',
+      subject: 'order/123',
+    } as any);
+  } catch (error) {
+    if ((error as any).code === 'eventarc/invalid-argument') {
+      throw new Error('CloudEvent payload is missing required fields (id, source, type, specversion).');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 34. Remote Config — rollback / getServerTemplate — added 2026-06-25 depth pass 3 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getRemoteConfig as getRC } from 'firebase-admin/remote-config';
+
+// @expect-violation: remote-config-rollback-version-not-found
+// @expect-violation: remote-config-rollback-invalid-version
+async function gt_remoteConfigRollback_missing(version: number) {
+  const rc = getRC();
+  // SHOULD_FIRE: remote-config-rollback-version-not-found / invalid-version
+  await rc.rollback(version);
+}
+
+// @expect-clean
+async function gt_remoteConfigRollback_proper(version: number) {
+  const rc = getRC();
+  try {
+    // SHOULD_NOT_FIRE: rollback inside try-catch
+    await rc.rollback(version);
+  } catch (error) {
+    if ((error as any).code === 'remote-config/not-found') {
+      throw new Error(`Remote Config version ${version} is no longer available (deleted or out of 300-version window).`);
+    }
+    if ((error as any).code === 'remote-config/failed-precondition') {
+      throw new Error(`Cannot roll back to version ${version}: must be less than current version.`);
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: remote-config-server-template-auth-error
+async function gt_remoteConfigGetServerTemplate_missing() {
+  const rc = getRC();
+  // SHOULD_FIRE: remote-config-server-template-auth-error
+  const template = await rc.getServerTemplate();
+  return template;
+}
+
+// @expect-clean
+async function gt_remoteConfigGetServerTemplate_proper() {
+  const rc = getRC();
+  try {
+    // SHOULD_NOT_FIRE: getServerTemplate inside try-catch
+    const template = await rc.getServerTemplate();
+    return template;
+  } catch (error) {
+    if ((error as any).code === 'remote-config/permission-denied') {
+      throw new Error('Service account lacks Firebase Remote Config Viewer permission.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────
+// 35. Machine Learning — createModel / publishModel / deleteModel — added 2026-06-25 depth pass 3 (deepen-stream-2)
+// ──────────────────────────────────────────────
+
+import { getMachineLearning } from 'firebase-admin/machine-learning';
+
+// @expect-violation: ml-create-model-already-exists
+// @expect-violation: ml-create-model-invalid-argument
+async function gt_mlCreateModel_missing() {
+  const ml = getMachineLearning();
+  // SHOULD_FIRE: ml-create-model-already-exists / invalid-argument
+  const model = await ml.createModel({
+    displayName: 'my-classifier',
+    tfliteModel: { gcsTfliteUri: 'gs://my-bucket/model.tflite' },
+  });
+  return model;
+}
+
+// @expect-clean
+async function gt_mlCreateModel_proper() {
+  const ml = getMachineLearning();
+  try {
+    // SHOULD_NOT_FIRE: createModel inside try-catch
+    const model = await ml.createModel({
+      displayName: 'my-classifier',
+      tfliteModel: { gcsTfliteUri: 'gs://my-bucket/model.tflite' },
+    });
+    return model;
+  } catch (error) {
+    if ((error as any).code === 'machine-learning/already-exists') {
+      // Model exists — retrieve and update instead
+      throw new Error('Model already exists. Use updateModel() to update the existing model.');
+    }
+    if ((error as any).code === 'machine-learning/invalid-argument') {
+      throw new Error('Invalid model options: check gcsTfliteUri format and display name.');
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: ml-publish-model-not-found
+// @expect-violation: ml-publish-model-failed-precondition
+async function gt_mlPublishModel_missing(modelId: string) {
+  const ml = getMachineLearning();
+  // SHOULD_FIRE: ml-publish-model-not-found / failed-precondition
+  const model = await ml.publishModel(modelId);
+  return model;
+}
+
+// @expect-clean
+async function gt_mlPublishModel_proper(modelId: string) {
+  const ml = getMachineLearning();
+  try {
+    // SHOULD_NOT_FIRE: publishModel inside try-catch
+    const model = await ml.publishModel(modelId);
+    return model;
+  } catch (error) {
+    if ((error as any).code === 'machine-learning/not-found') {
+      throw new Error(`Model ${modelId} not found — verify the model was created successfully.`);
+    }
+    if ((error as any).code === 'machine-learning/failed-precondition') {
+      throw new Error(`Model ${modelId} is locked — wait for processing to complete before publishing.`);
+    }
+    throw error;
+  }
+}
+
+// @expect-violation: ml-delete-model-not-found
+async function gt_mlDeleteModel_missing(modelId: string) {
+  const ml = getMachineLearning();
+  // SHOULD_FIRE: ml-delete-model-not-found
+  await ml.deleteModel(modelId);
+}
+
+// @expect-clean
+async function gt_mlDeleteModel_proper(modelId: string) {
+  const ml = getMachineLearning();
+  try {
+    // SHOULD_NOT_FIRE: deleteModel inside try-catch
+    await ml.deleteModel(modelId);
+  } catch (error) {
+    if ((error as any).code === 'machine-learning/not-found') {
+      // Idempotent — model already deleted; treat as success
+      return;
+    }
+    throw error;
+  }
+}

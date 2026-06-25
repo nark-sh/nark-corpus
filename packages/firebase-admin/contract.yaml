@@ -2,7 +2,7 @@ package: firebase-admin
 semver: ">=11.0.0 <15.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-24"
+last_verified: "2026-06-25"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -35,7 +35,20 @@ evidence_quality: confirmed
 #   executeMutation, insert, insertMany, upsert, upsertMany) — they share the
 #   same error profile as executeGraphql and are covered by the same await_patterns.
 # API surface total: 77; contracted: 46; omitted: 31; coverage_score: 0.60
-coverage_score: 0.6
+# Depth pass 2026-06-25 (deepen-stream-2 pass 3):
+# Added 8 new function entries: TaskQueue.enqueue, TaskQueue.delete (Cloud Functions),
+#   Channel.publish (Eventarc), RemoteConfig.rollback, RemoteConfig.getServerTemplate,
+#   MachineLearning.createModel, MachineLearning.publishModel, MachineLearning.deleteModel.
+# New omissions: TaskQueue.delete/not-found as idempotent, listVersions (read-only),
+#   getTemplateAtVersion (read-only fetch), listRulesetMetadata (read-only),
+#   MachineLearning.getModel (read-only), MachineLearning.updateModel (already
+#   covered via createModel patterns), MachineLearning.unpublishModel (same as
+#   publishModel but inverted — shares error profile), setProcessingState (extension
+#   lifecycle, low blast-radius for SaaS apps), setFatalError (same),
+#   Security Rules release helpers (admin-only, niche SaaS usage).
+# API surface total: 90 (re-enumerated, including functions/eventarc/ML/extensions);
+#   contracted: 54; omitted: 36; coverage_score: 0.60 raw (54/90)
+coverage_score: 0.60
 
 detection:
   class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck", "DataConnect", "PhoneNumberVerification"]
@@ -2424,3 +2437,429 @@ functions:
           visibility: visible
           user_experience: service_unavailable
           incident_cost_range: high
+
+  # ── Cloud Functions / Task Queue ─────────────────────────────────────────────
+
+  - name: TaskQueue.enqueue
+    import_path: "firebase-admin/functions"
+    description: >
+      Creates a task and adds it to a Cloud Tasks-backed queue for deferred
+      background execution. Requires cloudtasks.tasks.create IAM permission on
+      the service account. Accepts optional TaskOptions for scheduling delay,
+      absolute delivery time, dispatch deadline, custom headers, and deduplication
+      ID. Task payload is serialized to JSON and POSTed to the Cloud Functions
+      worker. If an explicit ID is provided, duplicate enqueues throw
+      'task-already-exists' — a deliberate de-duplication contract useful for
+      idempotency but often mishandled as an error.
+
+    postconditions:
+      # Evidence: lib/functions/error.d.ts — FunctionsErrorCode.TASK_ALREADY_EXISTS: 'task-already-exists'
+      # Evidence: lib/functions/functions-api.d.ts — id field comment "The call will throw an error
+      #   with code 'functions/task-already-exists'"
+      # Evidence: https://firebase.google.com/docs/functions/task-functions
+      - id: task-queue-enqueue-already-exists
+        severity: error
+        condition: >
+          TaskOptions.id is set to an explicit value and a task with that ID
+          already exists in the queue, or was deleted/executed within the last
+          ~1 hour (deduplication window).
+        throws: "FirebaseFunctionsError with code 'functions/task-already-exists'"
+        required_handling: >
+          Caller MUST either catch and treat this as idempotent success (task
+          is already queued — no action needed), or use a different ID. Do NOT
+          retry blindly — the same ID will fail again until the deduplication
+          window expires. If at-least-once semantics are acceptable, catch and
+          continue. If exactly-once is required, check error.code before deciding
+          whether to surface the error upstream.
+        sources:
+          - "https://firebase.google.com/docs/functions/task-functions"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/functions/functions-api.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/functions/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: lib/functions/error.d.ts — FUNCTIONS_ERROR_CODE_MAPPING: PERMISSION_DENIED → 'permission-denied'
+      # Evidence: https://firebase.google.com/docs/functions/task-functions — "PERMISSION DENIED errors when
+      #   enqueueing tasks" requires cloudtasks.tasks.create permission on service account
+      - id: task-queue-enqueue-permission-denied
+        severity: error
+        condition: >
+          The service account lacks the cloudtasks.tasks.create IAM permission,
+          or the Cloud Tasks API is not enabled for the project.
+        throws: "FirebaseFunctionsError with code 'functions/permission-denied'"
+        required_handling: >
+          This is a deployment-time configuration error — fix the service account
+          IAM binding before retrying. Grant roles/cloudtasks.enqueuer or a
+          custom role with cloudtasks.tasks.create. Do NOT retry in code — the
+          permission check is server-side and will fail repeatedly.
+        sources:
+          - "https://firebase.google.com/docs/functions/task-functions"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/functions/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: lib/functions/error.d.ts — FUNCTIONS_ERROR_CODE_MAPPING: NOT_FOUND → 'not-found'
+      # The queue (backed by a Cloud Function) may not exist if the function is not deployed
+      - id: task-queue-enqueue-not-found
+        severity: error
+        condition: >
+          The Cloud Functions task-queue function referenced by functionName is
+          not deployed or does not exist in the specified project/location.
+        throws: "FirebaseFunctionsError with code 'functions/not-found'"
+        required_handling: >
+          Verify the function name is correct and deployed. In multi-environment
+          setups, check that the function is deployed in the environment matching
+          the Firebase app's project. Fail fast with an alert — tasks cannot be
+          enqueued for a function that doesn't exist.
+        sources:
+          - "https://firebase.google.com/docs/functions/task-functions"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/functions/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: TaskQueue.delete
+    import_path: "firebase-admin/functions"
+    description: >
+      Deletes an enqueued task from the Cloud Tasks queue by its task ID, if the
+      task has not yet started execution. Idempotent in the sense that a task
+      that has already executed cannot be deleted (returns not-found). Useful for
+      cancellation flows (e.g. cancel a scheduled email when a user unsubscribes
+      before the task runs).
+
+    postconditions:
+      # Evidence: lib/functions/error.d.ts — FUNCTIONS_ERROR_CODE_MAPPING: NOT_FOUND → 'not-found'
+      # Cloud Tasks returns 404 if the task does not exist or has already been executed
+      - id: task-queue-delete-not-found
+        severity: error
+        condition: >
+          The task with the given ID does not exist in the queue — either it was
+          already executed, already deleted, never enqueued, or the deduplication
+          window has passed.
+        throws: "FirebaseFunctionsError with code 'functions/not-found'"
+        required_handling: >
+          Caller SHOULD handle not-found as an idempotent no-op in most cancellation
+          scenarios — the task may have already executed before the cancellation
+          request arrived. If strict delivery-guarantees are required (task must
+          not run), treat not-found as an error requiring investigation.
+        sources:
+          - "https://firebase.google.com/docs/functions/task-functions"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/functions/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  # ── Eventarc ─────────────────────────────────────────────────────────────────
+
+  - name: Channel.publish
+    import_path: "firebase-admin/eventarc"
+    description: >
+      Publishes one or more CloudEvents to an Eventarc channel. Used by Extensions
+      and custom backend services to trigger downstream event handlers. The channel
+      must exist and the publisher service account needs eventarc.events.create
+      permission. Silently ignores events whose type is not in allowedEventTypes
+      (if the channel was constructed with that filter). HTTP POST to the Eventarc
+      REST API — a network call that can fail transiently or due to misconfiguration.
+
+    postconditions:
+      # Evidence: lib/eventarc/error.d.ts — EventarcErrorCode: INVALID_ARGUMENT: 'invalid-argument'
+      # Evidence: lib/eventarc/eventarc.js — throws FirebaseEventarcError 'invalid-argument'
+      #   when channel name or event payload is malformed
+      - id: eventarc-publish-invalid-argument
+        severity: error
+        condition: >
+          The CloudEvent payload is missing required fields (id, source, type,
+          specversion), contains an invalid field type, or the channel resource
+          name is malformed.
+        throws: "FirebaseEventarcError with code 'eventarc/invalid-argument'"
+        required_handling: >
+          Validate CloudEvent structure before publishing. Required fields:
+          id (unique per event), source (URI), type (reverse-DNS string),
+          specversion ('1.0'). A missing or malformed field throws immediately
+          before the network call is made. Fix the event construction — retrying
+          the same payload produces the same failure.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/eventarc/eventarc.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/eventarc/error.ts"
+          - "https://cloudevents.io/blog/2021/04/05/introducing-cloudevents-sdk-for-javascript/"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: medium
+
+      # Evidence: lib/eventarc/eventarc-client-internal.js — toFirebaseError maps HTTP errors to
+      #   FirebaseEventarcError 'unknown-error'. PERMISSION DENIED returns 403 from Eventarc API.
+      - id: eventarc-publish-permission-denied
+        severity: error
+        condition: >
+          The publisher service account lacks eventarc.events.create permission on
+          the Eventarc channel, or the Eventarc API is not enabled for the project.
+        throws: "FirebaseEventarcError with code 'eventarc/unknown-error' (wraps 403 HTTP response)"
+        required_handling: >
+          Grant the service account roles/eventarc.eventPublisher or the specific
+          eventarc.events.create permission. This is a deployment-time configuration
+          error — retrying in code will not help. Alert on-call immediately as all
+          event publications from this service are silently failing.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/eventarc/eventarc-client-internal.ts"
+          - "https://firebase.google.com/docs/eventarc/admin/send-events"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ── Remote Config (additional methods) ───────────────────────────────────────
+
+  - name: RemoteConfig.rollback
+    import_path: "firebase-admin/remote-config"
+    description: >
+      Rolls back the active Remote Config template to a previously published version.
+      Equivalent to fetching the specified historical version and re-publishing it with
+      force=true. Only the last 300 versions are retained; versions deleted for staleness
+      (older than 90 days when non-active) cannot be rolled back to. Used as an emergency
+      revert during a config-driven incident. A critical operational method — a bug here
+      can leave an app in a broken config state or roll back to a wrong version.
+
+    postconditions:
+      # Evidence: lib/remote-config/error.d.ts — RemoteConfigErrorCode: NOT_FOUND: 'not-found'
+      # Rolling back to a version number that was deleted due to staleness or never existed
+      - id: remote-config-rollback-version-not-found
+        severity: error
+        condition: >
+          The specified version number does not exist — it was never published, was
+          deleted due to staleness (older than 90 days and no longer active), or
+          exceeds the 300-version retention window.
+        throws: "FirebaseRemoteConfigError with code 'remote-config/not-found'"
+        required_handling: >
+          Catch and alert. During an incident rollback, a not-found error means
+          the target version is unavailable — fall back to the next-older known-good
+          version. Use listVersions() to inspect the available version window before
+          calling rollback(). Do NOT retry with the same version number.
+        sources:
+          - "https://firebase.google.com/docs/remote-config/automate-rc"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/remote-config/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: lib/remote-config/error.d.ts — RemoteConfigErrorCode: FAILED_PRECONDITION
+      # Rolling back to a version number >= current version violates the precondition
+      - id: remote-config-rollback-invalid-version
+        severity: error
+        condition: >
+          The specified version number is invalid — it is greater than or equal to
+          the current version, or is not a positive integer.
+        throws: "FirebaseRemoteConfigError with code 'remote-config/failed-precondition' or 'remote-config/invalid-argument'"
+        required_handling: >
+          Validate that the target version number is less than the current template
+          version (available from template.version.versionNumber after getTemplate()).
+          Rollback to the same or newer version is logically invalid.
+        sources:
+          - "https://firebase.google.com/docs/remote-config/automate-rc"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/remote-config/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: RemoteConfig.getServerTemplate
+    import_path: "firebase-admin/remote-config"
+    description: >
+      Fetches the active Remote Config template for server-side evaluation, returning
+      a ServerTemplate object. ServerTemplate is used in Server-Side Personalization
+      flows where parameter values are evaluated server-side (with user context) rather
+      than being fetched on the client. Requires network access to the Remote Config
+      REST API. Added in firebase-admin v12 for server-side personalization use cases.
+
+    postconditions:
+      # Evidence: lib/remote-config/error.d.ts — RemoteConfigErrorCode: UNAUTHENTICATED, PERMISSION_DENIED
+      # Evidence: https://firebase.google.com/docs/remote-config/server
+      - id: remote-config-server-template-auth-error
+        severity: error
+        condition: >
+          The service account lacks Firebase Remote Config Viewer or Admin permission,
+          or the Remote Config REST API is not enabled for the project. Also fires
+          if the credentials have expired (UNAUTHENTICATED).
+        throws: "FirebaseRemoteConfigError with code 'remote-config/permission-denied' or 'remote-config/unauthenticated'"
+        required_handling: >
+          Grant roles/firebaseremoteconfig.viewer to the service account. If the
+          credential has expired, re-initialize the Admin SDK. This error blocks
+          all server-side personalization — surface as a startup error rather than
+          letting it manifest as a runtime NullPointerException when using the
+          template object.
+        sources:
+          - "https://firebase.google.com/docs/remote-config/server"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/remote-config/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: high
+
+  # ── Machine Learning ──────────────────────────────────────────────────────────
+
+  - name: MachineLearning.createModel
+    import_path: "firebase-admin/machine-learning"
+    description: >
+      Creates a new Firebase ML model in the project. Requires a display name and
+      a TFLite model source (GCS URI pointing to a .tflite file). The model starts
+      in UNPUBLISHED state — call publishModel() to make it downloadable by clients.
+      Fails if the GCS file does not exist, the service account lacks Storage read
+      access, or the model display name is already in use.
+
+    postconditions:
+      # Evidence: lib/machine-learning/error.d.ts — MachineLearningErrorCode: ALREADY_EXISTS: 'already-exists'
+      - id: ml-create-model-already-exists
+        severity: error
+        condition: >
+          A model with the same display name already exists in the project.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/already-exists'"
+        required_handling: >
+          Catch and either update the existing model via updateModel() or use a
+          unique display name. In idempotent create-or-update flows, catch this
+          error, retrieve the existing model, and call updateModel() with the new
+          model file URI.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+      # Evidence: lib/machine-learning/error.d.ts — MachineLearningErrorCode: INVALID_ARGUMENT
+      # Fires when model GCS URI is malformed or the .tflite file is not a valid TFLite model
+      - id: ml-create-model-invalid-argument
+        severity: error
+        condition: >
+          The model options are invalid — display name is empty, gcsTfliteUri is
+          malformed, or the referenced GCS file is not a valid TFLite model.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/invalid-argument'"
+        required_handling: >
+          Validate model options before calling createModel(). Verify the GCS URI
+          format (gs://bucket/path/to/model.tflite) and that the file exists and
+          is a valid TFLite model. A malformed URI causes an immediate error before
+          any upload attempt.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low
+
+  - name: MachineLearning.publishModel
+    import_path: "firebase-admin/machine-learning"
+    description: >
+      Publishes a Firebase ML model, making it downloadable by client SDKs (Android,
+      iOS, Flutter). The model must exist and be in a valid state (not locked by an
+      ongoing operation). A published model is what end-user devices download via
+      the Firebase ML SDK. If this call fails silently, clients continue using the
+      old model version indefinitely with no alert.
+
+    postconditions:
+      # Evidence: lib/machine-learning/error.d.ts — MachineLearningErrorCode: NOT_FOUND: 'not-found'
+      - id: ml-publish-model-not-found
+        severity: error
+        condition: >
+          The model with the given modelId does not exist in the project —
+          it was never created, or was deleted before publish was called.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/not-found'"
+        required_handling: >
+          Catch and fail the deployment pipeline with a clear error. In CI/CD
+          model-deployment flows, treat this as a fatal error requiring manual
+          intervention — a missing model cannot be auto-recovered by retrying.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: lib/machine-learning/error.d.ts — MachineLearningErrorCode: FAILED_PRECONDITION
+      # publishModel() fails if the model is locked (e.g. another operation in progress) or
+      # if the model file validation is still pending
+      - id: ml-publish-model-failed-precondition
+        severity: error
+        condition: >
+          The model is in a locked state due to a concurrent operation (e.g. the
+          model file is still being processed or validated by Firebase ML).
+        throws: "FirebaseMachineLearningError with code 'machine-learning/failed-precondition'"
+        required_handling: >
+          Catch and poll for the model to reach a non-locked state using getModel()
+          before retrying publishModel(). Implement exponential backoff with a
+          reasonable timeout (e.g. 60 seconds) — model processing is typically fast
+          but can be slow for large models.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: MachineLearning.deleteModel
+    import_path: "firebase-admin/machine-learning"
+    description: >
+      Permanently deletes a Firebase ML model from the project. The model is
+      immediately removed and clients will no longer be able to download it.
+      This is irreversible — there is no trash or undelete. Published models
+      that are deleted immediately become unavailable to new client downloads,
+      although clients that have already cached the model may continue using
+      the cached version.
+
+    postconditions:
+      # Evidence: lib/machine-learning/error.d.ts — MachineLearningErrorCode: NOT_FOUND: 'not-found'
+      - id: ml-delete-model-not-found
+        severity: error
+        condition: >
+          The model with the given modelId does not exist — it was already deleted
+          or the ID was never valid.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/not-found'"
+        required_handling: >
+          Caller SHOULD treat not-found as an idempotent success in cleanup
+          workflows (the goal was to remove the model — it's already gone). If
+          strict deletion confirmation is required, propagate the error as a
+          deletion-failed alert.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_transaction
+          incident_cost_range: low

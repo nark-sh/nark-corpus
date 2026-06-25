@@ -1,5 +1,24 @@
 # CHANGELOG — firebase-admin
 
+## 2026-06-25 — deepen pass 3 (deepen-stream-2) — coverage 60% → 60% (expanded surface)
+
+- **Profile:** `packages/firebase-admin/contract.yaml`
+- **Functions added:** TaskQueue.enqueue, TaskQueue.delete, Channel.publish (Eventarc), RemoteConfig.rollback, RemoteConfig.getServerTemplate, MachineLearning.createModel, MachineLearning.publishModel, MachineLearning.deleteModel (8 total)
+- **Postconditions added:** 16
+- **Functions intentionally omitted this pass:** listVersions / getTemplateAtVersion (read-only Remote Config); MachineLearning.getModel (read-only) / updateModel (shares createModel error profile) / unpublishModel (inverse of publishModel); setProcessingState / setFatalError (Extensions lifecycle, low SaaS blast-radius); Security Rules release helpers (releaseFirestoreRuleset* etc. — admin-only); Installations.deleteInstallation (admin op)
+- **Scanner concerns queued:** 4 (`concern-20260625-firebase-admin-deepen-1` through `-deepen-4`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `lib/functions/error.d.ts`, `lib/functions/functions.d.ts` (firebase-admin@14.0.0 node_modules)
+  - `lib/eventarc/error.d.ts`, `lib/eventarc/eventarc.d.ts` (firebase-admin@14.0.0 node_modules)
+  - `lib/remote-config/error.d.ts`, `lib/remote-config/remote-config.d.ts` (firebase-admin@14.0.0 node_modules)
+  - `lib/machine-learning/error.d.ts`, `lib/machine-learning/machine-learning.d.ts` (firebase-admin@14.0.0 node_modules)
+  - https://firebase.google.com/docs/functions/task-functions
+  - https://firebase.google.com/docs/remote-config/automate-rc
+  - https://firebase.google.com/docs/ml/manage-models-admin
+- **Coverage math:** API surface re-enumerated from 77 to 90 (added Cloud Functions/TaskQueue, Eventarc/Channel, additional Remote Config, Machine Learning). 54 contracted / 36 omitted / 90 total = 0.60 raw (same ratio as 46/77 pass 42 — surface growth was proportional to coverage growth).
+- **Verified by:** bc-deepen-contract (deepen-stream-2, pass 3 on 2026-06-25T17:03:30+00:00)
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** firebase-admin@14.1.0
