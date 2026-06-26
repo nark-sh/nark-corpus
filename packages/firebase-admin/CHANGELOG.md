@@ -1,5 +1,24 @@
 # CHANGELOG — firebase-admin
 
+## 2026-06-26 — deepen pass 6 (deepen-stream-1 pass 4) — coverage 67% → 74%
+
+- **Profile:** `packages/firebase-admin/contract.yaml`
+- **Functions added:** AppCheck.createToken, AppCheck.verifyToken, deleteUsers, generateEmailVerificationLink, sendEachForMulticast, unsubscribeFromTopic (6 total)
+- **Postconditions added:** 14 (3 for createToken, 3 for verifyToken, 2 for deleteUsers, 2 for generateEmailVerificationLink, 2 for sendEachForMulticast, 2 for unsubscribeFromTopic)
+- **Functions intentionally omitted this pass:** getUserByPhoneNumber/getUserByProviderUid (same profile as getUserByEmail), getUsers (batch lookup, no distinct errors), listUsers (read-only pagination), sendMulticast (deprecated alias)
+- **Scanner concerns queued:** 4 (`concern-20260626-firebase-admin-deepen-appcheck-createtoken`, `-appcheck-verifytoken`, `-deleteusers`, `-generateemailverificationlink`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/app-check-api-client-internal.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/token-verifier.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/messaging/messaging.ts`
+  - firebase-admin@14.1.0 node_modules (app-check.js, token-verifier.js, base-auth.js, messaging.js)
+- **Coverage math:** 67 contracted / 23 omitted / 90 total = 0.7444 (67% → 74%). +6 contracted this pass.
+- **Verified by:** bc-deepen-contract (deepen-stream-1 pass 4 on 2026-06-26)
+
 ## 2026-06-26 — deepen pass 5 (deepen-stream-2 pass 1) — coverage 60% → 67%
 
 - **Profile:** `packages/firebase-admin/contract.yaml`

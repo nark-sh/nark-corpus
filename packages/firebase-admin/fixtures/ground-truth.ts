@@ -22,6 +22,9 @@
  *     createRuleset, deleteRuleset
  *   ML (new 2026-06-26 pass 1): updateModel
  *   Installations (new 2026-06-26 pass 1): deleteInstallation
+ *   App Check (new 2026-06-26 pass 4): createToken, verifyToken
+ *   Auth batch (new 2026-06-26 pass 4): deleteUsers, generateEmailVerificationLink
+ *   Messaging (new 2026-06-26 pass 4): sendEachForMulticast, unsubscribeFromTopic
  *
  * Detection note: namespace API (admin.auth()) and stored instances are fully detected.
  * Modular getAuth().verifyIdToken() pattern is not currently detected (analyzer limitation).
@@ -38,6 +41,7 @@ import { getPhoneNumberVerification } from 'firebase-admin/phone-number-verifica
 import { getSecurityRules } from 'firebase-admin/security-rules';
 import { getMachineLearning } from 'firebase-admin/machine-learning';
 import { getInstallations } from 'firebase-admin/installations';
+import { getAppCheck } from 'firebase-admin/app-check';
 
 // ──────────────────────────────────────────────
 // 1. verifyIdToken — namespace API
@@ -1242,6 +1246,215 @@ async function gt_deleteInstallation_proper(fid: string) {
       }
       // Re-throw for rate-limit / server errors that need retry
       throw error;
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// AppCheck.createToken (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: app-check-create-token-invalid-argument
+// @expect-violation: app-check-create-token-permission-denied
+// @expect-violation: app-check-create-token-not-found
+async function gt_appcheck_createToken_missing(appId: string) {
+  const appCheck = getAppCheck();
+  // SHOULD_FIRE: app-check-create-token-invalid-argument / permission-denied / not-found
+  const token = await appCheck.createToken(appId);
+  return token.token;
+}
+
+// @expect-clean
+async function gt_appcheck_createToken_proper(appId: string) {
+  const appCheck = getAppCheck();
+  try {
+    // SHOULD_NOT_FIRE: createToken inside try-catch
+    const token = await appCheck.createToken(appId);
+    return token.token;
+  } catch (error) {
+    if ((error as any).code === 'app-check/invalid-argument') {
+      throw new Error('Invalid appId — must be a non-empty string registered in Firebase.');
+    }
+    if ((error as any).code === 'app-check/permission-denied') {
+      throw new Error('Service account lacks Firebase App Check Admin role.');
+    }
+    if ((error as any).code === 'app-check/not-found') {
+      throw new Error(`App ${appId} not registered in Firebase project.`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// AppCheck.verifyToken (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: app-check-verify-token-expired
+// @expect-violation: app-check-verify-token-invalid-argument
+// @expect-violation: app-check-verify-token-invalid-credential
+async function gt_appcheck_verifyToken_missing(appCheckToken: string) {
+  const appCheck = getAppCheck();
+  // SHOULD_FIRE: app-check-verify-token-expired / invalid-argument / invalid-credential
+  const decoded = await appCheck.verifyToken(appCheckToken);
+  return decoded.appId;
+}
+
+// @expect-clean
+async function gt_appcheck_verifyToken_proper(appCheckToken: string) {
+  const appCheck = getAppCheck();
+  try {
+    // SHOULD_NOT_FIRE: verifyToken inside try-catch
+    const decoded = await appCheck.verifyToken(appCheckToken);
+    return decoded.appId;
+  } catch (error) {
+    if ((error as any).code === 'app-check/app-check-token-expired') {
+      // Return 401 — tell client to refresh App Check token
+      throw Object.assign(new Error('App Check token expired — client must refresh.'), { status: 401 });
+    }
+    if ((error as any).code === 'app-check/invalid-argument') {
+      throw Object.assign(new Error('Invalid App Check token — possible tampering.'), { status: 401 });
+    }
+    if ((error as any).code === 'app-check/invalid-credential') {
+      throw new Error('Admin SDK not initialized with project credentials.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// deleteUsers (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: delete-users-partial-failure
+// @expect-violation: delete-users-batch-size-exceeded
+async function gt_deleteUsers_missing(uids: string[]) {
+  // SHOULD_FIRE: delete-users-partial-failure — result not inspected
+  const result = await admin.auth().deleteUsers(uids);
+  return result.successCount;
+}
+
+// @expect-clean
+async function gt_deleteUsers_proper(uids: string[]) {
+  try {
+    // SHOULD_NOT_FIRE: deleteUsers with result inspection
+    const result = await admin.auth().deleteUsers(uids);
+    if (result.failureCount > 0) {
+      for (const err of result.errors) {
+        console.error(`Failed to delete user at index ${err.index}:`, err.error.message);
+      }
+      throw new Error(`Batch deletion partially failed: ${result.failureCount} of ${uids.length} users not deleted`);
+    }
+    return result.successCount;
+  } catch (error) {
+    if ((error as any).code === 'auth/maximum-user-count-exceeded') {
+      throw new Error('Batch too large — chunk into batches of <= 1000 uids.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// generateEmailVerificationLink (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: generate-email-verification-link-email-not-found
+// @expect-violation: generate-email-verification-link-unauthorized-domain
+async function gt_generateEmailVerificationLink_missing(email: string) {
+  // SHOULD_FIRE: generate-email-verification-link-email-not-found
+  const link = await admin.auth().generateEmailVerificationLink(email);
+  return link;
+}
+
+// @expect-clean
+async function gt_generateEmailVerificationLink_proper(email: string) {
+  try {
+    // SHOULD_NOT_FIRE: generateEmailVerificationLink inside try-catch
+    const link = await admin.auth().generateEmailVerificationLink(email);
+    return link;
+  } catch (error) {
+    if ((error as any).code === 'auth/email-not-found') {
+      // Security: do not reveal registration status to callers
+      throw new Error('Could not generate verification link — check server logs.');
+    }
+    if ((error as any).code === 'auth/unauthorized-continue-uri') {
+      throw new Error('Continue URL domain not authorized — add it in Firebase console.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// sendEachForMulticast (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: send-each-for-multicast-batch-size-exceeded
+// @expect-violation: send-each-for-multicast-partial-failure
+async function gt_sendEachForMulticast_missing(tokens: string[], payload: object) {
+  // SHOULD_FIRE: send-each-for-multicast-partial-failure — result not inspected
+  const response = await admin.messaging().sendEachForMulticast({ tokens, ...payload } as any);
+  return response.successCount;
+}
+
+// @expect-clean
+async function gt_sendEachForMulticast_proper(tokens: string[], title: string, body: string) {
+  try {
+    // SHOULD_NOT_FIRE: sendEachForMulticast with result inspection
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+    });
+    if (response.failureCount > 0) {
+      const staleTokens: string[] = [];
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          if (resp.error?.code === 'messaging/registration-token-not-registered') {
+            staleTokens.push(tokens[idx]);
+          } else {
+            console.error(`Failed to send to token[${idx}]:`, resp.error?.message);
+          }
+        }
+      });
+      // Remove stale tokens from database
+      if (staleTokens.length > 0) {
+        console.log(`Removing ${staleTokens.length} stale tokens`);
+      }
+    }
+    return response.successCount;
+  } catch (error) {
+    if ((error as any).code === 'messaging/invalid-argument') {
+      throw new Error('Invalid multicast message — check tokens array and message fields.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// unsubscribeFromTopic (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: unsubscribe-from-topic-partial-failure
+// @expect-violation: unsubscribe-from-topic-invalid-argument
+async function gt_unsubscribeFromTopic_missing(tokens: string[], topic: string) {
+  // SHOULD_FIRE: unsubscribe-from-topic-partial-failure — result not inspected
+  const result = await admin.messaging().unsubscribeFromTopic(tokens, topic);
+  return result.successCount;
+}
+
+// @expect-clean
+async function gt_unsubscribeFromTopic_proper(tokens: string[], topic: string) {
+  try {
+    // SHOULD_NOT_FIRE: unsubscribeFromTopic with result inspection
+    const result = await admin.messaging().unsubscribeFromTopic(tokens, topic);
+    if (result.failureCount > 0) {
+      result.errors.forEach((err) => {
+        console.error(`Failed to unsubscribe token at index ${err.index}:`, err.error.message);
+      });
+    }
+    return result.successCount;
+  } catch (error) {
+    if ((error as any).code === 'messaging/invalid-argument') {
+      throw new Error('Invalid topic name or tokens — check topic format and token list.');
     }
     throw error;
   }

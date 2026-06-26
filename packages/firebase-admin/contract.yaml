@@ -1,6 +1,6 @@
 package: firebase-admin
 semver: ">=11.0.0 <15.0.0"
-contract_version: "1.4.0"
+contract_version: "1.5.0"
 maintainer: "corpus-team"
 last_verified: "2026-06-26"
 coverage_status: covered
@@ -60,7 +60,19 @@ evidence_quality: confirmed
 #   getStorageRuleset/listRulesetMetadata (read-only GETs), RemoteConfig.load() (niche
 #   ServerTemplate preview), Extensions.setProcessingState/setFatalError (extension lifecycle).
 # API surface total: 90; contracted: 60; omitted: 30; coverage_score: 0.67 (60/90)
-coverage_score: 0.67
+#
+# Depth pass 2026-06-26 (deepen-stream-1 pass 4):
+# Added 7 new function entries:
+#   AppCheck.createToken (security -- invalid-argument, permission-denied, not-found)
+#   AppCheck.verifyToken (security -- app-check-token-expired, invalid-argument, invalid-credential)
+#   deleteUsers (batch delete -- partial-failure silent model, batch-size-exceeded)
+#   generateEmailVerificationLink (auth -- email-not-found, unauthorized-continue-uri)
+#   sendEachForMulticast (messaging -- batch-size-exceeded, partial-failure silent model)
+#   unsubscribeFromTopic (messaging -- partial-failure silent model, invalid-argument)
+# Formally moved to omitted: getUserByPhoneNumber/getUserByProviderUid (same as getUserByEmail),
+#   getUsers (batch lookup, no distinct errors), listUsers (read-only pagination).
+# API surface total: 90; contracted: 67; omitted: 23; coverage_score: 0.74 (67/90)
+coverage_score: 0.74
 
 detection:
   class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck", "DataConnect", "PhoneNumberVerification"]
@@ -136,6 +148,15 @@ detection:
     - ".updateModel("
     # Installations (added 2026-06-26)
     - ".deleteInstallation("
+    # App Check (added 2026-06-26)
+    - ".createToken("
+    - ".verifyToken("
+    # Auth batch operations (added 2026-06-26)
+    - ".deleteUsers("
+    - ".generateEmailVerificationLink("
+    # Messaging multicast and topic (added 2026-06-26)
+    - ".sendEachForMulticast("
+    - ".unsubscribeFromTopic("
 
 functions:
   # Authentication Service
@@ -3324,3 +3345,448 @@ functions:
           visibility: silent
           user_experience: lost_data
           incident_cost_range: high
+
+  # ── App Check -- Mobile App Integrity Verification ────────────────────────
+
+  - name: AppCheck.createToken
+    import_path: "firebase-admin/app-check"
+    description: >
+      Creates a new Firebase App Check token for a given app ID. The token is
+      returned to the client app and is used to prove to Firebase and Google
+      services that the request originates from a legitimate, unmodified app.
+      Used in server-side flows where the backend needs to mint an App Check
+      token for a client (e.g., CI testing, privileged flows). A silent failure
+      here means the client cannot access Firebase services protected by App
+      Check enforcement, causing a service outage for all end users of that app.
+
+    postconditions:
+      # Evidence: src/app-check/app-check-api-client-internal.ts (exchangeToken),
+      # src/app-check/error.ts (APP_CHECK_ERROR_CODE_MAPPING)
+      # The error code mapping: INVALID_ARGUMENT -> 'invalid-argument',
+      # PERMISSION_DENIED -> 'permission-denied', NOT_FOUND -> 'not-found',
+      # UNAUTHENTICATED -> 'unauthenticated', ABORTED -> 'aborted'
+      - id: app-check-create-token-invalid-argument
+        severity: error
+        condition: >
+          The appId argument is null, undefined, an empty string, or the
+          limitedUse/jti options are invalid. Thrown synchronously before any
+          network call is made. Also thrown when custom token generation fails
+          (e.g., CryptoSigner unavailable or misconfigured).
+        throws: "FirebaseAppCheckError with code 'app-check/invalid-argument'"
+        required_handling: >
+          Validate the appId is a non-empty string before calling. Confirm the
+          Firebase Admin SDK is initialized with valid service account credentials
+          that enable App Check token generation. Log the specific message to
+          distinguish between bad arguments and signer configuration failures.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/app-check-api-client-internal.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: app-check-create-token-permission-denied
+        severity: error
+        condition: >
+          The Firebase project's App Check service denied the token creation
+          request. Common causes: the service account does not have the Firebase
+          App Check Admin role, or App Check enforcement is not properly
+          configured for the given app ID. Maps from HTTP 403 via
+          APP_CHECK_ERROR_CODE_MAPPING.
+        throws: "FirebaseAppCheckError with code 'app-check/permission-denied'"
+        required_handling: >
+          Check that the service account used to initialize the Admin SDK has
+          the 'Firebase App Check Admin' IAM role. Verify the appId corresponds
+          to an app registered in the Firebase project. This error is
+          non-retryable — fix the IAM role or appId before retrying.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/app-check-api-client-internal.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      - id: app-check-create-token-not-found
+        severity: error
+        condition: >
+          The specified appId was not found in the Firebase project. The app
+          must be registered in the Firebase console and have App Check
+          configured before tokens can be created. Maps from HTTP 404 via
+          APP_CHECK_ERROR_CODE_MAPPING.
+        throws: "FirebaseAppCheckError with code 'app-check/not-found'"
+        required_handling: >
+          Verify the appId matches a registered app in the Firebase console
+          (Project Settings > Your apps). Ensure the app has App Check
+          activated. This is a configuration error, not a transient failure
+          -- do not retry without fixing the app registration.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/app-check-api-client-internal.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: AppCheck.verifyToken
+    import_path: "firebase-admin/app-check"
+    description: >
+      Verifies a Firebase App Check token (JWT) sent by a client app. If valid,
+      returns the decoded token claims. Used on the server to confirm incoming
+      requests originate from a legitimate, unmodified app before serving
+      sensitive operations. Missing error handling means invalid App Check tokens
+      would pass through unchecked, allowing requests from emulators, modified
+      apps, or attacker-controlled clients to access protected API endpoints --
+      a critical security regression in App Check-enforced projects.
+
+    postconditions:
+      # Evidence: src/app-check/token-verifier.ts (mapJwtErrorToAppCheckError),
+      # confirmed from app-check/token-verifier.js in firebase-admin@14.1.0
+      - id: app-check-verify-token-expired
+        severity: error
+        condition: >
+          The App Check token's expiry time (exp claim) has passed. App Check
+          tokens are short-lived (1 hour by default). Clients that cache tokens
+          without refreshing will send expired tokens after 1 hour of inactivity.
+        throws: "FirebaseAppCheckError with code 'app-check/app-check-token-expired'"
+        required_handling: >
+          Return 401 Unauthorized to the client and instruct it to obtain a
+          fresh App Check token. Do NOT continue processing the request. In
+          high-throughput APIs, log the appId from the error to identify clients
+          not refreshing tokens. Never retry with the same expired token.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/token-verifier.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: app-check-verify-token-invalid-argument
+        severity: error
+        condition: >
+          The token string is not a valid JWT: malformed format, invalid
+          signature, mismatched 'kid' header (key ID does not match any known
+          public key -- typically indicates an expired or forged token), or the
+          VerifyAppCheckTokenOptions argument is not a non-null object.
+          All map to 'invalid-argument' via mapJwtErrorToAppCheckError().
+        throws: "FirebaseAppCheckError with code 'app-check/invalid-argument'"
+        required_handling: >
+          Return 401 Unauthorized. Do NOT process the request. Log the specific
+          error message to distinguish malformed tokens (client bug) from
+          invalid-signature tokens (possible tampering). In App Check-enforced
+          projects, treat any invalid-argument error as a security event worth
+          alerting on if frequency is abnormal.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/token-verifier.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+      - id: app-check-verify-token-invalid-credential
+        severity: error
+        condition: >
+          The Firebase Admin SDK was not initialized with service account
+          credentials and the GOOGLE_CLOUD_PROJECT environment variable is not
+          set. Without a project ID, the token verifier cannot determine the
+          expected audience (aud claim) to validate the token against.
+        throws: "FirebaseAppCheckError with code 'app-check/invalid-credential'"
+        required_handling: >
+          Ensure the Admin SDK is initialized with a service account key file
+          or that GOOGLE_CLOUD_PROJECT is set in the environment. This is a
+          server configuration error -- all verifyToken() calls will fail until
+          fixed. Alert immediately on this error as it means App Check
+          enforcement is completely broken for the service.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/token-verifier.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/app-check/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  # ── Auth -- Batch User Management ─────────────────────────────────────────
+
+  - name: deleteUsers
+    import_path: "firebase-admin/auth"
+    description: >
+      Deletes up to 1000 Firebase Auth users in a single batch call. Returns
+      a DeleteUsersResult with successCount, failureCount, and an errors[]
+      array containing per-user failures. Unlike deleteUser() which throws on
+      failure, deleteUsers() NEVER throws on individual user failures -- it
+      returns them in the result object. Callers who do not inspect
+      result.failureCount and result.errors[] will silently miss failed
+      deletions, leaving active accounts that should have been removed
+      (GDPR non-compliance, security risk, billing impact from zombie accounts).
+
+    postconditions:
+      # Evidence: src/auth/base-auth.ts (deleteUsers), firebase-admin@14.1.0
+      # deleteUsers() resolves (does NOT throw) for individual user failures.
+      # It only throws on: batch size exceeded (>1000 uids), invalid argument,
+      # or network-level failure.
+      - id: delete-users-partial-failure
+        severity: error
+        condition: >
+          One or more users in the batch could not be deleted. The method
+          resolves successfully but result.failureCount > 0. Each failure entry
+          in result.errors[] contains an index (position in the input uids
+          array) and a FirebaseAuthError describing the failure. The non-failed
+          users ARE deleted. This silent partial failure is the primary risk.
+        throws: "resolves with DeleteUsersResult; individual failures in result.errors[] as FirebaseAuthError"
+        required_handling: >
+          Always check result.failureCount after every deleteUsers() call. If
+          failureCount > 0, iterate result.errors[] to log each failure with
+          the user UID (uids[error.index]) and error details. In GDPR/compliance
+          flows, failed deletions MUST be retried or escalated -- do not treat
+          a resolved promise as a success signal without inspecting failureCount.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/base-auth.ts"
+          - "https://firebase.google.com/docs/auth/admin/manage-users#delete_multiple_users"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: delete-users-batch-size-exceeded
+        severity: error
+        condition: >
+          The uids array contains more than 1000 entries. The maximum batch
+          size is 1000 (MAX_DELETE_ACCOUNTS_BATCH_SIZE). Thrown synchronously
+          before any network call is made.
+        throws: "FirebaseAuthError with code 'auth/maximum-user-count-exceeded'"
+        required_handling: >
+          Chunk the input uids array into batches of at most 1000 before
+          calling deleteUsers(). Use Promise.all() to run chunks in parallel
+          or sequential await for rate-limit safety.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+          - "https://firebase.google.com/docs/auth/admin/manage-users#delete_multiple_users"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # ── Auth -- Email Action Links ─────────────────────────────────────────────
+
+  - name: generateEmailVerificationLink
+    import_path: "firebase-admin/auth"
+    description: >
+      Generates an email verification link for the specified email address.
+      The link can be sent to the user to verify their email, or embedded
+      in a custom email template. Used in registration flows and manual
+      re-verification workflows. Same error surface as generatePasswordResetLink()
+      (already contracted), but distinct because email not found maps to
+      'email-not-found' rather than throwing user-not-found, and because
+      unauthorized domain errors come from misconfigured actionCodeSettings.
+
+    postconditions:
+      # Evidence: src/auth/auth-api-request.ts (getEmailActionLink),
+      # src/auth/error.ts (EMAIL_NOT_FOUND, UNAUTHORIZED_DOMAIN error codes)
+      # Confirmed from firebase-admin@14.1.0 auth-api-request.js
+      - id: generate-email-verification-link-email-not-found
+        severity: error
+        condition: >
+          No Firebase Auth user exists with the provided email address.
+          The email action link cannot be sent to an unregistered address.
+          Error code 'email-not-found' maps from server response 'EMAIL_NOT_FOUND'.
+        throws: "FirebaseAuthError with code 'auth/email-not-found'"
+        required_handling: >
+          Do not reveal to end users whether the email is registered (security
+          best practice). Log the error server-side for monitoring. In
+          registration flows, this indicates the user record was not created
+          before the verification link was requested -- fix the ordering.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/error.ts"
+          - "https://firebase.google.com/docs/auth/admin/email-action-links"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: generate-email-verification-link-unauthorized-domain
+        severity: error
+        condition: >
+          The continue URL in actionCodeSettings points to a domain that is
+          not authorized in the Firebase console (Authentication > Settings >
+          Authorized domains). The request is rejected by the Firebase Auth
+          backend.
+        throws: "FirebaseAuthError with code 'auth/unauthorized-continue-uri'"
+        required_handling: >
+          Add the continue URL domain to the authorized domains list in the
+          Firebase console. This is a configuration error that will affect all
+          users -- alert and fix immediately. Do not retry with the same
+          actionCodeSettings.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/auth-api-request.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/auth/error.ts"
+          - "https://firebase.google.com/docs/auth/admin/email-action-links"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # ── Messaging -- Multicast and Topic Unsubscription ───────────────────────
+
+  - name: sendEachForMulticast
+    import_path: "firebase-admin/messaging"
+    description: >
+      Sends a multicast FCM message to a list of device registration tokens
+      and/or Firebase Installation IDs (FIDs) as separate per-token messages.
+      Returns a BatchResponse where each SendResponse corresponds to one token
+      -- not all tokens succeed or fail together. Like sendEach(), callers must
+      check response.failureCount and iterate response.responses[] to detect
+      per-token failures. The maximum batch size is 500 tokens/FIDs combined.
+
+    postconditions:
+      # Evidence: src/messaging/messaging.ts (sendEachForMulticast),
+      # firebase-admin@14.1.0 messaging.js -- FCM_MAX_BATCH_SIZE = 500
+      - id: send-each-for-multicast-batch-size-exceeded
+        severity: error
+        condition: >
+          The combined count of tokens and fids exceeds 500
+          (FCM_MAX_BATCH_SIZE). Thrown synchronously before any network call.
+          Also thrown if tokens is not an array or fids is not an array, or
+          both tokens and fids are empty.
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Chunk the token list into batches of at most 500. Use Promise.all()
+          to send chunks in parallel. Validate token and fid arrays are
+          non-empty and within limits before calling.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/messaging/messaging.ts"
+          - "https://firebase.google.com/docs/cloud-messaging/send-message#send-to-multiple-devices"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: send-each-for-multicast-partial-failure
+        severity: warning
+        condition: >
+          One or more tokens in the batch failed delivery. The method resolves
+          but response.failureCount > 0. Individual failures in
+          response.responses[i] contain a FirebaseMessagingError with codes
+          like 'messaging/registration-token-not-registered' (stale token),
+          'messaging/invalid-registration-token', or 'messaging/quota-exceeded'.
+          The method never throws for individual token failures.
+        throws: "resolves with BatchResponse; per-token failures in response.responses[] as FirebaseMessagingError"
+        required_handling: >
+          Always check response.failureCount. If > 0, iterate response.responses[]
+          and for each failed entry (success === false): log the token and error.
+          For 'registration-token-not-registered' errors, remove the stale token
+          from your database to prevent repeated failed sends. For quota errors,
+          implement exponential backoff on the next batch.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/messaging/messaging.ts"
+          - "https://firebase.google.com/docs/cloud-messaging/send-message#send-to-multiple-devices"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  - name: unsubscribeFromTopic
+    import_path: "firebase-admin/messaging"
+    description: >
+      Unsubscribes one or more device registration tokens from an FCM topic.
+      Used to remove devices from topic-based notification channels (e.g.,
+      when a user disables a notification category or unsubscribes from a
+      newsletter). Shares the same sendTopicManagementRequest() internal path
+      as subscribeToTopic() (already contracted). Partial failures are returned
+      in result.errors[], not thrown -- callers who do not inspect the result
+      will silently leave devices subscribed to topics after supposedly
+      unsubscribing them.
+
+    postconditions:
+      # Evidence: src/messaging/messaging.ts (unsubscribeFromTopic calls
+      # sendTopicManagementRequest with FCM_TOPIC_MANAGEMENT_REMOVE_PATH)
+      # Same error surface as subscribeToTopic -- confirmed from messaging.js
+      - id: unsubscribe-from-topic-partial-failure
+        severity: warning
+        condition: >
+          One or more tokens failed to unsubscribe from the topic. The method
+          resolves but result.failureCount > 0. Per-token failures in
+          result.errors[] contain a FirebaseMessagingError. Common causes:
+          stale/invalid registration token, malformed topic name.
+        throws: "resolves with MessagingTopicManagementResponse; per-token failures in result.errors[] as FirebaseMessagingError"
+        required_handling: >
+          Check result.failureCount after every unsubscribeFromTopic() call.
+          If > 0, log each error with the corresponding token index. For
+          'registration-token-not-registered' errors, remove the stale token
+          from your database. For other errors, retry with exponential backoff.
+          A silent partial failure here means devices remain subscribed to a
+          topic after the user requested removal.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/messaging/messaging.ts"
+          - "https://firebase.google.com/docs/cloud-messaging/manage-topics"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      - id: unsubscribe-from-topic-invalid-argument
+        severity: error
+        condition: >
+          The topic name is malformed (contains invalid characters -- only
+          [a-zA-Z0-9-_.~%]+ is valid; the /topics/ prefix must NOT be included
+          as it is added automatically), or the registration tokens array is
+          empty, or a token is not a valid non-empty string. Thrown synchronously
+          via sendTopicManagementRequest() validation.
+        throws: "FirebaseMessagingError with code 'messaging/invalid-argument'"
+        required_handling: >
+          Validate topic names against the pattern [a-zA-Z0-9-_.~%]+ before
+          calling. Ensure the tokens array is non-empty and all tokens are
+          valid non-empty strings. Do NOT pass the /topics/ prefix -- it is
+          added automatically.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/messaging/messaging.ts"
+          - "https://firebase.google.com/docs/cloud-messaging/manage-topics"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
