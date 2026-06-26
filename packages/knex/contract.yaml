@@ -2,11 +2,11 @@ package: knex
 semver: '>=3.0.0 <4.0.0'
 contract_version: 1.1.0
 maintainer: corpus-team
-last_verified: '2026-06-23'
+last_verified: '2026-06-26'
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 1.0
+coverage_score: 0.862   # 25 contracted / 29 total async-callable (24 → 25 this pass: +upsert). Effective coverage 25/(29-4) = 25/25 = 100% — 4 additional omitted (truncate, renameTable, createTableIfNotExists-deprecated, asCallback-deprecated). Pass 2026-06-26 deepen-stream-5.
 detection:
   type_names:
     - Knex
@@ -1119,6 +1119,96 @@ functions:
           form handles this automatically (the docs state: "if the loop terminates with a
           break, return, or a throw, the stream will be destroyed"). The raw-pipe form
           does not.
+
+  - name: upsert
+    import_path: knex
+    description: >
+      Executes a dialect-specific upsert operation. Implemented ONLY for MySQL and CockroachDB.
+      MySQL compiles to REPLACE INTO (which deletes the existing row and inserts a new one, not
+      a true UPDATE — AUTO_INCREMENT IDs change and unspecified columns are reset to DEFAULT).
+      Calling upsert() on any other dialect (PostgreSQL, MSSQL, Oracle, SQLite, Redshift) throws
+      a synchronous Error before any database call is made.
+      PostgreSQL/SQLite users should use insert().onConflict().merge() instead.
+    postconditions:
+      # Evidence: https://knexjs.org/guide/query-builder.html#upsert
+      # Source confirmed: knex/lib/query/querybuilder.js — base upsert() throws synchronously;
+      # knex/lib/dialects/mysql/query/mysql-querybuilder.js — MySQL override uses REPLACE INTO via
+      # knex/lib/dialects/mysql/query/mysql-querycompiler.js upsert() method.
+      # Warning confirmed: mysql-querycompiler.js constructor — `.returning()` on MySQL upsert logs
+      # warning and has no effect.
+      - id: upsert-unsupported-dialect
+        condition: >
+          upsert() called when the knex instance is configured for PostgreSQL, MSSQL, Oracle,
+          SQLite, or Redshift (any dialect other than MySQL and CockroachDB)
+        throws: >
+          Error("Upsert is not yet supported for dialect <name>") — thrown synchronously from
+          knex/lib/query/querybuilder.js upsert() base method before any network call is made
+        required_handling: >
+          Caller MUST check the configured dialect before calling upsert(), or catch the Error.
+          For PostgreSQL/SQLite, use insert().onConflict(column).merge() instead.
+          For MSSQL, Oracle: no native upsert — use raw SQL MERGE or INSERT ... WHERE NOT EXISTS.
+          A try-catch is required if the dialect may change across environments (e.g., SQLite in
+          test, PostgreSQL in production).
+        sources:
+          - https://knexjs.org/guide/query-builder.html#upsert
+          - https://github.com/knex/knex/blob/master/lib/query/querybuilder.js
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      - id: upsert-mysql-replace-into-data-loss
+        condition: >
+          upsert() called on a MySQL knex instance on a table where a row with the same PRIMARY
+          KEY already exists, and the caller expects UPDATE semantics (preserving unspecified
+          columns, preserving the existing primary key ID)
+        throws: does not throw — executes REPLACE INTO which deletes then re-inserts the row
+        required_handling: >
+          Caller MUST understand that MySQL upsert() uses REPLACE INTO, NOT INSERT ... ON
+          DUPLICATE KEY UPDATE. REPLACE INTO: (1) deletes the existing row (including its
+          AUTO_INCREMENT ID), (2) inserts a new row with a new AUTO_INCREMENT ID, (3) silently
+          resets any column not present in the upsert values to its DEFAULT. Foreign keys
+          referencing the old ID are broken. Any columns the caller expected to retain unchanged
+          (e.g. created_at, soft-delete flags, column not in the upsert payload) are lost.
+          Use insert().onConflict().merge() for true upsert semantics on MySQL.
+        sources:
+          - https://knexjs.org/guide/query-builder.html#upsert
+          - https://knexjs.org/guide/query-builder.html#on-conflict
+          - https://github.com/knex/knex/blob/master/lib/dialects/mysql/query/mysql-querycompiler.js
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high
+
+      - id: upsert-mysql-returning-ignored
+        condition: >
+          upsert() called on a MySQL knex instance with a .returning() modifier to get the
+          inserted/updated row back
+        throws: does not throw — .returning() is silently ignored on MySQL; upsert returns number
+        required_handling: >
+          Caller MUST NOT rely on .returning() with MySQL upsert(). The knex MySQL driver logs a
+          warning ("'.returning()' is not supported by mysql") but continues execution, returning
+          the count instead of the row. To get the row back after a MySQL upsert, run a follow-up
+          SELECT. On PostgreSQL/SQLite, use insert().onConflict().merge().returning() instead.
+        sources:
+          - https://knexjs.org/guide/query-builder.html#upsert
+          - https://github.com/knex/knex/blob/master/lib/dialects/mysql/query/mysql-querycompiler.js
+        severity: warning
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
 
 edge_cases:
   - id: connection-pool-exhaustion

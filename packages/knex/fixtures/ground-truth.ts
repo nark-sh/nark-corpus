@@ -14,6 +14,7 @@
  *   - db.batchInsert()       postcondition: batch-insert-no-try-catch
  *   - db.migrate.latest()    postconditions: migrate-latest-no-try-catch
  *   - db.migrate.rollback()  postcondition: migrate-rollback-no-try-catch
+ *   - db(table).upsert()    postconditions: upsert-unsupported-dialect, upsert-mysql-replace-into-data-loss, upsert-mysql-returning-ignored
  *
  * Detection path: db.transaction() →
  *   ThrowingFunctionDetector fires direct method call →
@@ -439,6 +440,30 @@ export async function streamForAwaitWithTryCatch() {
     }
   } catch (err) {
     console.error('Stream consumption failed:', err);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// N. db(table).upsert() — dialect-unsupported throw
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function upsertUserNoCatch(data: Record<string, unknown>) {
+  // DETECTION_PENDING: upsert-unsupported-dialect — db is configured for 'pg'; upsert() throws
+  // synchronously "Upsert is not yet supported for dialect postgresql". No try-catch.
+  // Scanner concern queued: concern-20260626-knex-deepen-upsert-1
+  // @ts-ignore — upsert is only typed for MySQL/CockroachDB generics in some setups
+  await (db('users') as any).upsert(data);
+}
+
+export async function upsertUserWithCatch(data: Record<string, unknown>) {
+  try {
+    // SHOULD_NOT_FIRE: upsert() inside try-catch satisfies the dialect-error contract
+    // @ts-ignore
+    await (db('users') as any).upsert(data);
+  } catch (err) {
+    // Expected on non-MySQL/CockroachDB — rethrow or switch to onConflict().merge()
+    console.error('Upsert failed (dialect unsupported?):', err);
     throw err;
   }
 }

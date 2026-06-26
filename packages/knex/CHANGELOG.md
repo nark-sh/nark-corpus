@@ -1,5 +1,23 @@
 # CHANGELOG — knex
 
+## 2026-06-26 — deepen pass — coverage 82.8% → 86.2%
+
+- **Profile:** `packages/knex/contract.yaml`
+- **Functions added:** upsert (1 total)
+- **Postconditions added:** 3
+  - `upsert-unsupported-dialect` — synchronous Error thrown on PostgreSQL/MSSQL/Oracle/SQLite/Redshift
+  - `upsert-mysql-replace-into-data-loss` — REPLACE INTO deletes+inserts row, silently changing AUTO_INCREMENT ID and resetting unspecified columns
+  - `upsert-mysql-returning-ignored` — .returning() silently no-ops on MySQL upsert
+- **Functions intentionally omitted this pass:** none (omit list unchanged from prior pass)
+- **Scanner concerns queued:** 1 (`concern-20260626-knex-deepen-upsert-1` — add detection for upsert() without try-catch)
+- **Scanner version used:** nark@3.2.10
+- **Sources fetched:**
+    - https://knexjs.org/guide/query-builder.html#upsert
+    - https://knexjs.org/guide/query-builder.html#on-conflict
+    - knex@3.2.10 lib/query/querybuilder.js (base upsert() throws synchronously)
+    - knex@3.2.10 lib/dialects/mysql/query/mysql-querycompiler.js (REPLACE INTO + returning warning)
+- **Verified by:** bc-deepen-contract (pass 26 on 2026-06-26, deepen-stream-5)
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** knex@3.2.10
