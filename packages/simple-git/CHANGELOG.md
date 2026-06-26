@@ -2,6 +2,20 @@
 
 All notable verification, deepen, and fork events for this profile. Newest first.
 
+## 2026-06-26 — deepen pass — coverage 96% → 100%
+
+- **Profile:** `packages/simple-git/contract.yaml`
+- **Functions added:** `checkoutBranch` (1 total)
+- **Postconditions added:** 1 (`simple-git-checkout-branch-missing-try-catch`)
+- **Key finding:** `checkoutBranch(branchName, startPoint)` was the 26th "worth-contracting" function that had been deferred as "transitively covered" by the `checkout` postcondition. Promoted to its own entry because the startPoint-validation failure is a distinct, common CI/CD production pattern: after `git fetch --prune`, stale remote tracking branches are removed from the local ref database, causing `git.checkoutBranch('feature', 'origin/feature')` to throw "fatal: 'origin/feature' is not a valid object." The required_handling pattern (always `fetch` before `checkoutBranch` when startPoint is a remote tracking ref) is specific to this method signature and not highlighted by the generic checkout postcondition. Source: `dist/cjs/index.js` lines 2067-2071 — `checkoutTask(["-b", branchName, startPoint, ...])` using `straightThroughStringTask`.
+- **Functions intentionally omitted this pass:** none (all 24 omissions carried forward)
+- **Scanner concerns queued:** 1 (`concern-20260626-simple-git-deepen-1` — verify scanner's checkoutBranch detection coverage)
+- **Fixture changes:** `ground-truth.ts` — added section for checkoutBranch with SHOULD_FIRE (missing try-catch on pruned startPoint) and @expect-clean (wrapped with fetch + try-catch)
+- **Sources fetched:**
+  - `simple-git@3.36.0 dist/cjs/index.js` lines 2067-2071 (checkoutBranch implementation)
+  - `https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md`
+  - `https://git-scm.com/docs/git-checkout`
+- **Verified by:** bc-deepen-contract deepen-stream-6 pass 1 (2026-06-26T17:21:00Z)
 
 ## 2026-06-25 — deepen pass — coverage 88% → 96%
 

@@ -7,11 +7,18 @@ package: "simple-git"
 semver: ">=3.32.3"
 contract_version: "1.2.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-25"
+last_verified: "2026-06-26"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.96  # 25 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 25/26
+coverage_score: 1.0  # 26 contracted / 26 worth-contracting (50 total - 24 intentionally omitted) = 26/26
+# Depth pass 2026-06-26 (deepen-stream-6 pass 1):
+# Added: checkoutBranch() — GitError when startPoint ref pruned ('not a valid object'),
+#   branch name collision, or dirty working tree. Distinct from checkoutLocalBranch:
+#   validates the startPoint ref exists at call time; pruned remote tracking branches
+#   cause immediate failure. Source: dist/cjs/index.js lines 2067-2071.
+# Contracted after this pass: 26 (+1: checkoutBranch)
+# Note: coverage_score was 0.96 with 25/26; now 1.0 with 26/26.
 # Depth pass 2026-06-25 (deepen-stream-1 pass 1):
 # Added: init() — GitError on permission denied or invalid template directory
 # Added: checkoutLatestTag() — GitError when no tags (tags.latest===undefined), or pull/checkout fails
@@ -1286,6 +1293,80 @@ functions:
           or commit SHA) to avoid collisions on retry:
             const branchName = `automation/fix-${Date.now()}-${shortSha}`;
             await git.checkoutLocalBranch(branchName);
+        sources:
+          - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
+          - "https://git-scm.com/docs/git-checkout"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: checkoutBranch
+    import_path: "simple-git"
+    description: >
+      Creates and checks out a new branch from a specified start point. Used as:
+      git.checkoutBranch(branchName, startPoint). Equivalent to `git checkout -b
+      <branchName> <startPoint>`. The startPoint is typically a remote tracking
+      branch (e.g. 'origin/main') or a commit SHA. Fails when the startPoint no
+      longer exists (pruned remote branch), when the new branch name already
+      exists, or when the working tree is dirty. Most common production failure:
+      the startPoint is a remote tracking branch that was deleted after pruning
+      (git fetch --prune), causing a "not a valid object" fatal error.
+
+    postconditions:
+      # Evidence: https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md
+      # Source: dist/cjs/index.js checkoutBranch() (lines 2067-2071):
+      #   checkoutTask(["-b", branchName, startPoint, ...getTrailingOptions(arguments)])
+      #   checkoutTask uses straightThroughStringTask — throws GitError on non-zero exit
+      # Distinct from checkoutLocalBranch: adds startPoint validation — the remote
+      # tracking ref must exist at checkout time; pruned refs cause immediate failure.
+      - id: simple-git-checkout-branch-missing-try-catch
+        condition: >
+          async function calls git.checkoutBranch(branchName, startPoint) without
+          wrapping in try-catch. The startPoint argument is a ref that must exist
+          at call time — it is NOT automatically fetched. Most common failure in
+          CI/CD: after `git fetch --prune`, stale remote tracking branches are
+          removed from the local ref database, causing any subsequent
+          git.checkoutBranch('feature', 'origin/feature') to throw immediately.
+          Unlike checkoutLocalBranch (which only checks for local name collisions),
+          this method validates the startPoint ref exists before creating the branch.
+        throws: >
+          GitError — on any non-zero exit:
+          "fatal: 'origin/<branch>' is not a valid object" (startPoint ref pruned
+            or never fetched — most common production failure),
+          "error: pathspec '<startPoint>' did not match any file(s) known to git"
+            (startPoint is a tag or commit that doesn't exist locally),
+          "fatal: A branch named '<branchName>' already exists" (name collision
+            with existing local branch),
+          "error: Your local changes to the following files would be overwritten"
+            (dirty working tree prevents branch creation).
+        required_handling: >
+          Caller MUST wrap git.checkoutBranch() in try-catch.
+
+          Pattern for safe branch creation from remote tracking branch:
+            try {
+              // Ensure tracking branch is current before using as startPoint
+              await git.fetch('origin', baseBranch);
+              await git.checkoutBranch(newBranch, `origin/${baseBranch}`);
+            } catch (err) {
+              if (err instanceof GitError) {
+                if (err.message.includes('not a valid object') ||
+                    err.message.includes('did not match any file(s)')) {
+                  // startPoint was pruned or never fetched — fetch first
+                  console.error(`startPoint ref does not exist: ${err.message}`);
+                } else if (err.message.includes('already exists')) {
+                  // Branch collision — checkout existing or use unique name
+                  await git.checkout(newBranch);
+                }
+              }
+              throw err;
+            }
+
+          For CI pipelines that run after prune, always include a fetch step
+          before checkoutBranch when the startPoint is a remote tracking ref.
         sources:
           - "https://raw.githubusercontent.com/steveukx/git-js/refs/heads/main/simple-git/readme.md"
           - "https://git-scm.com/docs/git-checkout"

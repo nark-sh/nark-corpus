@@ -729,3 +729,36 @@ export async function checkoutLatestTagWithGuard(cwd: string) {
     throw err;
   }
 }
+
+// checkoutBranch tests — postcondition: simple-git-checkout-branch-missing-try-catch
+// Distinct from checkoutLocalBranch: validates the startPoint ref exists at call time.
+// Most common failure: origin/<branch> pruned after `git fetch --prune`.
+
+export async function checkoutBranchMissingErrorHandling(cwd: string, newBranch: string, baseBranch: string) {
+  const git = simpleGit(cwd);
+  // SHOULD_FIRE: simple-git-checkout-branch-missing-try-catch
+  // startPoint 'origin/baseBranch' may have been pruned (git fetch --prune).
+  // Throws: "fatal: 'origin/<branch>' is not a valid object"
+  await git.checkoutBranch(newBranch, `origin/${baseBranch}`);
+}
+
+// @expect-clean
+export async function checkoutBranchWithErrorHandling(cwd: string, newBranch: string, baseBranch: string) {
+  const git = simpleGit(cwd);
+  try {
+    // SHOULD_NOT_FIRE: wrapped in try-catch
+    await git.fetch('origin', baseBranch);
+    await git.checkoutBranch(newBranch, `origin/${baseBranch}`);
+  } catch (err) {
+    const message = (err as Error).message || '';
+    if (message.includes('not a valid object') || message.includes('did not match any file')) {
+      // startPoint ref was pruned or never fetched
+      console.error(`startPoint ref missing — fetch first: ${message}`);
+    } else if (message.includes('already exists')) {
+      // Branch name collision — switch to existing
+      await git.checkout(newBranch);
+      return;
+    }
+    throw err;
+  }
+}
