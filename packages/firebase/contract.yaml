@@ -8,14 +8,14 @@ package: firebase
 semver: ">=9.0.0"
 contract_version: "1.0.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-24"
+last_verified: "2026-06-26"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.83  # 35 contracted / 42 total async-callable (after intentional omissions)
-# effective_coverage: 0.83 — 35/42 considered functions contracted (+5 this pass: applyActionCode,
-#   getRedirectResult, signInWithCustomToken, uploadString, getMetadata)
-# intentionally omitted (~7): signInWithPhoneNumber/linkWithPhoneNumber/updatePhoneNumber (SMS-only niche),
+coverage_score: 1.0  # 42 contracted / 42 total async-callable (after intentional omissions)
+# effective_coverage: 1.0 — 42/42 considered functions contracted (+7 this pass: sendSignInLinkToEmail,
+#   verifyPasswordResetCode, checkActionCode, unlink, reload, signInWithCredential, updateMetadata)
+# intentionally omitted (7): signInWithPhoneNumber/linkWithPhoneNumber/updatePhoneNumber (SMS-only niche),
 #   getDocFromServer/getDocsFromServer (same errors as getDoc/getDocs, already contracted),
 #   fetchSignInMethodsForEmail (deprecated), validatePassword (optional policy enforcement)
 
@@ -1774,6 +1774,411 @@ functions:
           incident_label: SILENT_FAILURE
           production_behavior: immediate_exception
           visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  # ----- Additional auth functions (depth pass 2026-06-26, deepen-stream-1 pass 1) -----
+
+  - name: sendSignInLinkToEmail
+    import_path: "firebase"
+    description: >
+      Sends a passwordless sign-in email link to the given email address. The link is used
+      to complete sign-in via signInWithEmailLink(). ActionCodeSettings.handleCodeInApp MUST
+      be true or the call throws immediately. The authorized domain must be added in the
+      Firebase Console. Throws FirebaseError on invalid email, unauthorized domain, or
+      missing handleCodeInApp setting.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/src/core/strategies/email_link.ts — _assert(handleCodeInApp, ARGUMENT_ERROR)
+      # @firebase/auth/dist/node/totp-9e84e53d.js — AuthErrorCode enum and sendSignInLinkToEmail$1 implementation
+      # https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_link.ts
+      - id: send-sign-in-link-argument-error
+        condition: >
+          sendSignInLinkToEmail() called without try-catch when actionCodeSettings.handleCodeInApp
+          is not explicitly set to true, or when the domain in actionCodeSettings.url is not in
+          the Firebase Console's authorized domains list.
+        throws: >
+          FirebaseError with code: auth/argument-error (handleCodeInApp must be true — the SDK
+          asserts this before making any network call; omitting it or setting false causes an
+          immediate synchronous throw), auth/unauthorized-domain (the domain in actionCodeSettings.url
+          is not in the Firebase Console's authorized domains list — common when testing on localhost
+          without adding it to the list), auth/invalid-email (email address is malformed),
+          auth/network-request-failed (network failure during OOB code generation).
+        required_handling: >
+          Caller MUST wrap await sendSignInLinkToEmail() in try-catch. The auth/argument-error
+          is a programmer mistake that surfaces as a runtime throw — always set handleCodeInApp: true.
+          The auth/unauthorized-domain error often surprises teams when deploying to a new environment
+          (staging, prod) where the domain hasn't been added to Firebase Console yet.
+
+          try {
+            await sendSignInLinkToEmail(auth, email, {
+              url: `${window.location.origin}/finish-sign-in`,
+              handleCodeInApp: true,
+            });
+            window.localStorage.setItem('emailForSignIn', email);
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/argument-error') {
+                throw new Error('Invalid sign-in link configuration — handleCodeInApp must be true');
+              }
+              if (error.code === 'auth/unauthorized-domain') {
+                throw new Error('This domain is not authorized for Firebase sign-in links');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/auth/web/email-link-auth"
+          - "https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_link.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: verifyPasswordResetCode
+    import_path: "firebase"
+    description: >
+      Checks a password reset code sent to the user by email. Returns the email address
+      of the user associated with the code if valid. Called before confirmPasswordReset()
+      to validate the code and display the user's email in the reset UI.
+      Throws on expired, invalid, or already-used codes.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/node/totp-9e84e53d.js — verifyPasswordResetCode delegates
+      # to checkActionCode which calls resetPassword() API; expired-action-code and invalid-action-code
+      # confirmed from AuthErrorCode enum (EXPIRED_OOB_CODE, INVALID_OOB_CODE) in same file.
+      # https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_and_password.ts
+      - id: verify-password-reset-code-error
+        condition: >
+          verifyPasswordResetCode(auth, code) called without try-catch. The reset code has
+          expired (default TTL ~1 hour), was already used, was malformed, or the associated
+          user account no longer exists.
+        throws: >
+          FirebaseError with code: auth/expired-action-code (the password reset code has expired —
+          Firebase action codes expire after approximately 1 hour by default), auth/invalid-action-code
+          (the code is malformed, has already been used, or was generated for a different operation),
+          auth/user-disabled (the user account associated with the reset code was disabled by an admin
+          after the code was issued), auth/user-not-found (user account was deleted after the code
+          was issued), auth/network-request-failed (network failure during code validation).
+        required_handling: >
+          Caller MUST wrap await verifyPasswordResetCode() in try-catch. Expired and already-used
+          codes are the most common failures — users who close the tab and return later, or who
+          click the link from a forwarded email. An unhandled rejection leaves the user on a broken
+          reset page with no recovery path.
+
+          try {
+            const email = await verifyPasswordResetCode(auth, actionCode);
+            // Show password reset form, display email to user
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/expired-action-code') {
+                return { error: 'Password reset link has expired. Please request a new one.' };
+              }
+              if (error.code === 'auth/invalid-action-code') {
+                return { error: 'Invalid or already used password reset link.' };
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth#verifypasswordresetcode"
+          - "https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_and_password.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: checkActionCode
+    import_path: "firebase"
+    description: >
+      Checks a verification code (OOB code) sent to the user by email and returns metadata
+      about the code (operation type, email). Used to validate and inspect OOB codes for any
+      action type (EMAIL_SIGNIN, VERIFY_EMAIL, PASSWORD_RESET, VERIFY_AND_CHANGE_EMAIL).
+      More general than verifyPasswordResetCode. Called before applyActionCode() to display
+      the operation type and email to the user.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/node/totp-9e84e53d.js — checkActionCode calls resetPassword() API
+      # which throws with AuthErrorCode; expired-action-code="auth/expired-action-code" and
+      # invalid-action-code="auth/invalid-action-code" confirmed from AuthErrorCode enum.
+      # https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_and_password.ts
+      - id: check-action-code-error
+        condition: >
+          checkActionCode(auth, oobCode) called without try-catch. The OOB code has expired,
+          was already consumed, is malformed, or the associated user account no longer exists.
+        throws: >
+          FirebaseError with code: auth/expired-action-code (the action code has expired — TTL
+          is typically 1 hour for verification links), auth/invalid-action-code (the code is
+          malformed, has already been applied, or was generated for a different Firebase project),
+          auth/user-disabled (the user account linked to this code was disabled), auth/user-not-found
+          (the user account was deleted after the code was issued), auth/network-request-failed
+          (network failure during code validation with Firebase servers).
+        required_handling: >
+          Caller MUST wrap await checkActionCode() in try-catch. Common in custom email action
+          handler pages that process Firebase OOB codes from email links. Unhandled rejection
+          on an already-used code leaves the user on a silent error page.
+
+          try {
+            const info = await checkActionCode(auth, actionCode);
+            const email = info.data.email;
+            // Use info.operation to determine action type (EMAIL_SIGNIN, PASSWORD_RESET, etc.)
+            await applyActionCode(auth, actionCode);
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/expired-action-code') {
+                return { error: 'This link has expired. Please request a new one.' };
+              }
+              if (error.code === 'auth/invalid-action-code') {
+                return { error: 'This link is invalid or has already been used.' };
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth#checkactioncode"
+          - "https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/strategies/email_and_password.ts"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: medium
+
+  - name: unlink
+    import_path: "firebase"
+    description: >
+      Unlinks a provider (e.g. 'google.com', 'password', 'github.com') from a user account.
+      Called as unlink(user, providerId). If the provider is not currently linked to the
+      account, throws auth/no-such-provider. Used in account settings to let users remove
+      a sign-in method.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/src/core/user/link_unlink.ts — _assertLinkedStatus throws
+      # NO_SUCH_PROVIDER when provider not linked; @firebase/auth/dist/node/totp-9e84e53d.js
+      # confirms: no-such-provider="User was not linked to an account with the given provider."
+      # deleteLinkedAccounts API call can also throw user-token-expired and network errors.
+      - id: unlink-no-such-provider
+        condition: >
+          unlink(user, providerId) called without try-catch. The provider is not currently
+          linked to the user account, or the user's auth token is expired.
+        throws: >
+          FirebaseError with code: auth/no-such-provider (provider is not linked to this user
+          account — the linkage must be confirmed before attempting unlink), auth/requires-recent-login
+          (unlinking a provider is a security-sensitive operation on some Firebase configurations,
+          requiring the user to have recently authenticated), auth/user-token-expired (user's
+          ID token expired during the unlink request — user must sign in again),
+          auth/network-request-failed (network failure during the unlink request to Firebase).
+        required_handling: >
+          Caller MUST wrap await unlink() in try-catch. auth/no-such-provider is the most common
+          error — app state may be out of sync with the actual linked providers. Always confirm
+          the provider is linked (via user.providerData) before calling unlink. An unhandled
+          rejection here leaves the account settings UI in an inconsistent state.
+
+          try {
+            const updatedUser = await unlink(user, 'google.com');
+            // updatedUser.providerData no longer includes Google
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/no-such-provider') {
+                throw new Error('Google is not linked to your account');
+              }
+              if (error.code === 'auth/requires-recent-login') {
+                throw new Error('Please sign in again before unlinking a provider');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth#unlink"
+          - "https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/user/link_unlink.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  - name: reload
+    import_path: "firebase"
+    description: >
+      Reloads user account data from the Firebase server, refreshing profile fields and
+      providerData. Called as reload(user). Commonly used after email verification to check
+      whether the user's emailVerified field has been updated, or to refresh claims after
+      a server-side update. Throws on network failure or expired/invalid tokens.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/node/totp-9e84e53d.js — _reloadWithoutSaving calls
+      # _logoutIfInvalidated which propagates FirebaseError; user-token-expired="user's credential
+      # is no longer valid" confirmed in AuthErrorCode enum; user.getIdToken() can throw on
+      # expired session before the API call is made.
+      - id: reload-token-or-network-error
+        condition: >
+          reload(user) called without try-catch. The user's ID token is expired or invalid,
+          or the network is unavailable during the account info refresh.
+        throws: >
+          FirebaseError with code: auth/user-token-expired (the user's credential is no longer
+          valid — session was revoked, user was deleted, or password was changed from another
+          device), auth/user-not-found (user account was deleted between the current session
+          and this call), auth/network-request-failed (network failure during the account
+          info fetch from Firebase servers), auth/user-disabled (account was disabled while
+          the session was active — _logoutIfInvalidated signs the user out automatically
+          when this occurs).
+        required_handling: >
+          Caller MUST wrap await reload() in try-catch. Most commonly called after
+          sendEmailVerification() to poll emailVerified status — a silent failure here means
+          the app shows stale email verification state. On auth/user-token-expired, sign the
+          user out.
+
+          try {
+            await reload(auth.currentUser);
+            if (auth.currentUser.emailVerified) {
+              // Email is now verified
+            }
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/user-token-expired' || error.code === 'auth/user-not-found') {
+                await signOut(auth);
+                router.push('/login');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth#reload"
+          - "https://github.com/firebase/firebase-js-sdk/blob/main/packages/auth/src/core/user/reload.ts"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+  - name: signInWithCredential
+    import_path: "firebase"
+    description: >
+      Asynchronously signs in using an AuthCredential object. The credential is typically
+      obtained from an OAuth provider (e.g. GoogleAuthProvider.credential(idToken)) or from
+      an email/password combination via EmailAuthProvider.credential(). Used in server-side
+      token exchange flows, MFA completion, and custom OAuth integrations.
+
+    postconditions:
+      # Evidence: @firebase/auth/dist/node/totp-9e84e53d.js — signInWithCredential delegates to
+      # _signInWithCredential which performs the auth/verifyAssertion or auth/signInWithPassword
+      # API call; invalid-credential confirmed: "The supplied auth credential is malformed or
+      # has expired"; account-exists-with-different-credential and user-disabled also confirmed.
+      - id: sign-in-with-credential-error
+        condition: >
+          signInWithCredential(auth, credential) called without try-catch. The credential is
+          malformed, expired, from a different provider than expected, or the account is disabled.
+        throws: >
+          FirebaseError with code: auth/invalid-credential (the credential is malformed or has
+          expired — common when Google/Apple ID tokens are passed stale or after provider token
+          refresh), auth/account-exists-with-different-credential (the email associated with
+          this credential is already registered under a different sign-in method — user must
+          sign in with their original method and then link), auth/user-disabled (the account
+          linked to this credential is disabled), auth/operation-not-allowed (the provider
+          is not enabled in the Firebase Console), auth/network-request-failed (network failure
+          during credential verification).
+        required_handling: >
+          Caller MUST wrap await signInWithCredential() in try-catch. auth/invalid-credential
+          is common when OAuth tokens are used after a long delay (mobile background time).
+          auth/account-exists-with-different-credential must be handled to guide users to their
+          original sign-in method rather than creating duplicate accounts.
+
+          try {
+            const credential = GoogleAuthProvider.credential(idToken);
+            const result = await signInWithCredential(auth, credential);
+            return result.user;
+          } catch (error) {
+            if (error instanceof FirebaseError) {
+              if (error.code === 'auth/invalid-credential') {
+                throw new Error('Sign-in session expired. Please try again.');
+              }
+              if (error.code === 'auth/account-exists-with-different-credential') {
+                throw new Error('An account already exists with this email. Sign in with your original method.');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/auth#signinwithcredential"
+          - "https://firebase.google.com/docs/auth/web/google-signin#handle_the_sign-in_flow_with_the_firebase_sdk"
+        severity: error
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: authentication_failure
+          incident_cost_range: high
+
+  # ----- Additional Storage functions (depth pass 2026-06-26, deepen-stream-1 pass 1) -----
+
+  - name: updateMetadata
+    import_path: "firebase"
+    description: >
+      Updates the metadata (contentType, customMetadata, cacheControl, contentDisposition, etc.)
+      for a Firebase Storage object. Called as updateMetadata(ref, metadata). Throws StorageError
+      on permission denial, missing object, or network failure. Commonly used to set content-type
+      or custom metadata fields after upload.
+
+    postconditions:
+      # Evidence: @firebase/storage/dist/storage-public.d.ts — updateMetadata(ref, metadata): Promise<FullMetadata>
+      # StorageErrorCode enum confirmed from @firebase/storage/dist/storage-public.d.ts:
+      # OBJECT_NOT_FOUND='storage/object-not-found', UNAUTHORIZED='storage/unauthorized',
+      # RETRY_LIMIT_EXCEEDED='storage/retry-limit-exceeded'.
+      - id: update-metadata-error
+        condition: >
+          updateMetadata(ref, metadata) called without try-catch. Storage security rules deny
+          the write, the object does not exist at the given reference, or the network is
+          unavailable.
+        throws: >
+          StorageError (extends FirebaseError) with code: storage/object-not-found (no object
+          exists at the given StorageReference — updateMetadata requires the object to already
+          exist; calling it on a newly-allocated ref without a prior upload throws this),
+          storage/unauthorized (security rules deny the metadata write — the rules for metadata
+          updates may differ from upload rules), storage/retry-limit-exceeded (network failed
+          all automatic retries), storage/unauthenticated (user is not authenticated and the
+          bucket rules require authentication).
+        required_handling: >
+          Caller MUST wrap await updateMetadata() in try-catch. storage/object-not-found is
+          the most common error — the reference must point to an already-uploaded object.
+          Verify the object exists (via getMetadata) before attempting metadata updates in
+          workflows that race upload with metadata update.
+
+          try {
+            const metadata = await updateMetadata(storageRef, {
+              contentType: 'image/webp',
+              customMetadata: { userId: user.uid }
+            });
+            return metadata;
+          } catch (error) {
+            if (error instanceof StorageError) {
+              if (error.code === 'storage/object-not-found') {
+                throw new Error('File does not exist — upload it first before updating metadata');
+              }
+              if (error.code === 'storage/unauthorized') {
+                throw new Error('Not authorized to update metadata for this file');
+              }
+            }
+            throw error;
+          }
+        sources:
+          - "https://firebase.google.com/docs/reference/js/storage#updatemetadata"
+          - "https://firebase.google.com/docs/storage/web/file-metadata"
+        severity: error
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: silent
           user_experience: degraded_performance
           incident_cost_range: low
 

@@ -1,5 +1,21 @@
 # CHANGELOG — firebase
 
+## 2026-06-26 — deepen pass — coverage 83% -> 100%
+
+- **Profile:** `packages/firebase/contract.yaml`
+- **Functions added:** sendSignInLinkToEmail, verifyPasswordResetCode, checkActionCode, unlink, reload, signInWithCredential, updateMetadata (7 total)
+- **Postconditions added:** 7 (send-sign-in-link-argument-error, verify-password-reset-code-error, check-action-code-error, unlink-no-such-provider, reload-token-or-network-error, sign-in-with-credential-error, update-metadata-error)
+- **Coverage:** 35/42 (0.83) -> 42/42 (1.0) — all considered async functions now contracted
+- **Functions intentionally omitted (unchanged):** SMS-flow functions (signInWithPhoneNumber/linkWithPhoneNumber/updatePhoneNumber — phone-number niche), getDocFromServer/getDocsFromServer (duplicate error contract with getDoc/getDocs), fetchSignInMethodsForEmail (deprecated in newer Firebase), validatePassword (optional policy enforcement)
+- **Scanner concerns queued:** 7 (concern-20260626-firebase-deepen-1 through 7) — all 7 new postconditions require new scanner detection rules; none use the existing bare-await detection rule
+- **Sources fetched:**
+  - `@firebase/auth/dist/auth-public.d.ts` (signatures: sendSignInLinkToEmail, verifyPasswordResetCode, checkActionCode, unlink, reload, signInWithCredential)
+  - `nark-dev/tmp/firebase/node_modules/@firebase/auth/dist/node/totp-9e84e53d.js` (AuthErrorCodes enum: argument-error, expired-action-code, invalid-action-code, no-such-provider, requires-recent-login, user-token-expired, user-mismatch, invalid-credential, unauthorized-domain)
+  - `@firebase/storage/dist/storage-public.d.ts` (signature: updateMetadata)
+  - `@firebase/storage/dist/index.cjs.js` (StorageErrorCode enum: OBJECT_NOT_FOUND, UNAUTHORIZED, RETRY_LIMIT_EXCEEDED, UNAUTHENTICATED)
+- **Fixtures added:** ground-truth.ts entries #36-42 (14 functions: 7 SHOULD_FIRE + 7 SHOULD_NOT_FIRE)
+- **Deepen stream:** deepen-stream-1, pass 1 (2026-06-26)
+
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** firebase@12.15.0

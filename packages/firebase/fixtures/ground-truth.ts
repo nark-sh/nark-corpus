@@ -38,13 +38,20 @@
  *   custom-token-error         (signInWithCustomToken)
  *   upload-string-error        (uploadString)
  *   get-metadata-error         (getMetadata)
+ *
+ * Added in depth pass 2026-06-26 (deepen-stream-1 pass 1):
+ *   send-sign-in-link-argument-error   (sendSignInLinkToEmail)
+ *   verify-password-reset-code-error   (verifyPasswordResetCode)
+ *   check-action-code-error            (checkActionCode)
+ *   unlink-no-such-provider            (unlink)
+ *   reload-token-or-network-error      (reload)
+ *   sign-in-with-credential-error      (signInWithCredential)
+ *   update-metadata-error              (updateMetadata — storage)
  */
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset, signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, EmailAuthProvider, applyActionCode, getRedirectResult, signInWithCustomToken } from 'firebase/auth';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, getAuth, sendPasswordResetEmail, sendEmailVerification, deleteUser as firebaseDeleteUser, signOut, getIdToken, updateEmail, updatePassword, confirmPasswordReset, signInWithEmailLink, signInAnonymously, updateProfile, linkWithCredential, reauthenticateWithCredential, verifyBeforeUpdateEmail, EmailAuthProvider, applyActionCode, getRedirectResult, signInWithCustomToken, sendSignInLinkToEmail, verifyPasswordResetCode, checkActionCode, unlink, reload, signInWithCredential, GoogleAuthProvider as GoogleAuthProviderClass } from 'firebase/auth';
 import { getDocs, addDoc, setDoc, updateDoc, deleteDoc, getDoc, runTransaction, collection, doc, getFirestore, query, where, writeBatch, getCountFromServer } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject, uploadString, getMetadata } from 'firebase/storage';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject, uploadString, getMetadata, updateMetadata } from 'firebase/storage';
 import { getFunctions, httpsCallable } from 'firebase/functions';
-
-declare const GoogleAuthProvider: any;
 
 const auth = getAuth();
 const db = getFirestore();
@@ -95,14 +102,14 @@ async function gt_createUser_proper(email: string, password: string) {
 // ──────────────────────────────────────────────
 
 async function gt_popup_missing() {
-  const provider = new GoogleAuthProvider();
+  const provider = new GoogleAuthProviderClass();
   // SHOULD_FIRE: auth-error — signInWithPopup without try-catch
   const result = await signInWithPopup(auth, provider);
   return result.user;
 }
 
 async function gt_popup_proper() {
-  const provider = new GoogleAuthProvider();
+  const provider = new GoogleAuthProviderClass();
   try {
     // SHOULD_NOT_FIRE: signInWithPopup inside try-catch
     const result = await signInWithPopup(auth, provider);
@@ -706,5 +713,137 @@ async function gt_getMetadata_proper(path: string) {
     // SHOULD_NOT_FIRE: getMetadata inside try-catch
     const metadata = await getMetadata(storageRef);
     return metadata;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 36. sendSignInLinkToEmail (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_sendSignInLinkToEmail_missing(email: string) {
+  const actionCodeSettings = { url: 'https://example.com/finishSignUp', handleCodeInApp: true };
+  // SHOULD_FIRE: send-sign-in-link-argument-error — sendSignInLinkToEmail without try-catch
+  await sendSignInLinkToEmail(auth, email, actionCodeSettings);
+}
+
+async function gt_sendSignInLinkToEmail_proper(email: string) {
+  const actionCodeSettings = { url: 'https://example.com/finishSignUp', handleCodeInApp: true };
+  try {
+    // SHOULD_NOT_FIRE: sendSignInLinkToEmail inside try-catch
+    await sendSignInLinkToEmail(auth, email, actionCodeSettings);
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 37. verifyPasswordResetCode (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_verifyPasswordResetCode_missing(oobCode: string) {
+  // SHOULD_FIRE: verify-password-reset-code-error — verifyPasswordResetCode without try-catch
+  const email = await verifyPasswordResetCode(auth, oobCode);
+  return email;
+}
+
+async function gt_verifyPasswordResetCode_proper(oobCode: string) {
+  try {
+    // SHOULD_NOT_FIRE: verifyPasswordResetCode inside try-catch
+    const email = await verifyPasswordResetCode(auth, oobCode);
+    return email;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 38. checkActionCode (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_checkActionCode_missing(oobCode: string) {
+  // SHOULD_FIRE: check-action-code-error — checkActionCode without try-catch
+  const info = await checkActionCode(auth, oobCode);
+  return info.operation;
+}
+
+async function gt_checkActionCode_proper(oobCode: string) {
+  try {
+    // SHOULD_NOT_FIRE: checkActionCode inside try-catch
+    const info = await checkActionCode(auth, oobCode);
+    return info.operation;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 39. unlink (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_unlink_missing(providerId: string) {
+  const user = auth.currentUser!;
+  // SHOULD_FIRE: unlink-no-such-provider — unlink without try-catch
+  const updatedUser = await unlink(user, providerId);
+  return updatedUser;
+}
+
+async function gt_unlink_proper(providerId: string) {
+  const user = auth.currentUser!;
+  try {
+    // SHOULD_NOT_FIRE: unlink inside try-catch
+    const updatedUser = await unlink(user, providerId);
+    return updatedUser;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 40. reload (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_reload_missing() {
+  const user = auth.currentUser!;
+  // SHOULD_FIRE: reload-token-or-network-error — reload without try-catch
+  await reload(user);
+}
+
+async function gt_reload_proper() {
+  const user = auth.currentUser!;
+  try {
+    // SHOULD_NOT_FIRE: reload inside try-catch
+    await reload(user);
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 41. signInWithCredential (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_signInWithCredential_missing(idToken: string) {
+  const credential = GoogleAuthProviderClass.credential(idToken);
+  // SHOULD_FIRE: sign-in-with-credential-error — signInWithCredential without try-catch
+  const result = await signInWithCredential(auth, credential);
+  return result.user;
+}
+
+async function gt_signInWithCredential_proper(idToken: string) {
+  const credential = GoogleAuthProviderClass.credential(idToken);
+  try {
+    // SHOULD_NOT_FIRE: signInWithCredential inside try-catch
+    const result = await signInWithCredential(auth, credential);
+    return result.user;
+  } catch (error) { throw error; }
+}
+
+// ──────────────────────────────────────────────
+// 42. updateMetadata — Storage (added 2026-06-26 — deepen-stream-1 pass 1)
+// ──────────────────────────────────────────────
+
+async function gt_updateMetadata_missing(path: string) {
+  const storageRef = ref(storage, path);
+  // SHOULD_FIRE: update-metadata-error — updateMetadata without try-catch
+  const result = await updateMetadata(storageRef, { contentType: 'image/png' });
+  return result;
+}
+
+async function gt_updateMetadata_proper(path: string) {
+  const storageRef = ref(storage, path);
+  try {
+    // SHOULD_NOT_FIRE: updateMetadata inside try-catch
+    const result = await updateMetadata(storageRef, { contentType: 'image/png' });
+    return result;
   } catch (error) { throw error; }
 }
