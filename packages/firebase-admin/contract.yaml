@@ -2,7 +2,7 @@ package: firebase-admin
 semver: ">=11.0.0 <15.0.0"
 contract_version: "1.4.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-25"
+last_verified: "2026-06-26"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
@@ -41,14 +41,26 @@ evidence_quality: confirmed
 #   MachineLearning.createModel, MachineLearning.publishModel, MachineLearning.deleteModel.
 # New omissions: TaskQueue.delete/not-found as idempotent, listVersions (read-only),
 #   getTemplateAtVersion (read-only fetch), listRulesetMetadata (read-only),
-#   MachineLearning.getModel (read-only), MachineLearning.updateModel (already
-#   covered via createModel patterns), MachineLearning.unpublishModel (same as
-#   publishModel but inverted — shares error profile), setProcessingState (extension
-#   lifecycle, low blast-radius for SaaS apps), setFatalError (same),
-#   Security Rules release helpers (admin-only, niche SaaS usage).
-# API surface total: 90 (re-enumerated, including functions/eventarc/ML/extensions);
-#   contracted: 54; omitted: 36; coverage_score: 0.60 raw (54/90)
-coverage_score: 0.60
+#   MachineLearning.getModel (read-only), MachineLearning.unpublishModel (same as
+#   publishModel but inverted -- shares error profile), setProcessingState (extension
+#   lifecycle, low blast-radius for SaaS apps), setFatalError (same).
+# API surface total: 90; contracted: 54; omitted: 36; coverage_score: 0.60 raw (54/90)
+#
+# Depth pass 2026-06-26 (deepen-stream-2 pass 1):
+# Added 6 new function entries:
+#   SecurityRules.releaseFirestoreRulesetFromSource (CI/CD deploy -- invalid-argument, auth-error, resource-exhausted)
+#   SecurityRules.releaseStorageRulesetFromSource (Storage deploy -- invalid-argument, auth-error, resource-exhausted)
+#   SecurityRules.createRuleset (standalone ruleset creation -- invalid-argument, auth-error)
+#   SecurityRules.deleteRuleset (cleanup rotation -- not-found, invalid-argument)
+#   MachineLearning.updateModel (model update -- not-found, invalid-argument, failed-precondition)
+#   Installations.deleteInstallation (GDPR deletion -- invalid-installation-id, api-error)
+# Formally moved to omitted this pass: MachineLearning.updateModel (was erroneously in
+#   prior omitted note -- now contracted). MachineLearning.waitForUnlocked (resolves
+#   silently on timeout -- does not throw), SecurityRules.getRuleset/getFirestoreRuleset/
+#   getStorageRuleset/listRulesetMetadata (read-only GETs), RemoteConfig.load() (niche
+#   ServerTemplate preview), Extensions.setProcessingState/setFatalError (extension lifecycle).
+# API surface total: 90; contracted: 60; omitted: 30; coverage_score: 0.67 (60/90)
+coverage_score: 0.67
 
 detection:
   class_names: ["Auth", "BaseAuth", "Messaging", "Firestore", "Database", "AppCheck", "DataConnect", "PhoneNumberVerification"]
@@ -115,6 +127,15 @@ detection:
     - ".executeQuery("
     # Phone Number Verification (v14+)
     - ".verifyToken("
+    # Security Rules (added 2026-06-26)
+    - ".releaseFirestoreRulesetFromSource("
+    - ".releaseStorageRulesetFromSource("
+    - ".createRuleset("
+    - ".deleteRuleset("
+    # Machine Learning -- updateModel (added 2026-06-26)
+    - ".updateModel("
+    # Installations (added 2026-06-26)
+    - ".deleteInstallation("
 
 functions:
   # Authentication Service
@@ -2863,3 +2884,443 @@ functions:
           visibility: visible
           user_experience: lost_transaction
           incident_cost_range: low
+
+  # ── Security Rules — Ruleset Management ─────────────────────────────────────
+
+  - name: SecurityRules.releaseFirestoreRulesetFromSource
+    import_path: "firebase-admin/security-rules"
+    description: >
+      Creates a new Ruleset from the given source string/Buffer and atomically
+      releases (applies) it to Cloud Firestore. This is the primary API for
+      deploying Firestore security rules from CI/CD pipelines, deployment scripts,
+      and infrastructure provisioning workflows. If either the createRuleset or
+      releaseRuleset step fails, the operation rejects — Firestore continues using
+      the previously applied ruleset. Silent failure here means a broken security
+      rules deployment goes undetected, leaving production data at risk.
+
+    postconditions:
+      # Evidence: src/security-rules/security-rules.ts — createRulesFileFromSource()
+      # throws FirebaseSecurityRulesError('invalid-argument') for empty/non-string source
+      # Evidence: src/security-rules/security-rules-api-client-internal.ts
+      # SecurityRulesErrorCode: INVALID_ARGUMENT -> 'invalid-argument'
+      - id: security-rules-release-firestore-invalid-argument
+        severity: error
+        condition: >
+          source is null, undefined, empty string, or not a string/Buffer.
+          Thrown synchronously before any network call is made.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/invalid-argument'"
+        required_handling: >
+          Validate the rules source before calling. The source must be a non-empty
+          string (rules text) or a Buffer containing the rules. Empty string is a
+          common bug in templated deployment scripts that interpolate an undefined
+          variable. Catch this error and fail the deployment pipeline immediately --
+          the rules were NOT updated.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: security-rules-api-client-internal.ts ERROR_CODE_MAPPING
+      # UNAUTHENTICATED -> 'authentication-error' (HTTP 401)
+      - id: security-rules-release-firestore-auth-error
+        severity: error
+        condition: >
+          The service account does not have permission to manage Firebase Security
+          Rules (requires Firebase Rules Admin role or securityrules.rulesets.create
+          IAM permission). HTTP 401 from the Cloud Security Rules API.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/authentication-error'"
+        required_handling: >
+          Catch and fail the deployment pipeline with a clear alert. This is a
+          service account misconfiguration -- the rules were NOT deployed. Do NOT
+          retry. Requires granting the Firebase Admin or Security Rules Admin IAM
+          role to the service account used by the deployment process.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+          - "https://firebase.google.com/docs/projects/iam/permissions"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: security-rules-api-client-internal.ts ERROR_CODE_MAPPING
+      # RESOURCE_EXHAUSTED -> 'resource-exhausted' (quota limit on rulesets)
+      - id: security-rules-release-firestore-resource-exhausted
+        severity: warning
+        condition: >
+          The project has exceeded the maximum number of rulesets (2500 per project
+          per day for creation, or 200 concurrent rulesets). Each call to
+          releaseFirestoreRulesetFromSource creates a new ruleset -- without
+          periodic deleteRuleset cleanup, quota is exhausted.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/resource-exhausted'"
+        required_handling: >
+          Catch and alert the ops team. After receiving this error, list and delete
+          old rulesets using listRulesetMetadata() + deleteRuleset() before retrying.
+          In CI/CD pipelines that deploy frequently, implement automatic ruleset
+          rotation: keep the last N rulesets and delete the oldest after each deploy.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+          - "https://firebase.google.com/docs/firestore/security/get-started"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: SecurityRules.releaseStorageRulesetFromSource
+    import_path: "firebase-admin/security-rules"
+    description: >
+      Creates a new Ruleset from the given source and atomically releases it to a
+      Cloud Storage bucket. Equivalent to releaseFirestoreRulesetFromSource but
+      for Storage security rules. Used in deployment pipelines that manage Cloud
+      Storage access rules alongside Firestore rules. Optionally accepts a bucket
+      name -- if omitted, applies to the default app bucket. Failing silently here
+      leaves the bucket with stale or overly permissive access rules.
+
+    postconditions:
+      # Evidence: src/security-rules/security-rules.ts -- getBucketName()
+      # throws FirebaseSecurityRulesError('invalid-argument') if bucket not configured
+      - id: security-rules-release-storage-invalid-argument
+        severity: error
+        condition: >
+          source is null, undefined, empty string, or not a string/Buffer. Also
+          thrown if no bucket is specified and the default Storage bucket is not
+          configured in AppOptions (storageBucket not set).
+        throws: "FirebaseSecurityRulesError with code 'security-rules/invalid-argument'"
+        required_handling: >
+          Validate source is a non-empty string or Buffer. If deploying to a
+          non-default bucket, always pass the bucket name explicitly. The
+          'default bucket not configured' variant is a configuration bug -- the
+          app initialization AppOptions must include storageBucket if no bucket
+          arg is provided. Fail the deployment pipeline and alert.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: security-rules-api-client-internal.ts ERROR_CODE_MAPPING -- same mapping as Firestore variant
+      - id: security-rules-release-storage-auth-error
+        severity: error
+        condition: >
+          Service account lacks Firebase Security Rules Admin permission for the
+          target Storage bucket. HTTP 401 from the Cloud Security Rules API.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/authentication-error'"
+        required_handling: >
+          Same as the Firestore variant -- catch and fail the deployment pipeline.
+          Requires Firebase Admin or Security Rules Admin IAM role. The storage
+          rules were NOT updated; the bucket continues using its old rules.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SECURITY_RISK
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+      # Evidence: security-rules-api-client-internal.ts -- resource-exhausted same as Firestore variant
+      - id: security-rules-release-storage-resource-exhausted
+        severity: warning
+        condition: >
+          Project has exceeded the Cloud Security Rules quota for ruleset creation.
+          Each releaseStorageRulesetFromSource call creates a new ruleset object.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/resource-exhausted'"
+        required_handling: >
+          Implement ruleset rotation: after each successful deploy, delete old
+          rulesets via deleteRuleset() to stay within quota. Alert ops if this
+          error fires in production -- it means deploy frequency exceeded cleanup
+          cadence.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  - name: SecurityRules.createRuleset
+    import_path: "firebase-admin/security-rules"
+    description: >
+      Creates a new Ruleset from a RulesFile object (built via
+      createRulesFileFromSource) WITHOUT releasing it to any service. Used when
+      the creation and release steps need to be decoupled -- e.g. to validate a
+      ruleset first, or to apply the same ruleset to multiple services. The
+      returned Ruleset object contains the short name needed for subsequent
+      releaseFirestoreRuleset() or releaseStorageRuleset() calls. If this fails
+      silently, the release step will receive a stale/invalid ruleset name.
+
+    postconditions:
+      # Evidence: security-rules-api-client-internal.ts createRuleset() -- validates rules object structure
+      # throws 'invalid-argument' for malformed file list
+      - id: security-rules-create-ruleset-invalid-argument
+        severity: error
+        condition: >
+          The RulesFile argument is null, undefined, has an empty name, or has
+          empty content. The createRulesFileFromSource() helper validates these
+          constraints before createRuleset() is called, but passing a hand-crafted
+          object bypasses those checks.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/invalid-argument'"
+        required_handling: >
+          Always use createRulesFileFromSource() to build the RulesFile object --
+          it performs local validation synchronously and will surface
+          'invalid-argument' before any network call. Catch the error and fail
+          the deployment pipeline. If building a custom RulesFile, ensure name
+          is a non-empty string and content is a non-empty string.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+      # Evidence: security-rules-api-client-internal.ts ERROR_CODE_MAPPING -- UNAUTHENTICATED -> 'authentication-error'
+      - id: security-rules-create-ruleset-auth-error
+        severity: error
+        condition: >
+          Service account lacks permission to create rulesets (Firebase Admin role
+          or securityrules.rulesets.create). HTTP 401 from the Security Rules API.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/authentication-error'"
+        required_handling: >
+          Do NOT retry with the same credentials. Alert ops team -- the deployment
+          service account is misconfigured. Grant the Firebase Admin SDK Service
+          Agent role or the securityrules.rulesets.create IAM permission.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: high
+
+  - name: SecurityRules.deleteRuleset
+    import_path: "firebase-admin/security-rules"
+    description: >
+      Deletes a named Ruleset (identified by its short name, without the project
+      path prefix). Used in ruleset rotation workflows to clean up old rulesets
+      and stay within the per-project quota. Rejects with 'not-found' if the
+      ruleset does not exist. Commonly called in automated cleanup pipelines after
+      a successful releaseFirestoreRulesetFromSource deploy.
+
+    postconditions:
+      # Evidence: security-rules.d.ts JSDoc -- "Rejects with a `not-found` error if the
+      # specified Ruleset cannot be found." security-rules-api-client-internal.ts:
+      # NOT_FOUND -> 'not-found'
+      - id: security-rules-delete-ruleset-not-found
+        severity: warning
+        condition: >
+          The ruleset name does not exist in the project -- it was already deleted,
+          never created, or the caller passed the full resource path instead of
+          the short name.
+        throws: "FirebaseSecurityRulesError with code 'security-rules/not-found'"
+        required_handling: >
+          In cleanup workflows, treat 'not-found' as an idempotent success -- the
+          goal was to remove the ruleset and it no longer exists. Always use the
+          short name from RulesetMetadata.name, NOT the full resource path.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+      # Evidence: security-rules-api-client-internal.ts -- validates name is non-empty and
+      # throws 'invalid-argument' for empty names or names containing '/'
+      - id: security-rules-delete-ruleset-invalid-argument
+        severity: error
+        condition: >
+          The name argument is an empty string, or contains a '/' character
+          (the full resource path was passed instead of the short name).
+        throws: "FirebaseSecurityRulesError with code 'security-rules/invalid-argument'"
+        required_handling: >
+          Always extract the short name from RulesetMetadata.name -- it is the
+          final segment of the full resource path. Never pass the full path
+          ('projects/proj/rulesets/name'). This error is thrown synchronously
+          before any network call.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: low
+
+  # ── Machine Learning -- Model Management ─────────────────────────────────────
+
+  - name: MachineLearning.updateModel
+    import_path: "firebase-admin/machine-learning"
+    description: >
+      Updates an existing Firebase ML model -- replaces the model file (GCS URI),
+      display name, or tags. Returns the updated Model object. The operation is
+      long-running: after the HTTP request succeeds, the model enters a locked
+      state while Firebase ML validates and processes the new model file.
+      The returned Model may still show as 'locked' -- callers who need to publish
+      immediately afterward must call model.waitForUnlocked() first. A silent
+      failure here means the production model is not updated.
+
+    postconditions:
+      # Evidence: machine-learning/error.d.ts -- MachineLearningErrorCode: NOT_FOUND: 'not-found'
+      - id: ml-update-model-not-found
+        severity: error
+        condition: >
+          The model with the given modelId does not exist -- it was never created
+          or was deleted before this update call.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/not-found'"
+        required_handling: >
+          Catch and fail the deployment pipeline. The model must be created first
+          via createModel() before it can be updated. Log the modelId so the
+          operations team can investigate.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+      # Evidence: machine-learning/error.d.ts -- MachineLearningErrorCode: INVALID_ARGUMENT
+      - id: ml-update-model-invalid-argument
+        severity: error
+        condition: >
+          The model options are invalid -- display name is empty, gcsTfliteUri is
+          malformed, or the referenced GCS file is not a valid TFLite model.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/invalid-argument'"
+        required_handling: >
+          Validate model options before calling updateModel(). Verify the GCS URI
+          format (gs://bucket/path/to/model.tflite) and that the file exists and
+          is a valid TFLite model. A malformed URI causes an immediate error.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: low
+
+      # Evidence: machine-learning/error.d.ts -- MachineLearningErrorCode: FAILED_PRECONDITION
+      - id: ml-update-model-failed-precondition
+        severity: error
+        condition: >
+          The model is in a locked state -- another operation (a prior updateModel,
+          publishModel, or model file processing) is still in progress.
+        throws: "FirebaseMachineLearningError with code 'machine-learning/failed-precondition'"
+        required_handling: >
+          Call model.waitForUnlocked() before calling updateModel() if there is
+          any chance a concurrent operation is in flight. If this fires in a
+          sequential pipeline, it indicates the previous update/publish did not
+          complete before the next was issued. Wait and retry with exponential
+          backoff.
+        sources:
+          - "https://firebase.google.com/docs/ml/manage-models-admin"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: SILENT_FAILURE
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: degraded_performance
+          incident_cost_range: medium
+
+  # ── Installations -- Installation ID Management ───────────────────────────────
+
+  - name: Installations.deleteInstallation
+    import_path: "firebase-admin/installations"
+    description: >
+      Deletes a Firebase Installation ID (FID) and all associated data from
+      Firebase. Used in privacy/compliance workflows (GDPR right-to-erasure,
+      CCPA deletion requests) to remove user device registration data, and in
+      forced sign-out flows to invalidate device tokens. Once deleted, the
+      installation is unregistered from all Firebase services (FCM, Remote Config,
+      Analytics). A silent failure here means a user's device data was NOT
+      deleted, creating GDPR compliance risk and potentially sending notifications
+      to users who requested deletion.
+
+    postconditions:
+      # Evidence: src/installations/installations-request-handler.ts
+      # INVALID_INSTALLATION_ID thrown synchronously: fid must be non-empty string
+      - id: installations-delete-invalid-installation-id
+        severity: error
+        condition: >
+          The fid argument is null, undefined, or an empty string. Thrown
+          synchronously before any network call is made.
+        throws: "FirebaseInstallationsError with code 'installations/invalid-installation-id'"
+        required_handling: >
+          Validate the FID is a non-empty string before calling. In GDPR deletion
+          workflows, the FID typically comes from a database record -- validate it
+          is present before calling. An empty FID indicates the user record is
+          malformed; log and alert rather than swallowing the error.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/installations/installations-request-handler.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/installations/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: lost_data
+          incident_cost_range: medium
+
+      # Evidence: src/installations/installations-request-handler.ts
+      # HTTP 404 -> API_ERROR with message "Failed to find the installation ID"
+      # HTTP 409 -> API_ERROR with message "Already deleted"
+      - id: installations-delete-api-error
+        severity: warning
+        condition: >
+          The Firebase API rejected the deletion request. Common causes: the
+          installation ID does not exist (404 -- already deleted or never
+          registered), conflict (409 -- concurrent deletion), rate limit (429),
+          or server error (500/503). All map to 'installations/api-error'.
+        throws: "FirebaseInstallationsError with code 'installations/api-error'"
+        required_handling: >
+          Catch and inspect the error message for the specific cause. In GDPR
+          deletion flows: 404/409 variants ('Failed to find' / 'Already deleted')
+          SHOULD be treated as idempotent success -- the FID no longer exists.
+          429 variants MUST be retried with exponential backoff. 500/503 variants
+          MUST be retried and alerted if persistent. Log each deletion attempt
+          result for compliance audit trails.
+        sources:
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/installations/installations-request-handler.ts"
+          - "https://github.com/firebase/firebase-admin-node/blob/master/src/installations/error.ts"
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DATA_LOSS
+          production_behavior: silent_failure
+          visibility: silent
+          user_experience: lost_data
+          incident_cost_range: high

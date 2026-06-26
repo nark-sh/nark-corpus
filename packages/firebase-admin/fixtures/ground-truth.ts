@@ -18,6 +18,10 @@
  *   Storage (new 2026-04-13 pass 14): getDownloadURL
  *   Data Connect (new 2026-06-24 pass 42): executeGraphql (v14+)
  *   Phone Number Verification (new 2026-06-24 pass 42): verifyToken (v14+)
+ *   Security Rules (new 2026-06-26 pass 1): releaseFirestoreRulesetFromSource, releaseStorageRulesetFromSource,
+ *     createRuleset, deleteRuleset
+ *   ML (new 2026-06-26 pass 1): updateModel
+ *   Installations (new 2026-06-26 pass 1): deleteInstallation
  *
  * Detection note: namespace API (admin.auth()) and stored instances are fully detected.
  * Modular getAuth().verifyIdToken() pattern is not currently detected (analyzer limitation).
@@ -31,6 +35,9 @@ import { getFirestore } from 'firebase-admin/firestore';
 import { getDatabase } from 'firebase-admin/database';
 import { getDataConnect } from 'firebase-admin/data-connect';
 import { getPhoneNumberVerification } from 'firebase-admin/phone-number-verification';
+import { getSecurityRules } from 'firebase-admin/security-rules';
+import { getMachineLearning } from 'firebase-admin/machine-learning';
+import { getInstallations } from 'firebase-admin/installations';
 
 // ──────────────────────────────────────────────
 // 1. verifyIdToken — namespace API
@@ -1040,6 +1047,201 @@ async function gt_mlDeleteModel_proper(modelId: string) {
     if ((error as any).code === 'machine-learning/not-found') {
       // Idempotent — model already deleted; treat as success
       return;
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SecurityRules.releaseFirestoreRulesetFromSource (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: security-rules-release-firestore-invalid-argument
+// @expect-violation: security-rules-release-firestore-auth-error
+// @expect-violation: security-rules-release-firestore-resource-exhausted
+async function gt_releaseFirestoreRulesetFromSource_missing(source: string) {
+  const rules = getSecurityRules();
+  // SHOULD_FIRE: security-rules-release-firestore-invalid-argument / auth-error / resource-exhausted
+  await rules.releaseFirestoreRulesetFromSource(source);
+}
+
+// @expect-clean
+async function gt_releaseFirestoreRulesetFromSource_proper(source: string) {
+  const rules = getSecurityRules();
+  try {
+    // SHOULD_NOT_FIRE: releaseFirestoreRulesetFromSource inside try-catch
+    await rules.releaseFirestoreRulesetFromSource(source);
+  } catch (error) {
+    if ((error as any).code === 'security-rules/invalid-argument') {
+      throw new Error('Invalid rules source — must be a non-empty string or Buffer.');
+    }
+    if ((error as any).code === 'security-rules/authentication-error') {
+      throw new Error('Service account lacks Security Rules admin permission.');
+    }
+    if ((error as any).code === 'security-rules/resource-exhausted') {
+      throw new Error('Ruleset quota exhausted — clean up old rulesets before retrying.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SecurityRules.releaseStorageRulesetFromSource (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: security-rules-release-storage-invalid-argument
+// @expect-violation: security-rules-release-storage-auth-error
+// @expect-violation: security-rules-release-storage-resource-exhausted
+async function gt_releaseStorageRulesetFromSource_missing(source: string, bucket?: string) {
+  const rules = getSecurityRules();
+  // SHOULD_FIRE: security-rules-release-storage-invalid-argument / auth-error / resource-exhausted
+  await rules.releaseStorageRulesetFromSource(source, bucket);
+}
+
+// @expect-clean
+async function gt_releaseStorageRulesetFromSource_proper(source: string, bucket?: string) {
+  const rules = getSecurityRules();
+  try {
+    // SHOULD_NOT_FIRE: releaseStorageRulesetFromSource inside try-catch
+    await rules.releaseStorageRulesetFromSource(source, bucket);
+  } catch (error) {
+    if ((error as any).code === 'security-rules/invalid-argument') {
+      throw new Error('Invalid rules source or bucket not configured.');
+    }
+    if ((error as any).code === 'security-rules/authentication-error') {
+      throw new Error('Service account lacks Storage security rules admin permission.');
+    }
+    if ((error as any).code === 'security-rules/resource-exhausted') {
+      throw new Error('Ruleset quota exhausted — delete old rulesets before retrying.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SecurityRules.createRuleset (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: security-rules-create-ruleset-invalid-argument
+// @expect-violation: security-rules-create-ruleset-auth-error
+async function gt_createRuleset_missing(file: { name: string; content: string }) {
+  const rules = getSecurityRules();
+  // SHOULD_FIRE: security-rules-create-ruleset-invalid-argument / auth-error
+  await rules.createRuleset(file);
+}
+
+// @expect-clean
+async function gt_createRuleset_proper(file: { name: string; content: string }) {
+  const rules = getSecurityRules();
+  try {
+    // SHOULD_NOT_FIRE: createRuleset inside try-catch
+    const ruleset = await rules.createRuleset(file);
+    return ruleset.name;
+  } catch (error) {
+    if ((error as any).code === 'security-rules/invalid-argument') {
+      throw new Error('Invalid rules file — name and content must be non-empty strings.');
+    }
+    if ((error as any).code === 'security-rules/authentication-error') {
+      throw new Error('Service account lacks permission to create rulesets.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SecurityRules.deleteRuleset (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: security-rules-delete-ruleset-not-found
+// @expect-violation: security-rules-delete-ruleset-invalid-argument
+async function gt_deleteRuleset_missing(name: string) {
+  const rules = getSecurityRules();
+  // SHOULD_FIRE: security-rules-delete-ruleset-not-found / invalid-argument
+  await rules.deleteRuleset(name);
+}
+
+// @expect-clean
+async function gt_deleteRuleset_proper(name: string) {
+  const rules = getSecurityRules();
+  try {
+    // SHOULD_NOT_FIRE: deleteRuleset inside try-catch
+    await rules.deleteRuleset(name);
+  } catch (error) {
+    if ((error as any).code === 'security-rules/not-found') {
+      // Idempotent in cleanup workflows — ruleset already gone
+      return;
+    }
+    if ((error as any).code === 'security-rules/invalid-argument') {
+      throw new Error('Invalid ruleset name — use the short name from RulesetMetadata.name.');
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// MachineLearning.updateModel (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: ml-update-model-not-found
+// @expect-violation: ml-update-model-invalid-argument
+// @expect-violation: ml-update-model-failed-precondition
+async function gt_mlUpdateModel_missing(modelId: string, options: object) {
+  const ml = getMachineLearning();
+  // SHOULD_FIRE: ml-update-model-not-found / invalid-argument / failed-precondition
+  await ml.updateModel(modelId, options);
+}
+
+// @expect-clean
+async function gt_mlUpdateModel_proper(modelId: string, options: object) {
+  const ml = getMachineLearning();
+  try {
+    // SHOULD_NOT_FIRE: updateModel inside try-catch
+    const model = await ml.updateModel(modelId, options);
+    return model;
+  } catch (error) {
+    if ((error as any).code === 'machine-learning/not-found') {
+      throw new Error(`Model ${modelId} not found — create it first with createModel().`);
+    }
+    if ((error as any).code === 'machine-learning/invalid-argument') {
+      throw new Error('Invalid model options — verify GCS URI format and display name.');
+    }
+    if ((error as any).code === 'machine-learning/failed-precondition') {
+      throw new Error(`Model ${modelId} is locked — call waitForUnlocked() before updating.`);
+    }
+    throw error;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Installations.deleteInstallation (added 2026-06-26)
+// ──────────────────────────────────────────────────────────────────
+
+// @expect-violation: installations-delete-invalid-installation-id
+// @expect-violation: installations-delete-api-error
+async function gt_deleteInstallation_missing(fid: string) {
+  const installations = getInstallations();
+  // SHOULD_FIRE: installations-delete-invalid-installation-id / api-error
+  await installations.deleteInstallation(fid);
+}
+
+// @expect-clean
+async function gt_deleteInstallation_proper(fid: string) {
+  const installations = getInstallations();
+  try {
+    // SHOULD_NOT_FIRE: deleteInstallation inside try-catch
+    await installations.deleteInstallation(fid);
+  } catch (error) {
+    if ((error as any).code === 'installations/invalid-installation-id') {
+      throw new Error('Invalid installation ID — must be a non-empty string.');
+    }
+    if ((error as any).code === 'installations/api-error') {
+      const msg = (error as any).message || '';
+      if (msg.includes('Failed to find') || msg.includes('Already deleted')) {
+        // Idempotent in GDPR deletion flows — FID no longer exists
+        return;
+      }
+      // Re-throw for rate-limit / server errors that need retry
+      throw error;
     }
     throw error;
   }

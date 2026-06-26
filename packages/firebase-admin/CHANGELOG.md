@@ -1,5 +1,23 @@
 # CHANGELOG — firebase-admin
 
+## 2026-06-26 — deepen pass 5 (deepen-stream-2 pass 1) — coverage 60% → 67%
+
+- **Profile:** `packages/firebase-admin/contract.yaml`
+- **Functions added:** SecurityRules.releaseFirestoreRulesetFromSource, SecurityRules.releaseStorageRulesetFromSource, SecurityRules.createRuleset, SecurityRules.deleteRuleset, MachineLearning.updateModel, Installations.deleteInstallation (6 total)
+- **Postconditions added:** 16 (3 for releaseFirestoreRulesetFromSource, 3 for releaseStorageRulesetFromSource, 2 for createRuleset, 2 for deleteRuleset, 3 for updateModel, 2 for deleteInstallation)
+- **Functions intentionally omitted this pass:** MachineLearning.waitForUnlocked (resolves silently on timeout), MachineLearning.unpublishModel (inverse of publishModel -- same error profile), SecurityRules.getRuleset/getFirestoreRuleset/getStorageRuleset/listRulesetMetadata (read-only GETs), SecurityRules.releaseFirestoreRuleset/releaseStorageRuleset (apply existing ruleset -- no distinct errors), RemoteConfig.getTemplateAtVersion/listVersions (read-only), RemoteConfig.load() (ServerTemplate preview), Extensions.setProcessingState/setFatalError (extension lifecycle)
+- **Scanner concerns queued:** 6 (`concern-20260626-firebase-admin-security-rules-release-1`, `-release-2`, `-create`, `-delete`, `-ml-update-model`, `-installations-delete`)
+- **Scanner version used:** nark@3.2.0
+- **Sources fetched:**
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/security-rules-api-client-internal.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/security-rules/error.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/machine-learning/error.ts`
+  - `https://github.com/firebase/firebase-admin-node/blob/master/src/installations/installations-request-handler.ts`
+  - firebase-admin@14.1.0 type declarations (security-rules.d.ts, machine-learning.d.ts, installations.d.ts)
+- **Coverage math:** 60 contracted / 90 total = 0.67 (60% → 67%). +6 contracted, -6 from "unaccounted" bucket.
+- **Verified by:** bc-deepen-contract (deepen-stream-2 pass 1 on 2026-06-26)
+
 ## 2026-06-25 — deepen pass 3 (deepen-stream-2) — coverage 60% → 60% (expanded surface)
 
 - **Profile:** `packages/firebase-admin/contract.yaml`
