@@ -1,14 +1,14 @@
 package: ai
 semver: ">=7.0.0"
-contract_version: "1.0.0"
+contract_version: "1.1.0"
 maintainer: "corpus-team"
-last_verified: "2026-06-25"
+last_verified: "2026-06-26"
 coverage_status: covered
 status: production
 evidence_quality: confirmed
-coverage_score: 0.94  # Inherits 14 functions from parent; adds contextSchema tool validation postcondition
+coverage_score: 0.96  # Inherits 14 functions from parent; adds contextSchema tool validation + allowSystemInMessages postconditions
 extends: "../ai/contract.yaml"
-# Fork point: ai v7.0.0 (Vercel AI SDK major release).
+# Fork point: ai v7.0.0 (Vercel AI SDK major release). Stable release: 2026-06-26 (latest=7.0.2).
 #
 # This profile inherits every postcondition from ../ai/contract.yaml
 # (which covers v2.0.0–v6.x) and adds ONLY the contracts that changed at v7:
@@ -31,13 +31,101 @@ extends: "../ai/contract.yaml"
 #      postcondition needed — the parent's agent-invalid-argument already matches
 #      the v7 behavior.
 #
-# Everything else (generateText, streamText, generateObject, streamObject,
+#   4. allowSystemInMessages: false default (4e095b0): generateText() and
+#      streamText() now throw InvalidPromptError if the messages array contains
+#      any {role: "system"} entry and allowSystemInMessages is not set to true.
+#      This is a breaking change for v6→v7 upgraders who stored system prompts
+#      as the first message in a persisted messages array. Source: ai/dist/index.js
+#      line 2446-2450 (confirmed from package source); migration guide at
+#      https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0.
+#
+# Everything else (streamText, generateObject, streamObject,
 # embed, embedMany, generateImage, generateSpeech, transcribe, rerank,
 # validateUIMessages, createUIMessageStream, ToolLoopAgent) inherits unchanged
 # from the parent — the error class hierarchy (APICallError, TypeValidationError,
 # NoImageGeneratedError, NoSpeechGeneratedError, etc.) did not change in v7.
 
 functions:
+  # Override generateText() to ADD the allowSystemInMessages: false default postcondition.
+  # All parent postconditions (api-error-rate-limit, api-error-auth, api-error-model-not-found,
+  # api-error-context-too-long, api-error-generic) are inherited automatically.
+  - name: generateText
+    import_path: "ai"
+    description: >
+      Generates text using an LLM model. In v7, throws InvalidPromptError if the
+      messages array contains system-role messages and allowSystemInMessages is not true.
+    postconditions:
+      # Evidence: ai/dist/index.js lines 2446-2450 (source-confirmed)
+      # if (!allowSystemInMessages && messages.some(msg => msg.role === "system")) {
+      #   throw new InvalidPromptError({ message: "System messages are not allowed..." })
+      # Evidence: https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0
+      - id: generate-text-system-message-in-messages-rejected
+        condition: >
+          generateText() is called with a messages array that contains any entry
+          with role: "system" and the allowSystemInMessages option is not explicitly
+          set to true. New default in v7.0.0 (CHANGELOG 4e095b0): v6 accepted system
+          messages in the messages field without restriction. Common trigger: persisted
+          chat history from a v6 app that stored the system prompt as the first message
+          in the messages array (a common pattern when building multi-turn chatbots).
+        throws: "InvalidPromptError (AI_InvalidPromptError from @ai-sdk/provider) with message 'System messages are not allowed in the prompt or messages fields. Use the instructions option instead.'"
+        required_handling: >
+          Either (a) migrate system prompt to the top-level instructions option:
+          `generateText({ model, instructions: 'You are...', messages })`, which is the
+          canonical v7 pattern and eliminates the error entirely. Or (b) set
+          allowSystemInMessages: true to opt back into the v6 behavior, but only when
+          the messages come from a trusted source (persisted server-side history) —
+          NOT for user-submitted messages, because user-controlled system role entries
+          can override the system prompt and cause prompt injection attacks. Callers
+          upgrading from v6 must audit every generateText/streamText call site for the
+          presence of {role: "system"} entries in the messages array.
+        sources:
+          - "https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0"
+          - "https://github.com/vercel/ai/blob/main/packages/ai/CHANGELOG.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
+  # Override streamText() with the identical allowSystemInMessages postcondition.
+  # The check and error are identical to generateText — same source location.
+  - name: streamText
+    import_path: "ai"
+    description: >
+      Streams text from an LLM model. In v7, throws InvalidPromptError if the
+      messages array contains system-role messages and allowSystemInMessages is not true.
+    postconditions:
+      # Evidence: ai/dist/index.js lines 2446-2450 (same check path as generateText)
+      # Evidence: https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0
+      - id: stream-text-system-message-in-messages-rejected
+        condition: >
+          streamText() is called with a messages array that contains any entry with
+          role: "system" and allowSystemInMessages is not set to true. Identical
+          behavior to generateText's generate-text-system-message-in-messages-rejected
+          postcondition — the validation runs before streaming begins.
+        throws: "InvalidPromptError (AI_InvalidPromptError from @ai-sdk/provider) with message 'System messages are not allowed in the prompt or messages fields. Use the instructions option instead.'"
+        required_handling: >
+          Same as generateText: migrate to instructions option or set
+          allowSystemInMessages: true for trusted server-side message sources.
+          Streaming callers are equally affected — the error is thrown synchronously
+          before any chunks are emitted, so any error-handling at the chunk level
+          will NOT catch this. The try-catch MUST surround the streamText() call itself,
+          not just the stream consumer.
+        sources:
+          - "https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0"
+          - "https://github.com/vercel/ai/blob/main/packages/ai/CHANGELOG.md"
+        severity: error
+        evidence_quality: confirmed
+        business_impact:
+          incident_label: DOWNTIME
+          production_behavior: immediate_exception
+          visibility: visible
+          user_experience: service_unavailable
+          incident_cost_range: medium
+
   # Override tool() ONLY to ADD the new contextSchema validation postcondition.
   # The two parent postconditions (tool-execution-error, tool-schema-validation-error)
   # are inherited automatically — they reference the same error classes that did not
