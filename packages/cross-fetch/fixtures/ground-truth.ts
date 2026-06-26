@@ -123,9 +123,7 @@ export async function textWithClone(url: string) {
 export async function textConvertedWithoutCatch(url: string) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-  // SHOULD_FIRE: text-converted-missing-encoding-package — textConverted() without try-catch;
-  // if optional 'encoding' package is not installed, throws Error at runtime.
-  // TODO(scanner): text-converted-missing-encoding-package — no scanner detection rule yet.
+  // SHOULD_FIRE: text-converted-missing-encoding-package — textConverted() without try-catch; if optional 'encoding' package is not installed, throws Error at runtime.
   const text = await (response as any).textConverted();
   return text;
 }
@@ -159,9 +157,7 @@ export async function textConvertedAfterBodyConsumed(url: string) {
     // First read consumes the body stream
     const rawText = await response.text();
     console.log('Raw response length:', rawText.length);
-    // SHOULD_FIRE: text-converted-body-consumed-twice — calling textConverted() on
-    // an already-consumed body throws TypeError "body used already".
-    // TODO(scanner): text-converted-body-consumed-twice — no scanner detection rule yet.
+    // TODO(scanner): text-converted-body-consumed-twice — calling textConverted() on already-consumed body throws TypeError "body used already". No scanner detection rule yet (requires tracking first-read on same response variable).
     const decoded = await (response as any).textConverted();
     return decoded;
   } catch (error) {
