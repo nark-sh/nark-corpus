@@ -657,8 +657,8 @@ export function createGitWithCatch(repoDir: string): ReturnType<typeof simpleGit
 // @expect-violation: simple-git-init-missing-try-catch
 export async function initNoCatch(cwd: string) {
   const git = simpleGit(cwd);
-  // SHOULD_FIRE: simple-git-init-missing-try-catch — git.init() throws GitError
   // "fatal: cannot mkdir <path>/.git: Permission denied" when target dir is read-only
+  // SHOULD_FIRE: simple-git-init-missing-try-catch — git.init() throws GitError
   await git.init();
 }
 
@@ -672,8 +672,8 @@ export async function initBareNoCatch(cwd: string) {
 // @expect-violation: simple-git-init-missing-try-catch
 export async function initWithTemplateNoCatch(cwd: string, templateDir: string) {
   const git = simpleGit(cwd);
-  // SHOULD_FIRE: simple-git-init-missing-try-catch — template dir may not exist
   // "fatal: template directory '<dir>' does not exist or is not a directory"
+  // SHOULD_FIRE: simple-git-init-missing-try-catch — template dir may not exist
   await git.init(false, { '--template': templateDir });
 }
 
