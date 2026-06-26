@@ -1,5 +1,11 @@
 # CHANGELOG — stripe
 
+## 2026-06-26 — re-verified clean
+
+- **Latest published:** stripe@22.3.0
+- **Profile semver:** >=8.0.0 <21.0.0 (unchanged)
+- **Verdict:** no changes — v21+ covered by stripe-v21 (>=21.0.0); parent semver intentionally upper-bounded
+- **Verified by:** bc-version-drift (sweep 2026-06-26)
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** stripe@22.3.0

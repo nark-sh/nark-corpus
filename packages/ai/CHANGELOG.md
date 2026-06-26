@@ -1,5 +1,12 @@
 # CHANGELOG — ai
 
+## 2026-06-26 — re-verified clean
+
+- **Latest published:** ai@7.0.2 (patch bump from 7.0.0)
+- **Profile semver:** >=2.0.0 <7.0.0 (unchanged)
+- **Verdict:** no changes — v7+ covered by ai-v7 (>=7.0.0); patch bump only, no new postconditions
+- **Note:** ai-v7 streamText NoOutputGeneratedError gap queued for bc-deepen-contract (v7 rejects empty streams; parent profile says streamText does not throw — needs override in ai-v7)
+- **Verified by:** bc-version-drift (sweep 2026-06-26)
 ## 2026-06-25 — extends-fork created for v7+
 
 - **Latest published:** ai@7.0.0

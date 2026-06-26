@@ -1,5 +1,12 @@
 # CHANGELOG — ai-v7
 
+## 2026-06-26 — re-verified clean
+
+- **Latest published:** ai@7.0.2 (patch bump from 7.0.0)
+- **Profile semver:** >=7.0.0 (unchanged)
+- **Verdict:** no error-handling changes in 7.0.1 or 7.0.2
+- **Open gap:** streamText NoOutputGeneratedError — v7 rejects result promises when stream ends without output; parent says streamText does not throw; ai-v7 should override this postcondition. Queued for bc-deepen-contract.
+- **Verified by:** bc-version-drift (sweep 2026-06-26)
 All notable verification, deepen, and fork events for this profile. Newest first.
 
 ## 2026-06-25 — extends-fork created for v7+

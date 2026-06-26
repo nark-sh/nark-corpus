@@ -1,5 +1,11 @@
 # CHANGELOG — stripe
 
+## 2026-06-26 — re-verified clean
+
+- **Latest published:** stripe@22.3.0
+- **Profile semver:** >=21.0.0 (unchanged)
+- **Verdict:** no error-handling-relevant changes in v22.x; v22.0.0 breaking changes are TypeScript types and callback removal — not error class or throw behavior changes
+- **Verified by:** bc-version-drift (sweep 2026-06-26)
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** stripe@22.3.0

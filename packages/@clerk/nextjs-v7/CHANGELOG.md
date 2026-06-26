@@ -1,5 +1,11 @@
 # CHANGELOG — @clerk/nextjs (v7+ extends-fork)
 
+## 2026-06-26 — re-verified clean
+
+- **Latest published:** @clerk/nextjs@7.5.9 (patch bump from 7.5.8)
+- **Profile semver:** >=7.0.0 (unchanged)
+- **Verdict:** no changes — patch bump, no error-handling changes
+- **Verified by:** bc-version-drift (sweep 2026-06-26)
 ## 2026-06-25 — re-verified clean
 
 - **Latest published:** @clerk/nextjs@7.5.8
