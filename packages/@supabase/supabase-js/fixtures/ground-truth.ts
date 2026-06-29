@@ -372,7 +372,7 @@ async function properCreateSignedUrl(path: string) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingGetUserIdentities() {
-  // FUTURE_FIRE: auth-get-identities-no-session — { error } not checked, session may be missing (scanner concern queued: concern-20260625-supabase-js-deepen-1)
+  // SHOULD_FIRE: auth-get-identities-no-session — { error } not checked, session may be missing
   const { data } = await supabase.auth.getUserIdentities();
   return data?.identities;
 }
@@ -391,7 +391,7 @@ async function properGetUserIdentities() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingLinkIdentity() {
-  // FUTURE_FIRE: auth-link-identity-already-exists — { error } not checked for identity_already_exists (scanner concern queued: concern-20260625-supabase-js-deepen-2)
+  // SHOULD_FIRE: auth-link-identity-already-exists — { error } not checked for identity_already_exists
   const { data } = await supabase.auth.linkIdentity({ provider: 'github' });
   return data;
 }
@@ -416,7 +416,7 @@ async function properLinkIdentity() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingUnlinkIdentity(identity: any) {
-  // FUTURE_FIRE: auth-unlink-identity-single-identity — { error } not checked before completing unlink (DATA_LOSS: user lockout) (scanner concern queued: concern-20260625-supabase-js-deepen-3)
+  // SHOULD_FIRE: auth-unlink-identity-single-identity — { error } not checked before completing unlink (DATA_LOSS: user lockout)
   const { data } = await supabase.auth.unlinkIdentity(identity);
   return data;
 }
@@ -443,7 +443,7 @@ async function properUnlinkIdentity(identity: any) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingStorageUpdate(path: string, file: File) {
-  // FUTURE_FIRE: storage-update-not-found — { error } not checked; object may not exist (scanner concern queued: concern-20260625-supabase-js-deepen-4)
+  // FUTURE_FIRE: storage-update-not-found — { error } not checked; object may not exist (scanner-gap: chainStr from.update doesn't disambiguate from DB update; scanner concern queued: concern-20260625-supabase-js-deepen-4)
   const { data } = await supabase.storage
     .from('avatars')
     .update(path, file);
@@ -466,7 +466,7 @@ async function properStorageUpdate(path: string, file: File) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingCreateSignedUploadUrl(path: string) {
-  // FUTURE_FIRE: storage-create-signed-upload-url-no-token — { error } not checked (scanner concern queued: concern-20260625-supabase-js-deepen-5)
+  // SHOULD_FIRE: storage-create-signed-upload-url-no-token — { error } not checked
   const { data } = await supabase.storage
     .from('uploads')
     .createSignedUploadUrl(path);
@@ -489,7 +489,7 @@ async function properCreateSignedUploadUrl(path: string) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function missingUploadToSignedUrl(path: string, token: string, file: File) {
-  // FUTURE_FIRE: storage-upload-to-signed-url-expired-token — { error } not checked; token may be expired (scanner concern queued: concern-20260625-supabase-js-deepen-6)
+  // SHOULD_FIRE: storage-upload-to-signed-url-expired-token — { error } not checked; token may be expired
   const { data } = await supabase.storage
     .from('uploads')
     .uploadToSignedUrl(path, token, file);
