@@ -600,7 +600,7 @@ export async function evaluateSignalWithCatch(
 // @expect-violation: assetReportCreate.invalid-input-error
 // @expect-violation: assetReportCreate.rate-limit-exceeded
 export async function createAssetReportNoCatch(accessTokens: string[]) {
-  // SHOULD_FIRE: asset-report-creation-error, invalid-input-error, rate-limit-exceeded — no try-catch
+  // SHOULD_FIRE: asset-report-creation-error — no try-catch (primary; invalid-input-error + rate-limit-exceeded as subViolations)
   const response = await plaidClient.assetReportCreate({
     access_tokens: accessTokens,
     days_requested: 60,
@@ -648,7 +648,7 @@ export async function createAssetReportWithCatch(accessTokens: string[]) {
 // @expect-violation: identityVerificationCreate.idempotent-conflict
 // @expect-violation: identityVerificationCreate.api-error
 export async function createIdentityVerificationNoCatch(clientUserId: string) {
-  // SHOULD_FIRE: invalid-input-error, idempotent-conflict, api-error — no try-catch
+  // SHOULD_FIRE: invalid-input-error — no try-catch (primary; idempotent-conflict + api-error as subViolations)
   const response = await plaidClient.identityVerificationCreate({
     is_shareable: true,
     template_id: 'idvtmp_xxx',
@@ -693,7 +693,7 @@ export async function createProcessorTokenNoCatch(
   accessToken: string,
   accountId: string,
 ) {
-  // SHOULD_FIRE: invalid-account-id, item-login-required, rate-limit-exceeded — no try-catch
+  // SHOULD_FIRE: invalid-account-id — no try-catch (primary; item-login-required + rate-limit-exceeded as subViolations)
   const response = await plaidClient.processorTokenCreate({
     access_token: accessToken,
     account_id: accountId,
