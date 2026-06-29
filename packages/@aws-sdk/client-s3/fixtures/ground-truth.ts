@@ -237,8 +237,7 @@ export async function waitBucketExistsWithCatch(bucket: string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function waitObjectNotExistsNoCatch(bucket: string, key: string) {
-  // FUTURE_SHOULD_FIRE: s3-object-not-exists-waiter-timeout-not-handled — no scanner rule yet (queued)
-  // waitUntilObjectNotExists without try-catch throws TimeoutError if object remains visible
+  // SHOULD_FIRE: s3-object-not-exists-waiter-timeout-not-handled — waitUntilObjectNotExists without try-catch throws TimeoutError
   await waitUntilObjectNotExists({ client: s3Client, maxWaitTime: 30 }, { Bucket: bucket, Key: key });
 }
 
@@ -266,8 +265,7 @@ export async function waitObjectNotExistsWithCatch(bucket: string, key: string) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function waitBucketNotExistsNoCatch(bucket: string) {
-  // FUTURE_SHOULD_FIRE: s3-bucket-not-exists-waiter-timeout-not-handled — no scanner rule yet (queued)
-  // waitUntilBucketNotExists without try-catch throws TimeoutError if bucket remains visible
+  // SHOULD_FIRE: s3-bucket-not-exists-waiter-timeout-not-handled — waitUntilBucketNotExists without try-catch throws TimeoutError
   await waitUntilBucketNotExists({ client: s3Client, maxWaitTime: 60 }, { Bucket: bucket });
 }
 

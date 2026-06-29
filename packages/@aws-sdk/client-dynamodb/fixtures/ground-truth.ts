@@ -709,8 +709,7 @@ import {
 } from '@aws-sdk/client-dynamodb';
 
 export async function provisionTenantTableNoCatch(tableName: string) {
-  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — no scanner rule yet (queued concern-20260623-aws-sdk-client-dynamodb-deepen-7)
-  // Bare await on waitUntilTableExists with no try-catch — TimeoutError propagates as unhandled rejection in tenant provisioning path.
+  // FUTURE_SHOULD_FIRE: aws-dynamodb-wait-until-table-exists-no-try-catch — scanner gap: waitUntilTableExists standalone import not detected (concern-20260623-aws-sdk-client-dynamodb-deepen-7)
   await waitUntilTableExists(
     { client: dynamoClient, maxWaitTime: 60 },
     { TableName: tableName },
