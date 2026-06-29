@@ -218,10 +218,10 @@ import { updateTag } from 'next/cache';
 
 // ----- forbidden() inside try-catch — VIOLATION -----
 
-// SHOULD_FIRE: forbidden-inside-try-catch
 async function forbiddenInsideTryCatch(postId: string, viewerId: string) {
   try {
     const post = await fetchPost(postId);
+    // SHOULD_FIRE: forbidden-inside-try-catch — catch block intercepts the 403 throw, 403 page never renders
     if ((post as any)?.ownerId !== viewerId) forbidden();
     return post;
   } catch (error) {
@@ -245,10 +245,10 @@ async function forbiddenOutsideTryCatch(postId: string, viewerId: string) {
 
 // ----- unauthorized() inside try-catch — VIOLATION -----
 
-// SHOULD_FIRE: unauthorized-inside-try-catch
 async function unauthorizedInsideTryCatch() {
   try {
     const session = await getSession();
+    // SHOULD_FIRE: unauthorized-inside-try-catch — catch block swallows 401 throw, unauthenticated user gets content
     if (!session) unauthorized();
     return session;
   } catch (error) {
@@ -272,8 +272,8 @@ async function unauthorizedOutsideTryCatch() {
 
 // ----- connection() missing await — VIOLATION -----
 
-// SHOULD_FIRE: connection-missing-await
 async function connectionWithoutAwait() {
+  // SHOULD_FIRE: connection-missing-await — unawaited connection() fails to mark route as dynamic
   connection();
   return Date.now();
 }
@@ -286,9 +286,9 @@ async function connectionWithAwait() {
 
 // ----- connection() inside after() — VIOLATION -----
 
-// SHOULD_FIRE: connection-inside-after
 async function connectionInsideAfterScope() {
   after(async () => {
+    // SHOULD_FIRE: connection-inside-after — connection() inside after() throws E827 at runtime
     await connection();
     await sendMetric('post-response');
   });
@@ -304,8 +304,8 @@ async function connectionBeforeAfterScope() {
 
 // ----- draftMode() missing await — VIOLATION -----
 
-// SHOULD_FIRE: draft-mode-missing-await
 async function draftModeWithoutAwait() {
+  // SHOULD_FIRE: draft-mode-missing-await — draftMode() returns Promise, isEnabled is undefined without await
   const { isEnabled } = draftMode() as unknown as { isEnabled: boolean };
   if (isEnabled) return fetchDraftPost('1');
   return fetchPost('1');
@@ -320,8 +320,8 @@ async function draftModeWithAwait() {
 
 // ----- after() callback with no error handling — VIOLATION -----
 
-// SHOULD_FIRE: after-error-swallowed
 async function afterCallbackNoErrorHandling(data: { id: string }) {
+  // SHOULD_FIRE: after-error-swallowed — after() callback error logged to stderr only, no Sentry alert
   after(async () => {
     await sendAnalytics(data);
   });
@@ -342,11 +342,11 @@ async function afterCallbackWithErrorHandling(data: { id: string }) {
 
 // ----- updateTag() after redirect — VIOLATION -----
 
-// SHOULD_FIRE: update-tag-after-redirect
 async function updateTagAfterRedirect(postId: string) {
   'use server';
   await updateInDB({ id: postId });
   redirect('/posts');
+  // SHOULD_FIRE: update-tag-after-redirect — redirect() throws first, updateTag() is dead code after it
   updateTag('posts');
 }
 
@@ -360,10 +360,10 @@ async function updateTagBeforeRedirect(postId: string) {
 
 // ----- updateTag() outside Server Action — VIOLATION -----
 
-// SHOULD_FIRE: update-tag-outside-server-action
 export async function POST_updateTagFromRouteHandler(req: Request) {
   const event = await req.json();
   await createInDB(event as { title: string });
+  // SHOULD_FIRE: update-tag-outside-server-action — updateTag() called from Route Handler, not Server Action
   updateTag('events');
   return Response.json({ ok: true });
 }
