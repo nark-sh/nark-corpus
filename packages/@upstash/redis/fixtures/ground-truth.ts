@@ -435,3 +435,88 @@ export async function pipelineKeepErrorsInspected(key: string, value: string) {
     throw error;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream commands: xadd, xgroup, xreadgroup (pass 13, 2026-06-23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareXaddNoCatch(key: string, entries: Record<string, string>) {
+  // SHOULD_FIRE: wrongtype-or-network-error — xadd can throw UpstashError, no try-catch
+  await redis.xadd(key, '*', entries);
+}
+
+export async function xaddWithCatch(key: string, entries: Record<string, string>) {
+  try {
+    // SHOULD_NOT_FIRE: xadd inside try-catch
+    await redis.xadd(key, '*', entries);
+  } catch (error) {
+    console.error('xadd failed:', error);
+    throw error;
+  }
+}
+
+export async function bareXgroupNoCatch(key: string, group: string) {
+  // SHOULD_FIRE: busygroup-or-nogroup-error — xgroup can throw BUSYGROUP error, no try-catch
+  await redis.xgroup({ type: 'CREATE', key, group, id: '$', mkstream: true });
+}
+
+export async function xgroupWithCatch(key: string, group: string) {
+  try {
+    // SHOULD_NOT_FIRE: xgroup inside try-catch
+    await redis.xgroup({ type: 'CREATE', key, group, id: '$', mkstream: true });
+  } catch (error) {
+    console.error('xgroup failed:', error);
+    throw error;
+  }
+}
+
+export async function bareXreadgroupNoCatch(key: string, group: string, consumer: string) {
+  // SHOULD_FIRE: nogroup-error — xreadgroup can throw NOGROUP error, no try-catch
+  await redis.xreadgroup({ group, consumer, streams: [{ key, id: '>' }] });
+}
+
+export async function xreadgroupWithCatch(key: string, group: string, consumer: string) {
+  try {
+    // SHOULD_NOT_FIRE: xreadgroup inside try-catch
+    await redis.xreadgroup({ group, consumer, streams: [{ key, id: '>' }] });
+  } catch (error) {
+    console.error('xreadgroup failed:', error);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// copy and flushdb (pass 13, 2026-06-23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bareCopyNoCatch(source: string, destination: string) {
+  // SHOULD_FIRE: wrongtype-or-network-error — copy can throw UpstashError, no try-catch
+  const result = await redis.copy(source, destination);
+  return result;
+}
+
+export async function copyWithCatch(source: string, destination: string) {
+  try {
+    // SHOULD_NOT_FIRE: copy inside try-catch
+    const result = await redis.copy(source, destination);
+    return result;
+  } catch (error) {
+    console.error('copy failed:', error);
+    throw error;
+  }
+}
+
+export async function bareFlushdbNoCatch() {
+  // SHOULD_FIRE: destructive-no-try-catch — flushdb destroys all keys, no error handling
+  await redis.flushdb();
+}
+
+export async function flushdbWithCatch() {
+  try {
+    // SHOULD_NOT_FIRE: flushdb inside try-catch
+    await redis.flushdb();
+  } catch (error) {
+    console.error('flushdb failed:', error);
+    throw error;
+  }
+}
