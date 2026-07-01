@@ -186,6 +186,7 @@ function parserInstanceCallbackClean(xml: string) {
 function parserInstanceCallbackIgnoresError(xml: string) {
   const parser = new Parser({ explicitArray: false });
   // SHOULD_FIRE: parser-instance-parse-string-callback-error-ignored — err discarded
+  // SKIP-CLEANUP: concern-20260630-xml2js-instance-disambiguation-1 — scanner fires parse-string-callback-error-ignored (module-level) instead of parser-instance-parse-string-callback-error-ignored
   parser.parseString(xml, (err, result) => {
     console.log(result.items);
   });
@@ -194,6 +195,7 @@ function parserInstanceCallbackIgnoresError(xml: string) {
 function parserInstanceCallbackUntypedIgnoresError(xml: string) {
   const parser = new Parser();
   // SHOULD_FIRE: parser-instance-parse-string-callback-error-ignored — function-expr callback ignores err
+  // SKIP-CLEANUP: concern-20260630-xml2js-instance-disambiguation-1 — scanner fires parse-string-callback-error-ignored (module-level) instead of parser-instance-parse-string-callback-error-ignored
   parser.parseString(xml, function(err: Error | null, result: any) {
     const items = result.items;
     return items;
@@ -203,6 +205,7 @@ function parserInstanceCallbackUntypedIgnoresError(xml: string) {
 function parserInstanceParseStringNoCallback(xml: string) {
   const parser = new Parser({ explicitArray: false });
   // SHOULD_FIRE: parser-instance-parse-string-no-callback — instance parseString called without cb
+  // SKIP-CLEANUP: concern-20260630-xml2js-instance-disambiguation-1 — scanner fires parse-string-callback-error-ignored (module-level) instead of parser-instance-parse-string-no-callback
   parser.parseString(xml);
 }
 
